@@ -24,10 +24,10 @@
  *                               [--res=1920x1080] [--no-build]
  *
  * `--before` is a directory holding a complete `src/` tree for the BEFORE variant. The
- * project's own `src/` is the AFTER variant and is never modified: the before build is
- * produced by moving `src` aside, copying the before tree in, building, and restoring —
- * with the restore in a `finally`, and a guard that refuses to start if a previous run
- * left the swap half-done.
+ * project's own `src/` is the AFTER variant and ends the run byte-identical to how it
+ * started: the before build swaps in only the files that actually differ, holds the
+ * originals in memory, and restores them in a `finally`. See buildBefore() for why a
+ * whole-directory rename is not usable on this machine.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -306,19 +306,17 @@ for (const name of Object.keys(report.results)) {
 
   printTable(METRICS.map(([label, key, fn]) => {
     const get = fn || ((r) => r[key]);
-    const b = rows.map(get).filter(Number.isFinite);
-    const a = rows.map((p) => get(p.after)).filter(Number.isFinite);
-    const bb = rows.map((p) => get(p.before)).filter(Number.isFinite);
+    const before = rows.map((p) => get(p.before)).filter(Number.isFinite);
+    const after = rows.map((p) => get(p.after)).filter(Number.isFinite);
     const deltas = rows.map((p) => get(p.after) - get(p.before)).filter(Number.isFinite);
-    const wins = deltas.filter((d) => d < 0).length;
-    void b; void a;
     return {
       label,
-      before: median(bb),
-      after: median(rows.map((p) => get(p.after)).filter(Number.isFinite)),
+      before: median(before),
+      after: median(after),
       dMed: median(deltas),
-      wins: wins + '/' + deltas.length,
-      per: rows.map((p) => r2(get(p.after) - get(p.before))).join(' '),
+      // Lower is better for every metric in this table, so a negative delta is a win.
+      wins: deltas.filter((d) => d < 0).length + '/' + deltas.length,
+      per: deltas.map(r2).join(' '),
     };
   }), [
     { h: 'metric', f: (r) => r.label },

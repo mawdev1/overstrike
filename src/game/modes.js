@@ -368,9 +368,9 @@ const DOMINATION = {
   },
 
   /**
-   * Release the shared zone rig. `cleanup()` only detaches it from the scene, because the
-   * mode is a singleton and the rig is rebuilt at most once per session; this is the
-   * teardown path, called from Match.dispose().
+   * Release the shared zone rig for good. `cleanup()` only hides it, because the mode is
+   * a singleton whose rig is built once per session and must stay in the scene for the
+   * shader prewarm; this is the teardown path, called from Match.dispose().
    */
   dispose() { disposeGfx(this); },
 
