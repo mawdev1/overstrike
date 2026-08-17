@@ -1,0 +1,63 @@
+{
+ "C3_renderSoundBankMs": {
+  "before_median": 361.1,
+  "after_median": 318.2,
+  "before_min": 239.5,
+  "after_min": 212.1,
+  "before_runs": [
+   2481.2,
+   274.6,
+   267.7,
+   239.5,
+   404.3,
+   361.1,
+   853.4
+  ],
+  "after_runs": [
+   2085.4,
+   238.1,
+   216,
+   212.1,
+   318.2,
+   567.5,
+   938.7
+  ]
+ },
+ "C3_longestMainThreadBlockMs": {
+  "before_median": 298.8,
+  "after_median": 96.9,
+  "before_min": 207.5,
+  "after_min": 42.8
+ },
+ "C4_createImpulseResponsesMs": {
+  "before_median": 16.5,
+  "after_median": 15.4,
+  "before_min": 13.2,
+  "after_min": 8.2,
+  "samples": 21
+ },
+ "C4_equivalence": {
+  "indoor": {
+   "lenMatch": true,
+   "bitIdenticalPct": 100,
+   "maxAbsDiff": 0,
+   "maxRelDiff": 0,
+   "maxAbsDiffVsPeak": 0
+  },
+  "outdoor": {
+   "lenMatch": true,
+   "bitIdenticalPct": 99.9912,
+   "maxAbsDiff": 7.276e-12,
+   "maxRelDiff": 2.293e-7,
+   "maxAbsDiffVsPeak": 1.613e-10
+  },
+  "concrete": {
+   "lenMatch": true,
+   "bitIdenticalPct": 99.9668,
+   "maxAbsDiff": 2.328e-10,
+   "maxRelDiff": 0.000002661,
+   "maxAbsDiffVsPeak": 8.207e-9
+  }
+ },
+ "pageErrors": []
+}

@@ -1,0 +1,31 @@
+{
+ "tag": "after",
+ "mode": "load",
+ "when": "2026-08-17T21:30:37.088Z",
+ "load": {
+  "ctxState": "running",
+  "audioInitMs": 2502.5,
+  "playMs": 0,
+  "playCalls": 1820,
+  "granted": 568,
+  "seconds": 6.04,
+  "grantRate": 0.312,
+  "callsPerSec": 301.4,
+  "mainThreadPlayMsTotal": 287.5,
+  "mainThreadPlayUsPerCall": 157.97,
+  "mainThreadPlayMsPerSec": 47.61,
+  "voiceRecordsAvg": 35,
+  "voiceRecordsMax": 45,
+  "voiceCountAvg": 28,
+  "voiceCountMax": 28,
+  "hrtfVoiceAvg": 6.1,
+  "hrtfVoiceMax": 8,
+  "liveNodesAvg": 123.8,
+  "liveNodesMax": 133,
+  "listenerWrites": 12,
+  "listenerSkips": 5,
+  "audioThreadAvgLoad": null
+ },
+ "pageErrors": [],
+ "consoleErrors": []
+}

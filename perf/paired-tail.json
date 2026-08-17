@@ -1,0 +1,116 @@
+{
+ "generatedAt": "2026-08-17T22:01:05.316Z",
+ "tool": "scripts/pairedtail.mjs",
+ "pairs": 1,
+ "resolution": "1920x1080",
+ "scenarios": [
+  "worstcase"
+ ],
+ "order": "ABBA (variant order alternates every pair)",
+ "results": {
+  "worstcase": [
+   {
+    "pair": 1,
+    "order": "before>after",
+    "before": {
+     "frames": 600,
+     "medianMs": 5.1,
+     "meanMs": 7.901,
+     "p95Ms": 21.935,
+     "p99Ms": 39,
+     "maxMs": 106.745,
+     "worst1pctMs": 70.919,
+     "worst01pctMs": 106.745,
+     "stutterFrames": 114,
+     "stutterPct": 19,
+     "cpuFrameMs": {
+      "n": 600,
+      "mean": 5.421,
+      "median": 4.24,
+      "p95": 10.36,
+      "p99": 35.09,
+      "min": 1.685,
+      "max": 82.97,
+      "std": 5.845
+     },
+     "gpuFrameMs": {
+      "n": 600,
+      "mean": 3.649,
+      "median": 3.456,
+      "p95": 4.668,
+      "p99": 7.535,
+      "min": 3.412,
+      "max": 13.258,
+      "std": 0.765
+     },
+     "msPerFixedStep": {
+      "n": 150,
+      "mean": 0.252,
+      "median": 0.244,
+      "p95": 0.518,
+      "p99": 0.742,
+      "min": 0.029,
+      "max": 1.238,
+      "std": 0.153
+     },
+     "programsDuringSample": 0,
+     "hitchLongFrames": 14,
+     "hitchMaxMs": 1194.91,
+     "drawCalls": 182,
+     "triangles": 235695,
+     "botsAlive": 22,
+     "pageErrors": []
+    },
+    "after": {
+     "frames": 600,
+     "medianMs": 8.195,
+     "meanMs": 9.324,
+     "p95Ms": 19.295,
+     "p99Ms": 29.095,
+     "maxMs": 38.445,
+     "worst1pctMs": 33.341,
+     "worst01pctMs": 38.445,
+     "stutterFrames": 55,
+     "stutterPct": 9.17,
+     "cpuFrameMs": {
+      "n": 600,
+      "mean": 7.04,
+      "median": 5.96,
+      "p95": 14.34,
+      "p99": 25.945,
+      "min": 2.07,
+      "max": 42.075,
+      "std": 4.425
+     },
+     "gpuFrameMs": {
+      "n": 600,
+      "mean": 3.713,
+      "median": 3.486,
+      "p95": 4.851,
+      "p99": 7.005,
+      "min": 3.437,
+      "max": 13.05,
+      "std": 0.858
+     },
+     "msPerFixedStep": {
+      "n": 150,
+      "mean": 0.32,
+      "median": 0.302,
+      "p95": 0.689,
+      "p99": 1.093,
+      "min": 0.051,
+      "max": 1.65,
+      "std": 0.221
+     },
+     "programsDuringSample": 0,
+     "hitchLongFrames": 56,
+     "hitchMaxMs": 966.42,
+     "drawCalls": 204,
+     "triangles": 248637,
+     "botsAlive": 23,
+     "pageErrors": []
+    }
+   }
+  ]
+ }
+}

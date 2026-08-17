@@ -17,7 +17,7 @@
  *      the sight lies and the feature is worse than nothing.
  *   2. COST. Frame time and draw calls with the scope up versus down.
  *
- * Usage: node scripts/scopeshot.mjs [--out=shots/scope] [--weapon=sr_reaver] [--scale=1]
+ * Usage: node scripts/scopeshot.mjs [--out=shots/scope] [--weapon=sr_reaver|dmr_meridian] [--scale=1]
  */
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
@@ -303,6 +303,166 @@ const fired = await page.evaluate(() => {
 });
 console.log('[scope] fired round vs aim axis:', JSON.stringify(fired));
 
+// ═══════════════════════════ stage 5b: RETICLE vs BULLET, every frame, live ══
+// One sample at one still moment proves very little. This tracks the disagreement
+// between screen centre (where the HUD draws the reticle) and the point the CURRENT
+// aim ray hits, once per rendered frame, through sway, breathing, mouse lag and the
+// recoil of live rounds — and fires real ones part-way through. If the sight ever
+// lies, it lies while the rifle is moving, which is the only time it matters.
+await page.evaluate(() => window.__GAME__.start());
+await setAds(true);
+await page.waitForTimeout(1400);
+const track = await page.evaluate(() => new Promise((resolve) => {
+  const g = window.__GAME__;
+  const V = g.player.position.constructor;
+  const eye = new V(), dir = new V(), pt = new V();
+  const w = window.innerWidth, h = window.innerHeight;
+  let n = 0, worst = 0, worstAt = null, sum = 0, samples = 0, misses = 0, shots = 0;
+  g.player.weapon.stopFire();
+  const tick = () => {
+    // Fire a live round every 40 frames so recoil, the bolt cycle and the reticle
+    // fade are all in the sample.
+    // Through the REAL input path, not weapon.tryFire(): the trigger is polled inside
+    // _fixedUpdate, so the recoil impulse and the camera that composes the frame land in
+    // the same tick. Calling tryFire() from rAF applies recoil AFTER the camera has
+    // already been written and manufactures a one-frame disagreement that no player can
+    // ever see.
+    g.input.enabled = true;
+    g.input.buttons[0] = (n > 20 && (n % 40 === 0 || n % 40 === 1));
+    if (g.player.weapon) {
+      if (g.player.weapon.ammo <= 0) g.player.weapon.ammo = g.player.weapon.def.magSize;
+      if (n > 20 && n % 40 === 2) shots++;
+    }
+    if (!g.player.alive && g.match?.respawn) g.match.respawn(g.player);
+    g.player.health = g.player.maxHealth;
+    g.player.getEyePosition(eye);
+    g.player.getAimDirection(dir);
+    const hit = g.world.raycast(eye, dir, 400);
+    if (!hit) { misses++; } else {
+      pt.copy(hit.point);
+      g.camera.updateMatrixWorld();
+      pt.project(g.camera);
+      const dx = pt.x * w * 0.5, dy = -pt.y * h * 0.5;
+      const d = Math.hypot(dx, dy);
+      sum += d; samples++;
+      if (d > worst) { worst = d; worstAt = { px: +dx.toFixed(3), py: +dy.toFixed(3), frame: n }; }
+    }
+    if (++n < 260) requestAnimationFrame(tick);
+    else {
+      resolve({
+        samples, misses, shots,
+        meanPx: +(sum / Math.max(1, samples)).toFixed(4),
+        worstPx: +worst.toFixed(4),
+        worstAt,
+        pxPerDeg: +((h * 0.5) / Math.tan(g.camera.fov * 0.5 * Math.PI / 180) * Math.tan(Math.PI / 180)).toFixed(2),
+      });
+    }
+  };
+  requestAnimationFrame(tick);
+}));
+console.log('[scope] reticle-vs-bullet, 260 live frames:', JSON.stringify(track));
+
+// Same measurement for every real round the ballistics layer actually reported an
+// impact for: the angle between the shot's own origin/direction and where it landed.
+const rounds = await page.evaluate(() => new Promise((resolve) => {
+  const g = window.__GAME__;
+  const V = g.player.position.constructor;
+  const out = [];
+  let pending = null;
+  const onShot = (e) => {
+    if (!e?.isPlayer) return;
+    pending = { o: new V(e.origin.x, e.origin.y, e.origin.z), d: new V(e.dir.x, e.dir.y, e.dir.z) };
+  };
+  const onLand = (e) => {
+    if (!pending || !e?.point) return;
+    const v = new V(e.point.x, e.point.y, e.point.z).sub(pending.o);
+    const dist = v.length();
+    const cos = Math.min(1, v.normalize().dot(pending.d.normalize()));
+    out.push({ dist: +dist.toFixed(2), offDeg: +(Math.acos(cos) * 180 / Math.PI).toFixed(5) });
+    pending = null;
+  };
+  const u1 = g.bus.on('shot', onShot);
+  const u2 = g.bus.on('impact', onLand);
+  const u3 = g.bus.on('hit', onLand);
+  let n = 0;
+  const tick = () => {
+    g.input.enabled = true;
+    g.input.buttons[0] = (n % 30 === 0 || n % 30 === 1);
+    if (g.player.weapon && g.player.weapon.ammo <= 0) g.player.weapon.ammo = g.player.weapon.def.magSize;
+    if (!g.player.alive && g.match?.respawn) g.match.respawn(g.player);
+    g.player.health = g.player.maxHealth;
+    if (++n < 200) requestAnimationFrame(tick);
+    else { g.input.buttons[0] = false; u1(); u2(); u3(); resolve(out); }
+  };
+  requestAnimationFrame(tick);
+}));
+const offs = rounds.map((r) => r.offDeg);
+console.log(`[scope] live rounds: n=${rounds.length} max off-axis=${offs.length ? Math.max(...offs) : 'n/a'} deg`);
+
+// ══════════════════════════════════ stage 5c: resize while fully scoped ══════
+const resized = await page.evaluate(() => new Promise((resolve) => {
+  const g = window.__GAME__;
+  const before = { amount: +g.engine.scope.amount.toFixed(3), res: g.engine.compositePass.uniforms.uResolution.value.toArray() };
+  window.dispatchEvent(new Event('resize'));
+  setTimeout(() => resolve({
+    before,
+    after: { amount: +g.engine.scope.amount.toFixed(3), res: g.engine.compositePass.uniforms.uResolution.value.toArray() },
+    aoDepth1: !!g.engine.composer.renderTarget1.depthTexture,
+    aoDepth2: !!g.engine.composer.renderTarget2.depthTexture,
+  }), 240);
+}));
+await page.setViewportSize({ width: 1280, height: 720 });
+await page.waitForTimeout(700);
+await shoot('09-scoped-720p');
+const small = await scopeState();
+console.log('[scope] resize while scoped:', JSON.stringify(resized), JSON.stringify(small));
+await page.setViewportSize({ width: 1600, height: 900 });
+await page.waitForTimeout(700);
+
+// ═════════════════════ stage 5d: control — a NON-scoped weapon at full ADS ══
+await setAds(false);
+await page.waitForTimeout(500);
+const control = await page.evaluate(async () => {
+  const g = window.__GAME__;
+  g.weapons.giveLoadout(g.player, ['ar_vector', 'pistol_sidewinder']);
+  g.weapons.switchTo(g.player, 0, true);
+  await new Promise((r) => setTimeout(r, 900));
+  g.input.buttons[2] = true;
+  await new Promise((r) => setTimeout(r, 1200));
+  const u = g.engine.compositePass.uniforms;
+  return {
+    weapon: g.player.weapon?.def?.id,
+    scopedFlag: !!g.player.weapon?.def?.scoped,
+    ads: +g.player.adsAmount.toFixed(3),
+    scopeAmount: +g.engine.scope.amount.toFixed(3),
+    uScope: u.uScope.value,
+    scopeActive: g.engine.scope.active,
+    reticleVisible: (() => {
+      const el = document.querySelector('#hud .scope');
+      if (!el) return 'missing';
+      const cs = getComputedStyle(el);
+      return cs.visibility === 'hidden' || Number(cs.opacity) === 0 ? 'hidden' : 'visible';
+    })(),
+    gunVisible: !!g.weapons.viewmodel?.current?.group?.visible,
+  };
+});
+await shoot('10-control-ar-ads');
+console.log('[scope] non-scoped control:', JSON.stringify(control));
+await page.evaluate((wid) => {
+  const g = window.__GAME__;
+  g.input.buttons[0] = g.input.buttons[2] = false;
+  if (!g.player.alive) g.match?.respawn?.(g.player) ?? g.player.respawn?.();
+  g.player.health = g.player.maxHealth;
+  g.weapons.giveLoadout(g.player, [wid, 'pistol_sidewinder']);
+  g.weapons.switchTo(g.player, 0, true);
+  // Keep the player upright for the cost measurement — a corpse cannot hold a scope up.
+  g.__heal = g.__heal || setInterval(() => {
+    if (!g.player.alive) g.match?.respawn?.(g.player) ?? g.player.respawn?.();
+    g.player.health = g.player.maxHealth;
+  }, 80);
+}, WEAPON);
+await page.waitForTimeout(1400);
+
 // ═══════════════════════════════════════════════════════════ stage 6: unscope ══
 await setAds(false);
 await page.waitForTimeout(160);
@@ -384,9 +544,12 @@ console.log(`[scope] scoped vs hip total:      ${(mean(onRuns, 'cleanMs') - off.
   + `${on.draws - off.draws} draw calls, ${on.tris - off.tris} tris`);
 
 // ═══════════════════════════════════════════════════ state-reset edge cases ══
-const edge = await page.evaluate(async () => {
+const edge = await page.evaluate(async (weaponId) => {
   const g = window.__GAME__;
   const out = {};
+  // Hand over to this block's own heal loop — the death test below has to be able to
+  // actually kill the player.
+  if (g.__heal) { clearInterval(g.__heal); g.__heal = null; }
   // Wall-clock, not frame counts: vsync is off for the cost measurement, so "90 frames"
   // is a quarter of a second and every timed transition below would be sampled early.
   // Also keep the player upright — seven bots have had several seconds of free shots at
@@ -397,6 +560,16 @@ const edge = await page.evaluate(async () => {
     p.health = p.maxHealth;
   }, 60);
   const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The stages above fire live rounds for several hundred frames with seven bots
+  // shooting back; put the player back on their feet and back on the scoped rifle
+  // before measuring anything about the sight picture.
+  g.input.buttons[0] = false;
+  if (!g.player.alive) g.match?.respawn?.(g.player) ?? g.player.respawn?.();
+  g.weapons.giveLoadout(g.player, [weaponId, 'pistol_sidewinder']);
+  g.weapons.switchTo(g.player, 0, true);
+  await settle(1000);
+  out.weapon = g.player.weapon?.def?.id ?? null;
 
   g.input.buttons[2] = true;
   await settle(1200);
@@ -444,12 +617,23 @@ const edge = await page.evaluate(async () => {
 
   g.input.buttons[2] = false;
   return out;
-});
+}, WEAPON);
 console.log('[scope] edge cases:', JSON.stringify(edge));
 
 const checks = [
   ['reticle within 2 px of the bullet path', aimTruth.ok && Math.hypot(aimTruth.px, aimTruth.py) < 2,
     aimTruth.ok ? `${Math.hypot(aimTruth.px, aimTruth.py).toFixed(2)} px (1° = ${aimTruth.pxPerDeg} px)` : 'no world hit'],
+  ['reticle tracks the bullet path through sway + recoil', track.samples > 100 && track.worstPx < 2,
+    `worst ${track.worstPx} px over ${track.samples} frames, ${track.shots} live rounds (1° = ${track.pxPerDeg} px)`],
+  ['every fired round leaves along its own aim axis', rounds.length > 0 && Math.max(...offs) < 0.001,
+    `n=${rounds.length}, max ${offs.length ? Math.max(...offs) : '-'}°`],
+  ['resize while scoped keeps the sight up and resizes the buffers',
+    resized.after.amount > 0.99 && resized.aoDepth1 && resized.aoDepth2 && small.amount > 0.99,
+    `amount ${resized.before.amount} -> ${resized.after.amount}, 720p amount=${small.amount}`],
+  ['a non-scoped weapon at full ADS is completely untouched',
+    control.scopedFlag === false && control.ads > 0.99 && control.uScope === 0
+      && control.scopeActive === false && control.reticleVisible === 'hidden' && control.gunVisible === true,
+    `${control.weapon} ads=${control.ads} uScope=${control.uScope} reticle=${control.reticleVisible} gun=${control.gunVisible}`],
   ['scope reaches full strength', scoped.amount > 0.99, `amount=${scoped.amount}`],
   ['gun hidden while scoped', scoped.gunVisible === false, `gunVisible=${scoped.gunVisible}`],
   ['zero extra draw calls when scoped', on.draws - off.draws <= 0, `${off.draws} -> ${on.draws}`],

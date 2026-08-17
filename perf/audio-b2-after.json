@@ -1,0 +1,62 @@
+{
+ "tag": "after",
+ "mode": "b2",
+ "when": "2026-08-17T21:29:46.445Z",
+ "b2": {
+  "airstrike": {
+   "label": "airstrike (9 bombs x 3 voices, rate 1)",
+   "explosionPlaysAttempted": 27,
+   "explosionsGranted": 27,
+   "explosionVoicesLiveAfterBarrage": 6,
+   "voicesLiveAfterBarrage": 6,
+   "gunshotAttempts": 528,
+   "gunshotsGranted": 281,
+   "gunshotGrantRate": 0.532,
+   "gunshotsPerSec": 111.6,
+   "longestGunfireSilenceMs": 228,
+   "gunVoiceStealCount": 176,
+   "avgGunVoiceStealAgeMs": 224.6,
+   "gunVoicesStolenUnder150ms": 0
+  },
+  "grenadePops": {
+   "label": "grenade pops (14 x rate 0.35/0.4)",
+   "explosionPlaysAttempted": 14,
+   "explosionsGranted": 14,
+   "explosionVoicesLiveAfterBarrage": 6,
+   "voicesLiveAfterBarrage": 6,
+   "gunshotAttempts": 480,
+   "gunshotsGranted": 283,
+   "gunshotGrantRate": 0.59,
+   "gunshotsPerSec": 112.7,
+   "longestGunfireSilenceMs": 317,
+   "gunVoiceStealCount": 168,
+   "avgGunVoiceStealAgeMs": 229,
+   "gunVoicesStolenUnder150ms": 0
+  },
+  "checks": [
+   {
+    "name": "airstrike: gunfire still gets voices",
+    "pass": true,
+    "detail": "grant rate 0.532"
+   },
+   {
+    "name": "airstrike: no multi-second gunfire blackout",
+    "pass": true,
+    "detail": "longest silence 228 ms"
+   },
+   {
+    "name": "grenade pops: gunfire still gets voices",
+    "pass": true,
+    "detail": "grant rate 0.59"
+   },
+   {
+    "name": "gunshot voices are not stolen inside their first 150 ms",
+    "pass": true,
+    "detail": "airstrike 0, pops 0"
+   }
+  ],
+  "failed": 0
+ },
+ "pageErrors": [],
+ "consoleErrors": []
+}

@@ -82,6 +82,7 @@ const CHOPPER_SPIN = 0.3;         // rad/s around the map
 const CHOPPER_BURST = 0.11;
 const CHOPPER_DAMAGE = 24;
 const CHOPPER_RANGE = 90;
+const CHOPPER_ACQUIRE = 0.4;      // seconds between target sweeps
 
 export class Killstreaks {
   constructor(game, match) {
@@ -102,7 +103,14 @@ export class Killstreaks {
     this._choppers = [];
     this._group = null;
     this._ballistics = null;
-    this._nextId = 1;
+    /**
+     * Streak hardware is NOT in `game.entities` and never goes through the player/bot id
+     * allocator, so its ids must not collide with theirs. Starting at 1 put sentry #1 on
+     * exactly the same id as the player (`player.js` also starts at 1), and anything that
+     * keys off `shooter.id` — spawn protection above all — then confused the two. Base
+     * the hardware space far above any plausible roster.
+     */
+    this._nextId = 100000;
     this._availTmp = [];
 
     this._onKillstreak = this._onKillstreak.bind(this);
@@ -365,8 +373,14 @@ export class Killstreaks {
 
   _detonate(point, radius, damage, attacker, weaponId) {
     this.game.fx?.explosion?.(point, radius);
-    this._sfx('explosion', 'explosion', { position: point, volume: 1 });
-
+    // NO audio here. Every path out of this method raises the canonical `explosion` bus
+    // event — `ballistics.applyExplosionDamage()` emits it unconditionally, so does the
+    // projectile system's, and so does the fallback at the bottom — and the audio
+    // engine's `_onExplosion` handler is the single intended source of the boom (it
+    // plays at priority 100 and owns the ducking/deafen response). Playing it here as
+    // well granted TWO voices per detonation against a six-voice `VOICE_LIMIT`, so a
+    // nine-bomb airstrike burned the budget twice as fast as the audio engineer's voice
+    // priority was tuned for. See the matching notes in fx.js and projectiles.js.
     const player = this.game.player;
     if (player?.position) {
       const d = player.position.distanceTo(point);
@@ -496,7 +510,11 @@ export class Killstreaks {
     s.life = def.duration;
     s.target = null;
     s.fireTimer = 0;
-    s.acquireTimer = 0;
+    // Phase-offset the reacquire cycle. Every `_acquire()` walks the whole entity list
+    // with a losClear per candidate in range; three sentries deployed on the same step
+    // otherwise share a phase for their whole 45 s life and pile all three sweeps onto
+    // the same 1/120 s step, forever. Seeded RNG, so the offset is still deterministic.
+    s.acquireTimer = (this.game.rng?.() ?? Math.random()) * SENTRY_REACQUIRE;
     s.mesh.position.copy(_v1);
     s.mesh.rotation.y = s.yaw;
     s.mesh.visible = true;
@@ -514,6 +532,11 @@ export class Killstreaks {
     s.mesh.visible = false;
     if (explode) {
       this.game.fx?.explosion?.(s.position, 3.2);
+      // This one STAYS. Unlike `_detonate()`, a sentry wreck does no radius damage and
+      // therefore never raises the `explosion` bus event, so the audio engine's handler
+      // is never reached on this path — removing the play would make a destroyed turret
+      // silent rather than merely single-voiced. Verified by counting `audio.play`
+      // grants: 1 per sentry destruction, 1 per sentry expiry, 0 from the bus.
       this._sfx('explosion', 'explosion', { position: s.position, volume: 0.7 });
     }
   }
@@ -613,8 +636,10 @@ export class Killstreaks {
     c.angle = (this.game.rng?.() ?? Math.random()) * Math.PI * 2;
     c.life = def.duration;
     c.target = null;
-    c.fireTimer = 0;
-    c.acquireTimer = 0;
+    // Same de-clustering as the sentry: two gunships called on the same step must not
+    // share an acquire phase (a full entity sweep with LOS) or a burst phase for 30 s.
+    c.fireTimer = (this.game.rng?.() ?? Math.random()) * CHOPPER_BURST;
+    c.acquireTimer = (this.game.rng?.() ?? Math.random()) * CHOPPER_ACQUIRE;
     c.mesh.visible = true;
     this._placeChopper(c);
 
@@ -658,7 +683,7 @@ export class Killstreaks {
 
       c.acquireTimer -= dt;
       if (c.acquireTimer <= 0) {
-        c.acquireTimer = 0.4;
+        c.acquireTimer = CHOPPER_ACQUIRE;
         c.target = this._acquire(c, CHOPPER_RANGE, 0.35);
       }
       const t = c.target;
