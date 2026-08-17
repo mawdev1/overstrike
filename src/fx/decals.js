@@ -125,17 +125,44 @@ const DECAL_FRAG = /* glsl */`
 /** Upload only `[0, count)`; the range object is retained so marking never allocates. */
 function markAll(attr, count) {
   if (count <= 0) return;
+  markSpan(attr, 0, count, true);
+}
+
+/**
+ * Upload only `[start, start + count)`.
+ *
+ * Ranges MERGE rather than replace: `_place` can run several times in one frame
+ * (`bloodOnGround` alone places four decals) and the renderer only empties
+ * `updateRanges` after it has uploaded. Overwriting the retained range instead of
+ * growing it would silently drop every write but the last. `reset` is the one case
+ * that may replace outright, because it always covers the whole live span.
+ */
+function markSpan(attr, start, count, reset = false) {
+  if (count <= 0) return;
   const ranges = attr.updateRanges;
   if (ranges) {
     let r = attr._fxRange;
     if (r === undefined) { r = { start: 0, count: 0 }; attr._fxRange = r; }
-    r.start = 0;
-    r.count = count;
-    ranges.length = 0;
-    ranges.push(r);
+    if (reset || ranges.length === 0) {
+      r.start = start;
+      r.count = count;
+      ranges.length = 0;
+      ranges.push(r);
+    } else {
+      const end = Math.max(r.start + r.count, start + count);
+      r.start = Math.min(r.start, start);
+      r.count = end - r.start;
+    }
   } else if (attr.updateRange) {
-    attr.updateRange.offset = 0;
-    attr.updateRange.count = count;
+    // Legacy single-range API: widen it the same way.
+    if (reset || attr.updateRange.count <= 0) {
+      attr.updateRange.offset = start;
+      attr.updateRange.count = count;
+    } else {
+      const end = Math.max(attr.updateRange.offset + attr.updateRange.count, start + count);
+      attr.updateRange.offset = Math.min(attr.updateRange.offset, start);
+      attr.updateRange.count = end - attr.updateRange.offset;
+    }
   }
   attr.needsUpdate = true;
 }
@@ -336,10 +363,20 @@ export class DecalSystem {
     this.alive[i] = 1;
     this.maxOpacity[i] = opacity;
 
-    mesh.count = this._used;
-    mesh.instanceMatrix.needsUpdate = true;
-    markAll(this.uvRectAttr, this._used * 4);
-    markAll(this.tintAttr, this._used * 3);
+    // Draw range only ever has to reach the highest LIVE slot; `update()` pulls it back
+    // down again as the tail expires.
+    if (i + 1 > mesh.count) mesh.count = i + 1;
+
+    // One decal changed, so upload one decal. Marking the whole 256-slot span pushed
+    // 23.5 KB (matrix + uvRect + tint) across the bus for a 64-byte edit, on every
+    // single bullet impact — ~470 KB/s at a realistic 20 impacts/s, plus three full
+    // buffer respecifies per bullet.
+    markSpan(mesh.instanceMatrix, i * 16, 16);
+    markSpan(this.uvRectAttr, i * 4, 4);
+    markSpan(this.tintAttr, i * 3, 3);
+    // The slot may be a recycled one whose previous occupant left a non-zero opacity on
+    // the GPU; without this the new decal pops in at full strength for one frame.
+    markSpan(this.opacityAttr, i, 1);
     return i;
   }
 
@@ -368,9 +405,11 @@ export class DecalSystem {
 
   update(dt) {
     const used = this._used;
-    if (!this.mesh || used === 0) return;
+    const mesh = this.mesh;
+    if (!mesh || used === 0) return;
     const age = this.age, life = this.life, alive = this.alive, op = this.opacity, mo = this.maxOpacity;
     let dirty = false;
+    let hi = 0;                 // highest live slot + 1 → the real draw range
     for (let i = 0; i < used; i++) {
       if (!alive[i]) continue;
       const a = age[i] + dt;
@@ -380,15 +419,26 @@ export class DecalSystem {
         alive[i] = 0;
         op[i] = 0;
         dirty = true;
+        // PARK THE SLOT. Zeroing opacity only makes the fragment shader `discard`
+        // later — the quad is still fully rasterised every frame for the rest of the
+        // round, which for a 5.85 m explosion scorch seen from 5 m is ~64% of screen
+        // height of pure fetch-then-discard. A zero-scale basis collapses it to a
+        // degenerate point instead, exactly as init() parks the untouched slots.
+        _m.makeScale(0, 0, 0);
+        mesh.setMatrixAt(i, _m);
+        markSpan(mesh.instanceMatrix, i * 16, 16);
         continue;
       }
+      hi = i + 1;
       let o = mo[i];
       if (a < FADE_IN) o *= a / FADE_IN;
       const remain = l - a;
       if (remain < FADE_OUT) o *= remain / FADE_OUT;
       if (op[i] !== o) { op[i] = o; dirty = true; }
     }
-    if (dirty) markAll(this.opacityAttr, used);
+    // Trailing dead slots do not even need their four vertices submitted.
+    if (hi < mesh.count) mesh.count = hi;
+    if (dirty) markSpan(this.opacityAttr, 0, used);
   }
 
   clear() {

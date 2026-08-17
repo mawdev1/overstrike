@@ -323,9 +323,15 @@ function surfaceSound(surface) {
   return SURFACE_SOUND[surface] || 'impactConcrete';
 }
 
-function spawnImpact(game, weaponId, point, normal, surface, decalSize) {
+/**
+ * NOTE: do NOT add a `fx.decal()` call here. `fx.impact()` already places the surface's
+ * bullet hole (fx.js `impact()`), sized from its own SURFACES record. Placing a second one
+ * spent two slots of the 256-slot decal ring per round, which wrapped the ring every ~1.3 s
+ * under fire and made the advertised 35 s decal lifetime fiction — and it also punched a
+ * hole into thin air on flesh hits, which `fx.impact()` deliberately does not do.
+ */
+function spawnImpact(game, weaponId, point, normal, surface) {
   game.fx?.impact?.(point, normal, surface);
-  game.fx?.decal?.(point, normal, surface, decalSize);
   game.audio?.play?.(surfaceSound(surface), { position: point, volume: 0.85 });
   _evImpact.point.copy(point);
   _evImpact.normal.copy(normal);
@@ -374,7 +380,8 @@ function whizby(game, shooter, ox, oy, oz, dx, dy, dz, length, hitPlayer) {
  *                  not the player's eyeball (the shot itself still starts at the eye)
  *   tracerColor, tracerWidth, tracerSpeed
  *   emitShot     — false for pellets 2..n of a shotgun blast
- *   decalSize
+ *   decalSize    — accepted for compatibility but ignored: the bullet hole is placed by
+ *                  `fx.impact()` and sized from the FX surface record (see spawnImpact)
  * @returns {{hitEntity, point:THREE.Vector3, distance:number, headshot:boolean}} POOLED
  */
 export function fireHitscan(game, o) {
@@ -490,12 +497,12 @@ export function fireHitscan(game, o) {
       _tracerTo.copy(_point);
       endSet = true;
 
-      spawnImpact(game, weaponId, _point, _normal, wallSurface, o.decalSize ?? 0.16);
+      spawnImpact(game, weaponId, _point, _normal, wallSurface);
 
       const canPunch = penetration > 0 && segment === 0 && remaining - wallDist > 0.5;
       if (canPunch && probeExit(game, _dir.x, _dir.y, _dir.z)) {
         // Exit spall on the far side, then carry on with reduced damage.
-        spawnImpact(game, weaponId, _exitPoint, _exitNormal, wallSurface, (o.decalSize ?? 0.16) * 1.25);
+        spawnImpact(game, weaponId, _exitPoint, _exitNormal, wallSurface);
         damage *= penetration;
         const consumed = _exitPoint.distanceTo(_point) + wallDist;
         travelled += consumed;
@@ -548,8 +555,9 @@ const _expDirWorld = new THREE.Vector3();
 /**
  * Radial damage with line-of-sight occlusion — a wall protects you.
  *
- * Three probes per entity (chest, head, feet) so crouching behind a low crate reduces
- * exposure instead of flipping it on/off, which is what makes grenade play readable.
+ * Up to three probes per entity (chest, head, feet) so crouching behind a low crate
+ * reduces exposure instead of flipping it on/off, which is what makes grenade play
+ * readable. The chest probe gates the other two — see the comment in the loop.
  *
  * @param {object} game
  * @param {{point:THREE.Vector3, radius:number, damage:number, attacker:object,
@@ -585,16 +593,40 @@ export function applyExplosionDamage(game, o) {
     const dist = _expCenter.distanceTo(point);
     if (dist > radius) continue;
 
-    // Exposure: how many of the three probes can see the blast.
+    // Exposure, probed cheapest-first. Three unconditional `losClear` marches per entity
+    // is the entire cost of a detonation: 25 entities in radius = 75 marches, and four
+    // frags in one frame = 300, which is the grenade hitch. The chest probe is the gate:
+    //
+    //   • chest blocked, and far out       -> in cover, no damage. 1 march.
+    //   • chest blocked, inside 60% radius -> one head probe, because a low crate leaving
+    //                                         only the head exposed is exactly the case
+    //                                         that makes crouching readable. 2 marches.
+    //   • chest clear, inside 60% radius   -> full 3-probe granularity, unchanged.
+    //   • chest clear, beyond 60% radius   -> 0.75, the midpoint of what the two extra
+    //                                         probes could have returned. The falloff
+    //                                         multiplier out there is <= 0.28, so the
+    //                                         worst-case error is a few HP. 1 march.
+    //
+    // Note the coarse branches can only ever LOWER exposure relative to "fully exposed";
+    // nobody fully behind a wall can start taking damage, because a blocked chest never
+    // grants more than the 0.25 a clear head earns.
+    const near = dist < radius * 0.6;
     let exposure = 0;
     if (!world || typeof world.losClear !== 'function') {
       exposure = 1;
-    } else {
+    } else if (world.losClear(point, _expCenter)) {
+      if (near) {
+        _expHead.set(e.position.x, e.position.y + h * 0.92, e.position.z);
+        _expFeet.set(e.position.x, e.position.y + 0.18, e.position.z);
+        exposure = 0.5;
+        if (world.losClear(point, _expHead)) exposure += 0.25;
+        if (world.losClear(point, _expFeet)) exposure += 0.25;
+      } else {
+        exposure = 0.75;
+      }
+    } else if (near) {
       _expHead.set(e.position.x, e.position.y + h * 0.92, e.position.z);
-      _expFeet.set(e.position.x, e.position.y + 0.18, e.position.z);
-      if (world.losClear(point, _expCenter)) exposure += 0.5;
-      if (world.losClear(point, _expHead)) exposure += 0.25;
-      if (world.losClear(point, _expFeet)) exposure += 0.25;
+      if (world.losClear(point, _expHead)) exposure = 0.25;
     }
     if (exposure <= 0) continue;
 

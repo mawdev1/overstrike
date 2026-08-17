@@ -67,6 +67,21 @@ export class Minimap {
     this._visible = true;
     this._uav = false;
 
+    /**
+     * Everything below is derived from the backing-store size and therefore only
+     * changes on a resize. Rebuilding a gradient means building and uploading a
+     * colour-ramp LUT, and assigning `ctx.font` means parsing a CSS font
+     * shorthand — neither belongs in a path that runs 120 times a second.
+     */
+    this._coneGrad = null;
+    this._sweepGrad = null;
+    this._font = '';
+    this._ro = null;
+    this._bakeBoxes = -1;
+    /** Banked frame time for draws we deliberately skipped (see `draw`). */
+    this._skipDt = 0;
+    this._deadTick = 0;
+
     this._onShot = this._onShot.bind(this);
     this._unsub = game?.bus?.on?.('shot', this._onShot) || null;
 
@@ -79,21 +94,55 @@ export class Minimap {
 
   /* ------------------------------------------------------------- lifecycle */
 
-  init() { this._syncSize(); }
+  init() {
+    // One layout read, at load, outside any frame that also writes style.
+    this._measureOnce();
+    this._observeSize();
+    this.prewarm();
+  }
+
+  /**
+   * Rasterise the static level layer up front.
+   *
+   * Left to itself `draw()` bakes lazily, which puts a full pass over every world
+   * collider on the FIRST gameplay frame of a match — the worst frame to spend
+   * anything on. This is idempotent and safe to call from a boot step or from a
+   * loading screen; the lazy path in `draw()` stays as a fallback.
+   * @returns {boolean} true once a bake exists
+   */
+  prewarm() {
+    if (this.baked) return true;
+    return this._bake();
+  }
+
+  /** Alias, for callers that read better as `bake()`. */
+  bake() { return this.prewarm(); }
 
   reset() {
     this.contacts.clear();
     this._losCursor = 0;
     this._pulse = 0;
+    this._skipDt = 0;
+    this._deadTick = 0;
     if (this._uav) { this._uav = false; this.el.classList.remove('uav'); this.tagEl.textContent = 'radar'; }
-    // The level can be rebuilt between matches; drop the bake so it re-bakes.
-    this.baked = null;
-    this.bakeInfo = null;
+    // The level is static today (`World.reset()` is a documented no-op), but if a
+    // future rebuild ever changes the collider set we must not keep a stale bake.
+    // Either way the work happens HERE — inside startMatch, alongside every other
+    // system's reset — and never on the first frame the player sees.
+    const boxes = this.game?.world?.boxes?.length ?? -1;
+    if (!this.baked || boxes !== this._bakeBoxes) {
+      this.baked = null;
+      this.bakeInfo = null;
+      this._bake();
+    }
   }
 
   dispose() {
     this._unsub?.();
     this._unsubBoom?.();
+    this._ro?.disconnect();
+    this._ro = null;
+    this._unsubResize?.();
     this.el.remove();
     this.baked = null;
   }
@@ -244,19 +293,82 @@ export class Minimap {
 
     this.baked = cv;
     this.bakeInfo = { originX, originZ, span, ppm };
+    this._bakeBoxes = boxes.length;
     return true;
   }
 
   /* ------------------------------------------------------------------ draw */
 
-  _syncSize() {
+  /**
+   * Watch our OWN element for size changes.
+   *
+   * `draw()` must never measure: it runs immediately after the HUD has queued a
+   * dozen style writes, so any layout read from there forces a synchronous layout
+   * of the whole document. A ResizeObserver is delivered after layout has already
+   * settled and hands us `contentRect` for free — zero reads, and it catches the
+   * things a window `resize` listener misses, notably the `--hud-scale` setting
+   * changing the minimap's size with the window untouched.
+   */
+  _observeSize() {
+    if (this._ro) return;
+    if (typeof ResizeObserver === 'function') {
+      this._ro = new ResizeObserver((entries) => {
+        const e = entries[entries.length - 1];
+        const box = e.contentBoxSize?.[0];
+        this._applySize(box ? box.inlineSize : e.contentRect.width);
+      });
+      this._ro.observe(this.el);
+      return;
+    }
+    // No ResizeObserver (never true in a browser this game runs in, but the probes
+    // and any future test harness deserve a working fallback): the engine emits
+    // `resize` with the new CSS size, and a one-off measure is safe outside draw.
+    this._unsubResize = this.game?.bus?.on?.('resize', () => this._measureOnce()) || null;
+  }
+
+  /** A single deliberate layout read, only ever from init / a resize event. */
+  _measureOnce() {
     const rect = this.el.getBoundingClientRect();
-    const css = Math.max(64, Math.round(rect.width || 160));
-    if (css === this._cssSize) return;
+    this._applySize(rect.width || 160);
+  }
+
+  /**
+   * Adopt a new CSS size. Zero-width entries are ignored: `.minimap.off` is
+   * `display:none`, and taking that as the real size would throw away the cached
+   * backing store and the caches derived from it every time the radar is toggled.
+   */
+  _applySize(cssW) {
+    const css = Math.max(64, Math.round(cssW || 0));
+    if (!(cssW > 0) || css === this._cssSize) return;
     this._cssSize = css;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const px = Math.round(css * dpr);
     if (this.canvas.width !== px) { this.canvas.width = px; this.canvas.height = px; }
+    this._buildCaches();
+  }
+
+  /**
+   * Rebuild everything that depends only on the backing-store size: the view-cone
+   * ramp, the UAV sweep ramp and the compass font shorthand. Previously all three
+   * were rebuilt every frame — a gradient LUT build plus a CSS font parse, forever.
+   */
+  _buildCaches() {
+    const ctx = this.ctx;
+    const W = this.canvas.width;
+    if (!ctx || !W) return;
+    const R = W * 0.5;
+
+    const cone = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.78);
+    cone.addColorStop(0, 'rgba(142, 247, 196, 0.30)');
+    cone.addColorStop(1, 'rgba(142, 247, 196, 0)');
+    this._coneGrad = cone;
+
+    const sweep = ctx.createLinearGradient(0, 0, R, 0);
+    sweep.addColorStop(0, 'rgba(142, 247, 196, 0.00)');
+    sweep.addColorStop(1, 'rgba(142, 247, 196, 0.22)');
+    this._sweepGrad = sweep;
+
+    this._font = `600 ${Math.round(W * 0.075)}px "Bahnschrift", "DIN Alternate", sans-serif`;
   }
 
   /** Called every frame by the HUD. `dt` is the real frame delta. */
@@ -266,10 +378,28 @@ export class Minimap {
     const me = g?.player;
     if (!me?.position) return;
 
+    // Any open menu shell puts a ~96%-opaque scrim over this corner AND stops the
+    // simulation, so a redraw here is invisible work on a frame the player is
+    // already waiting on. Returning before the contact ageing below is deliberate:
+    // paused time must not decay blips.
+    if (g.paused || g.state !== 'playing') return;
+
     if (!this.baked && !this._bake()) return;
 
-    // Cheap: getBoundingClientRect only when the layout could have changed.
-    if ((g.frame & 63) === 0 || this._cssSize === 0) this._syncSize();
+    // Size is cached and refreshed from a ResizeObserver — never measured here.
+    // (`draw` runs straight after the HUD's style writes; one read would force a
+    // synchronous layout of the entire document.)
+    if (this._cssSize === 0) this._measureOnce();
+    if (!this._coneGrad || !this._font) this._buildCaches();
+
+    // While the operator is down, the ELIMINATED overlay blurs and dims this
+    // corner and the radar is player-centric, so it is all but static. Quarter
+    // rate is indistinguishable through that overlay; the skipped frame time is
+    // banked so contacts still decay at exactly the right rate.
+    this._skipDt += dt;
+    if (!me.alive && (this._deadTick = (this._deadTick + 1) & 3) !== 0) return;
+    dt = this._skipDt;
+    this._skipDt = 0;
 
     this._pulse += dt;
     this._sampleVisibility();
@@ -282,8 +412,10 @@ export class Minimap {
       this.tagEl.textContent = uav ? 'uav · sat link' : 'radar';
     }
 
-    // Age contacts.
-    for (const [id, c] of this.contacts) {
+    // Age contacts. Iterating keys rather than entries avoids the two-element
+    // array Map entry destructuring allocates for every contact, every frame.
+    for (const id of this.contacts.keys()) {
+      const c = this.contacts.get(id);
       c.t += dt;
       if (c.t >= c.life) this.contacts.delete(id);
     }
@@ -322,10 +454,7 @@ export class Minimap {
     const aspect = cam?.aspect || 16 / 9;
     const half = Math.min(1.35, Math.atan(Math.tan(vFov * 0.5) * aspect));
     const coneR = R * 0.78;
-    const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, coneR);
-    grad.addColorStop(0, 'rgba(142, 247, 196, 0.30)');
-    grad.addColorStop(1, 'rgba(142, 247, 196, 0)');
-    ctx.fillStyle = grad;
+    ctx.fillStyle = this._coneGrad;      // built once per size, not per frame
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.arc(0, 0, coneR, -Math.PI / 2 - half, -Math.PI / 2 + half);
@@ -359,10 +488,7 @@ export class Minimap {
       ctx.save();
       ctx.translate(cx, cy);
       ctx.rotate(sweep);
-      const sg = ctx.createLinearGradient(0, 0, R, 0);
-      sg.addColorStop(0, 'rgba(142, 247, 196, 0.00)');
-      sg.addColorStop(1, 'rgba(142, 247, 196, 0.22)');
-      ctx.fillStyle = sg;
+      ctx.fillStyle = this._sweepGrad;   // built once per size, not per frame
       ctx.beginPath();
       ctx.moveTo(0, 0);
       ctx.arc(0, 0, R, -0.55, 0);
@@ -442,7 +568,7 @@ export class Minimap {
     ctx.fillStyle = 'rgba(4, 8, 12, 0.8)';
     ctx.fill();
     ctx.fillStyle = '#8ef7c4';
-    ctx.font = `600 ${Math.round(W * 0.075)}px "Bahnschrift", "DIN Alternate", sans-serif`;
+    ctx.font = this._font;               // cached shorthand — no font parse per frame
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('N', nx, ny + W * 0.004);

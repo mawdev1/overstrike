@@ -9,7 +9,9 @@
     "build": "vite build",
     "preview": "vite preview --port 5181",
     "check": "node scripts/check.mjs",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "perf": "node scripts/perf.mjs",
+    "perfcompare": "node scripts/perfcompare.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"

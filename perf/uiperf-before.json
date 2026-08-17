@@ -1,0 +1,123 @@
+{
+  "tag": "before",
+  "when": "2026-08-17T17:21:46.117Z",
+  "seed": 1592594996,
+  "mode": "tdm",
+  "bots": 7,
+  "gpu": "ANGLE (AMD, AMD Radeon RX 7600 XT (0x00007480) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "bake": {
+    "bakedAtBoot": false,
+    "bakedAfterReset": false,
+    "hitchesOnFirstGameplayFrame": true,
+    "bakeMs": 0.9,
+    "colliders": 1002
+  },
+  "gameplay": {
+    "seconds": 6.01,
+    "frames": 315,
+    "fps": 52.4,
+    "layoutCountPer1000Frames": 95.2,
+    "layoutForcingReadsPer1000Frames": 1015.9,
+    "layoutCountPerSec": 4.99,
+    "recalcStyleCountPerSec": 6.99,
+    "layoutMsPerSec": 1.371,
+    "recalcStyleMsPerSec": 0.358,
+    "layoutForcingReadsPerSec": 53.26,
+    "reads": {
+      "rect": 5,
+      "offset": 0,
+      "client": 315,
+      "scroll": 0,
+      "computed": 0
+    },
+    "topReadSites": [
+      [
+        "/src/weapons/weaponSystem.js:967:40",
+        315
+      ],
+      [
+        "/src/ui/minimap.js:253:26",
+        5
+      ]
+    ],
+    "minimapDrawMs": {
+      "n": 315,
+      "mean": 0.1137,
+      "p50": 0.1,
+      "p95": 0.2,
+      "max": 1.1,
+      "total": 35.8
+    },
+    "minimapMsPerSec": 5.958
+  },
+  "minimapBench": {
+    "canvasPx": 123,
+    "cssPx": 123,
+    "contacts": 2,
+    "entities": 8,
+    "msPerDraw": 0.0277,
+    "msPerDrawUav": 0.031,
+    "msPerDrawAt322": 0.0287,
+    "msPerDrawAt322Uav": 0.036
+  },
+  "pauseFrame": {
+    "samples": 8,
+    "jsMs": {
+      "n": 8,
+      "mean": 7.1375,
+      "p50": 6,
+      "p95": 20.6,
+      "max": 20.6,
+      "total": 57.1
+    },
+    "flushMs": {
+      "n": 8,
+      "mean": 0.875,
+      "p50": 0.8,
+      "p95": 1.6,
+      "max": 1.6,
+      "total": 7
+    },
+    "totalMs": {
+      "n": 8,
+      "mean": 8.0125,
+      "p50": 6.7,
+      "p95": 21.4,
+      "max": 21.4,
+      "total": 64.1
+    },
+    "layoutsPerOpen": {
+      "n": 8,
+      "mean": 2.25,
+      "p50": 2,
+      "p95": 3,
+      "max": 3,
+      "total": 18
+    },
+    "recalcsPerOpen": {
+      "n": 8,
+      "mean": 4.25,
+      "p50": 4,
+      "p95": 5,
+      "max": 5,
+      "total": 34
+    },
+    "nodeDeltaPerOpen": {
+      "n": 7,
+      "mean": 1547.5714,
+      "p50": 1547,
+      "p95": 1551,
+      "max": 1551,
+      "total": 10833
+    },
+    "listenerDeltaPerOpen": {
+      "n": 7,
+      "mean": 174.4286,
+      "p50": 174,
+      "p95": 176,
+      "max": 176,
+      "total": 1221
+    }
+  },
+  "pageErrors": []
+}

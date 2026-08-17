@@ -23,6 +23,9 @@ const SKIN = 0.03;              // keeps the collision sphere off the surface
 const REST_SPEED = 0.55;        // below this, on a floor, we switch to rolling
 const SLEEP_SPEED = 0.12;
 const WARN_INTERVAL = 1 / 15;   // HUD grenade indicator refresh
+// Metres of flight between rocket exhaust puffs. Matches the internal step of
+// fx.smokeTrail(), which is the spacing its 1.76 m sprites were sized to overlap at.
+const TRAIL_STEP = 1.1;
 
 // ------------------------------------------------------------------ scratch
 
@@ -90,6 +93,7 @@ export class ProjectileSystem {
         radius: 0.055,
         resting: false,
         bounces: 0,
+        trailFrom: new THREE.Vector3(),   // last point a smoke puff was laid at
         mesh,
         geoms: { ball, can, dart },
       });
@@ -166,6 +170,7 @@ export class ProjectileSystem {
     p.radius = pr.radiusMesh || 0.055;
     p.resting = false;
     p.bounces = 0;
+    p.trailFrom.copy(origin);
 
     this._dressMesh(p);
     p.mesh.position.copy(p.pos);
@@ -199,6 +204,7 @@ export class ProjectileSystem {
     p.radius = pr.radiusMesh || 0.07;
     p.resting = false;
     p.bounces = 0;
+    p.trailFrom.copy(origin);
 
     this._dressMesh(p);
     p.mesh.position.copy(p.pos);
@@ -312,10 +318,19 @@ export class ProjectileSystem {
 
       p.mesh.position.copy(p.pos);
 
-      // Smoke and rocket trails.
+      // Rocket exhaust trail, rate-limited by DISTANCE FLOWN, not by step.
+      //
+      // This used to fire every fixed step: 120 calls/s, each one clamped by
+      // smokeTrail() to at least one puff, so a single rocket laid 120-240 sprites per
+      // second and held 130-480 of them alive at 1.76 m each. Those are the biggest
+      // blended quads in the game and they sit right in front of the camera. One puff
+      // per TRAIL_STEP metres is the density smokeTrail() itself was written for, and
+      // it makes the trail resolution independent of frame rate as a bonus.
       if (p.kind === 'rocket' && this.game.fx?.smokeTrail) {
-        _a.copy(p.pos).addScaledVector(p.vel, -dt * 2);
-        this.game.fx.smokeTrail(_a, p.pos);
+        if (p.trailFrom.distanceToSquared(p.pos) >= TRAIL_STEP * TRAIL_STEP) {
+          this.game.fx.smokeTrail(p.trailFrom, p.pos);
+          p.trailFrom.copy(p.pos);
+        }
       }
     }
 
@@ -387,8 +402,10 @@ export class ProjectileSystem {
       selfMul: pr.selfDamageMul ?? 1,
     });
 
+    // fx.explosion() already lays the scorch decal on the real ground it probes for
+    // (fx.js), so no second decal here — that one landed at the burst's mid-air origin
+    // and cost a second slot of the 256-slot ring per detonation.
     game.fx?.explosion?.(p.pos, pr.radius);
-    game.fx?.decal?.(p.pos, _v.set(0, 1, 0), 'scorch', pr.radius * 0.35);
     game.audio?.play?.('explosion', { position: p.pos, volume: 1 });
 
     // Shake scales with how close the player is and whether a wall is in the way.

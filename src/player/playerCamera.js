@@ -159,6 +159,16 @@ const T = {
   FOV_RATE: 22,
   FOV_REF: 85,
 
+  // SCOPE — see `_updateScopeSway`. Amplitude is in DEGREES at full magnification and
+  // is scaled per weapon by `def.scopeSwayMul`.
+  SCOPE_SWAY: 0.36,
+  SCOPE_SWAY_RATE: 8,
+  SCOPE_ADS_IN: 0.40,        // adsAmount at which scope sway starts to come in
+  BREATH_HOLD_MUL: 0.13,     // sway multiplier while the breath is held
+  BREATH_GASP_MUL: 2.10,     // and immediately after it runs out
+  BREATH_GASP_TIME: 1.10,
+  BREATH_REFILL: 0.60,       // refill rate as a fraction of the drain rate
+
   DEATH_ORBIT: 0.32,
   DEATH_RADIUS: 2.4,
   DEATH_HEIGHT: 1.35,
@@ -256,6 +266,24 @@ export class PlayerCamera {
     this.viewSwayPitch = 0;
     this.viewRoll = 0;
 
+    // ── scope hold ──
+    // Scope sway is folded into `_writeAngles`, i.e. into the AIM, not into the camera
+    // on top of the aim. That is not a detail: `ballistics` fires along `player.yaw/
+    // pitch`, so sway added to the camera alone would put the reticle somewhere the
+    // bullet does not go. Sway the aim and the two can never disagree.
+    this.scopeSwayYaw = 0;
+    this.scopeSwayPitch = 0;
+    /** 1 = a full lungful, 0 = out of breath. Published for the HUD's breath meter. */
+    this.breath = 1;
+    this.breathHolding = false;
+    this.breathGasp = 0;
+    /**
+     * 0..1 — how much of the sight picture is up, as far as the camera is concerned.
+     * Fades out the feel-only camera offsets so that behind glass, screen centre IS the
+     * bullet path. See the `feel` term in `update()`.
+     */
+    this.scopeAim = 0;
+
     this.deathCam = false;
     this.deathT = 0;
     this.deathAngle = 0;
@@ -288,6 +316,11 @@ export class PlayerCamera {
     this.leanRoll = 0;
     this.mantleT = 1;
     this.meleeT = 1;
+    this.scopeSwayYaw = this.scopeSwayPitch = 0;
+    this.scopeAim = 0;
+    this.breath = 1;
+    this.breathHolding = false;
+    this.breathGasp = 0;
     this.worldFov = this.game.settings.get('fov');
     this.adsFovOnly = this.worldFov;
     this.fovWiden = 0;
@@ -301,6 +334,7 @@ export class PlayerCamera {
     this.basePitch = clamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
     this.recoilPitch = this.recoilYaw = 0;
     this.recoilPitchTarget = this.recoilYawTarget = 0;
+    this.scopeSwayYaw = this.scopeSwayPitch = 0;
     this._writeAngles();
   }
 
@@ -347,11 +381,11 @@ export class PlayerCamera {
     this._writeAngles();
   }
 
-  /** player.yaw/pitch = player intent + un-recovered recoil. */
+  /** player.yaw/pitch = player intent + un-recovered recoil + scope sway. */
   _writeAngles() {
     const p = this.player;
-    p.yaw = this.baseYaw + this.recoilYaw;
-    p.pitch = clamp(this.basePitch + this.recoilPitch, -PITCH_LIMIT, PITCH_LIMIT);
+    p.yaw = this.baseYaw + this.recoilYaw + this.scopeSwayYaw;
+    p.pitch = clamp(this.basePitch + this.recoilPitch + this.scopeSwayPitch, -PITCH_LIMIT, PITCH_LIMIT);
   }
 
   // ═════════════════════════════════════════════════════════════════ recoil ══
@@ -497,6 +531,7 @@ export class PlayerCamera {
 
     this.swayTime += dt;
     this._updateFov(dt);
+    this._updateScopeSway(dt);
 
     if (this.deathCam) {
       this._updateDeathCam(dt);
@@ -595,12 +630,20 @@ export class PlayerCamera {
     }
 
     // ── compose ──
+    // Everything in these two sums is a FEEL term: it moves the camera without moving
+    // the aim, so it is also, strictly, a lie about where the bullet is going. At 85°
+    // that lie is a fraction of the crosshair's own gap and nobody can see it. Behind a
+    // 6× scope, one twentieth of a degree is 2.5 px and the reticle visibly does not
+    // agree with the impact — so the whole lot is faded out as the sight picture
+    // arrives. The wander the scope needs instead comes from `_updateScopeSway`, which
+    // moves the AIM, and therefore moves the camera and the bullet together.
+    const feel = 1 - clamp(this.scopeAim, 0, 1);
     const worldLagYaw = this.lagYaw * T.SWAY_WORLD_FRAC;
     const worldLagPitch = this.lagPitch * T.SWAY_WORLD_FRAC;
 
-    const yaw = p.yaw + worldLagYaw + idleYaw + meleeYaw;
+    const yaw = p.yaw + (worldLagYaw + idleYaw + meleeYaw) * feel;
     const pitch = clamp(
-      p.pitch + worldLagPitch + idlePitch + bobPitch + mantlePitch,
+      p.pitch + (worldLagPitch + idlePitch + bobPitch + mantlePitch) * feel,
       -PITCH_LIMIT - 0.05, PITCH_LIMIT + 0.05,
     );
     const roll = this.leanRoll + this.slideTilt + this.strafeRoll + bobRoll
@@ -661,6 +704,74 @@ export class PlayerCamera {
       vc.fov = this.viewFov;
       vc.updateProjectionMatrix();
     }
+  }
+
+  /**
+   * Scoped-weapon hold: the low-frequency wander of a rifle held against a shoulder,
+   * and the breath you hold to stop it.
+   *
+   * `weaponDefs` has carried `scopeSwayMul` and `breathHoldTime` since the guns were
+   * authored; this is what finally reads them. Amplitude is deliberately modest — at the
+   * REAVER's 22° field of view, 0.36° × 1.6 is about 2 % of the screen height, enough to
+   * make a 200 m headshot a decision rather than a formality, small enough that it never
+   * feels like the rifle is fighting you.
+   *
+   * Holding the sprint key while scoped holds your breath (the sprint key is otherwise
+   * dead in this state — sprinting cancels ADS). Run the lungs dry and you gasp: sway
+   * spikes above baseline for a second, so spamming it is worse than timing it.
+   */
+  _updateScopeSway(dt) {
+    const p = this.player;
+    const game = this.game;
+    const def = p.weapon?.def;
+    const scoped = !!def?.scoped
+      && p.alive && !this.deathCam && !game.paused && game.state === 'playing';
+
+    // Everything below this line is scoped-only. Off the sniper it is one property
+    // chain and a compare, then a decay that reaches exact zero and stops.
+    if (!scoped) {
+      this.scopeAim = 0;
+      if (this.scopeSwayYaw === 0 && this.scopeSwayPitch === 0 && this.breath === 1
+        && this.breathGasp === 0) return;
+      this.breathHolding = false;
+      this.breathGasp = Math.max(0, this.breathGasp - dt);
+      this.breath = Math.min(1, this.breath + dt * 0.7);
+      this.scopeSwayYaw = damp(this.scopeSwayYaw, 0, T.SCOPE_SWAY_RATE, dt);
+      this.scopeSwayPitch = damp(this.scopeSwayPitch, 0, T.SCOPE_SWAY_RATE, dt);
+      if (Math.abs(this.scopeSwayYaw) < 1e-6) this.scopeSwayYaw = 0;
+      if (Math.abs(this.scopeSwayPitch) < 1e-6) this.scopeSwayPitch = 0;
+      this._writeAngles();
+      return;
+    }
+
+    const amt = clamp((clamp(p.adsAmount, 0, 1) - T.SCOPE_ADS_IN) / (1 - T.SCOPE_ADS_IN), 0, 1);
+    this.scopeAim = amt;
+
+    // ── breath ──
+    const holdTime = Math.max(0.4, def.breathHoldTime || 2.5);
+    const wantHold = amt > 0.5 && !!game.input?.isDown?.('sprint');
+    if (wantHold && this.breath > 0) {
+      this.breathHolding = true;
+      this.breath = Math.max(0, this.breath - dt / holdTime);
+      if (this.breath <= 0) this.breathGasp = T.BREATH_GASP_TIME;
+    } else {
+      this.breathHolding = false;
+      this.breath = Math.min(1, this.breath + dt * T.BREATH_REFILL / holdTime);
+      this.breathGasp = Math.max(0, this.breathGasp - dt);
+    }
+
+    // ── sway ──
+    const gasp = lerp(1, T.BREATH_GASP_MUL, clamp(this.breathGasp / T.BREATH_GASP_TIME, 0, 1));
+    const hold = this.breathHolding ? T.BREATH_HOLD_MUL : 1;
+    const a = T.SCOPE_SWAY * DEG * amt * (def.scopeSwayMul ?? 1) * hold * gasp;
+    const t = this.swayTime;
+    // Two incommensurable frequencies per axis: the drift never repeats, so it cannot
+    // be learned and timed the way a single sine can.
+    const ty = (Math.sin(t * 0.61) * 0.70 + Math.sin(t * 1.43 + 2.1) * 0.30) * a;
+    const tp = (Math.sin(t * 0.87 + 1.1) * 0.65 + Math.sin(t * 1.97 + 0.4) * 0.35) * a * 0.78;
+    this.scopeSwayYaw = damp(this.scopeSwayYaw, ty, T.SCOPE_SWAY_RATE, dt);
+    this.scopeSwayPitch = damp(this.scopeSwayPitch, tp, T.SCOPE_SWAY_RATE, dt);
+    this._writeAngles();
   }
 
   _updateDeathCam(dt) {

@@ -49,51 +49,155 @@ function canvas(size = TEX_SIZE) {
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
-/** Value noise with fBm, tileable via wrapped lattice lookups. */
-function makeNoise(seed) {
-  const rng = createRNG(seed);
-  const N = 64;
-  const grid = new Float32Array(N * N);
-  for (let i = 0; i < grid.length; i++) grid[i] = rng();
-  const at = (x, y) => grid[(((y % N) + N) % N) * N + (((x % N) + N) % N)];
-  const smooth = (t) => t * t * (3 - 2 * t);
-  const sample = (x, y) => {
-    const xi = Math.floor(x), yi = Math.floor(y);
-    const xf = smooth(x - xi), yf = smooth(y - yi);
-    const a = at(xi, yi), b = at(xi + 1, yi), c = at(xi, yi + 1), d = at(xi + 1, yi + 1);
-    return a * (1 - xf) * (1 - yf) + b * xf * (1 - yf) + c * (1 - xf) * yf + d * xf * yf;
-  };
-  return (x, y, octaves = 4, freq = 4, gain = 0.5) => {
-    let sum = 0, amp = 1, norm = 0, f = freq;
-    for (let o = 0; o < octaves; o++) {
-      sum += sample(x * f, y * f) * amp;
-      norm += amp;
-      amp *= gain;
-      f *= 2;
-    }
-    return sum / norm;
-  };
+/** `#rrggbb` -> `[r, g, b]`, so a flat base colour can be written straight into pixels. */
+function rgbOf(hex) {
+  const n = parseInt(hex.charCodeAt(0) === 35 ? hex.slice(1) : hex, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-/** Sobel a greyscale height canvas into a tangent-space normal map. */
+// ---------------------------------------------------------------- value noise
+//
+// The texture set costs roughly eight million octave-samples. Evaluated the obvious
+// way — a closure per noise field, called once per pixel, re-deriving the lattice
+// cell and its four corner weights on every call — that was the single most expensive
+// thing the game did at boot, ~200 ms of blocked main thread.
+//
+// Nothing about the *maths* was wrong, so none of it changed. What changed is where
+// the work happens: one octave is a uniform lattice walk, so the four corner indices
+// and the two horizontal weights repeat identically on every row, and the two vertical
+// weights repeat identically across a row. Hoisting those out of the pixel loop leaves
+// an inner loop of four array reads and a multiply-add — no calls, no `Math.floor`, no
+// modulo — and turns the whole set into flat typed-array passes.
+//
+// The arithmetic is written to be *bit-identical* to the closure version it replaces
+// (same expression shape, same accumulation order, same f64 accumulator), which is why
+// every texture still hashes exactly as it did before. See the plane cache below for
+// the other half of the win.
+
+const NOISE_N = 64;
+/** seed -> 64x64 lattice. Shared, because a seed is reused across octaves and passes. */
+const _noiseGrids = new Map();
+/**
+ * Fully evaluated fBm planes, keyed by every parameter that can change one.
+ *
+ * This is what makes the height passes free. `woodN`/`dirtN` are Sobels of the *same*
+ * generator run again over a grey base purely to get a height field — the most
+ * expensive texture in the game, computed twice. Keyed on the parameters rather than
+ * the call site, the second run is a map lookup, and the output is byte-for-byte the
+ * field the first run produced. Dropped at the end of `init()`; see `releasePlanes`.
+ */
+const _noisePlanes = new Map();
+
+function noiseGrid(seed) {
+  let g = _noiseGrids.get(seed);
+  if (!g) {
+    const rng = createRNG(seed);
+    g = new Float32Array(NOISE_N * NOISE_N);
+    for (let i = 0; i < g.length; i++) g[i] = rng();
+    _noiseGrids.set(seed, g);
+  }
+  return g;
+}
+
+const smoothT = (t) => t * t * (3 - 2 * t);
+
+/**
+ * A whole `size x size` plane of tileable fBm, row-major, values in 0..1.
+ *
+ * `uScale`/`vScale` pre-multiply the normalised coordinate before the octave
+ * frequency, matching `noise(u * 0.1, v, ...)`-style call sites exactly.
+ */
+function fbmPlane(seed, size, octaves = 4, freq = 4, gain = 0.5, uScale = 1, vScale = 1) {
+  const key = `${seed}|${size}|${octaves}|${freq}|${gain}|${uScale}|${vScale}`;
+  const cached = _noisePlanes.get(key);
+  if (cached) return cached;
+
+  const grid = noiseGrid(seed);
+  // f64 accumulator: the reference implementation summed octaves in a double, and a
+  // f32 accumulator here would quantise every partial sum and shift pixels by ±1.
+  const out = new Float64Array(size * size);
+  const xi0 = new Int32Array(size), xi1 = new Int32Array(size);
+  const wx0 = new Float64Array(size), wx1 = new Float64Array(size);
+
+  let amp = 1, norm = 0, f = freq;
+  for (let o = 0; o < octaves; o++) {
+    for (let px = 0; px < size; px++) {
+      const X = ((px / size) * uScale) * f;
+      const x0 = Math.floor(X);
+      const xf = smoothT(X - x0);
+      xi0[px] = (((x0 % NOISE_N) + NOISE_N) % NOISE_N);
+      xi1[px] = ((((x0 + 1) % NOISE_N) + NOISE_N) % NOISE_N);
+      wx0[px] = 1 - xf;
+      wx1[px] = xf;
+    }
+    for (let py = 0; py < size; py++) {
+      const Y = ((py / size) * vScale) * f;
+      const y0 = Math.floor(Y);
+      const yf = smoothT(Y - y0);
+      const wy0 = 1 - yf, wy1 = yf;
+      const rowA = (((y0 % NOISE_N) + NOISE_N) % NOISE_N) * NOISE_N;
+      const rowB = ((((y0 + 1) % NOISE_N) + NOISE_N) % NOISE_N) * NOISE_N;
+      const base = py * size;
+      for (let px = 0; px < size; px++) {
+        const a = xi0[px], b = xi1[px], w0 = wx0[px], w1 = wx1[px];
+        out[base + px] += (grid[rowA + a] * w0 * wy0 + grid[rowA + b] * w1 * wy0
+                         + grid[rowB + a] * w0 * wy1 + grid[rowB + b] * w1 * wy1) * amp;
+      }
+    }
+    norm += amp;
+    amp *= gain;
+    f *= 2;
+  }
+  for (let i = 0; i < out.length; i++) out[i] /= norm;
+
+  _noisePlanes.set(key, out);
+  return out;
+}
+
+/** Free the plane/lattice caches. Generation is boot-only, so this runs once. */
+function releasePlanes() {
+  _noisePlanes.clear();
+  _noiseGrids.clear();
+}
+
+/**
+ * Sobel a greyscale height field into a tangent-space normal map.
+ *
+ * `src` is either a canvas (for heights that can only be produced by rasterising —
+ * the metal panel's seams and rivets) or a `{ data, size }` RGBA buffer, which skips
+ * a putImageData/getImageData round-trip through a canvas that exists only to be read
+ * straight back out again.
+ */
 function heightToNormal(src, strength = 2.4) {
-  const size = src.width;
-  const sctx = src.getContext('2d', { willReadFrequently: true });
-  const h = sctx.getImageData(0, 0, size, size).data;
+  let h, size;
+  if (src.data) {
+    h = src.data; size = src.size;
+  } else {
+    size = src.width;
+    h = src.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, size, size).data;
+  }
   const out = canvas(size);
   const octx = out.getContext('2d');
   const img = octx.createImageData(size, size);
-  const H = (x, y) => h[((((y % size) + size) % size) * size + (((x % size) + size) % size)) * 4] / 255;
+  const D = img.data;
+  // Wrapped neighbour indices, hoisted out of the pixel loop.
+  const xm = new Int32Array(size), xp = new Int32Array(size);
+  for (let x = 0; x < size; x++) {
+    xm[x] = ((x - 1) % size + size) % size;
+    xp[x] = ((x + 1) % size + size) % size;
+  }
   for (let y = 0; y < size; y++) {
+    const rowM = ((y - 1) % size + size) % size, rowP = ((y + 1) % size + size) % size;
+    const oM = rowM * size, oP = rowP * size, oC = y * size;
     for (let x = 0; x < size; x++) {
-      const dx = (H(x - 1, y) - H(x + 1, y)) * strength;
-      const dy = (H(x, y - 1) - H(x, y + 1)) * strength;
+      const dx = (h[(oC + xm[x]) * 4] / 255 - h[(oC + xp[x]) * 4] / 255) * strength;
+      const dy = (h[(oM + x) * 4] / 255 - h[(oP + x) * 4] / 255) * strength;
       const len = Math.hypot(dx, dy, 1);
-      const i = (y * size + x) * 4;
-      img.data[i] = ((dx / len) * 0.5 + 0.5) * 255;
-      img.data[i + 1] = ((dy / len) * 0.5 + 0.5) * 255;
-      img.data[i + 2] = ((1 / len) * 0.5 + 0.5) * 255;
-      img.data[i + 3] = 255;
+      const i = (oC + x) * 4;
+      D[i] = ((dx / len) * 0.5 + 0.5) * 255;
+      D[i + 1] = ((dy / len) * 0.5 + 0.5) * 255;
+      D[i + 2] = ((1 / len) * 0.5 + 0.5) * 255;
+      D[i + 3] = 255;
     }
   }
   octx.putImageData(img, 0, 0);
@@ -112,18 +216,15 @@ function toTexture(cv, { repeat = 1, srgb = false, aniso = 8 } = {}) {
 
 // ---------------------------------------------------------------- generators
 
-function grungeOverlay(ctx, size, noise, alpha = 0.16, scale = 8) {
+function grungeOverlay(ctx, size, seed, alpha = 0.16, scale = 8) {
   const img = ctx.getImageData(0, 0, size, size);
   const d = img.data;
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const n = noise(x / size, y / size, 5, scale);
-      const f = 1 + (n - 0.5) * alpha * 2;
-      const i = (y * size + x) * 4;
-      d[i] = Math.min(255, d[i] * f);
-      d[i + 1] = Math.min(255, d[i + 1] * f);
-      d[i + 2] = Math.min(255, d[i + 2] * f);
-    }
+  const P = fbmPlane(seed, size, 5, scale);
+  for (let i = 0, j = 0; i < P.length; i++, j += 4) {
+    const f = 1 + (P[i] - 0.5) * alpha * 2;
+    d[j] = Math.min(255, d[j] * f);
+    d[j + 1] = Math.min(255, d[j + 1] * f);
+    d[j + 2] = Math.min(255, d[j + 2] * f);
   }
   ctx.putImageData(img, 0, 0);
 }
@@ -131,23 +232,22 @@ function grungeOverlay(ctx, size, noise, alpha = 0.16, scale = 8) {
 function genConcrete(seed, base = '#8d8f8c', dark = 0.5) {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
-  ctx.fillStyle = base;
-  ctx.fillRect(0, 0, size, size);
-  // Aggregate speckle.
-  const img = ctx.getImageData(0, 0, size, size);
+  const [br, bg, bb] = rgbOf(base);
+  // Aggregate speckle. Written straight into a fresh ImageData: filling the canvas and
+  // reading it back only to add to a colour we already know is a wasted readback.
+  const nA = fbmPlane(seed, size, 5, 6);
+  const nB = fbmPlane(seed, size, 3, 22);
+  const img = ctx.createImageData(size, size);
   const d = img.data;
   const rng = createRNG(seed + 7);
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const n = noise(x / size, y / size, 5, 6) * 0.7 + noise(x / size, y / size, 3, 22) * 0.3;
-      const s = rng() < 0.035 ? -32 : 0;
-      const v = (n - 0.5) * 74 * dark + s;
-      const i = (y * size + x) * 4;
-      d[i] = Math.max(0, Math.min(255, d[i] + v));
-      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + v));
-      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + v * 0.92));
-    }
+  for (let i = 0, j = 0; i < nA.length; i++, j += 4) {
+    const n = nA[i] * 0.7 + nB[i] * 0.3;
+    const s = rng() < 0.035 ? -32 : 0;
+    const v = (n - 0.5) * 74 * dark + s;
+    d[j] = Math.max(0, Math.min(255, br + v));
+    d[j + 1] = Math.max(0, Math.min(255, bg + v));
+    d[j + 2] = Math.max(0, Math.min(255, bb + v * 0.92));
+    d[j + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   // Hairline cracks.
@@ -167,28 +267,22 @@ function genConcrete(seed, base = '#8d8f8c', dark = 0.5) {
   return cv;
 }
 
+/** Height field for `concreteN`. Returned as a raw buffer — only the Sobel ever reads it. */
 function genConcreteHeight(seed) {
   const size = TEX_SIZE;
-  const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
-  const img = ctx.createImageData(size, size);
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const n = noise(x / size, y / size, 5, 14);
-      const v = 120 + (n - 0.5) * 150;
-      const i = (y * size + x) * 4;
-      img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
-      img.data[i + 3] = 255;
-    }
+  const P = fbmPlane(seed, size, 5, 14);
+  const data = new Uint8ClampedArray(size * size * 4);
+  for (let i = 0, j = 0; i < P.length; i++, j += 4) {
+    const v = 120 + (P[i] - 0.5) * 150;
+    data[j] = data[j + 1] = data[j + 2] = v;
+    data[j + 3] = 255;
   }
-  ctx.putImageData(img, 0, 0);
-  return cv;
+  return { data, size };
 }
 
 function genMetalPanel(seed, base = '#6d737d', accent = '#4a5058') {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
   const rng = createRNG(seed + 3);
   ctx.fillStyle = base;
   ctx.fillRect(0, 0, size, size);
@@ -215,7 +309,7 @@ function genMetalPanel(seed, base = '#6d737d', accent = '#4a5058') {
     const ry = i < 4 ? 12 : size - 12;
     ctx.beginPath(); ctx.arc(rx, ry, 2.6, 0, Math.PI * 2); ctx.fill();
   }
-  grungeOverlay(ctx, size, noise, 0.22, 7);
+  grungeOverlay(ctx, size, seed, 0.22, 7);
   // Rust streaks.
   for (let i = 0; i < 5; i++) {
     const x = rng() * size;
@@ -231,7 +325,12 @@ function genMetalPanel(seed, base = '#6d737d', accent = '#4a5058') {
 
 function genMetalHeight(seed) {
   const size = TEX_SIZE;
-  const cv = canvas(size), ctx = cv.getContext('2d');
+  // `willReadFrequently` matters here and nowhere else in this function: the very next
+  // thing that happens to this canvas is `heightToNormal` reading every pixel back.
+  // Per spec a second `getContext('2d', ...)` returns the FIRST context and silently
+  // ignores the new attributes, so asking for it there did nothing at all and the
+  // readback ran against a GPU-backed surface.
+  const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
   ctx.fillStyle = '#8a8a8a';
   ctx.fillRect(0, 0, size, size);
   ctx.strokeStyle = '#303030';
@@ -250,22 +349,25 @@ function genMetalHeight(seed) {
 function genWood(seed, base = '#8a6238') {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
-  ctx.fillStyle = base;
-  ctx.fillRect(0, 0, size, size);
-  const img = ctx.getImageData(0, 0, size, size);
+  const [br, bg, bb] = rgbOf(base);
+  // Seven octaves across two fields — the most expensive single texture in the game,
+  // and it used to be generated twice (see the plane cache).
+  const W = fbmPlane(seed, size, 3, 3);
+  const F = fbmPlane(seed, size, 4, 30);
+  const img = ctx.createImageData(size, size);
   const d = img.data;
   for (let y = 0; y < size; y++) {
+    const row = y * size;
     for (let x = 0; x < size; x++) {
       // Grain: warped stripes along X.
-      const warp = noise(x / size, y / size, 3, 3) * 26;
+      const warp = W[row + x] * 26;
       const g = Math.sin((y + warp) * 0.55) * 0.5 + 0.5;
-      const fine = noise(x / size, y / size, 4, 30);
-      const v = (g * 0.62 + fine * 0.38 - 0.5) * 58;
-      const i = (y * size + x) * 4;
-      d[i] = Math.max(0, Math.min(255, d[i] + v));
-      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + v * 0.78));
-      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + v * 0.55));
+      const v = (g * 0.62 + F[row + x] * 0.38 - 0.5) * 58;
+      const i = (row + x) * 4;
+      d[i] = Math.max(0, Math.min(255, br + v));
+      d[i + 1] = Math.max(0, Math.min(255, bg + v * 0.78));
+      d[i + 2] = Math.max(0, Math.min(255, bb + v * 0.55));
+      d[i + 3] = 255;
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -278,21 +380,17 @@ function genWood(seed, base = '#8a6238') {
 function genDirt(seed, base = '#6b5a44') {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
+  const [br, bg, bb] = rgbOf(base);
   const rng = createRNG(seed + 11);
-  ctx.fillStyle = base;
-  ctx.fillRect(0, 0, size, size);
-  const img = ctx.getImageData(0, 0, size, size);
+  const P = fbmPlane(seed, size, 6, 8);
+  const img = ctx.createImageData(size, size);
   const d = img.data;
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const n = noise(x / size, y / size, 6, 8);
-      const v = (n - 0.5) * 88;
-      const i = (y * size + x) * 4;
-      d[i] = Math.max(0, Math.min(255, d[i] + v));
-      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + v * 0.9));
-      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + v * 0.72));
-    }
+  for (let i = 0, j = 0; i < P.length; i++, j += 4) {
+    const v = (P[i] - 0.5) * 88;
+    d[j] = Math.max(0, Math.min(255, br + v));
+    d[j + 1] = Math.max(0, Math.min(255, bg + v * 0.9));
+    d[j + 2] = Math.max(0, Math.min(255, bb + v * 0.72));
+    d[j + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   // Pebbles.
@@ -308,21 +406,17 @@ function genDirt(seed, base = '#6b5a44') {
 function genAsphalt(seed) {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
+  const [br, bg, bb] = rgbOf('#3a3d42');
   const rng = createRNG(seed + 5);
-  ctx.fillStyle = '#3a3d42';
-  ctx.fillRect(0, 0, size, size);
-  const img = ctx.getImageData(0, 0, size, size);
+  const P = fbmPlane(seed, size, 5, 24);
+  const img = ctx.createImageData(size, size);
   const d = img.data;
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const n = noise(x / size, y / size, 5, 24);
-      const v = (n - 0.5) * 46 + (rng() < 0.06 ? 22 : 0);
-      const i = (y * size + x) * 4;
-      d[i] = Math.max(0, Math.min(255, d[i] + v));
-      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + v));
-      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + v));
-    }
+  for (let i = 0, j = 0; i < P.length; i++, j += 4) {
+    const v = (P[i] - 0.5) * 46 + (rng() < 0.06 ? 22 : 0);
+    d[j] = Math.max(0, Math.min(255, br + v));
+    d[j + 1] = Math.max(0, Math.min(255, bg + v));
+    d[j + 2] = Math.max(0, Math.min(255, bb + v));
+    d[j + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   return cv;
@@ -331,7 +425,6 @@ function genAsphalt(seed) {
 function genTile(seed, base = '#b9b4a8', groutCol = '#57544d', tiles = 4) {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
   const rng = createRNG(seed + 13);
   ctx.fillStyle = groutCol;
   ctx.fillRect(0, 0, size, size);
@@ -343,14 +436,13 @@ function genTile(seed, base = '#b9b4a8', groutCol = '#57544d', tiles = 4) {
       ctx.fillRect(x * step + 1.5, y * step + 1.5, step - 3, step - 3);
     }
   }
-  grungeOverlay(ctx, size, noise, 0.2, 9);
+  grungeOverlay(ctx, size, seed, 0.2, 9);
   return cv;
 }
 
 function genBrick(seed) {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
   const rng = createRNG(seed + 17);
   ctx.fillStyle = '#736c62';
   ctx.fillRect(0, 0, size, size);
@@ -373,26 +465,32 @@ function genBrick(seed) {
       }
     }
   }
-  grungeOverlay(ctx, size, noise, 0.26, 6);
+  grungeOverlay(ctx, size, seed, 0.26, 6);
   return cv;
 }
 
 function genSandbag(seed) {
   const size = TEX_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
-  ctx.fillStyle = '#9c8f6d';
-  ctx.fillRect(0, 0, size, size);
-  const img = ctx.getImageData(0, 0, size, size);
+  const [br, bg, bb] = rgbOf('#9c8f6d');
+  const P = fbmPlane(seed, size, 4, 12);
+  // The weave is separable: sin(x*1.6) and sin(y*1.6) are each one row/column of
+  // values, not 65k independent transcendentals.
+  const sx = new Float64Array(size);
+  for (let x = 0; x < size; x++) sx[x] = Math.sin(x * 1.6);
+  const img = ctx.createImageData(size, size);
   const d = img.data;
   for (let y = 0; y < size; y++) {
+    const sy = Math.sin(y * 1.6);
+    const row = y * size;
     for (let x = 0; x < size; x++) {
-      const weave = (Math.sin(x * 1.6) * Math.sin(y * 1.6)) * 12;
-      const n = (noise(x / size, y / size, 4, 12) - 0.5) * 40;
-      const i = (y * size + x) * 4;
-      d[i] = Math.max(0, Math.min(255, d[i] + weave + n));
-      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + weave + n * 0.9));
-      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + weave + n * 0.7));
+      const weave = (sx[x] * sy) * 12;
+      const n = (P[row + x] - 0.5) * 40;
+      const i = (row + x) * 4;
+      d[i] = Math.max(0, Math.min(255, br + weave + n));
+      d[i + 1] = Math.max(0, Math.min(255, bg + weave + n * 0.9));
+      d[i + 2] = Math.max(0, Math.min(255, bb + weave + n * 0.7));
+      d[i + 3] = 255;
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -422,43 +520,54 @@ function genRM(seed, {
 } = {}) {
   const size = RM_SIZE;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const nA = makeNoise(seed);
-  const nB = makeNoise(seed + 61);
   const rng = createRNG(seed + 23);
   const varnished = new Uint8Array(plankRows);
   for (let i = 0; i < plankRows; i++) varnished[i] = rng() < 0.5 ? 1 : 0;
 
+  // Only the fields this material actually uses get evaluated. `metalVar` is 0 on eight
+  // of the eleven entries, and a field multiplied by zero is a whole plane of fBm bought
+  // for nothing.
+  const pRough = fbmPlane(seed, size, 4, roughFreq);
+  const pMetal = metalVar !== 0 ? fbmPlane(seed, size, 3, roughFreq * 1.7) : null;
+  const pWet = wet > 0 ? fbmPlane(seed + 61, size, 3, wetFreq) : null;
+  const pStreak = streak > 0 ? fbmPlane(seed + 61, size, 4, 10, 0.5, 0.1) : null;
+  const pChip = chip > 0 ? fbmPlane(seed, size, 4, 24) : null;
+  const chipCut = 1 - chip * 0.34;
+  const wetDiv = Math.max(0.06, wet * 0.5);
+  const wetSub = (1 - wet) * 0.62;
+
   const img = ctx.createImageData(size, size);
   const d = img.data;
   for (let y = 0; y < size; y++) {
+    const v = y / size;
+    const row = y * size;
+    // Plank and grout bands are per-row constants; only the tile gutter varies in x.
+    const plankAdd = planks > 0 && varnished[Math.min(plankRows - 1, Math.floor(v * plankRows))];
+    const groutRow = grout > 0 && Math.abs(((v * tiles) % 1) - 0.5) > 0.455;
     for (let x = 0; x < size; x++) {
-      const u = x / size, v = y / size;
-      let r = rough + (nA(u, v, 4, roughFreq) - 0.5) * 2 * roughVar;
-      let m = metal + (nA(u, v, 3, roughFreq * 1.7) - 0.5) * 2 * metalVar;
+      const u = x / size;
+      const i = row + x;
+      let r = rough + (pRough[i] - 0.5) * 2 * roughVar;
+      let m = metal + (pMetal ? (pMetal[i] - 0.5) * 2 * metalVar : 0);
 
       if (wet > 0) {
         // Threshold a low-frequency field so damp areas form connected patches rather
         // than an even wash — a wash just shifts the average and looks like nothing.
-        const w = clamp01((nB(u, v, 3, wetFreq) - (1 - wet) * 0.62) / Math.max(0.06, wet * 0.5));
+        const w = clamp01((pWet[i] - wetSub) / wetDiv);
         r += (wetRough - r) * w;
       }
-      if (streak > 0) r += (nB(u * 0.1, v, 4, 10) - 0.5) * streak;
-      if (planks > 0) {
-        const row = Math.min(plankRows - 1, Math.floor(v * plankRows));
-        if (varnished[row]) r += (plankRough - r) * planks;
+      if (streak > 0) r += (pStreak[i] - 0.5) * streak;
+      if (plankAdd) r += (plankRough - r) * planks;
+      if (grout > 0 && (groutRow || Math.abs(((u * tiles) % 1) - 0.5) > 0.455)) {
+        r += (groutRough - r) * grout;
       }
-      if (grout > 0) {
-        const gx = Math.abs(((u * tiles) % 1) - 0.5);
-        const gy = Math.abs(((v * tiles) % 1) - 0.5);
-        if (gx > 0.455 || gy > 0.455) r += (groutRough - r) * grout;
-      }
-      if (chip > 0 && nA(u, v, 4, 24) > 1 - chip * 0.34) { r = chipRough; m = 0.94; }
+      if (chip > 0 && pChip[i] > chipCut) { r = chipRough; m = 0.94; }
 
-      const i = (y * size + x) * 4;
-      d[i] = 255;
-      d[i + 1] = clamp01(r) * 255;
-      d[i + 2] = clamp01(m) * 255;
-      d[i + 3] = 255;
+      const j = i * 4;
+      d[j] = 255;
+      d[j + 1] = clamp01(r) * 255;
+      d[j + 2] = clamp01(m) * 255;
+      d[j + 3] = 255;
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -477,16 +586,13 @@ function genRM(seed, {
  */
 function genFbmField(seed, { size = 128, octaves = 5, freq = 2, gain = 0.52, contrast = 1 } = {}) {
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
+  const P = fbmPlane(seed, size, octaves, freq, gain);
   const img = ctx.createImageData(size, size);
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      let n = noise(x / size, y / size, octaves, freq, gain);
-      n = clamp01((n - 0.5) * contrast + 0.5);
-      const i = (y * size + x) * 4;
-      img.data[i] = img.data[i + 1] = img.data[i + 2] = n * 255;
-      img.data[i + 3] = 255;
-    }
+  const d = img.data;
+  for (let i = 0, j = 0; i < P.length; i++, j += 4) {
+    const n = clamp01((P[i] - 0.5) * contrast + 0.5);
+    d[j] = d[j + 1] = d[j + 2] = n * 255;
+    d[j + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   return cv;
@@ -500,6 +606,9 @@ function genFbmField(seed, { size = 128, octaves = 5, freq = 2, gain = 0.52, con
 export function makeCloudTexture() {
   const t = toTexture(genFbmField(2408, { size: 256, octaves: 6, freq: 3, gain: 0.55, contrast: 1.25 }));
   t.anisotropy = 4;
+  // The sky is built in the Engine constructor, before `Assets.init()` — nothing else
+  // will reuse this plane, so hand the 512 KB back immediately.
+  releasePlanes();
   return t;
 }
 
@@ -622,17 +731,19 @@ function genScorchDecal() {
 function genSmoke(seed) {
   const size = 128;
   const cv = canvas(size), ctx = cv.getContext('2d', { willReadFrequently: true });
-  const noise = makeNoise(seed);
+  const P = fbmPlane(seed, size, 5, 5);
   const img = ctx.createImageData(size, size);
+  const d = img.data;
   for (let y = 0; y < size; y++) {
+    const dy = (y - 64) / 64;
+    const row = y * size;
     for (let x = 0; x < size; x++) {
-      const dx = (x - 64) / 64, dy = (y - 64) / 64;
+      const dx = (x - 64) / 64;
       const r = Math.hypot(dx, dy);
-      const n = noise(x / size, y / size, 5, 5);
-      const a = Math.max(0, 1 - r) * (0.45 + n * 0.85);
-      const i = (y * size + x) * 4;
-      img.data[i] = img.data[i + 1] = img.data[i + 2] = 255;
-      img.data[i + 3] = Math.min(255, a * 255);
+      const a = Math.max(0, 1 - r) * (0.45 + P[row + x] * 0.85);
+      const i = (row + x) * 4;
+      d[i] = d[i + 1] = d[i + 2] = 255;
+      d[i + 3] = Math.min(255, a * 255);
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -752,90 +863,133 @@ export class Assets {
     this.ready = false;
   }
 
-  init() {
-    if (this.ready) return;
+  /**
+   * Build the library. Boot-only: `ready` latches, and `World.reset()` never touches
+   * any of this, so a match restart regenerates nothing.
+   *
+   * `yieldTo(fraction)` is awaited between units of work, which is what lets the boot
+   * screen repaint and keeps the tab responsive while ~40 textures are generated.
+   * Called without it, everything runs in one synchronous pass — the resolved promise
+   * is already settled by the time it returns, so a caller that ignores it still sees
+   * a fully built library.
+   */
+  init(yieldTo = null) {
+    if (this.ready) return Promise.resolve();
+    if (this._pending) return this._pending;
 
-    // --- textures
-    const concrete = genConcrete(101);
-    const concreteN = heightToNormal(genConcreteHeight(101), 1.7);
-    const concreteDark = genConcrete(202, '#5d6064', 0.75);
-    const metal = genMetalPanel(303);
-    const metalN = heightToNormal(genMetalHeight(303), 3.2);
-    const metalRed = genMetalPanel(304, '#7d4038', '#4c231f');
-    const metalGreen = genMetalPanel(305, '#4d5b45', '#2f3a2b');
-    const wood = genWood(404);
-    const woodN = heightToNormal(genWood(404, '#808080'), 1.4);
-    const dirt = genDirt(505);
-    const dirtN = heightToNormal(genDirt(505, '#808080'), 2.2);
-    const asphalt = genAsphalt(606);
-    const tile = genTile(707);
-    const brick = genBrick(808);
-    const sandbag = genSandbag(909);
-    const plaster = genConcrete(1010, '#b6ac9a', 0.35);
+    const units = this._plan();
+    if (!yieldTo) {
+      for (const u of units) u();
+      this._finish();
+      return Promise.resolve();
+    }
+    this._pending = (async () => {
+      for (let i = 0; i < units.length; i++) {
+        units[i]();
+        await yieldTo((i + 1) / units.length);
+      }
+      this._finish();
+      this._pending = null;
+    })();
+    return this._pending;
+  }
 
-    this._tex('concrete', concrete, { repeat: 1, srgb: true });
-    this._tex('concreteN', concreteN, { repeat: 1 });
-    this._tex('concreteDark', concreteDark, { repeat: 1, srgb: true });
-    this._tex('metal', metal, { repeat: 1, srgb: true });
-    this._tex('metalN', metalN, { repeat: 1 });
-    this._tex('metalRed', metalRed, { repeat: 1, srgb: true });
-    this._tex('metalGreen', metalGreen, { repeat: 1, srgb: true });
-    this._tex('wood', wood, { repeat: 1, srgb: true });
-    this._tex('woodN', woodN, { repeat: 1 });
-    this._tex('dirt', dirt, { repeat: 1, srgb: true });
-    this._tex('dirtN', dirtN, { repeat: 1 });
-    this._tex('asphalt', asphalt, { repeat: 1, srgb: true });
-    this._tex('tile', tile, { repeat: 1, srgb: true });
-    this._tex('brick', brick, { repeat: 1, srgb: true });
-    this._tex('sandbag', sandbag, { repeat: 1, srgb: true });
-    this._tex('plaster', plaster, { repeat: 1, srgb: true });
-    this._tex('glow', genGlow(), { repeat: 1, srgb: true });
-    this._tex('smoke', genSmoke(1234), { repeat: 1, srgb: true });
-    this._tex('bulletHole', genBulletHole(1), { repeat: 1, srgb: true });
-    this._tex('bulletHoleMetal', genBulletHole(2, '#1a1c20'), { repeat: 1, srgb: true });
-    this._tex('bulletHoleGlass', genBulletHole(3, '#c8dbe6'), { repeat: 1, srgb: true });
-    this._tex('blood', genBloodDecal(9), { repeat: 1, srgb: true });
-    this._tex('scorch', genScorchDecal(), { repeat: 1, srgb: true });
+  /**
+   * Generation split into units small enough that no single one can hold the main
+   * thread long enough to drop a frame of the loading animation.
+   */
+  _plan() {
+    return [
+      () => {
+        this._tex('concrete', genConcrete(101), { repeat: 1, srgb: true });
+        this._tex('concreteN', heightToNormal(genConcreteHeight(101), 1.7), { repeat: 1 });
+        this._tex('concreteDark', genConcrete(202, '#5d6064', 0.75), { repeat: 1, srgb: true });
+      },
+      () => {
+        this._tex('metal', genMetalPanel(303), { repeat: 1, srgb: true });
+        this._tex('metalN', heightToNormal(genMetalHeight(303), 3.2), { repeat: 1 });
+        this._tex('metalRed', genMetalPanel(304, '#7d4038', '#4c231f'), { repeat: 1, srgb: true });
+        this._tex('metalGreen', genMetalPanel(305, '#4d5b45', '#2f3a2b'), { repeat: 1, srgb: true });
+      },
+      () => {
+        // The grey-based second pass is what `woodN`/`dirtN` are Sobelled from. It hits
+        // the fBm plane cache the albedo pass just filled, so the seven octaves of wood
+        // grain and six of dirt are evaluated once between the two, not twice.
+        this._tex('wood', genWood(404), { repeat: 1, srgb: true });
+        this._tex('woodN', heightToNormal(genWood(404, '#808080'), 1.4), { repeat: 1 });
+      },
+      () => {
+        this._tex('dirt', genDirt(505), { repeat: 1, srgb: true });
+        this._tex('dirtN', heightToNormal(genDirt(505, '#808080'), 2.2), { repeat: 1 });
+      },
+      () => {
+        this._tex('asphalt', genAsphalt(606), { repeat: 1, srgb: true });
+        this._tex('tile', genTile(707), { repeat: 1, srgb: true });
+        this._tex('brick', genBrick(808), { repeat: 1, srgb: true });
+      },
+      () => {
+        this._tex('sandbag', genSandbag(909), { repeat: 1, srgb: true });
+        this._tex('plaster', genConcrete(1010, '#b6ac9a', 0.35), { repeat: 1, srgb: true });
+      },
+      () => {
+        this._tex('glow', genGlow(), { repeat: 1, srgb: true });
+        this._tex('smoke', genSmoke(1234), { repeat: 1, srgb: true });
+        this._tex('bulletHole', genBulletHole(1), { repeat: 1, srgb: true });
+        this._tex('bulletHoleMetal', genBulletHole(2, '#1a1c20'), { repeat: 1, srgb: true });
+        this._tex('bulletHoleGlass', genBulletHole(3, '#c8dbe6'), { repeat: 1, srgb: true });
+        this._tex('blood', genBloodDecal(9), { repeat: 1, srgb: true });
+        this._tex('scorch', genScorchDecal(), { repeat: 1, srgb: true });
+      },
 
-    // --- roughness/metalness (G = roughness, B = metalness)
-    // This is where surfaces stop being interchangeable. Every entry below is a
-    // deliberate material story, not a number nudge.
-    this._tex('rmConcrete', genRM(1101, {          // dry and chalky, damp in the low spots
-      rough: 0.93, roughVar: 0.09, roughFreq: 7, wet: 0.5, wetFreq: 1.7, wetRough: 0.66,
-    }));
-    this._tex('rmConcreteWet', genRM(1102, {       // shaded/north faces stay damp longer
-      rough: 0.9, roughVar: 0.1, roughFreq: 6, wet: 0.62, wetFreq: 1.5, wetRough: 0.55,
-    }));
-    this._tex('rmPlaster', genRM(1103, {           // chalky lime render — no sheen anywhere
-      rough: 0.97, roughVar: 0.035, roughFreq: 10,
-    }));
-    this._tex('rmMetal', genRM(1104, {             // polished panels, worn dull at the edges
-      rough: 0.4, roughVar: 0.26, roughFreq: 4, metal: 0.9, metalVar: 0.1, streak: 0.22,
-    }));
-    this._tex('rmPaint', genRM(1105, {             // painted steel: dielectric, chipped to bare metal
-      rough: 0.58, roughVar: 0.16, roughFreq: 5, metal: 0.1, metalVar: 0.05,
-      streak: 0.14, chip: 0.55, chipRough: 0.31,
-    }));
-    this._tex('rmWood', genRM(1106, {              // some boards varnished, some raw
-      rough: 0.82, roughVar: 0.13, roughFreq: 8, planks: 0.85, plankRough: 0.36,
-    }));
-    this._tex('rmDirt', genRM(1107, { rough: 0.99, roughVar: 0.03, roughFreq: 9 }));
-    this._tex('rmAsphalt', genRM(1108, {           // ruts hold water and shine
-      rough: 0.88, roughVar: 0.12, roughFreq: 6, wet: 0.4, wetFreq: 2.4, wetRough: 0.52,
-    }));
-    this._tex('rmTile', genRM(1109, {              // glazed tile with rough grout
-      rough: 0.4, roughVar: 0.1, roughFreq: 7, grout: 1, groutRough: 0.94, tiles: 4,
-    }));
-    this._tex('rmBrick', genRM(1110, {
-      rough: 0.92, roughVar: 0.08, roughFreq: 9, grout: 0.7, groutRough: 0.99, tiles: 4,
-    }));
-    this._tex('rmCloth', genRM(1111, { rough: 1.0, roughVar: 0.02, roughFreq: 12 }));
+      // --- roughness/metalness (G = roughness, B = metalness)
+      // This is where surfaces stop being interchangeable. Every entry below is a
+      // deliberate material story, not a number nudge.
+      () => {
+        this._tex('rmConcrete', genRM(1101, {          // dry and chalky, damp in the low spots
+          rough: 0.93, roughVar: 0.09, roughFreq: 7, wet: 0.5, wetFreq: 1.7, wetRough: 0.66,
+        }));
+        this._tex('rmConcreteWet', genRM(1102, {       // shaded/north faces stay damp longer
+          rough: 0.9, roughVar: 0.1, roughFreq: 6, wet: 0.62, wetFreq: 1.5, wetRough: 0.55,
+        }));
+        this._tex('rmPlaster', genRM(1103, {           // chalky lime render — no sheen anywhere
+          rough: 0.97, roughVar: 0.035, roughFreq: 10,
+        }));
+        this._tex('rmMetal', genRM(1104, {             // polished panels, worn dull at the edges
+          rough: 0.4, roughVar: 0.26, roughFreq: 4, metal: 0.9, metalVar: 0.1, streak: 0.22,
+        }));
+      },
+      () => {
+        this._tex('rmPaint', genRM(1105, {             // painted steel: dielectric, chipped to bare metal
+          rough: 0.58, roughVar: 0.16, roughFreq: 5, metal: 0.1, metalVar: 0.05,
+          streak: 0.14, chip: 0.55, chipRough: 0.31,
+        }));
+        this._tex('rmWood', genRM(1106, {              // some boards varnished, some raw
+          rough: 0.82, roughVar: 0.13, roughFreq: 8, planks: 0.85, plankRough: 0.36,
+        }));
+        this._tex('rmDirt', genRM(1107, { rough: 0.99, roughVar: 0.03, roughFreq: 9 }));
+        this._tex('rmAsphalt', genRM(1108, {           // ruts hold water and shine
+          rough: 0.88, roughVar: 0.12, roughFreq: 6, wet: 0.4, wetFreq: 2.4, wetRough: 0.52,
+        }));
+      },
+      () => {
+        this._tex('rmTile', genRM(1109, {              // glazed tile with rough grout
+          rough: 0.4, roughVar: 0.1, roughFreq: 7, grout: 1, groutRough: 0.94, tiles: 4,
+        }));
+        this._tex('rmBrick', genRM(1110, {
+          rough: 0.92, roughVar: 0.08, roughFreq: 9, grout: 0.7, groutRough: 0.99, tiles: 4,
+        }));
+        this._tex('rmCloth', genRM(1111, { rough: 1.0, roughVar: 0.02, roughFreq: 12 }));
 
-    // Large-scale discolouration field, sampled in world space by every surface shader
-    // so a 20 m wall stops reading as one texture repeated ten times.
-    this._tex('macroField', genFbmField(4242, { size: 128, octaves: 5, freq: 2, gain: 0.5, contrast: 1.15 }));
-    MACRO_FIELD.texture = this.textures.get('macroField');
+        // Large-scale discolouration field, sampled in world space by every surface
+        // shader so a 20 m wall stops reading as one texture repeated ten times.
+        this._tex('macroField', genFbmField(4242, { size: 128, octaves: 5, freq: 2, gain: 0.5, contrast: 1.15 }));
+        MACRO_FIELD.texture = this.textures.get('macroField');
+      },
+      () => this._buildMaterials(),
+    ];
+  }
 
+  _buildMaterials() {
     // --- surface materials
     // With a roughness/metalness map the scalars become multipliers, so they sit at 1
     // and the map carries the absolute values.
@@ -873,7 +1027,11 @@ export class Assets {
     // materials pass amt 0, so the noise branch is skipped, but they still pick up the
     // sun-tinted fog — a grenade at 40 m has to sit in the same air as the wall behind it.
     for (const m of this.materials.values()) this._hook(m);
+  }
 
+  _finish() {
+    // Every plane is now baked into a texture; hand the ~15 MB of scratch back.
+    releasePlanes();
     this.ready = true;
   }
 

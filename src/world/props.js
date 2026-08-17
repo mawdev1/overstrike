@@ -150,6 +150,49 @@ function templateBuilder() {
 
 const _c = new THREE.Color();
 const _c2 = new THREE.Color();
+const WHITE = new THREE.Color(1, 1, 1);
+
+/**
+ * Give `geo` a flat `color` attribute. Used to bake a prop's tint / per-instance colour
+ * into geometry so it can join a static merge bucket instead of holding an InstancedMesh
+ * open on its own. Values are linear-space, exactly like `InstancedMesh.setColorAt()`
+ * writes them, and three multiplies both into `vColor` identically.
+ */
+function fillVertexColor(geo, color) {
+  const n = geo.attributes.position.count;
+  const arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    arr[i * 3] = color.r; arr[i * 3 + 1] = color.g; arr[i * 3 + 2] = color.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  return geo;
+}
+
+/**
+ * `vertexColors` is a shader define, so a bucket carrying baked tints needs its own
+ * material. Cached by base-material name — there are only ever a couple of these, and
+ * the alternative (flipping the shared library material) would render every other user
+ * of it black for want of a `color` attribute.
+ *
+ * `Material.copy()` does NOT carry `onBeforeCompile`, and assets.js hangs the shared
+ * macro/aerial-perspective hook there, so it is reattached by hand. It is the same
+ * function object as the base's, which keeps three's default `customProgramCacheKey()`
+ * in agreement with the rest of the library.
+ */
+const _vcMats = new Map();
+function vertexColorMat(name) {
+  let m = _vcMats.get(name);
+  if (m) return m;
+  const base = assets.mat(name);
+  m = base.clone();
+  m.vertexColors = true;
+  m.onBeforeCompile = base.onBeforeCompile;
+  m.userData.macro = base.userData.macro;
+  m.userData.surface = base.userData.surface || name;
+  m.needsUpdate = true;
+  _vcMats.set(name, m);
+  return m;
+}
 const _m4 = new THREE.Matrix4();
 const _quat = new THREE.Quaternion();
 const _pos = new THREE.Vector3();
@@ -181,10 +224,17 @@ export class Builder {
 
   // ── raw plumbing ────────────────────────────────────────────────────────────────
 
-  addGeo(geo, matName, cast = true, receive = true) {
+  /**
+   * @param {boolean} [colored] true when `geo` carries a baked `color` attribute. The
+   *   bucket then renders with a vertexColors variant of the material and every other
+   *   geometry in it gets a white `color` attribute at merge time — mergeGeometries
+   *   requires a matching attribute set across the whole bucket.
+   */
+  addGeo(geo, matName, cast = true, receive = true, colored = false) {
     const key = `${matName}|${cast ? 1 : 0}${receive ? 1 : 0}`;
     let b = this._static.get(key);
-    if (!b) { b = { mat: matName, cast, receive, geos: [] }; this._static.set(key, b); }
+    if (!b) { b = { mat: matName, cast, receive, colored: false, geos: [] }; this._static.set(key, b); }
+    if (colored) b.colored = true;
     b.geos.push(geo);
   }
 
@@ -674,26 +724,38 @@ export class Builder {
   /**
    * An InstancedMesh that holds one or two copies is a whole draw call (plus a second
    * one in the shadow pass) spent on a handful of triangles. Bake those few copies into
-   * the matching static merge bucket instead — as long as nothing about them is
-   * per-instance (no tint, no colour), the result is pixel-identical and free.
+   * the matching static merge bucket instead — the result is pixel-identical and free.
+   *
+   * Tint used to disqualify a bucket, because the only place a per-instance colour could
+   * live was `instanceColor`. That excluded genuinely silly cases: `crane|#3` is ONE
+   * instance of TWELVE triangles holding a whole draw call plus its shadow twin purely
+   * because it is painted yellow. So the tint is now baked into a vertex-colour
+   * attribute instead — `instanceColor` and `color` multiply into `vColor` by exactly
+   * the same shader path, so the pixels are identical either way.
    */
   _foldSingletons(maxCount = 3, maxTris = 3200) {
     for (const [key, b] of this._inst) {
       const n = b.items.length / 7;
       if (n === 0) { this._inst.delete(key); continue; }
-      if (n > maxCount || b.tint) continue;
+      if (n > maxCount) continue;
       const tris = (b.geo.index ? b.geo.index.count : b.geo.attributes.position.count) / 3;
       if (tris * n > maxTris) continue;
-      let tinted = false;
-      for (let i = 0; i < n; i++) if (b.items[i * 7 + 6] >= 0) { tinted = true; break; }
-      if (tinted) continue;
       for (let i = 0; i < n; i++) {
         const o = i * 7;
         _pos.set(b.items[o], b.items[o + 1], b.items[o + 2]);
         _quat.setFromAxisAngle(_up, b.items[o + 3]);
         _scl.set(b.items[o + 4], b.items[o + 5], b.items[o + 4]);
         _m4.compose(_pos, _quat, _scl);
-        this.addGeo(b.geo.clone().applyMatrix4(_m4), b.mat, b.cast, b.receive);
+        const g = b.geo.clone().applyMatrix4(_m4);
+        const col = b.items[o + 6];
+        const colored = col >= 0 || !!b.tint;
+        if (colored) {
+          // Same product finish() would have handed setColorAt().
+          _c.setHex(col >= 0 ? col : 0xffffff);
+          if (b.tint) { _c2.setHex(b.tint); _c.multiply(_c2); }
+          fillVertexColor(g, _c);
+        }
+        this.addGeo(g, b.mat, b.cast, b.receive, colored);
       }
       this._inst.delete(key);
     }
@@ -705,11 +767,14 @@ export class Builder {
 
     for (const b of this._static.values()) {
       if (!b.geos.length) continue;
+      // mergeGeometries() demands an identical attribute set across the bucket, so once
+      // one folded prop has brought a baked tint in, everything else needs a white one.
+      if (b.colored) for (const g of b.geos) if (!g.attributes.color) fillVertexColor(g, WHITE);
       const geo = b.geos.length === 1 ? b.geos[0] : mergeGeometries(b.geos, false);
       if (!geo) { console.warn(`[props] merge failed for material ${b.mat}`); continue; }
       if (b.geos.length > 1) for (const g of b.geos) g.dispose();
       geo.computeBoundingSphere();
-      const mesh = new THREE.Mesh(geo, assets.mat(b.mat));
+      const mesh = new THREE.Mesh(geo, b.colored ? vertexColorMat(b.mat) : assets.mat(b.mat));
       mesh.name = `static_${b.mat}`;
       mesh.castShadow = b.cast;
       mesh.receiveShadow = b.receive;

@@ -71,6 +71,43 @@ export function keyLabel(code) {
   return MAP[code] || code.toUpperCase();
 }
 
+/**
+ * A duplex mil-dot reticle, in scope space (100 = aperture radius).
+ *
+ * Duplex is not decoration: the four heavy outer posts drag the eye to the middle of a
+ * magnified image with no other landmarks in it, and then get out of the way, which is
+ * why every hunting and military optic since the 1960s uses the shape. The hairlines are
+ * 0.9 units — under a pixel at any sane aperture, hence the halo pass in CSS.
+ */
+function reticleShapes() {
+  let s = '';
+  // Heavy outer posts, stopping at 36 % of the radius.
+  s += '<rect x="-1.55" y="-100" width="3.1" height="64"/>';
+  s += '<rect x="-1.55" y="36" width="3.1" height="64"/>';
+  s += '<rect x="-100" y="-1.55" width="64" height="3.1"/>';
+  s += '<rect x="36" y="-1.55" width="64" height="3.1"/>';
+  // Hairline cross, with a 3.2-unit gap so the aiming point is never covered.
+  s += '<rect x="-0.58" y="-36" width="1.16" height="32.8"/>';
+  s += '<rect x="-0.58" y="3.2" width="1.16" height="32.8"/>';
+  s += '<rect x="-36" y="-0.58" width="32.8" height="1.16"/>';
+  s += '<rect x="3.2" y="-0.58" width="32.8" height="1.16"/>';
+  // Windage marks, one mil apart, alternating long/short.
+  for (let i = 1; i <= 3; i++) {
+    const x = i * 9;
+    const h = i === 2 ? 5.6 : 3.6;
+    s += `<rect x="${(x - 0.55).toFixed(2)}" y="${(-h / 2).toFixed(2)}" width="1.1" height="${h}"/>`;
+    s += `<rect x="${(-x - 0.55).toFixed(2)}" y="${(-h / 2).toFixed(2)}" width="1.1" height="${h}"/>`;
+  }
+  // Holdover ladder: wider as it drops, the way a real bullet-drop scale is drawn.
+  for (let i = 1; i <= 3; i++) {
+    const y = i * 9;
+    const w = 4 + i * 2;
+    s += `<rect x="${(-w / 2).toFixed(2)}" y="${(y - 0.55).toFixed(2)}" width="${w}" height="1.1"/>`;
+  }
+  s += '<circle cx="0" cy="0" r="0.75"/>';
+  return s;
+}
+
 export class HUD {
   constructor(game) {
     this.game = game;
@@ -90,6 +127,7 @@ export class HUD {
       scoreA: -1, scoreB: -1, timer: -1, urgent: false, modeTxt: '',
       tagA: '', tagB: '', metric: '', phase: '',
       spread: -1, xhStyle: '', xhColor: '', xhHidden: null,
+      scopeAmt: -1, scopeSize: -1, scopeBreath: -1, scopeHold: null,
       vignette: -1, crit: false, flash: -1, blind: -1,
       perf: '', live: null, secondary: '', nades: -1, hmKind: '',
       deathKiller: '', deathCount: -1, deathReady: null, deathHp: -1, deathHow: '',
@@ -158,6 +196,9 @@ export class HUD {
     const fs = parseFloat(getComputedStyle(this.root).fontSize);
     this._gapPx = (isFinite(fs) ? fs : 16) * 0.3;
     this._c.spread = -1;   // force a rewrite at the new scale
+    // The scope aperture is a fraction of the viewport HEIGHT; a resize while scoped
+    // has to re-derive it or the SVG reticle stops matching the shader's mask.
+    this._c.scopeSize = -1;
   }
 
   /* ======================================================================
@@ -262,6 +303,27 @@ export class HUD {
     center.style.cssText = 'position:absolute;inset:0;';
     this._center = center;
 
+    // ---- telescopic sight reticle ----
+    // Drawn in the HUD, not in the composite shader, on purpose: the composer runs at
+    // `renderScale`, and at 0.6 a shader-drawn hairline is resampled into a grey smudge.
+    // Here it rasterises at native device resolution however the world is rendered.
+    //
+    // The viewBox is the SCOPE's own space — 100 units is the aperture radius — so the
+    // reticle is sized once from `scope.apertureR` and thereafter never scales with the
+    // view, the FOV or the magnification. Screen centre is 0,0, which is exactly where
+    // the bullet goes (see `_pollScope`).
+    const scope = mk('scope', `
+      <svg viewBox="-120 -120 240 240" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        <defs><g id="os-reticle">${reticleShapes()}</g></defs>
+        <use href="#os-reticle" class="ret-halo"></use>
+        <use href="#os-reticle" class="ret-ink"></use>
+        <g class="scope-breath">
+          <rect class="trk" x="-23" y="103.4" width="46" height="1.9" rx="0.95"></rect>
+          <rect class="fil" x="-23" y="103.4" width="46" height="1.9" rx="0.95"></rect>
+        </g>
+      </svg>`);
+    center.appendChild(scope);
+
     const xh = mk('xh', `
       <i class="xh-t"></i><i class="xh-b"></i><i class="xh-l"></i><i class="xh-r"></i>
       <i class="xh-dot"></i>`);
@@ -348,7 +410,9 @@ export class HUD {
     // ---- ref table (queried exactly once) ----
     this.el = {
       root: r, vignette, flash, blind, top, perf, ammo, health, xh, hitmark, arcs,
-      notice, streak, death, center, streaks, uav,
+      notice, streak, death, center, streaks, uav, scope,
+      scopeBreath: scope.querySelector('.scope-breath'),
+      scopeBreathFill: scope.querySelector('.scope-breath .fil'),
       scoreA: top.querySelector('.score-team.a .val'),
       scoreB: top.querySelector('.score-team.b .val'),
       tagA: top.querySelector('.score-team.a .tag'),
@@ -842,6 +906,12 @@ export class HUD {
     this._c.magFrac = -1;
     this._c.uav = null;
     this._c.phase = '';
+    this._c.scopeAmt = 0;
+    this._c.scopeSize = -1;
+    this._c.scopeBreath = -1;
+    this._c.scopeHold = null;
+    this.el.scope.style.opacity = '0';
+    this.el.scope.style.visibility = 'hidden';
     this._c.deathKiller = '';
     this._c.deathHow = '';
     this._spreadExternal = false;
@@ -866,6 +936,9 @@ export class HUD {
       this._pollMatch();
       this._pollKit();
       this._pollStreaks();
+      this._pollScope();
+    } else if (this._c.scopeAmt !== 0) {
+      this._pollScope();
     }
 
     this._tickHitmarker(dt);
@@ -967,10 +1040,78 @@ export class HUD {
     const ads = w?.adsAmount ?? 0;
     // Optics with real magnification hide the reticle; a red dot keeps it.
     const optic = !!def && (def.class === 'sniper' || (def.adsFov ?? 60) <= 42);
-    const hide = optic && ads > 0.55;
+    // A scoped weapon must never show both crosshairs at once, and the scope's own
+    // reticle starts fading in at adsAmount 0.52 — before the 0.55 rule below fires.
+    const scoping = !!def?.scoped && ads > 0.5;
+    const hide = (optic && ads > 0.55) || scoping;
     if (this._c.xhHidden !== hide) {
       this._c.xhHidden = hide;
       this.el.xh.classList.toggle('ads', hide);
+    }
+  }
+
+  /**
+   * The telescopic sight overlay.
+   *
+   * The aperture is expressed in screen HALF-HEIGHTS by `ScopeFX`, and three keeps
+   * vertical FOV fixed, so `apertureR * innerHeight` is the aperture diameter in CSS
+   * pixels at any aspect ratio — the same circle the composite shader masks. Nothing
+   * here reads layout, and every write is guarded by a cached value, so a scoped frame
+   * costs at most three style writes and normally zero.
+   */
+  _pollScope() {
+    const el = this.el.scope;
+    if (!el) return;
+    const s = this.game.engine?.scope;
+    const amt = s && s.active ? s.amount : 0;
+
+    if (amt <= 0.002) {
+      if (this._c.scopeAmt !== 0) {
+        this._c.scopeAmt = 0;
+        this._c.scopeHold = null;
+        el.style.opacity = '0';
+        el.style.visibility = 'hidden';
+      }
+      return;
+    }
+
+    const size = Math.round(s.apertureR * this._vh * 1.2);
+    if (size !== this._c.scopeSize) {
+      this._c.scopeSize = size;
+      el.style.width = `${size}px`;
+      el.style.height = `${size}px`;
+    }
+
+    // The reticle waits for the gun to get out of the way (viewmodel.js hides it at
+    // 0.5) — a hairline cross floating over a rifle that is still coming up reads as a
+    // bug. From there it comes in fast.
+    const q = Math.round(Math.min(1, Math.max(0, (amt - 0.48) / 0.34)) * 200) / 200;
+    if (q !== this._c.scopeAmt) {
+      const wasOff = this._c.scopeAmt <= 0;
+      this._c.scopeAmt = q;
+      el.style.opacity = String(q);
+      if (wasOff) el.style.visibility = 'visible';
+      // Settles from slightly oversize as the sight comes up — the eye reading a scope
+      // that is not yet at the right eye relief. Transform only: no layout, no paint.
+      el.style.transform = `translate(-50%,-50%) scale(${(1 + (1 - q) * 0.16).toFixed(3)})`;
+    }
+
+    // Breath meter, on the scope body just under the glass.
+    const cam = this.game.player?.camera;
+    const b = cam ? clamp01(cam.breath) : 1;
+    const hold = !!cam?.breathHolding;
+    // Quantised to whole scope units: an SVG attribute write repaints the whole
+    // 800-pixel overlay, and a meter that is 46 units wide cannot show more than 46
+    // states anyway.
+    const w = Math.round(b * 46);
+    if (w !== this._c.scopeBreath) {
+      this._c.scopeBreath = w;
+      this.el.scopeBreathFill.setAttribute('width', String(w));
+    }
+    const show = hold || b < 0.995;
+    if (show !== this._c.scopeHold) {
+      this._c.scopeHold = show;
+      this.el.scopeBreath.setAttribute('class', show ? 'scope-breath on' : 'scope-breath');
     }
   }
 

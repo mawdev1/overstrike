@@ -8,6 +8,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { clamp, damp } from './mathUtils.js';
 import { ATMOSPHERE, makeCloudTexture } from './assets.js';
+import { ScopeFX } from '../fx/scope.js';
 
 // Scratch — the shadow cascade runs every frame and must not allocate (§1).
 const _fwd = new THREE.Vector3();
@@ -20,8 +21,14 @@ const _worldUp = new THREE.Vector3(0, 1, 0);
 const SUN = ATMOSPHERE.sunDir;   // unit vector pointing at the sun
 
 /**
- * Final composite: vignette, film grain, chromatic aberration, damage flash and a
- * desaturating low-health pass. One pass so we only pay a single fullscreen blit.
+ * Final composite: vignette, film grain, chromatic aberration, damage flash, a
+ * desaturating low-health pass and the telescopic sight picture. One pass so we only
+ * pay a single fullscreen blit.
+ *
+ * The scope block is guarded by `uScope`, a UNIFORM — every fragment in the frame takes
+ * the same side of that branch, so with no scope up the whole thing is skipped
+ * coherently and costs nothing measurable. See `src/fx/scope.js` for why the sight
+ * picture is composited here rather than rendered picture-in-picture.
  */
 const CompositeShader = {
   uniforms: {
@@ -34,6 +41,11 @@ const CompositeShader = {
     uLowHealth: { value: 0.0 },    // 0..1 desaturate + pulse
     uFade: { value: 0.0 },         // 0..1 fade to black
     uResolution: { value: new THREE.Vector2(1, 1) },
+    // ── telescopic sight ──
+    uScope: { value: 0.0 },                                  // 0..1 master guard
+    uScopeGeom: { value: new THREE.Vector4(0.8, 0.005, 0, 0) }, // radius, edge, haze, —
+    uScopeShift: { value: new THREE.Vector2(0, 0) },         // eye-relief offset
+    uScopeGlint: { value: new THREE.Vector3(0, 0, 0) },      // sun x, sun y, intensity
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -43,6 +55,10 @@ const CompositeShader = {
     uniform sampler2D tDiffuse;
     uniform float uTime, uVignette, uGrain, uAberration, uDamage, uLowHealth, uFade;
     uniform vec2 uResolution;
+    uniform float uScope;
+    uniform vec4 uScopeGeom;
+    uniform vec2 uScopeShift;
+    uniform vec3 uScopeGlint;
     varying vec2 vUv;
 
     float hash(vec2 p) {
@@ -64,6 +80,7 @@ const CompositeShader = {
       col.r = texture2D(tDiffuse, uv + off).r;
       col.g = texture2D(tDiffuse, uv).g;
       col.b = texture2D(tDiffuse, uv - off).b;
+      vec3 base = col;
 
       // Vignette.
       float vig = smoothstep(0.95, 0.18, r2 * uVignette * 2.2);
@@ -86,6 +103,72 @@ const CompositeShader = {
       float g = hash(uv * uResolution + fract(uTime) * 431.7) - 0.5;
       float lum2 = dot(col, vec3(0.299, 0.587, 0.114));
       col += g * uGrain * (0.35 + 0.65 * (1.0 - lum2));
+
+      // ═══════════════════════════════════════════════ telescopic sight picture ══
+      // Uniform branch: with no scope up not one fragment enters this block.
+      if (uScope > 0.001) {
+        float R    = uScopeGeom.x;    // aperture radius, screen half-heights
+        float edge = uScopeGeom.y;    // aperture edge softness
+        float haze = uScopeGeom.z;    // focus-in wash, 1 -> 0 as the sight settles
+        float asp  = uResolution.x / max(uResolution.y, 1.0);
+
+        // Half-height space: a circle here is a circle on screen at any aspect ratio,
+        // and it is the SAME space the HUD sizes the reticle in.
+        vec2 q  = c * vec2(asp, 1.0) * 2.0;
+        vec2 qs = q - uScopeShift;                       // eye-relief shadow offset
+        float d = length(qs);
+        float dn = clamp(d / R, 0.0, 1.4);
+
+        float mask = 1.0 - smoothstep(R - edge, R + edge, d);
+
+        // Four bilinear taps on the diagonals: the out-of-focus periphery outside the
+        // ocular, and the not-yet-focused wash as the sight comes up. One kernel, two
+        // jobs — the scope never pays for a second blur.
+        vec2 bo = vec2(1.0 / asp, 1.0) * 0.010;
+        vec3 blur = ( texture2D(tDiffuse, uv + bo).rgb
+                    + texture2D(tDiffuse, uv - bo).rgb
+                    + texture2D(tDiffuse, uv + vec2(bo.x, -bo.y)).rgb
+                    + texture2D(tDiffuse, uv - vec2(bo.x, -bo.y)).rgb ) * 0.25;
+
+        // ---- inside the glass ----
+        // Lateral colour error: a real objective cannot bring R and B to the same focal
+        // plane off-axis, and it grows with the cube of the distance from that axis.
+        vec2 rad = qs / max(d, 1e-4);
+        vec2 fo = rad * pow(dn, 3.5) * 0.0016 * vec2(1.0 / asp, 1.0);
+        float fr = texture2D(tDiffuse, uv + fo).r;
+        float fb = texture2D(tDiffuse, uv - fo).b;
+        vec3 glass = col + vec3(fr - base.r, 0.0, fb - base.b);
+
+        // Coated glass is faintly cool and loses light toward the tube wall; the last
+        // few per cent of the radius fall away hard, which is the tube itself and the
+        // difference between a lens and a hole cut in a card.
+        glass *= vec3(0.968, 0.996, 1.040);
+        glass *= 1.0 - 0.34 * pow(dn, 3.2) - 0.34 * smoothstep(0.90, 1.0, dn);
+        // Focusing in.
+        glass = mix(glass, blur * 1.06 + 0.014, haze);
+
+        // Objective glint. A tight core plus a wide Mie-ish bloom, then a cool ghost
+        // thrown to the opposite side of the optical axis by the second element.
+        float gd = length(q - uScopeGlint.xy);
+        float glint = uScopeGlint.z * (exp(-gd * gd * 1.15) * 0.34 + exp(-gd * 5.0) * 0.30);
+        glass += vec3(1.0, 0.84, 0.58) * glint;
+        float ghd = length(q + uScopeGlint.xy * 0.62);
+        glass += vec3(0.42, 0.62, 1.0) * uScopeGlint.z * exp(-ghd * ghd * 5.0) * 0.14;
+
+        // ---- outside the glass: the scope body ----
+        // Not raw world and not flat black: a barely-lit smear of what the periphery is
+        // doing, killed off over a few centimetres of tube.
+        vec3 body = blur * 0.115 * (1.0 - smoothstep(R, R + 0.16, d));
+        // Light catching the bevelled lip of the ocular — the crisp edge of the sight.
+        float lip = smoothstep(R + 0.020, R + 0.001, d) * smoothstep(R - 0.010, R + 0.001, d);
+        body += vec3(0.46, 0.52, 0.62) * lip * 0.34;
+        // The tube is 2 % of full brightness, which is where an 8-bit backbuffer starts
+        // showing its steps. Reuse the grain hash to dither it flat.
+        body += g * 0.010;
+
+        vec3 scoped = mix(body, glass, mask);
+        col = mix(col, scoped, uScope);
+      }
 
       col *= (1.0 - uFade);
       gl_FragColor = vec4(col, 1.0);
@@ -361,7 +444,14 @@ export class Engine {
     this._buildSky();
     this._buildComposer();
 
-    this.stats = { fps: 0, frameMs: 0, drawCalls: 0, triangles: 0, programs: 0 };
+    /**
+     * Telescopic sight picture. Holds no GPU resources of its own — it writes into the
+     * composite pass's uniforms, re-read every frame, so a context-loss rebuild that
+     * replaces the whole composer needs no special handling here.
+     */
+    this.scope = new ScopeFX(game, this);
+
+    this.stats ={ fps: 0, frameMs: 0, drawCalls: 0, triangles: 0, programs: 0 };
     this._fpsAccum = 0;
     this._fpsFrames = 0;
     this._lastFrameStart = 0;
@@ -415,6 +505,9 @@ export class Engine {
     this._buildEnvironment();
     this._buildSky();
     this._buildComposer();
+    // The composer's uniforms are a fresh clone now; the scope re-resolves them on its
+    // next write, but its transient state must not survive the black frame.
+    this.scope?.reset();
     this._onResize();
     this.sun.shadow.map?.dispose();
     this.sun.shadow.map = null;
@@ -818,6 +911,10 @@ export class Engine {
     this.sky.position.copy(this.camera.position);
     this.viewMuzzleLight.intensity = damp(this.viewMuzzleLight.intensity, 0, 26, dt);
 
+    // Runs last of everything visual: the player camera has already composed this
+    // frame's transform, so the sight picture is never a frame behind the view.
+    this.scope.update(dt);
+
     if (this.renderer.shadowMap.enabled) this._updateShadowCascade();
   }
 
@@ -855,6 +952,7 @@ export class Engine {
     window.removeEventListener('resize', this._onResize);
     this.canvas.removeEventListener('webglcontextlost', this._onContextLost);
     this.canvas.removeEventListener('webglcontextrestored', this._onContextRestored);
+    this.scope?.dispose();
     this.composer?.dispose();
     this.aoPass?.dispose();
     this.cloudTex?.dispose();

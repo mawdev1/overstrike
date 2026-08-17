@@ -361,12 +361,25 @@ export class FX {
     const viewScene = this.game.engine?.viewScene;
     if (viewScene) viewScene.add(this.flashView.mesh);
 
-    // --- pooled point lights (created once, never added/removed → no recompiles)
+    // --- pooled point lights
+    //
+    // These are created once, added once, and **never added, removed or hidden again**.
+    // Both halves of that sentence matter. `WebGLRenderer.projectObject` skips invisible
+    // objects before `pushLight`, so flipping `visible` changes `pointLength`, which bumps
+    // `WebGLLights.state.version`, which sets `needsProgramChange` on EVERY lit material
+    // in the scene — a full `getParameters()` + `getProgramCacheKey()` per material, and a
+    // genuine shader COMPILE for each light count the game has not seen before (measured:
+    // +13 programs per extra live light, 35 → 100 across the pool, all of it lazily during
+    // a firefight). An idle light costs ~35 ALU per lit pixel and nothing else.
+    //
+    // So: `visible` is pinned true here for the lifetime of the pool, and `intensity` is
+    // the ONLY thing `_light()` / `_updateLights()` drive. Any future code that adds,
+    // removes or hides a light reintroduces the stall.
     this.lights = [];
     for (let i = 0; i < MAX_LIGHTS; i++) {
       const l = new THREE.PointLight(0xffb066, 0, 9, 2);
       l.castShadow = false;
-      l.visible = false;
+      l.visible = true;
       scene.add(l);
       this.lights.push(l);
     }
@@ -588,6 +601,20 @@ export class FX {
     if (!this.enabled || !this.particles.groups) return;
     const r = clamp(radius, 0.5, 24);
 
+    // Distance LOD, on the same curve impact() uses. A detonation is the single biggest
+    // transparent-overdraw spike in the game — ~12x full-screen blended fill at 5 m,
+    // every pixel of it above the bloom threshold — and a frag 60 m away was paying the
+    // full price for a puff of colour a few dozen pixels across.
+    const cam = this.game.camera;
+    let camDist = 0;
+    let lod = 1;
+    if (cam) {
+      _camPos.setFromMatrixPosition(cam.matrixWorld);
+      camDist = _camPos.distanceTo(point);
+      lod = camDist <= FX_NEAR ? 1 : camDist >= FX_FAR ? 0.25
+        : 1 - 0.75 * (camDist - FX_NEAR) / (FX_FAR - FX_NEAR);
+    }
+
     // 0. one downward probe — it drives the scorch decal, the debris bounce plane and
     //    the height of the ground ring. Everything else is allocation free.
     let groundY = point.y;
@@ -608,9 +635,10 @@ export class FX {
       12, 10.5, 8.0, 4.0, 1.4, 0.4, 3, 0);
     this._light(point.x, point.y + r * 0.15, point.z, 1.0, 0.85, 0.6, 14 + r * 2.2, 0.42, 2, r * 3.5);
 
-    // 2. fireball
-    this.particles.emit('explosionFireball', point, _up, r * 0.35, -Infinity);
-    for (let i = 0; i < 3; i++) {
+    // 2. fireball — the extra billboards are the screen-fillers, so they thin out first
+    this.particles.emit('explosionFireball', point, _up, r * 0.35 * lod, -Infinity);
+    const puffs = lod >= 0.85 ? 3 : lod >= 0.5 ? 2 : 1;
+    for (let i = 0; i < puffs; i++) {
       const a = rnd() * Math.PI * 2;
       const rr = r * 0.22 * rnd();
       this.flashWorld.spawn(
@@ -621,22 +649,20 @@ export class FX {
 
     // 3. embers + debris burst, bouncing on the real floor rather than mid-air
     const floorY = grounded ? groundY : -Infinity;
-    this.particles.emit('explosionEmbers', point, _up, r * 0.3, floorY);
-    this.particles.emit('concreteChips', point, _up, r * 0.55, floorY);
+    this.particles.emit('explosionEmbers', point, _up, r * 0.3 * lod, floorY);
+    this.particles.emit('concreteChips', point, _up, r * 0.55 * lod, floorY);
 
     // 4. ground-hugging shockwave dust ring (plane mode → spreads horizontally, fast)
     _v1.set(point.x, (grounded ? groundY : point.y) + 0.12, point.z);
-    this.particles.emitTinted('explosionDustRing', _v1, _up, r * 0.5, -Infinity, 1.15, 1.05, 0.95);
+    this.particles.emitTinted('explosionDustRing', _v1, _up, r * 0.5 * lod, -Infinity, 1.15, 1.05, 0.95);
 
     // 5. lingering smoke column
-    this.particles.emit('explosionSmoke', point, _up, r * 0.32, -Infinity);
+    this.particles.emit('explosionSmoke', point, _up, r * 0.32 * lod, -Infinity);
 
-    // 6. audio + shake
+    // 6. audio + shake (distance is already in hand from the LOD probe above)
     this._play('explosion', point, 1, 0.9 + rnd() * 0.2);
-    if (this.game.camera) {
-      _camPos.setFromMatrixPosition(this.game.camera.matrixWorld);
-      const d = _camPos.distanceTo(point);
-      const falloff = clamp(1 - d / (r * 5 + 6), 0, 1);
+    if (cam) {
+      const falloff = clamp(1 - camDist / (r * 5 + 6), 0, 1);
       if (falloff > 0.01) this.screenShake(1.15 * falloff, 0.35 + 0.35 * falloff);
     }
   }
@@ -753,7 +779,6 @@ export class FX {
     if (this.lights) {
       for (let i = 0; i < MAX_LIGHTS; i++) {
         this.lights[i].intensity = 0;
-        this.lights[i].visible = false;
         this._lightLife[i] = 0;
       }
     }
@@ -784,7 +809,18 @@ export class FX {
     out.shells = this._shellCount;
     out.flashes = (this.flashWorld?.count || 0) + (this.flashView?.count || 0);
     out.lights = this._liveLights();
-    out.drawCalls = 9;
+    // Counted, never asserted. This used to be a hardcoded `9`, which is a claim rather
+    // than a measurement and silently goes stale the first time anyone adds a batch.
+    // Every one of these is a single always-resident mesh, so the sum IS the draw-call
+    // contribution of the whole facade (the point lights contribute none).
+    out.drawCalls =
+      (this.particles?.groups ? Object.keys(this.particles.groups).length : 0)
+      + (this.decals?.mesh ? 1 : 0)
+      + (this.tracers?.batch ? 1 : 0)
+      + (this.tracers?.vapour ? 1 : 0)
+      + (this.flashWorld ? 1 : 0)
+      + (this.flashView ? 1 : 0)
+      + (this.shells ? 1 : 0);
     return out;
   }
 
@@ -827,7 +863,7 @@ export class FX {
     l.color.setRGB(r, g, b);
     l.intensity = intensity;
     l.distance = distance;
-    l.visible = true;
+    // NOTE: never touch `l.visible` — see the pool comment in init().
     this._lightLife[idx] = life;
     this._lightMax[idx] = life;
     this._lightI0[idx] = intensity;
@@ -842,8 +878,8 @@ export class FX {
       const nl = l - dt;
       if (nl <= 0) {
         this._lightLife[i] = 0;
+        // Intensity 0 is the whole retirement — see the pool comment in init().
         this.lights[i].intensity = 0;
-        this.lights[i].visible = false;
         continue;
       }
       this._lightLife[i] = nl;

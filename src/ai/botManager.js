@@ -13,9 +13,12 @@ import { clamp } from '../core/mathUtils.js';
  *
  *   • think() (senses + LOS + transitions) runs on a per-bot stride of 8 fixed
  *     steps out of combat and 4 in combat, phase-offset by roster index. With
- *     12 bots and stride 8 that is ~1.5 bots thinking per fixed step.
- *   • findPath() is capped at PATH_BUDGET searches per fixed step, served
- *     round-robin so no bot can starve.
+ *     12 bots and stride 8 that is ~1.5 bots thinking per fixed step. The pass
+ *     itself runs at most ONCE per rendered frame (see fixedUpdate).
+ *   • findPath() is capped at PATH_BUDGET searches per RENDERED FRAME, served
+ *     round-robin so no bot can starve. Per-frame, not per-step: a frame only ever
+ *     takes several substeps when it is already late, so a per-step budget scaled
+ *     the AI cost up by 6x on exactly the frames that had no room for it.
  *   • fixedUpdate() (steering + one world.move) runs for every bot every step;
  *     it is the same per-entity cost the player pays.
  *
@@ -24,10 +27,13 @@ import { clamp } from '../core/mathUtils.js';
  */
 
 const RESPAWN_DELAY = 3.5;
-// One A* per fixed step. At 120 Hz that serves 120 searches/s against a demand
-// of roughly 10/s for 12 bots, and it hard-bounds the worst frame: a single
-// cross-layer search (~1.2 ms) can never be doubled up in one step.
+// One A* per RENDERED FRAME. At 120 fps that serves 120 searches/s against a demand of
+// roughly 10/s for 12 bots, and it hard-bounds the worst frame: a single cross-layer
+// search (~1.2 ms) can never be doubled up, not even on a frame that took six substeps.
 const PATH_BUDGET = 1;
+// Mirrors MAX_SUBSTEPS in core/game.js. Only used to recognise a headless harness that
+// drives _fixedUpdate() directly and therefore never advances `game.frame`.
+const MAX_STEPS_PER_FRAME = 6;
 const MAX_BOTS = 24;
 
 export const TEAM_COLORS = [new THREE.Color(0xd9b45a), new THREE.Color(0xe0453f)];
@@ -92,6 +98,11 @@ export class BotManager {
     this._unsub = [];
     this._tick = 0;
     this._pathCursor = 0;
+    // Per-rendered-frame budget bookkeeping — see fixedUpdate().
+    this._budgetFrame = -1;
+    this._stepsThisFrame = 0;
+    this._pathsThisFrame = 0;
+    this._thinkTick = 0;
     this._namePool = [];
     this._nameCursor = 0;
     this._spawnScratch = [];
@@ -146,6 +157,10 @@ export class BotManager {
     this._resizeRoster(count);
     this._configureRoster();
     this._tick = 0;
+    this._thinkTick = 0;
+    this._budgetFrame = -1;
+    this._stepsThisFrame = 0;
+    this._pathsThisFrame = 0;
   }
 
   /**
@@ -499,10 +514,41 @@ export class BotManager {
     const debug = game.debug;
     const t0 = debug ? performance.now() : 0;
 
-    this._tick++;
+    const tick = ++this._tick;
     const now = game.time;
 
+    // ---- the frame budget -----------------------------------------------------
+    //
+    // think() and A* are budgeted per RENDERED FRAME, not per fixed step. The engine
+    // takes up to MAX_SUBSTEPS=6 substeps in one frame, and it only ever takes more
+    // than one when that frame is ALREADY LATE — so a per-step budget multiplied the
+    // most expensive AI work by up to 6x at exactly the moment it had to shrink. That
+    // is what turned one dropped frame into a visible multi-frame stutter (measured
+    // ~7.2 ms of A* on a 6-substep frame against ~1.2 ms on a normal one).
+    //
+    // `game.frame` identifies the frame. The offline harnesses in scripts/ drive
+    // `game._fixedUpdate()` in a tight loop with no rAF at all, so `frame` never
+    // advances there; after MAX_STEPS_PER_FRAME steps carrying the same frame id we
+    // re-arm and treat it as a new frame. The real loop can never exceed that count,
+    // so the fallback is inert in the game and keeps the harnesses honest.
+    const frame = game.frame;
+    let firstStepOfFrame = false;
+    if (frame !== this._budgetFrame || this._stepsThisFrame >= MAX_STEPS_PER_FRAME) {
+      this._budgetFrame = frame;
+      this._stepsThisFrame = 0;
+      this._pathsThisFrame = 0;
+      firstStepOfFrame = true;
+    }
+    this._stepsThisFrame++;
+
     // 1) staggered thinking + respawn timers
+    //
+    // The think pass runs once per frame. A bot is due when its stride boundary falls
+    // anywhere in the ticks since the previous pass, so the stride still means "every
+    // N fixed steps" and no phase can starve — a 6-substep frame just collapses the six
+    // opportunities into the single think() the bot would have wanted anyway.
+    const prevTick = this._thinkTick;
+    if (firstStepOfFrame) this._thinkTick = tick;
     for (let i = 0; i < bots.length; i++) {
       const b = bots[i];
       if (!b.alive) {
@@ -512,8 +558,10 @@ export class BotManager {
         if (now - b.deathTime >= RESPAWN_DELAY) this._spawnBot(b);
         continue;
       }
+      if (!firstStepOfFrame) continue;
       const stride = b.thinkStride || 8;
-      if (((this._tick + b.thinkPhase) % stride) === 0) {
+      const ph = b.thinkPhase;
+      if (Math.floor((tick + ph) / stride) !== Math.floor((prevTick + ph) / stride)) {
         const last = b._lastThinkTime ?? now;
         b._lastThinkTime = now;
         b.think(clamp(now - last, dt, 0.25));
@@ -521,13 +569,12 @@ export class BotManager {
     }
 
     // 2) global A* budget, round-robin so nobody starves
-    let served = 0;
-    for (let n = 0; n < bots.length && served < PATH_BUDGET; n++) {
+    for (let n = 0; n < bots.length && this._pathsThisFrame < PATH_BUDGET; n++) {
       const b = bots[this._pathCursor % bots.length];
       this._pathCursor++;
       if (b.alive && b.pathPending) {
         b.servicePath();
-        served++;
+        this._pathsThisFrame++;
         this._pathCount++;
       }
     }

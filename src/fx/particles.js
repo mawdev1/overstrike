@@ -27,6 +27,32 @@ import { createRNG } from '../core/rng.js';
 const TAU = Math.PI * 2;
 const WORLD_GRAVITY = -22; // ARCHITECTURE §1
 
+/**
+ * Point-size clamps, expressed as a FRACTION OF THE DRAWING BUFFER HEIGHT rather than
+ * as an absolute pixel count.
+ *
+ * `gl_PointSize` is in pixels, so a fixed px clamp means a completely different sprite
+ * at every resolution: the old flat 512 let one smoke puff cover 28% of a 720p screen,
+ * 12.6% of 1080p and 7.1% of 1440p — the same explosion was three different effects,
+ * and the cheapest configuration (low `renderScale`, the one §11 actually targets) got
+ * the *most* expensive smoke. Because the projected size of a sprite is
+ * `world * 0.5 * proj[1][1] / dist` in units of buffer heights, a fraction of the
+ * buffer height is the resolution-invariant quantity: pick it once and the effect
+ * looks identical, and costs the same share of the frame, everywhere.
+ *
+ * Values are tuned by eye against `scripts/fillprobe.mjs` screenshots (frag at 3/6/12 m,
+ * smoke cloud from inside):
+ *   smoke 0.34 — a 4.42 m explosion column at 3 m still reads as one solid bank; at
+ *                0.27 it visibly breaks into separate blobs, so 0.34 keeps a margin.
+ *   add   0.38 — additive is the fireball. It is looser than the smoke because a
+ *                grenade at your feet SHOULD fill the view with fire, and because the
+ *                measured additive term is a third of the smoke term to begin with.
+ *   debris 0.27 — debris sprites are centimetres across and never reach this; it exists
+ *                only to bound a pathological near-camera case.
+ */
+const MAX_SIZE_FRAC = { smoke: 0.34, debris: 0.27, add: 0.38 };
+const FALLBACK_BUFFER_H = 720;
+
 /** Private stream — never touch `game.rng`, that one is simulation-deterministic. */
 const rnd = createRNG(0x51ed17a3);
 
@@ -221,6 +247,13 @@ const PARTICLE_FRAG = /* glsl */`
   uniform float fogNear;
   uniform float fogFar;
 
+  #ifdef SOFT_PARTICLES
+    uniform sampler2D uDepth;   // scene depth, NOT the buffer we are drawing into
+    uniform vec2 uInvRes;       // 1 / drawingBufferSize
+    uniform vec2 uNearFar;      // camera.near, camera.far
+    uniform float uSoftDist;    // metres over which a sprite fades into geometry
+  #endif
+
   varying vec3 vColor;
   varying float vAlpha;
   varying float vRot;
@@ -235,6 +268,19 @@ const PARTICLE_FRAG = /* glsl */`
     float soft = tex.a;
     float hard = smoothstep(0.30, 0.62, tex.a);
     float a = mix(soft, hard, uHard) * vAlpha;
+
+    #ifdef SOFT_PARTICLES
+      // Depth fade. Without it every sprite hard-cuts against geometry and a smoke
+      // bank reads as a stack of cards leaning on the wall behind it. Linearising a
+      // perspective depth buffer: dist = n*f / (f - d*(f-n)); d == 1 (sky) gives far,
+      // so open sky never fades anything. vFogDepth is the sprite CENTRE's view
+      // depth — the standard point-sprite approximation, and correct to well within a
+      // sprite radius for the soft blobs this actually matters for.
+      float d = texture2D(uDepth, gl_FragCoord.xy * uInvRes).x;
+      float sceneDist = (uNearFar.x * uNearFar.y) / (uNearFar.y - d * (uNearFar.y - uNearFar.x));
+      a *= clamp((sceneDist - vFogDepth) / uSoftDist, 0.0, 1.0);
+    #endif
+
     if (a < 0.004) discard;
 
     vec3 col = tex.rgb * vColor;
@@ -286,9 +332,11 @@ function basisFromDir() {
 // ---------------------------------------------------------------- system
 
 class ParticleGroup {
-  constructor(cap, texture, blending, hard, fogMode, renderOrder, maxPointSize) {
+  constructor(cap, texture, blending, hard, fogMode, renderOrder, maxSizeFrac) {
     this.cap = cap;
     this.count = 0;
+    /** Point-size clamp as a fraction of drawing-buffer height — see MAX_SIZE_FRAC. */
+    this.maxSizeFrac = maxSizeFrac;
 
     // GPU attributes
     this.pos = new Float32Array(cap * 3);
@@ -327,13 +375,19 @@ class ParticleGroup {
       uniforms: {
         uMap: { value: texture },
         uScale: { value: 600 },
-        uMaxSize: { value: maxPointSize },
+        uMaxSize: { value: maxSizeFrac * FALLBACK_BUFFER_H },
         uHard: { value: hard },
         uFogMode: { value: fogMode },
         fogColor: { value: new THREE.Color(0x8b98ab) },
         fogDensity: { value: 0.0075 },
         fogNear: { value: 1 },
         fogFar: { value: 400 },
+        // Soft-particle block. Inert (and stripped from the compiled program) unless
+        // ParticleSystem.setSceneDepth() turns the SOFT_PARTICLES define on.
+        uDepth: { value: null },
+        uInvRes: { value: new THREE.Vector2(1 / 1280, 1 / FALLBACK_BUFFER_H) },
+        uNearFar: { value: new THREE.Vector2(0.05, 900) },
+        uSoftDist: { value: 0.65 },
       },
       vertexShader: PARTICLE_VERT,
       fragmentShader: PARTICLE_FRAG,
@@ -389,6 +443,7 @@ export class ParticleSystem {
     this.groups = null;
     this._order = null;
     this._scene = null;
+    this._soft = false;
   }
 
   init(scene) {
@@ -399,16 +454,52 @@ export class ParticleSystem {
 
     // renderOrder: smoke/debris first, additive last so glow sits over the haze.
     // The point-size clamps bound fill cost — a smoke puff detonating in your face is
-    // the single biggest overdraw risk in the whole FX budget.
+    // the single biggest overdraw risk in the whole FX budget. See MAX_SIZE_FRAC.
     this.groups = {
-      smoke: new ParticleGroup(1600, smoke, THREE.NormalBlending, 0, 1, 8, 512),
-      debris: new ParticleGroup(1200, glow, THREE.NormalBlending, 1, 1, 9, 192),
-      add: new ParticleGroup(1200, glow, THREE.AdditiveBlending, 0, 0, 10, 512),
+      smoke: new ParticleGroup(1600, smoke, THREE.NormalBlending, 0, 1, 8, MAX_SIZE_FRAC.smoke),
+      debris: new ParticleGroup(1200, glow, THREE.NormalBlending, 1, 1, 9, MAX_SIZE_FRAC.debris),
+      add: new ParticleGroup(1200, glow, THREE.AdditiveBlending, 0, 0, 10, MAX_SIZE_FRAC.add),
     };
     this._order = [this.groups.smoke, this.groups.debris, this.groups.add];
 
     this._scene = scene;
     for (let i = 0; i < this._order.length; i++) scene.add(this._order[i].points);
+  }
+
+  /**
+   * Turn on soft particles (depth fade against scene geometry).
+   *
+   * PASS A DEPTH TEXTURE THAT IS **NOT** THE DEPTH ATTACHMENT OF THE FRAMEBUFFER THE
+   * SCENE IS BEING RENDERED INTO. Sampling the attachment you are drawing into is a
+   * feedback loop: undefined in WebGL, and engine.js already documents it hanging
+   * outright under a software rasteriser (see the `renderTarget2.depthTexture` comment
+   * there). Today the particles are drawn inside `RenderPass`, whose target owns that
+   * depth texture, so this stays OFF until the engine can offer either a copy of the
+   * depth buffer or a separate pass for the transparent layer. Everything on this side
+   * is finished and costs nothing while it is off — the define is not set, so the fade
+   * is not even compiled into the program.
+   *
+   * @param {?THREE.Texture} depthTexture  scene depth, or null to switch soft off
+   * @param {THREE.Camera} [camera]        supplies near/far for linearisation
+   * @param {number} [fadeDistance]        metres of fade at a geometry contact
+   */
+  setSceneDepth(depthTexture, camera, fadeDistance = 0.65) {
+    if (!this._order) return;
+    const on = !!depthTexture;
+    this._soft = on;
+    for (let i = 0; i < this._order.length; i++) {
+      const mat = this._order[i].mat;
+      const u = mat.uniforms;
+      u.uDepth.value = depthTexture || null;
+      u.uSoftDist.value = fadeDistance;
+      if (camera) u.uNearFar.value.set(camera.near, camera.far);
+      const has = mat.defines && mat.defines.SOFT_PARTICLES !== undefined;
+      if (on === has) continue;
+      mat.defines = mat.defines || {};
+      if (on) mat.defines.SOFT_PARTICLES = '';
+      else delete mat.defines.SOFT_PARTICLES;
+      mat.needsUpdate = true;   // one recompile per toggle, never per frame
+    }
   }
 
   get liveCount() {
@@ -532,15 +623,25 @@ export class ParticleSystem {
     const renderer = this.game.renderer;
     const cam = this.game.camera;
     let scale = 600;
+    let bufW = 1280, bufH = FALLBACK_BUFFER_H;
     if (renderer && cam) {
       renderer.getDrawingBufferSize(_drawSize);
-      scale = 0.5 * _drawSize.y * cam.projectionMatrix.elements[5];
+      bufW = _drawSize.x || bufW;
+      bufH = _drawSize.y || bufH;
+      scale = 0.5 * bufH * cam.projectionMatrix.elements[5];
     }
 
     for (let gi = 0; gi < this._order.length; gi++) {
       const g = this._order[gi];
       const uni = g.mat.uniforms;
       uni.uScale.value = scale;
+      // Resolution-invariant sprite clamp — the buffer size changes with the window
+      // AND with the `renderScale` setting, so this has to be re-derived every frame.
+      uni.uMaxSize.value = g.maxSizeFrac * bufH;
+      if (this._soft) {
+        uni.uInvRes.value.set(1 / bufW, 1 / bufH);
+        if (cam) uni.uNearFar.value.set(cam.near, cam.far);
+      }
 
       const pos = g.pos, vel = g.vel, col = g.col, siz = g.siz, par = g.par;
       const cA = g.cA, cB = g.cB;

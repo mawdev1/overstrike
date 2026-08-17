@@ -144,6 +144,28 @@ export class Menu {
     this._slot = 'primary';
     this._pick = { primary: null, secondary: null };
 
+    /**
+     * `open()` runs on the pause frame, mid-match, every single time Escape drops
+     * pointer lock. Rebuilding the nav, the mode cards, the bind rows, the weapon
+     * list and the dossier there costs ~1500 element creations and ~175 listener
+     * registrations plus the style recalc and layout they force — a guaranteed
+     * hitch, and almost all of it recreates markup that is already correct.
+     *
+     * So every builder is idempotent behind one of these. The rule is: a flag is
+     * raised by whatever can actually change what the builder renders, and the
+     * builder is the only thing that lowers it. A stale panel is a worse bug than
+     * a hitch, so the invalidation side is deliberately generous.
+     */
+    this._dirty = {
+      modes: true,      // the mode roster (static, but built lazily) + card state
+      binds: true,      // settings.binds
+      loadout: true,    // loadoutPrimary/Secondary, or the unlock level moving
+    };
+    this._navShell = null;   // the shell the nav rail was last built for
+    this._hdrStamp = '';     // progression signature the header was painted from
+    this._dosStamp = '';     // ... and the dossier
+    this._unlockLvl = -1;    // rank the weapon list's lock state was built at
+
     this._build();
     this._bind();
   }
@@ -151,9 +173,21 @@ export class Menu {
   async init() {
     this._readLoadout();
     this._buildLoadout();
+    this._dirty.loadout = false;
+    this._unlockLvl = progression.getLevel();
     this._refreshAll();
     if (this.game?.state === 'menu' || this.game?.state === 'boot') this.open('main');
     return this;
+  }
+
+  /**
+   * Cheap signature for everything the dossier and the header render.
+   * `updatedAt` is bumped by `Progression.save()`, which every award and every
+   * recorded match goes through, so this moves whenever the numbers do.
+   */
+  _progSig() {
+    const d = progression.data;
+    return `${d.level}|${d.xp}|${d.updatedAt}`;
   }
 
   /* ======================================================================

@@ -212,6 +212,14 @@ export class Viewmodel {
 
     this._lastYaw = 0; this._lastPitch = 0; this._haveLast = false;
 
+    /**
+     * True while the gun is hidden behind a scope's sight picture. Separate from
+     * `group.visible` meaning "this weapon is equipped", because a hidden gun still has
+     * a live muzzle — tracers and shell ejection must keep coming out of the right
+     * place while the player is scoped in.
+     */
+    this._scopeHidden = false;
+
     // --- falling magazine prop (one, reused)
     this.dropMag = null;
     this.dropMagLife = 0;
@@ -247,6 +255,7 @@ export class Viewmodel {
       this.kick.add(entry.group);
     }
     entry.group.visible = true;
+    this._scopeHidden = false;
     this.current = entry;
     this.def = def;
 
@@ -1032,7 +1041,8 @@ export class Viewmodel {
   }
 
   _anchorToWorld(node, out) {
-    if (!node || !this.current || !this.current.group.visible) return false;
+    if (!node || !this.current) return false;
+    if (!this.current.group.visible && !this._scopeHidden) return false;
     const engine = this.engine;
     const viewCam = engine?.viewCamera;
     const mainCam = this.game.camera;
@@ -1066,6 +1076,21 @@ export class Viewmodel {
 
     const ads = inst ? inst.adsAmount : 0;
     this.adsAmount = ads;
+
+    // ---------------------------------------------------------- scope takeover
+    // At full ADS a telescopic optic sits ON the camera axis, so the tube, the turrets
+    // and the objective bell fill the middle of the screen — the gun is standing in
+    // front of its own sight picture. Once the aperture has closed to the width of the
+    // ocular there is nothing left of the model worth drawing, so it goes away, exactly
+    // as it does in every game that ships a sniper rifle. `_scopeHidden` keeps the
+    // muzzle and eject anchors live while it is gone.
+    const scopeAmt = this.engine?.scope?.amount ?? 0;
+    const hide = scopeAmt > 0.5;
+    if (hide !== this._scopeHidden) {
+      this._scopeHidden = hide;
+      c.group.visible = !hide;
+      if (this.dropMag && hide) this.dropMag.visible = false;
+    }
 
     // ---------------------------------------------------------- sprint / lower
     const sprinting = !!(owner?.sprinting) && ads < 0.02 && !(inst?.triggerDown)
@@ -1443,6 +1468,10 @@ export class Viewmodel {
     this.boltT = this.pumpT = 0;
     this.boltLocked = false;
     this._haveLast = false;
+    if (this._scopeHidden) {
+      this._scopeHidden = false;
+      if (this.current) this.current.group.visible = true;
+    }
     if (this.dropMag) { this.dropMag.visible = false; this.dropMagLife = 0; }
     this._applyRestPose();
   }
