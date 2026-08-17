@@ -350,7 +350,22 @@ class DepthAOPass extends Pass {
   render(renderer, writeBuffer, readBuffer) {
     const depth = readBuffer.depthTexture;
     // Nothing to read from — stay out of the way rather than corrupting the chain.
-    if (!depth) { this.needsSwap = false; return; }
+    //
+    // This must never happen now that BOTH composer targets carry their own depth
+    // texture (see `_buildComposer`), and it is worth a loud warning if it does: when
+    // this pass bails it also declines its swap, so the composer's buffer parity stops
+    // alternating. That is self-latching — one bad frame and the parity is stuck on the
+    // side this pass cannot read, so AO stays off for the rest of the session rather
+    // than glitching for a frame. It is exactly how AO silently rendered on frame 1
+    // and never again.
+    if (!depth) {
+      if (!this._warnedNoDepth) {
+        this._warnedNoDepth = true;
+        console.warn('[DepthAOPass] read buffer has no depth texture — AO disabled');
+      }
+      this.needsSwap = false;
+      return;
+    }
     this.needsSwap = true;
 
     this.aoMaterial.uniforms.tDepth.value = depth;
@@ -675,6 +690,35 @@ export class Engine {
     this.scene.fog = new THREE.FogExp2(ATMOSPHERE.fog.getHex(), ATMOSPHERE.fogDensity);
   }
 
+  /** A 24-bit depth texture the AO pass can sample. See `_buildComposer`. */
+  _makeDepthTexture(w, h) {
+    const d = new THREE.DepthTexture(w, h);
+    d.format = THREE.DepthFormat;
+    d.type = THREE.UnsignedIntType;
+    return d;
+  }
+
+  /**
+   * Resize the composer's depth textures alongside its colour targets.
+   *
+   * `RenderTarget.setSize()` walks `this.textures` — the colour attachments — and does
+   * NOT touch `depthTexture`. Without this the depth texture keeps its original
+   * dimensions after any window resize while the colour buffers change underneath it,
+   * so the AO pass samples a mismatched buffer for the rest of the session.
+   */
+  _resizeComposerDepth(w, h) {
+    const c = this.composer;
+    if (!c) return;
+    for (const rt of [c.renderTarget1, c.renderTarget2]) {
+      const d = rt?.depthTexture;
+      if (!d) continue;
+      if (d.image.width === w && d.image.height === h) continue;
+      d.image.width = w;
+      d.image.height = h;
+      d.dispose();          // force reallocation at the new size on next bind
+    }
+  }
+
   _buildComposer() {
     const size = this._targetSize();
     const rt = new THREE.WebGLRenderTarget(size.w, size.h, {
@@ -688,16 +732,24 @@ export class Engine {
     // A real depth texture rather than a renderbuffer, so the AO pass can read the
     // depth the main render already produced instead of re-rendering the scene.
     //
-    // It goes on renderTarget2 ONLY, and it must: the composer builds its second buffer
-    // with `clone()`, and a cloned texture shares its `Source` — which means a shared
-    // GL texture object. Attach it to both and the AO pass ends up sampling the exact
-    // depth attachment of the framebuffer it is drawing into, which is undefined
-    // behaviour in WebGL and hangs outright under a software rasteriser. RenderPass
-    // always draws into the composer's *read* buffer, and that is renderTarget2.
-    const depthTex = new THREE.DepthTexture(size.w, size.h);
-    depthTex.format = THREE.DepthFormat;
-    depthTex.type = THREE.UnsignedIntType;
-    this.composer.renderTarget2.depthTexture = depthTex;
+    // BOTH targets get one, and they must be two SEPARATE DepthTexture instances.
+    //
+    // The old code attached one to renderTarget2 alone, reasoning that RenderPass always
+    // draws into the composer's read buffer and that this is renderTarget2. That is true
+    // only on the first frame. `EffectComposer.render()` never resets `readBuffer` /
+    // `writeBuffer` between frames, and this chain runs an ODD number of swapping passes
+    // (AO, OutputPass, composite), so the two buffers trade places every frame. On frame
+    // 2 RenderPass wrote into renderTarget1, the AO pass found no depth texture, bailed —
+    // and because bailing also skips its swap, the parity stopped alternating and stuck
+    // there. AO rendered on exactly one frame per session and was silently off forever
+    // after. Giving both targets depth removes the failure case entirely.
+    //
+    // Separate instances, not a shared one: a cloned texture shares its `Source` and so
+    // its GL texture object, which would leave the AO pass sampling the exact depth
+    // attachment of the framebuffer it is drawing into — undefined behaviour in WebGL,
+    // and a hard hang under a software rasteriser.
+    this.composer.renderTarget1.depthTexture = this._makeDepthTexture(size.w, size.h);
+    this.composer.renderTarget2.depthTexture = this._makeDepthTexture(size.w, size.h);
 
     this.renderPass = new RenderPass(this.scene, this.camera);
     this.composer.addPass(this.renderPass);
@@ -787,8 +839,9 @@ export class Engine {
     this.viewCamera.aspect = aspect;
     this.viewCamera.updateProjectionMatrix();
 
+    // setSize already forwards to every pass, bloom included — no second call needed.
     this.composer?.setSize(w, h);
-    this.bloomPass?.setSize(w, h);
+    this._resizeComposerDepth(w, h);
     if (this.compositePass) this.compositePass.uniforms.uResolution.value.set(w, h);
     this.game.bus?.emit('resize', { w: cssW, h: cssH });
   }
