@@ -1,0 +1,864 @@
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+import { clamp, damp } from './mathUtils.js';
+import { ATMOSPHERE, makeCloudTexture } from './assets.js';
+
+// Scratch — the shadow cascade runs every frame and must not allocate (§1).
+const _fwd = new THREE.Vector3();
+const _focus = new THREE.Vector3();
+const _lx = new THREE.Vector3();
+const _ly = new THREE.Vector3();
+const _lz = new THREE.Vector3();
+const _worldUp = new THREE.Vector3(0, 1, 0);
+
+const SUN = ATMOSPHERE.sunDir;   // unit vector pointing at the sun
+
+/**
+ * Final composite: vignette, film grain, chromatic aberration, damage flash and a
+ * desaturating low-health pass. One pass so we only pay a single fullscreen blit.
+ */
+const CompositeShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 },
+    uVignette: { value: 0.85 },
+    uGrain: { value: 0.035 },
+    uAberration: { value: 0.0016 },
+    uDamage: { value: 0.0 },       // 0..1 red flash
+    uLowHealth: { value: 0.0 },    // 0..1 desaturate + pulse
+    uFade: { value: 0.0 },         // 0..1 fade to black
+    uResolution: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform float uTime, uVignette, uGrain, uAberration, uDamage, uLowHealth, uFade;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+
+    float hash(vec2 p) {
+      p = fract(p * vec2(443.897, 441.423));
+      p += dot(p, p + 19.19);
+      return fract(p.x * p.y);
+    }
+
+    void main() {
+      vec2 uv = vUv;
+      vec2 c = uv - 0.5;
+      float r2 = dot(c, c);
+
+      // Chromatic aberration grows toward the edges. Kept to roughly a pixel at the
+      // extreme corners — anything stronger reads as a broken display, not a lens.
+      float ab = uAberration * (1.0 + uDamage * 6.0 + uLowHealth * 2.0);
+      vec2 off = c * r2 * ab * 2.5;
+      vec3 col;
+      col.r = texture2D(tDiffuse, uv + off).r;
+      col.g = texture2D(tDiffuse, uv).g;
+      col.b = texture2D(tDiffuse, uv - off).b;
+
+      // Vignette.
+      float vig = smoothstep(0.95, 0.18, r2 * uVignette * 2.2);
+      col *= mix(1.0, vig, 0.85);
+
+      // Low health: desaturate, darken edges, slow pulse.
+      if (uLowHealth > 0.001) {
+        float lum = dot(col, vec3(0.299, 0.587, 0.114));
+        float pulse = 0.5 + 0.5 * sin(uTime * 4.2);
+        float amt = uLowHealth;
+        col = mix(col, vec3(lum) * vec3(1.15, 0.72, 0.72), amt * 0.55);
+        float edge = smoothstep(0.02, 0.28, r2);
+        col = mix(col, vec3(0.32, 0.02, 0.02), edge * amt * (0.35 + 0.25 * pulse));
+      }
+
+      // Damage flash.
+      col = mix(col, vec3(0.62, 0.05, 0.04), uDamage * 0.55);
+
+      // Film grain (animated, luminance-weighted so shadows stay clean).
+      float g = hash(uv * uResolution + fract(uTime) * 431.7) - 0.5;
+      float lum2 = dot(col, vec3(0.299, 0.587, 0.114));
+      col += g * uGrain * (0.35 + 0.65 * (1.0 - lum2));
+
+      col *= (1.0 - uFade);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+};
+
+/**
+ * Screen-space ambient occlusion from the depth buffer alone.
+ *
+ * three ships `SSAOPass`/`GTAOPass`, and both re-render the entire scene with an
+ * override material to get view normals. That would roughly double the draw calls and
+ * blow the §11 budget on its own. This pass instead reconstructs view position and
+ * normal from the depth texture the main render already wrote, so it costs exactly one
+ * fullscreen quad and zero extra draw calls.
+ *
+ * It runs before bloom so that occluded creases do not glow, and it is what actually
+ * grounds objects: a crate is only standing on the floor if the floor darkens where
+ * they meet. A shadow map at any resolution cannot do that at the contact scale.
+ */
+const FS_VERT = /* glsl */`
+  varying vec2 vUv;
+  void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+`;
+
+const AO_FRAG = /* glsl */`
+  uniform sampler2D tDepth;
+  uniform mat4 uProjInv;
+  uniform vec2 uProjScale, uResolution, uFade;
+  uniform float uRadius, uIntensity, uBias;
+  varying vec2 vUv;
+
+  #define AO_SAMPLES 12
+  const float GOLDEN = 2.39996323;
+  const float SKY = 0.99995;
+
+  float depthAt(vec2 uv) { return texture2D(tDepth, uv).x; }
+
+  vec3 viewPos(vec2 uv, float d) {
+    vec4 c = uProjInv * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+    return c.xyz / c.w;
+  }
+
+  float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+
+  void main() {
+    float d = depthAt(vUv);
+    // Sky. Occluding it would draw a dark halo around every roofline.
+    if (d >= SKY) { gl_FragColor = vec4(1.0); return; }
+
+    vec3 P = viewPos(vUv, d);
+    vec2 px = 1.0 / uResolution;
+
+    // Normal from depth. Taking the CLOSER of the two neighbours on each axis keeps
+    // silhouettes sharp; a plain central difference smears the normal across every
+    // depth discontinuity and rings each object with a dark outline.
+    vec3 pr = viewPos(vUv + vec2(px.x, 0.0), depthAt(vUv + vec2(px.x, 0.0)));
+    vec3 pl = viewPos(vUv - vec2(px.x, 0.0), depthAt(vUv - vec2(px.x, 0.0)));
+    vec3 pu = viewPos(vUv + vec2(0.0, px.y), depthAt(vUv + vec2(0.0, px.y)));
+    vec3 pd = viewPos(vUv - vec2(0.0, px.y), depthAt(vUv - vec2(0.0, px.y)));
+    vec3 ddx = abs(pr.z - P.z) < abs(pl.z - P.z) ? (pr - P) : (P - pl);
+    vec3 ddy = abs(pu.z - P.z) < abs(pd.z - P.z) ? (pu - P) : (P - pd);
+    vec3 N = normalize(cross(ddx, ddy));
+    if (dot(N, P) > 0.0) N = -N;
+
+    // World-space radius projected to screen space, clamped so a wall two centimetres
+    // from the muzzle does not turn the kernel into a full-screen blur.
+    vec2 rUV = clamp(uRadius * uProjScale / max(-P.z, 0.08) * 0.5, px * 1.5, vec2(0.06));
+
+    float rot = hash12(gl_FragCoord.xy) * 6.2831853;
+    float occ = 0.0;
+    for (int i = 0; i < AO_SAMPLES; i++) {
+      float fi = float(i) + 0.5;
+      float a = rot + fi * GOLDEN;
+      vec2 suv = vUv + vec2(cos(a), sin(a)) * sqrt(fi / float(AO_SAMPLES)) * rUV;
+      float sd = depthAt(suv);
+      vec3 v = viewPos(suv, sd) - P;
+      float len = max(length(v), 1e-4);
+      // Range check: a sample far in front of this surface belongs to another object,
+      // not to an occluder, and must not bleed its silhouette onto this one.
+      float range = clamp(uRadius / len, 0.0, 1.0);
+      occ += max(0.0, dot(N, v / len) - uBias) * range * range * step(sd, SKY);
+    }
+
+    float ao = 1.0 - clamp(occ / float(AO_SAMPLES) * uIntensity, 0.0, 1.0);
+    // Fade with distance — a fixed tap count is badly undersampled at range, so past
+    // ~30 m it buys noise rather than occlusion.
+    ao = mix(1.0, ao, 1.0 - smoothstep(uFade.x, uFade.y, -P.z));
+    gl_FragColor = vec4(ao, ao, ao, 1.0);
+  }
+`;
+
+/**
+ * Upsample the half-res AO and multiply it into the beauty buffer.
+ *
+ * Four bilinear taps on the diagonals do double duty: they scale the buffer back up and
+ * they average out the per-pixel rotation noise of the sampling kernel, which is the
+ * usual reason a cheap SSAO looks like dirty film rather than shading.
+ */
+const AO_COMBINE_FRAG = /* glsl */`
+  uniform sampler2D tDiffuse;
+  uniform sampler2D tAO;
+  uniform vec2 uTexel;
+  uniform vec3 uAoColor;
+  varying vec2 vUv;
+  void main() {
+    vec4 base = texture2D(tDiffuse, vUv);
+    float ao = ( texture2D(tAO, vUv + uTexel * vec2( 0.5,  0.5)).r
+               + texture2D(tAO, vUv + uTexel * vec2(-0.5,  0.5)).r
+               + texture2D(tAO, vUv + uTexel * vec2( 0.5, -0.5)).r
+               + texture2D(tAO, vUv + uTexel * vec2(-0.5, -0.5)).r ) * 0.25;
+    gl_FragColor = vec4(base.rgb * mix(uAoColor, vec3(1.0), ao), base.a);
+  }
+`;
+
+/**
+ * Half-resolution SSAO. The AO term itself is a low-frequency signal, so computing it
+ * at quarter the pixel count costs almost nothing visually and roughly quarters the
+ * fill cost of the single most expensive pass in the chain — which matters, because the
+ * §11 target is an integrated GPU and the simulation already claims ~18% of the frame.
+ */
+class DepthAOPass extends Pass {
+  constructor() {
+    super();
+    this.needsSwap = true;
+    this.aoMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        tDepth: { value: null },
+        uProjInv: { value: new THREE.Matrix4() },
+        uProjScale: { value: new THREE.Vector2(1, 1) },
+        uResolution: { value: new THREE.Vector2(1, 1) },
+        uRadius: { value: 0.8 },
+        uIntensity: { value: 1.15 },
+        uBias: { value: 0.05 },
+        uFade: { value: new THREE.Vector2(24, 48) },
+      },
+      vertexShader: FS_VERT,
+      fragmentShader: AO_FRAG,
+      depthTest: false, depthWrite: false,
+    });
+    this.combineMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: null },
+        tAO: { value: null },
+        uTexel: { value: new THREE.Vector2() },
+        // Occlusion is the absence of *sky* light, so the shadow it leaves is cool,
+        // not neutral grey. Neutral AO always reads as dirt smeared on the lens.
+        uAoColor: { value: new THREE.Color(0.34, 0.38, 0.47) },
+      },
+      vertexShader: FS_VERT,
+      fragmentShader: AO_COMBINE_FRAG,
+      depthTest: false, depthWrite: false,
+    });
+    this.aoTarget = new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false, stencilBuffer: false });
+    this.aoTarget.texture.minFilter = THREE.LinearFilter;
+    this.aoTarget.texture.magFilter = THREE.LinearFilter;
+    this._quad = new FullScreenQuad(this.aoMaterial);
+  }
+
+  setSize(w, h) {
+    const hw = Math.max(1, Math.floor(w * 0.5));
+    const hh = Math.max(1, Math.floor(h * 0.5));
+    this.aoTarget.setSize(hw, hh);
+    this.aoMaterial.uniforms.uResolution.value.set(hw, hh);
+    this.combineMaterial.uniforms.uTexel.value.set(1 / hw, 1 / hh);
+  }
+
+  /** Called once per frame by the engine with the live camera projection. */
+  setCamera(camera) {
+    const e = camera.projectionMatrix.elements;
+    this.aoMaterial.uniforms.uProjInv.value.copy(camera.projectionMatrixInverse);
+    this.aoMaterial.uniforms.uProjScale.value.set(e[0], e[5]);
+  }
+
+  render(renderer, writeBuffer, readBuffer) {
+    const depth = readBuffer.depthTexture;
+    // Nothing to read from — stay out of the way rather than corrupting the chain.
+    if (!depth) { this.needsSwap = false; return; }
+    this.needsSwap = true;
+
+    this.aoMaterial.uniforms.tDepth.value = depth;
+    this._quad.material = this.aoMaterial;
+    renderer.setRenderTarget(this.aoTarget);
+    renderer.clear();
+    this._quad.render(renderer);
+
+    this.combineMaterial.uniforms.tDiffuse.value = readBuffer.texture;
+    this.combineMaterial.uniforms.tAO.value = this.aoTarget.texture;
+    this._quad.material = this.combineMaterial;
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    if (this.clear) renderer.clear();
+    this._quad.render(renderer);
+  }
+
+  dispose() {
+    this.aoTarget.dispose();
+    this.aoMaterial.dispose();
+    this.combineMaterial.dispose();
+    this._quad.dispose();
+  }
+}
+
+/**
+ * Draws the viewmodel scene into the composer chain instead of straight to the screen.
+ *
+ * The depth buffer is cleared first so the weapon can never clip into a wall (the whole
+ * reason it lives in its own scene), but because it now lands *before* bloom and the
+ * composite, a muzzle flash actually glows and the gun sits under the same grain,
+ * vignette, damage flash and fade as the world instead of floating above them.
+ */
+class ViewLayerPass extends Pass {
+  constructor(scene, camera) {
+    super();
+    this.scene = scene;
+    this.camera = camera;
+    this.needsSwap = false;   // paint on top of what is already in the read buffer
+  }
+
+  render(renderer, writeBuffer, readBuffer) {
+    const prevAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    renderer.setRenderTarget(this.renderToScreen ? null : readBuffer);
+    renderer.clearDepth();
+    renderer.render(this.scene, this.camera);
+    renderer.autoClear = prevAutoClear;
+  }
+}
+
+export class Engine {
+  constructor(game, canvas) {
+    this.game = game;
+    this.canvas = canvas;
+    const s = game.settings;
+
+    this.renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: false,           // handled by render scale + post; MSAA is costly with a composer
+      powerPreference: 'high-performance',
+      stencil: false,
+      depth: true,
+      alpha: false,
+    });
+    this.renderer.setClearColor(0x0a0d12, 1);
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    // Slightly under 1.0: ACES rolls highlights off gracefully, but a sunlit exterior
+    // still clips to white if the exposure is left hot.
+    this.renderer.toneMappingExposure = 0.86;
+    this.renderer.shadowMap.enabled = s.get('shadows');
+    // PCFSoftShadowMap is deprecated in three 0.185 and silently downgrades to PCF.
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    this.renderer.info.autoReset = false;
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x0a0d12);
+
+    this.camera = new THREE.PerspectiveCamera(s.get('fov'), 1, 0.05, 900);
+    this.camera.rotation.order = 'YXZ';
+    this.scene.add(this.camera);
+
+    /** Separate scene rendered on top so the viewmodel never clips into walls. */
+    this.viewScene = new THREE.Scene();
+    this.viewCamera = new THREE.PerspectiveCamera(70, 1, 0.01, 12);
+    this.viewCamera.rotation.order = 'YXZ';
+    this.viewScene.add(this.viewCamera);
+
+    this._buildEnvironment();
+    this._buildLighting();
+    this._buildSky();
+    this._buildComposer();
+
+    this.stats = { fps: 0, frameMs: 0, drawCalls: 0, triangles: 0, programs: 0 };
+    this._fpsAccum = 0;
+    this._fpsFrames = 0;
+    this._lastFrameStart = 0;
+
+    this.damageFlash = 0;
+    this.fade = 0;
+    this.fadeTarget = 0;
+
+    this._onResize = this._onResize.bind(this);
+    window.addEventListener('resize', this._onResize);
+    s.onChange((k, v) => this._onSetting(k, v));
+    this._onResize();
+
+    // A lost context is not exotic: a driver reset, a GPU hang, or a laptop switching
+    // between its integrated and discrete GPU all take it away. Without a handler the
+    // canvas silently freezes on the last frame while the simulation carries on, which
+    // reads to the player as the game hanging.
+    this._contextLost = false;
+    this._onContextLost = (e) => {
+      // Mandatory: skip preventDefault and the browser will never fire a restore.
+      e.preventDefault();
+      this._contextLost = true;
+      this.game.bus?.emit('contextLost', {});
+      console.warn('[engine] WebGL context lost');
+    };
+    this._onContextRestored = () => {
+      this._contextLost = false;
+      this._rebuildGpuResources();
+      this.game.bus?.emit('contextRestored', {});
+      console.warn('[engine] WebGL context restored');
+    };
+    canvas.addEventListener('webglcontextlost', this._onContextLost, false);
+    canvas.addEventListener('webglcontextrestored', this._onContextRestored, false);
+  }
+
+  /**
+   * Everything that lives only on the GPU has to be made again after a restore. Textures
+   * and geometry three re-uploads on demand; these two do not, because both are baked
+   * once by rendering INTO them — the PMREM probe (every metal surface goes black
+   * without it) and the composer's render targets.
+   */
+  _rebuildGpuResources() {
+    this.scene.remove(this.sky);
+    this.sky.geometry.dispose();
+    this.sky.material.dispose();
+    this.cloudTex?.dispose();
+    this.envMap?.dispose();
+    this.composer?.dispose();
+    this.aoPass?.dispose();
+
+    this._buildEnvironment();
+    this._buildSky();
+    this._buildComposer();
+    this._onResize();
+    this.sun.shadow.map?.dispose();
+    this.sun.shadow.map = null;
+  }
+
+  /**
+   * A metallic PBR surface gets essentially all of its colour from what it reflects.
+   * With no environment map, `metalness: 0.9` renders pure black no matter how many
+   * lights are in the scene — which is exactly what every gun and every metal panel
+   * was doing. One small prefiltered probe fixes the whole material library.
+   */
+  _buildEnvironment() {
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    pmrem.compileEquirectangularShader();
+    const room = new RoomEnvironment();
+    this.envMap = pmrem.fromScene(room, 0.04).texture;
+    room.dispose?.();
+    pmrem.dispose();
+
+    this.scene.environment = this.envMap;
+    this.scene.environmentIntensity = 0.38;   // sunlight does the heavy lifting
+    this.viewScene.environment = this.envMap;
+    this.viewScene.environmentIntensity = 0.85; // the viewmodel has no sky above it
+  }
+
+  _buildLighting() {
+    // Lighting is deliberately key-dominant. Piling on ambient makes a scene *bright*
+    // but flat — contrast between a warm sun and a cool sky is what gives geometry
+    // form, and it is the main thing separating a hobby render from a shipped one.
+    // The PMREM probe (see _buildEnvironment) supplies most of the indirect light, so
+    // the hemisphere and ambient terms here stay low on purpose.
+    this.hemi = new THREE.HemisphereLight(0x9dc0e8, 0x3a3026, 0.34);
+    this.scene.add(this.hemi);
+
+    this.ambient = new THREE.AmbientLight(0x2c3646, 0.16);
+    this.scene.add(this.ambient);
+
+    this.sun = new THREE.DirectionalLight(ATMOSPHERE.sunColor.getHex(), 2.9);
+    this.sun.position.copy(SUN).multiplyScalar(120);
+    this.sun.castShadow = true;
+    this.sun.shadow.camera.near = 1;
+    this.scene.add(this.sun);
+    this.scene.add(this.sun.target);
+    this._shadowExt = 30;
+    this._shadowDist = 120;
+
+    // A cool, low-intensity bounce from the opposite side so shadowed faces keep
+    // some form without washing out the key.
+    this.fill = new THREE.DirectionalLight(0x7ea2d8, 0.30);
+    this.fill.position.set(-SUN.x * 40, 24, -SUN.z * 40);
+    this.scene.add(this.fill);
+
+    // Viewmodel gets its own rig — it must read the same regardless of world lighting.
+    const vmKey = new THREE.DirectionalLight(0xfff0da, 2.1);
+    vmKey.position.set(0.6, 1.2, 0.9);
+    this.viewScene.add(vmKey);
+    const vmFill = new THREE.DirectionalLight(0x7fa4d6, 0.85);
+    vmFill.position.set(-1.1, -0.3, -0.6);
+    this.viewScene.add(vmFill);
+    this.viewScene.add(new THREE.AmbientLight(0x9fb2cc, 0.55));
+    this.viewMuzzleLight = new THREE.PointLight(0xffca7a, 0, 6, 2);
+    this.viewMuzzleLight.position.set(0.25, -0.2, -1.2);
+    this.viewScene.add(this.viewMuzzleLight);
+  }
+
+  /**
+   * The sky is half the lighting and most of the mood, and a three-stop vertical ramp
+   * is not a sky — it is a backdrop. This one is built from the pieces that actually
+   * read: a horizon that compresses (real sky brightness falls off as a power of
+   * altitude, it is not linear), a hot sun disc small enough to be a disc and bright
+   * enough for the bloom pass to bloom, a wide Mie glow around it, layered cloud from
+   * the same value noise the textures use, and a haze band at the horizon in exactly
+   * the fog colour so distant geometry dissolves into the sky instead of stopping at it.
+   */
+  _buildSky() {
+    this.cloudTex = makeCloudTexture();
+    const geo = new THREE.SphereGeometry(600, 40, 24);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      depthTest: false,
+      fog: false,
+      uniforms: {
+        uZenith: { value: ATMOSPHERE.skyZenith },
+        uMid: { value: ATMOSPHERE.skyMid },
+        uHorizon: { value: ATMOSPHERE.skyHorizon },
+        uGround: { value: ATMOSPHERE.skyGround },
+        uHaze: { value: ATMOSPHERE.fog },
+        uSunDir: { value: SUN },
+        uSunColor: { value: ATMOSPHERE.sunColor },
+        uCloudLit: { value: ATMOSPHERE.cloudLit },
+        uCloudDark: { value: ATMOSPHERE.cloudDark },
+        uCloud: { value: this.cloudTex },
+      },
+      vertexShader: /* glsl */`
+        varying vec3 vDir;
+        void main() {
+          vDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */`
+        uniform vec3 uZenith, uMid, uHorizon, uGround, uHaze, uSunColor, uCloudLit, uCloudDark;
+        uniform vec3 uSunDir;
+        uniform sampler2D uCloud;
+        varying vec3 vDir;
+
+        float hash21(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.x + p3.y) * p3.z);
+        }
+
+        void main() {
+          vec3 dir = normalize(vDir);
+          float h = dir.y;
+          float sd = max(dot(dir, uSunDir), 0.0);
+
+          // Vertical ramp. pow() on the altitude compresses the gradient into the
+          // bottom of the sky, which is where a real one does almost all of its work.
+          float t = pow(clamp(h, 0.0, 1.0), 0.45);
+          vec3 col = mix(uHorizon, uMid, smoothstep(0.0, 0.42, t));
+          col = mix(col, uZenith, smoothstep(0.34, 1.0, t));
+
+          // Warm the sky toward the sun near the horizon (forward Mie scattering).
+          col = mix(col, mix(col, uSunColor, 0.55), pow(sd, 3.0) * (1.0 - t * 0.7));
+          col += uSunColor * pow(sd, 9.0) * 0.35;
+
+          // Cloud deck: the view direction projected onto a flat layer overhead, so the
+          // cells stretch and converge toward the horizon the way real cloud does.
+          float deck = smoothstep(0.015, 0.22, h);
+          if (deck > 0.0) {
+            vec2 cp = dir.xz / max(h, 0.055) * 0.075;
+            float n = texture2D(uCloud, cp).r;
+            float detail = texture2D(uCloud, cp * 2.7 + 0.31).r;
+            float cover = smoothstep(0.50, 0.86, n * 0.7 + detail * 0.3) * deck;
+            // Sunward edges catch the light; the bulk stays a cool grey.
+            vec3 cloud = mix(uCloudDark, uCloudLit, smoothstep(0.40, 0.92, n) * 0.7 + pow(sd, 2.0) * 0.5);
+            col = mix(col, cloud, cover * 0.8);
+          }
+
+          // Sun disc, then a tight corona. The disc is pushed well above 1.0 so the
+          // bloom pass has something genuinely hot to work with.
+          col += uSunColor * smoothstep(0.99965, 0.99991, sd) * 11.0;
+          col += uSunColor * pow(sd, 700.0) * 1.6;
+
+          // Horizon haze in the fog colour — the seam where the world meets the sky.
+          col = mix(col, uHaze, smoothstep(0.11, -0.01, h) * 0.9);
+          col = mix(uGround, col, smoothstep(-0.16, -0.02, h));
+
+          // Break 8-bit banding in the smooth gradient.
+          col += (hash21(dir.xy * 811.0) - 0.5) * 0.004;
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+    this.sky = new THREE.Mesh(geo, mat);
+    this.sky.frustumCulled = false;
+    this.sky.renderOrder = -1000;
+    this.scene.add(this.sky);
+
+    // Aerial perspective: distant geometry drifts toward the sky's horizon colour.
+    // The surface shaders tint this warm when you look into the sun (see assets.js) so
+    // the haze belongs to the same atmosphere the sky dome is made of.
+    this.scene.fog = new THREE.FogExp2(ATMOSPHERE.fog.getHex(), ATMOSPHERE.fogDensity);
+  }
+
+  _buildComposer() {
+    const size = this._targetSize();
+    const rt = new THREE.WebGLRenderTarget(size.w, size.h, {
+      type: THREE.HalfFloatType,
+      samples: 0,
+      depthBuffer: true,
+    });
+    this.composer = new EffectComposer(this.renderer, rt);
+    this.composer.setSize(size.w, size.h);
+
+    // A real depth texture rather than a renderbuffer, so the AO pass can read the
+    // depth the main render already produced instead of re-rendering the scene.
+    //
+    // It goes on renderTarget2 ONLY, and it must: the composer builds its second buffer
+    // with `clone()`, and a cloned texture shares its `Source` — which means a shared
+    // GL texture object. Attach it to both and the AO pass ends up sampling the exact
+    // depth attachment of the framebuffer it is drawing into, which is undefined
+    // behaviour in WebGL and hangs outright under a software rasteriser. RenderPass
+    // always draws into the composer's *read* buffer, and that is renderTarget2.
+    const depthTex = new THREE.DepthTexture(size.w, size.h);
+    depthTex.format = THREE.DepthFormat;
+    depthTex.type = THREE.UnsignedIntType;
+    this.composer.renderTarget2.depthTexture = depthTex;
+
+    this.renderPass = new RenderPass(this.scene, this.camera);
+    this.composer.addPass(this.renderPass);
+
+    this.aoPass = new DepthAOPass();
+    this.composer.addPass(this.aoPass);
+
+    // Viewmodel goes in here, after AO (its depth belongs to a different camera) but
+    // before bloom, so muzzle flashes actually glow.
+    this.viewPass = new ViewLayerPass(this.viewScene, this.viewCamera);
+    this.composer.addPass(this.viewPass);
+
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(size.w, size.h), 0.78, 0.52, 1.05);
+    this.composer.addPass(this.bloomPass);
+
+    this.outputPass = new OutputPass();
+    this.composer.addPass(this.outputPass);
+
+    this.compositePass = new ShaderPass(CompositeShader);
+    this.compositePass.renderToScreen = true;
+    this.composer.addPass(this.compositePass);
+
+    this._applyPostSettings();
+  }
+
+  _applyPostSettings() {
+    const s = this.game.settings;
+    const on = s.get('postFx');
+    this.bloomPass.enabled = on;
+    // AO is the single biggest per-pixel cost in the chain, so it rides the same
+    // switch as the rest of post — but unlike bloom it is a lighting cue, not a
+    // flourish, so it stays on at every quality level that keeps post at all.
+    this.aoPass.enabled = on;
+    this.compositePass.enabled = true; // always on — it also owns fade-to-black
+    const u = this.compositePass.uniforms;
+    u.uGrain.value = on && s.get('filmGrain') ? 0.035 : 0.0;
+    u.uVignette.value = s.get('vignette') ? 0.85 : 0.0;
+    u.uAberration.value = on ? 0.0016 : 0.0;
+  }
+
+  _onSetting(k, v) {
+    const s = this.game.settings;
+    if (k === 'fov' || k === '*') this.setFov(s.get('fov'));
+    if (k === 'shadows' || k === 'shadowQuality' || k === '*') {
+      this.renderer.shadowMap.enabled = s.get('shadows') && s.get('shadowQuality') !== 'off';
+      this._applyShadowQuality();
+      this.scene.traverse((o) => { if (o.isMesh) o.material && (o.material.needsUpdate = true); });
+    }
+    if (k === 'postFx' || k === 'filmGrain' || k === 'vignette' || k === '*') this._applyPostSettings();
+    if (k === 'renderScale' || k === '*') this._onResize();
+  }
+
+  setFov(deg) {
+    this.baseFov = deg;
+    this.camera.fov = deg;
+    this.camera.updateProjectionMatrix();
+  }
+
+  /** Called by the player camera each frame — ADS narrows the world FOV only. */
+  setRenderFov(deg) {
+    if (Math.abs(this.camera.fov - deg) < 0.01) return;
+    this.camera.fov = deg;
+    this.camera.updateProjectionMatrix();
+  }
+
+  _targetSize() {
+    const scale = clamp(this.game.settings.get('renderScale'), 0.4, 1.0);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    return {
+      w: Math.max(320, Math.floor(window.innerWidth * dpr * scale)),
+      h: Math.max(240, Math.floor(window.innerHeight * dpr * scale)),
+      cssW: window.innerWidth,
+      cssH: window.innerHeight,
+    };
+  }
+
+  _onResize() {
+    const { w, h, cssW, cssH } = this._targetSize();
+    this.renderer.setPixelRatio(1);
+    this.renderer.setSize(w, h, false);
+    this.canvas.style.width = cssW + 'px';
+    this.canvas.style.height = cssH + 'px';
+
+    const aspect = cssW / cssH;
+    this.camera.aspect = aspect;
+    this.camera.updateProjectionMatrix();
+    this.viewCamera.aspect = aspect;
+    this.viewCamera.updateProjectionMatrix();
+
+    this.composer?.setSize(w, h);
+    this.bloomPass?.setSize(w, h);
+    if (this.compositePass) this.compositePass.uniforms.uResolution.value.set(w, h);
+    this.game.bus?.emit('resize', { w: cssW, h: cssH });
+  }
+
+  /**
+   * Register the playable bounds and arm the shadow cascade.
+   *
+   * The old implementation stretched one 2048² map over the whole 86 × 86 m map, which
+   * works out at ~4.8 cm per texel — coarser than a hand, so nothing ever made crisp
+   * contact with anything. Instead of one frustum for the map, this keeps a single
+   * tight cascade parked around the *camera* and drags it along as the player moves
+   * (see `_updateShadowCascade`), roughly doubling texel density for free.
+   */
+  fitShadowCamera(bounds) {
+    this._worldBounds = bounds;
+    this._applyShadowQuality();
+    this._updateShadowCascade();
+  }
+
+  /**
+   * `shadowQuality` now changes what you can actually see rather than just the texture
+   * allocation: the cascade shrinks with the map so texel density stays roughly
+   * constant, trading shadow *distance* for shadow *crispness* at the low setting.
+   */
+  _applyShadowQuality() {
+    const q = this.game.settings.get('shadowQuality');
+    const dim = q === 'low' ? 1024 : 2048;
+    const ext = q === 'low' ? 20 : 30;
+    this._shadowExt = ext;
+    this._shadowDist = ext * 1.5 + 70;
+
+    if (this.sun.shadow.mapSize.x !== dim) {
+      this.sun.shadow.mapSize.set(dim, dim);
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+    }
+
+    const cam = this.sun.shadow.camera;
+    cam.left = -ext; cam.right = ext; cam.top = ext; cam.bottom = -ext;
+    cam.near = 1;
+    cam.far = this._shadowDist + ext * 2.4 + 40;
+    cam.updateProjectionMatrix();
+
+    // Both biases are derived from the texel footprint rather than hand-picked, so
+    // changing the cascade size or the map resolution can never reintroduce acne or
+    // peter-panning. normalBias pushes the sample along the surface normal by a little
+    // over one texel — enough to clear the staircase a depth map makes of a slope,
+    // small enough that a crate still touches its own shadow.
+    const texel = (2 * ext) / dim;
+    this.sun.shadow.bias = -texel * 0.0016;
+    this.sun.shadow.normalBias = texel * 1.15;
+  }
+
+  /**
+   * Slide the cascade to sit around the player, snapped to whole shadow texels.
+   *
+   * The snap is not optional: without it the projection shifts by a fraction of a texel
+   * every frame and every shadow edge in the scene crawls and sparkles as you walk.
+   * Snapping happens in the light's own basis, which is the space the map is rasterised
+   * in — snapping in world space does nothing.
+   */
+  _updateShadowCascade() {
+    const ext = this._shadowExt;
+    const cam = this.camera;
+
+    _fwd.set(0, 0, -1).applyQuaternion(cam.quaternion);
+    _fwd.y = 0;
+    if (_fwd.lengthSq() < 1e-8) _fwd.set(0, 0, -1); else _fwd.normalize();
+
+    // Bias the cascade forward of the camera: nothing behind you needs a shadow, so
+    // spending half the map there is half the resolution thrown away.
+    _focus.copy(cam.position).addScaledVector(_fwd, ext * 0.42);
+    _focus.y = cam.position.y - 1.2;
+    const b = this._worldBounds;
+    if (b) {
+      _focus.x = clamp(_focus.x, b.min.x, b.max.x);
+      _focus.z = clamp(_focus.z, b.min.z, b.max.z);
+      _focus.y = clamp(_focus.y, b.min.y, b.max.y);
+    }
+
+    // Light basis, matching how three builds the shadow camera (lookAt with +Y up).
+    _lz.copy(SUN);
+    _lx.copy(_worldUp).cross(_lz).normalize();
+    _ly.copy(_lz).cross(_lx);
+    const texel = (2 * ext) / this.sun.shadow.mapSize.x;
+    const sx = Math.round(_focus.dot(_lx) / texel) * texel;
+    const sy = Math.round(_focus.dot(_ly) / texel) * texel;
+    const sz = _focus.dot(_lz);
+    _focus.copy(_lx).multiplyScalar(sx).addScaledVector(_ly, sy).addScaledVector(_lz, sz);
+
+    this.sun.target.position.copy(_focus);
+    this.sun.target.updateMatrixWorld();
+    this.sun.position.copy(_focus).addScaledVector(SUN, this._shadowDist);
+    this.sun.updateMatrixWorld();
+  }
+
+  flashDamage(amount = 1) {
+    this.damageFlash = Math.min(1, this.damageFlash + amount);
+  }
+
+  setFade(target, instant = false) {
+    this.fadeTarget = target;
+    if (instant) this.fade = target;
+  }
+
+  update(dt) {
+    // Effects that live purely in the composite pass.
+    this.damageFlash = damp(this.damageFlash, 0, 5.5, dt);
+    this.fade = damp(this.fade, this.fadeTarget, 6, dt);
+    const u = this.compositePass.uniforms;
+    u.uTime.value = performance.now() / 1000;
+    u.uDamage.value = this.damageFlash;
+    u.uFade.value = this.fade;
+    const p = this.game.player;
+    u.uLowHealth.value = p && p.alive
+      ? clamp(1 - p.health / (p.maxHealth * 0.45), 0, 1)
+      : 0;
+
+    // Keep the sky centred on the camera so it never parallaxes.
+    this.sky.position.copy(this.camera.position);
+    this.viewMuzzleLight.intensity = damp(this.viewMuzzleLight.intensity, 0, 26, dt);
+
+    if (this.renderer.shadowMap.enabled) this._updateShadowCascade();
+  }
+
+  render(dt) {
+    // Issuing GL work against a dead context is at best wasted and at worst a hard
+    // error every frame; sit still until the browser hands it back.
+    if (this._contextLost) return;
+
+    const t0 = performance.now();
+    this.renderer.info.reset();
+
+    if (this.aoPass.enabled) this.aoPass.setCamera(this.camera);
+
+    // The viewmodel is drawn inside the chain now (see ViewLayerPass), so this single
+    // call produces the whole frame.
+    this.composer.render(dt);
+
+    const info = this.renderer.info;
+    this.stats.drawCalls = info.render.calls;
+    this.stats.triangles = info.render.triangles;
+    this.stats.programs = info.programs?.length ?? 0;
+
+    const ms = performance.now() - t0;
+    this.stats.frameMs = this.stats.frameMs * 0.9 + ms * 0.1;
+    this._fpsAccum += dt;
+    this._fpsFrames++;
+    if (this._fpsAccum >= 0.25) {
+      this.stats.fps = Math.round(this._fpsFrames / this._fpsAccum);
+      this._fpsAccum = 0;
+      this._fpsFrames = 0;
+    }
+  }
+
+  dispose() {
+    window.removeEventListener('resize', this._onResize);
+    this.canvas.removeEventListener('webglcontextlost', this._onContextLost);
+    this.canvas.removeEventListener('webglcontextrestored', this._onContextRestored);
+    this.composer?.dispose();
+    this.aoPass?.dispose();
+    this.cloudTex?.dispose();
+    this.envMap?.dispose();
+    this.renderer.dispose();
+  }
+}

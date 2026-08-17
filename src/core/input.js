@@ -1,0 +1,194 @@
+/**
+ * Input: pointer lock mouse look + action-mapped keyboard.
+ *
+ * Mouse deltas accumulate between simulation steps and are drained by the player
+ * controller via `consumeLook()`. Raw deltas are never smoothed here — smoothing is a
+ * camera concern and would add input latency for everyone if done at this layer.
+ */
+export class Input {
+  constructor(game, canvas) {
+    this.game = game;
+    this.canvas = canvas;
+    this.settings = game.settings;
+
+    /** @type {Set<string>} action names currently held */
+    this.actions = new Set();
+    /** @type {Set<string>} actions that went down this frame */
+    this.pressed = new Set();
+    /** @type {Set<string>} actions that went up this frame */
+    this.released = new Set();
+    /** @type {Set<string>} raw key codes currently held */
+    this.codes = new Set();
+
+    this.mouseDX = 0;
+    this.mouseDY = 0;
+    this.wheelDelta = 0;
+    this.buttons = [false, false, false];
+    this.buttonsPressed = [false, false, false];
+    this.buttonsReleased = [false, false, false];
+
+    this.locked = false;
+    this.enabled = true;
+    /** Set while the UI is capturing a key for rebinding. */
+    this.captureBind = null;
+
+    this._onLockChange = this._onLockChange.bind(this);
+    this._onMouseMove = this._onMouseMove.bind(this);
+    this._onKeyDown = this._onKeyDown.bind(this);
+    this._onKeyUp = this._onKeyUp.bind(this);
+    this._onMouseDown = this._onMouseDown.bind(this);
+    this._onMouseUp = this._onMouseUp.bind(this);
+    this._onWheel = this._onWheel.bind(this);
+    this._onBlur = this._onBlur.bind(this);
+    this._onContext = (e) => e.preventDefault();
+
+    document.addEventListener('pointerlockchange', this._onLockChange);
+    document.addEventListener('pointerlockerror', () => { this.locked = false; });
+    document.addEventListener('mousemove', this._onMouseMove);
+    window.addEventListener('keydown', this._onKeyDown);
+    window.addEventListener('keyup', this._onKeyUp);
+    window.addEventListener('mousedown', this._onMouseDown);
+    window.addEventListener('mouseup', this._onMouseUp);
+    window.addEventListener('wheel', this._onWheel, { passive: false });
+    window.addEventListener('blur', this._onBlur);
+    canvas.addEventListener('contextmenu', this._onContext);
+  }
+
+  /**
+   * Pointer lock can only be taken during a user gesture. Every failure path here is
+   * expected and must be swallowed: an uncaught rejection from requestPointerLock
+   * surfaces as a page error and, in a browser, a console full of red.
+   */
+  requestLock() {
+    if (this.locked || !this.canvas.requestPointerLock) return;
+    try {
+      const p = this.canvas.requestPointerLock({ unadjustedMovement: true });
+      // Chrome returns a promise when options are passed; older engines return undefined.
+      if (p && typeof p.catch === 'function') {
+        p.catch(() => {
+          try {
+            const q = this.canvas.requestPointerLock();
+            if (q && typeof q.catch === 'function') q.catch(() => {});
+          } catch { /* no gesture available — the menu will ask again on click */ }
+        });
+      }
+    } catch { /* same */ }
+  }
+
+  exitLock() { if (this.locked) document.exitPointerLock(); }
+
+  _onLockChange() {
+    this.locked = document.pointerLockElement === this.canvas;
+    this.game.bus.emit(this.locked ? 'pointerLock' : 'pointerUnlock', {});
+    if (!this.locked) this._clearHeld();
+  }
+
+  _clearHeld() {
+    this.actions.clear();
+    this.codes.clear();
+    this.buttons[0] = this.buttons[1] = this.buttons[2] = false;
+    this.mouseDX = this.mouseDY = 0;
+  }
+
+  _onBlur() { this._clearHeld(); }
+
+  _onMouseMove(e) {
+    if (!this.locked || !this.enabled) return;
+    // Some browsers report huge spurious deltas on lock acquisition; clamp them.
+    const dx = Math.abs(e.movementX) > 300 ? 0 : e.movementX;
+    const dy = Math.abs(e.movementY) > 300 ? 0 : e.movementY;
+    this.mouseDX += dx;
+    this.mouseDY += dy;
+  }
+
+  _onKeyDown(e) {
+    if (this.captureBind) {
+      e.preventDefault();
+      const cb = this.captureBind;
+      this.captureBind = null;
+      cb(e.code);
+      return;
+    }
+    if (e.repeat) return;
+    if (e.code === 'Tab' || (e.code === 'Space' && this.locked)) e.preventDefault();
+    this.codes.add(e.code);
+    const action = this.settings.actionFor(e.code);
+    if (action) {
+      this.actions.add(action);
+      this.pressed.add(action);
+    }
+    this.game.bus.emit('keydown', { code: e.code, action });
+  }
+
+  _onKeyUp(e) {
+    this.codes.delete(e.code);
+    const action = this.settings.actionFor(e.code);
+    if (action) {
+      this.actions.delete(action);
+      this.released.add(action);
+    }
+    this.game.bus.emit('keyup', { code: e.code, action });
+  }
+
+  _onMouseDown(e) {
+    if (e.button < 3) {
+      this.buttons[e.button] = true;
+      this.buttonsPressed[e.button] = true;
+    }
+    this.game.bus.emit('mousedown', { button: e.button, target: e.target });
+  }
+
+  _onMouseUp(e) {
+    if (e.button < 3) {
+      this.buttons[e.button] = false;
+      this.buttonsReleased[e.button] = true;
+    }
+  }
+
+  _onWheel(e) {
+    if (this.locked) e.preventDefault();
+    this.wheelDelta += Math.sign(e.deltaY);
+  }
+
+  // ---- query API ----
+  isDown(action) { return this.enabled && this.actions.has(action); }
+  wasPressed(action) { return this.enabled && this.pressed.has(action); }
+  wasReleased(action) { return this.enabled && this.released.has(action); }
+  isCode(code) { return this.codes.has(code); }
+  get fire() { return this.enabled && this.buttons[0]; }
+  get aim() { return this.enabled && this.buttons[2]; }
+  get firePressed() { return this.enabled && this.buttonsPressed[0]; }
+  get aimPressed() { return this.enabled && this.buttonsPressed[2]; }
+  get aimReleased() { return this.enabled && this.buttonsReleased[2]; }
+
+  /** Drain accumulated mouse movement. Returns raw pixels. */
+  consumeLook(out = { x: 0, y: 0 }) {
+    out.x = this.mouseDX;
+    out.y = this.mouseDY;
+    this.mouseDX = 0;
+    this.mouseDY = 0;
+    return out;
+  }
+
+  consumeWheel() { const w = this.wheelDelta; this.wheelDelta = 0; return w; }
+
+  /** Called at the very end of each rendered frame. */
+  endFrame() {
+    this.pressed.clear();
+    this.released.clear();
+    this.buttonsPressed[0] = this.buttonsPressed[1] = this.buttonsPressed[2] = false;
+    this.buttonsReleased[0] = this.buttonsReleased[1] = this.buttonsReleased[2] = false;
+  }
+
+  dispose() {
+    document.removeEventListener('pointerlockchange', this._onLockChange);
+    document.removeEventListener('mousemove', this._onMouseMove);
+    window.removeEventListener('keydown', this._onKeyDown);
+    window.removeEventListener('keyup', this._onKeyUp);
+    window.removeEventListener('mousedown', this._onMouseDown);
+    window.removeEventListener('mouseup', this._onMouseUp);
+    window.removeEventListener('wheel', this._onWheel);
+    window.removeEventListener('blur', this._onBlur);
+    this.canvas.removeEventListener('contextmenu', this._onContext);
+  }
+}

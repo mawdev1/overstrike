@@ -1,0 +1,21 @@
+{
+  "name": "overstrike",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OVERSTRIKE — a browser-native first-person shooter built on three.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5181",
+    "check": "node scripts/check.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.57.0",
+    "vite": "^8.2.1"
+  }
+}
