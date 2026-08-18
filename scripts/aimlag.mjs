@@ -16,7 +16,11 @@
  * `alpha` assignment in src/player/playerCamera.js, which quotes this probe's numbers.
  * Re-run it before changing that branch.
  *
- * Usage: node scripts/aimlag.mjs [--weapon=sr_reaver] [--frames=260] [--label=name]
+ * `scopeAimOnMovingFrames` is reported alongside, because `scopeAim` is what keys the
+ * alpha — a disagreement is only interpretable next to how much of the sight picture was
+ * up when it happened.
+ *
+ * Usage: node scripts/aimlag.mjs [--weapon=sr_reaver] [--frames=260] [--label=name] [--seed=4242]
  */
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
@@ -32,6 +36,7 @@ const arg = (k, d) => {
 const WEAPON = arg('weapon', 'sr_reaver');
 const FRAMES = Number(arg('frames', 260));
 const LABEL = arg('label', 'run');
+const SEED = Number(arg('seed', 4242));
 
 const server = await createServer({
   root: ROOT,
@@ -56,7 +61,11 @@ page.on('pageerror', (e) => errs.push(e.message));
 
 await page.goto(url, { waitUntil: 'domcontentloaded' });
 await page.waitForFunction(() => window.__GAME__?.state === 'menu', null, { timeout: 180000, polling: 250 });
-await page.evaluate(() => window.__GAME__.startMatch({ mode: 'tdm', botCount: 7, difficulty: 'regular' }));
+// Pinned seed: the whole point of this probe is comparing two runs, and startMatch
+// otherwise rolls Math.random(), so the bots would be doing different things in each.
+await page.evaluate((seed) => window.__GAME__.startMatch({
+  mode: 'tdm', botCount: 7, difficulty: 'regular', seed,
+}), SEED);
 await page.waitForTimeout(2200);
 
 // Same siting logic as scopeshot: the most open sightline on the map, so the aim ray
@@ -97,7 +106,7 @@ const track = await page.evaluate((frames) => new Promise((resolve) => {
   const eye = new V(), dir = new V(), pt = new V();
   const w = window.innerWidth, h = window.innerHeight;
   let n = 0;
-  const all = [], hot = [], cold = [];
+  const all = [], hot = [], cold = [], scopeAims = [];
   let misses = 0, shots = 0;
   let worst = 0, worstAt = null;
   g.player.weapon.stopFire();
@@ -108,7 +117,9 @@ const track = await page.evaluate((frames) => new Promise((resolve) => {
       if (g.player.weapon.ammo <= 0) g.player.weapon.ammo = g.player.weapon.def.magSize;
       if (n > 20 && n % 40 === 2) shots++;
     }
-    if (!g.player.alive && g.match?.respawn) g.match.respawn(g.player);
+    // Keep the player alive rather than trying to respawn them: Match has no public
+    // respawn (only _queueRespawn / _updateRespawns), and a death would teleport them
+    // off the sited sightline and silently change what is being measured.
     g.player.health = g.player.maxHealth;
     g.player.getEyePosition(eye);
     g.player.getAimDirection(dir);
@@ -131,9 +142,17 @@ const track = await page.evaluate((frames) => new Promise((resolve) => {
       const movePx = Math.hypot(dYaw, dPitch) * (180 / Math.PI)
         * ((h * 0.5) / Math.tan(g.camera.fov * 0.5 * Math.PI / 180) * Math.tan(Math.PI / 180));
       (movePx > 0.05 ? hot : cold).push(d);
+      // scopeAim is what actually keys the interpolation alpha, so record it: a
+      // disagreement is only explicable alongside how much of the sight picture was up
+      // when it happened.
+      if (movePx > 0.05) scopeAims.push(p.scopeAim);
       if (d > worst) {
         worst = d;
-        worstAt = { px: +dx.toFixed(3), py: +dy.toFixed(3), frame: n, phase: n % 40, movePx: +movePx.toFixed(3) };
+        worstAt = {
+          px: +dx.toFixed(3), py: +dy.toFixed(3), frame: n, phase: n % 40,
+          movePx: +movePx.toFixed(3),
+          scopeAim: +p.scopeAim.toFixed(3), ads: +p.adsAmount.toFixed(3),
+        };
       }
     }
     if (++n < frames) requestAnimationFrame(tick);
@@ -146,6 +165,7 @@ const track = await page.evaluate((frames) => new Promise((resolve) => {
       resolve({
         misses, shots, worstAt,
         all: stat(all), hot: stat(hot), cold: stat(cold),
+        scopeAimOnMovingFrames: stat(scopeAims),
         pxPerDeg: +((h * 0.5) / Math.tan(g.camera.fov * 0.5 * Math.PI / 180) * Math.tan(Math.PI / 180)).toFixed(2),
       });
     }
@@ -153,9 +173,12 @@ const track = await page.evaluate((frames) => new Promise((resolve) => {
   requestAnimationFrame(tick);
 }), FRAMES);
 
-console.log(`[aimlag:${LABEL}] weapon=${WEAPON} ${JSON.stringify(track)}`);
+console.log(`[aimlag:${LABEL}] weapon=${WEAPON} seed=${SEED} ${JSON.stringify(track)}`);
 if (errs.length) console.log(`[aimlag:${LABEL}] page errors: ${errs.join(' | ')}`);
 
 await browser.close();
 await server.close();
-process.exit(0);
+// Exit non-zero on page errors: this reports a number that looks perfectly plausible
+// even when the sim threw on the way there, and a probe whose output is trusted for
+// A/B decisions must not report a clean-looking result from a broken run.
+process.exit(errs.length ? 1 : 0);

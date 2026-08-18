@@ -454,32 +454,52 @@ export class PlayerCamera {
     // past the last tick (`game.accumAlpha`). `baseYaw`/`basePitch` (mouse) are added
     // fresh, at full resolution, un-interpolated.
     //
-    // Scoped weapons render UN-interpolated (alpha = 1), and this is a correctness
-    // decision, not a taste one. The reticle is drawn at screen centre, but the bullet
-    // leaves along the CURRENT tick's aim — so any blend toward the previous tick makes
-    // screen centre point somewhere the shot will not go. The error is exactly
-    // (1 - alpha) x the one-tick recoil delta, which at 6x magnification is large enough
-    // to see and to miss with.
+    // Through a scope that blend is turned OFF (alpha = 1), and this is a correctness
+    // decision, not a taste one. The scope reticle is an SVG at screen centre, but the
+    // bullet leaves along the CURRENT tick's aim — so any blend toward the previous tick
+    // makes screen centre point somewhere the shot will not go. The error is exactly
+    // (1 - alpha) x the one-tick recoil delta, which under ~4x magnification is large
+    // enough to see and to miss with.
     //
-    // Measured, both ways, on sr_reaver over 260 live-fire frames (scripts/aimlag.mjs);
-    // disagreement between screen centre and where the live aim ray actually lands, on
-    // the frames where the aim is moving:
+    // The firing order is what makes alpha = 1 exact rather than merely close. A shot is
+    // consumed by the NEXT tick, and `_fireRound` hitscans before `_applyRecoil` runs, so
+    // it fires along the aim as it stands at the end of the current tick — precisely the
+    // `cur` endpoint. Rendering that endpoint un-blended shows the player exactly where
+    // their next round is going.
     //
-    //                          mean      worst
-    //   alpha = accumAlpha     1.16 px   7.65 px      <- the blend, visibly lying
-    //   alpha = 1              0.13 px   3.25 px      <- what ships
+    // Measured on sr_reaver over 260 live-fire frames (scripts/aimlag.mjs); disagreement
+    // between screen centre and where the live aim ray actually lands, on the frames
+    // where the aim is moving:
     //
-    // At the worst frame the disagreement equalled the one-tick recoil delta almost
-    // exactly (7.65 px measured vs 7.62 px of actual movement), which is the mechanism
-    // stated plainly: through a scope you are watching the lag, not the aim.
+    //                                    mean      worst
+    //   alpha = accumAlpha               1.16 px   7.65 px   <- the blend, visibly lying
+    //   alpha = 1 whenever def.scoped    0.13 px   3.25 px
+    //   alpha keyed on scopeAim          0.19 px   4.03 px   <- what ships
     //
-    // The cost is real and accepted: un-interpolated recoil stair-steps at 120 Hz, which
-    // is visible on the 200 rpm semi-auto MERIDIAN at full trigger speed. Through a
-    // scope, a reticle that tells the truth beats a reticle that moves smoothly. Do not
-    // "fix" the stair-step by deleting this branch — that trade has been measured and
-    // it loses. Everything else interpolates, where the reticle is a dot on a wide FOV
-    // and a fraction of a degree costs nothing.
-    const alpha = this.player.weapon?.def?.scoped ? 1 : game.accumAlpha;
+    // With the blend on, the worst frame's disagreement equalled the one-tick recoil
+    // delta almost exactly (7.65 px measured against 7.62 px of actual movement), which
+    // is the mechanism stated plainly: through a scope you are watching the lag, not the
+    // aim.
+    //
+    // Keyed on `scopeAim` rather than on `weapon.def.scoped`, because the honesty is only
+    // owed while actually looking through the optic. A sniper fired from the hip has no
+    // reticle to be honest to — the crosshair is a dot on an 85-degree FOV — and would
+    // otherwise pay the whole stair-step cost for nothing. This also matches how `feel`
+    // above already works: the camera's decorative lies fade out on the same curve, as
+    // truth-through-a-scope arrives.
+    //
+    // That costs a measured 0.06 px of mean honesty against the blunt `def.scoped` test,
+    // and all of it sits in ADS transitions rather than in the steady state — at the
+    // worst frame `scopeAim` was 0.433 (ADS 0.66), i.e. mid bolt-cycle with the sight
+    // picture not yet back up, where the player cannot fire anyway. Fully scoped,
+    // `scopeAim` is 1 and this is exactly `alpha = 1`.
+    //
+    // The remaining cost is real and accepted: un-interpolated recoil stair-steps at
+    // 120 Hz, which is visible on the 200 rpm semi-auto MERIDIAN at full trigger speed.
+    // Through glass, a reticle that tells the truth beats one that moves smoothly. Do
+    // not "fix" the stair-step by making this unconditional — that trade has been
+    // measured and it loses.
+    const alpha = lerp(game.accumAlpha, 1, clamp(p.scopeAim, 0, 1));
     const aimYaw = p.baseYaw + lerp(p.prevRecoilYaw + p.prevScopeSwayYaw, p.recoilYaw + p.scopeSwayYaw, alpha);
     const aimPitch = clamp(
       p.basePitch + lerp(p.prevRecoilPitch + p.prevScopeSwayPitch, p.recoilPitch + p.scopeSwayPitch, alpha),
