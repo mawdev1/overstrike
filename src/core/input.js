@@ -29,6 +29,8 @@ export class Input {
 
     this.locked = false;
     this.enabled = true;
+    /** In-flight requestLock(), resolved by pointerlockchange or by its own timeout. */
+    this._lockPending = null;
     /** Set while the UI is capturing a key for rebinding. */
     this.captureBind = null;
 
@@ -40,10 +42,11 @@ export class Input {
     this._onMouseUp = this._onMouseUp.bind(this);
     this._onWheel = this._onWheel.bind(this);
     this._onBlur = this._onBlur.bind(this);
+    this._onCanvasDown = this._onCanvasDown.bind(this);
     this._onContext = (e) => e.preventDefault();
 
     document.addEventListener('pointerlockchange', this._onLockChange);
-    document.addEventListener('pointerlockerror', () => { this.locked = false; });
+    document.addEventListener('pointerlockerror', () => { this.locked = false; this._settleLock(); });
     document.addEventListener('mousemove', this._onMouseMove);
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
@@ -52,15 +55,34 @@ export class Input {
     window.addEventListener('wheel', this._onWheel, { passive: false });
     window.addEventListener('blur', this._onBlur);
     canvas.addEventListener('contextmenu', this._onContext);
+    canvas.addEventListener('mousedown', this._onCanvasDown);
   }
 
   /**
    * Pointer lock can only be taken during a user gesture. Every failure path here is
    * expected and must be swallowed: an uncaught rejection from requestPointerLock
    * surfaces as a page error and, in a browser, a console full of red.
+   *
+   * Resolves true only once the lock is genuinely held. Callers need that answer: a
+   * refused lock — macOS browsers do not count Escape as a gesture, and Chrome
+   * throttles re-locking for about a second after a user-initiated exit — used to be
+   * indistinguishable from success, which left the player unpaused and alive with the
+   * system cursor sitting on top of the window.
    */
   requestLock() {
-    if (this.locked || !this.canvas.requestPointerLock) return;
+    if (this.locked) return Promise.resolve(true);
+    if (!this.canvas.requestPointerLock) return Promise.resolve(false);
+
+    if (!this._lockPending) {
+      const pending = {};
+      pending.promise = new Promise((res) => { pending.resolve = res; });
+      // Engines that return no promise (Safari) never report refusal at all, so the
+      // timeout is the only honest answer available for them.
+      pending.timer = setTimeout(() => this._settleLock(), 700);
+      this._lockPending = pending;
+    }
+    const result = this._lockPending.promise;
+
     try {
       const p = this.canvas.requestPointerLock({ unadjustedMovement: true });
       // Chrome returns a promise when options are passed; older engines return undefined.
@@ -68,19 +90,42 @@ export class Input {
         p.catch(() => {
           try {
             const q = this.canvas.requestPointerLock();
-            if (q && typeof q.catch === 'function') q.catch(() => {});
-          } catch { /* no gesture available — the menu will ask again on click */ }
+            if (q && typeof q.catch === 'function') q.catch(() => this._settleLock());
+          } catch { this._settleLock(); }
         });
       }
-    } catch { /* same */ }
+    } catch { this._settleLock(); }
+
+    return result;
+  }
+
+  /** Answer a pending requestLock() with the real lock state, whatever it is. */
+  _settleLock() {
+    const p = this._lockPending;
+    if (!p) return;
+    this._lockPending = null;
+    clearTimeout(p.timer);
+    p.resolve(this.locked);
   }
 
   exitLock() { if (this.locked) document.exitPointerLock(); }
 
   _onLockChange() {
     this.locked = document.pointerLockElement === this.canvas;
+    this._settleLock();
     this.game.bus.emit(this.locked ? 'pointerLock' : 'pointerUnlock', {});
     if (!this.locked) this._clearHeld();
+  }
+
+  /**
+   * Last-resort recovery: clicking the canvas while unlocked but in play takes the
+   * lock back. A click is always a valid gesture, so this works even when the browser
+   * refused every earlier request.
+   */
+  _onCanvasDown() {
+    if (this.locked || this.game.state !== 'playing' || this.game.paused) return;
+    if (this.game.menu?.isOpen) return;
+    this.requestLock();
   }
 
   _clearHeld() {
@@ -190,5 +235,7 @@ export class Input {
     window.removeEventListener('wheel', this._onWheel);
     window.removeEventListener('blur', this._onBlur);
     this.canvas.removeEventListener('contextmenu', this._onContext);
+    this.canvas.removeEventListener('mousedown', this._onCanvasDown);
+    this._settleLock();
   }
 }

@@ -285,8 +285,17 @@ export class Game {
     if (this.state !== 'playing' && this.state !== 'paused') return;
     this.paused = p;
     this.state = p ? 'paused' : 'playing';
-    if (p) this.input.exitLock();
-    else this.input.requestLock();
+    if (p) {
+      this.input.exitLock();
+    } else {
+      // Unpausing without the pointer lock is not a resume, it is a player standing
+      // still in a live match with a system cursor over the window. If the browser
+      // refuses the lock (Escape is not a gesture; re-locks are throttled right after
+      // a user-initiated exit), fall straight back into the pause menu.
+      this.input.requestLock().then((ok) => {
+        if (!ok && this.state === 'playing') this.setPaused(true);
+      });
+    }
     this.bus.emit(p ? 'pause' : 'unpause', {});
   }
 
