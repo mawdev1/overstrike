@@ -10,6 +10,7 @@
  */
 import * as THREE from 'three';
 import { World } from '../src/world/world.js';
+import { createRNG, mixSeed } from '../src/core/rng.js';
 
 let passed = 0;
 const failures = [];
@@ -118,6 +119,110 @@ test('a wide query keeps every distinct box (the failure the guard prevents)', (
 
   assert(bad.size < good.size,
     'the unguarded path did not lose boxes, so the guard is not load-bearing here');
+});
+
+// ═══════════════════════════════════════════════════════════ rng snapshot / restore ══
+//
+// Reconciliation replays a tick and demands an identical result. Any draw taken during
+// that tick must come from the same stream position both times, so the position is
+// simulation state and has to be capturable.
+//
+// The trap is `gauss`: it rejection-samples (a variable number of draws) and banks its
+// second Box-Muller sample. Two streams with the same `a` but different banked samples
+// are NOT in the same state, and the difference only shows up on the next gauss call —
+// i.e. several ticks later, as a shot that lands somewhere else.
+
+console.log('\nrng snapshot / restore');
+
+test('a restored stream replays an identical sequence', () => {
+  const r = createRNG(0xBEEF);
+  for (let i = 0; i < 17; i++) r();               // arbitrary starting offset
+  const st = r.getState();
+  const first = Array.from({ length: 32 }, () => r());
+  r.setState(st);
+  const second = Array.from({ length: 32 }, () => r());
+  for (let i = 0; i < first.length; i++) {
+    assertEq(second[i], first[i], `draw ${i} diverged after restore`);
+  }
+});
+
+test('restore rewinds a stream that has run on past the capture', () => {
+  const r = createRNG(0x1234);
+  const st = r.getState();
+  const want = r();
+  for (let i = 0; i < 500; i++) r();             // run far past the snapshot
+  r.setState(st);
+  assertEq(r(), want, 'the first draw after restore was not the captured one');
+});
+
+test('getState fills a provided out-object without allocating', () => {
+  const r = createRNG(7);
+  const out = {};
+  const ret = r.getState(out);
+  assert(ret === out, 'getState did not return the out-object it was given');
+  assert(typeof out.a === 'number', 'out.a was not populated');
+});
+
+test('gauss replays identically across a restore', () => {
+  const r = createRNG(0xC0FFEE);
+  const st = r.getState();
+  const first = Array.from({ length: 16 }, () => r.gauss());
+  r.setState(st);
+  const second = Array.from({ length: 16 }, () => r.gauss());
+  for (let i = 0; i < first.length; i++) {
+    assertEq(second[i], first[i], `gauss ${i} diverged after restore`);
+  }
+});
+
+test('the banked gauss sample is part of the state, not incidental', () => {
+  // Capture with a sample banked (odd number of gauss calls leaves `spare` set), then
+  // restore and confirm the very next gauss returns the banked one. Capturing `a` alone
+  // would drop it and return a freshly drawn value instead.
+  const r = createRNG(0x5EED);
+  r.gauss();                                      // banks the second sample
+  const st = r.getState();
+  assert(st.spare !== null && st.spare !== undefined,
+    'test precondition: expected a banked sample after an odd number of gauss calls');
+  const want = r.gauss();                         // should consume the bank
+  assertEq(want, st.spare, 'precondition: the next gauss did not return the banked sample');
+  r.setState(st);
+  assertEq(r.gauss(), want, 'the banked sample did not survive the restore');
+});
+
+test('a state restored without a banked sample does not inherit a stale one', () => {
+  const r = createRNG(0x5EED);
+  r.gauss(); r.gauss();                           // even count — bank is spent
+  const clean = r.getState();
+  assertEq(clean.spare, null, 'precondition: expected an empty bank');
+  r.gauss();                                      // re-bank
+  r.setState(clean);
+  const after = r.getState();
+  assertEq(after.spare, null, 'restoring an empty bank left the previous sample behind');
+});
+
+test('setState tolerates a state that has been through JSON', () => {
+  // `spare: null` survives JSON; a state captured mid-bank keeps its number. Both must
+  // restore identically to the in-memory object, or a snapshot sent over the wire
+  // desyncs from the same snapshot kept locally.
+  const r = createRNG(0xABCD);
+  r.gauss();
+  const st = r.getState();
+  const viaJson = JSON.parse(JSON.stringify(st));
+  const want = r.gauss();
+  r.setState(viaJson);
+  assertEq(r.gauss(), want, 'a JSON round-tripped state did not restore identically');
+});
+
+test('mixSeed gives each index an independent stream', () => {
+  const base = 0x12345678;
+  const firstDraws = new Set();
+  for (let i = 0; i < 32; i++) {
+    const seed = mixSeed(base, i);
+    assert(Number.isInteger(seed) && seed >= 0 && seed <= 0xFFFFFFFF,
+      `mixSeed(${base}, ${i}) produced a non-uint32: ${seed}`);
+    firstDraws.add(createRNG(seed)());
+  }
+  assertEq(firstDraws.size, 32, 'two indices produced the same first draw — streams are not independent');
 });
 
 // ══════════════════════════════════════════════════════════════════════════ report ══

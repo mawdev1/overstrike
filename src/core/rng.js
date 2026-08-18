@@ -26,6 +26,37 @@ export function createRNG(seed = 0x9e3779b9) {
     return u * m;
   };
   rng.reseed = (s) => { a = s >>> 0; spare = null; };
+
+  /**
+   * Capture / restore the stream's exact position.
+   *
+   * Reconciliation replays a tick: restore the world to the state before it, feed the
+   * command again, and the result must be identical. Any draw taken during that tick
+   * has to come from the same place in the stream both times, so the stream position is
+   * simulation state like any other and belongs in the snapshot.
+   *
+   * `spare` matters as much as `a`. `gauss` draws a variable number of times (rejection
+   * sampling) and caches its second sample, so a stream that has one banked is a full
+   * draw ahead of an identical-looking one that does not. Capturing `a` alone restores
+   * to a position that is off by however much the next gauss consumes.
+   *
+   * `getState` takes an optional out-object because this runs per entity per tick and
+   * allocating a fresh one each time is the kind of garbage a fixed-timestep loop
+   * notices.
+   */
+  rng.getState = (out) => {
+    const o = out || {};
+    o.a = a >>> 0;
+    o.spare = spare;
+    return o;
+  };
+  rng.setState = (s) => {
+    a = s.a >>> 0;
+    // Anything nullish means "no banked sample" — tolerated so a state that has been
+    // through JSON (where `null` survives but `undefined` silently vanishes) restores
+    // the same as one that has not.
+    spare = (s.spare === undefined || s.spare === null) ? null : s.spare;
+  };
   return rng;
 }
 
