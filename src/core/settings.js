@@ -46,6 +46,22 @@ export const DEFAULTS = {
   },
 };
 
+/**
+ * Is there a usable Web Storage implementation?
+ *
+ * Checks the METHOD, not the global. Node defines `localStorage` as an object whose
+ * accessors throw or are absent without `--localstorage-file`, so `typeof localStorage
+ * !== 'undefined'` passes and the call then fails — which is why a headless boot warned
+ * about unreadable settings it had simply never written.
+ */
+function hasStorage() {
+  try {
+    return typeof localStorage !== 'undefined'
+      && typeof localStorage.getItem === 'function'
+      && typeof localStorage.setItem === 'function';
+  } catch { return false; }
+}
+
 export class Settings {
   constructor() {
     this.data = structuredClone(DEFAULTS);
@@ -133,6 +149,11 @@ export class Settings {
   }
 
   load() {
+    // Absence of storage is not an error, so it must not warn. `typeof localStorage` is
+    // not the right test: Node exposes the global while its methods are missing unless
+    // started with --localstorage-file, so a server booted every match with a stack
+    // trace about "unreadable settings" that were simply never there.
+    if (!hasStorage()) return;
     let parsed;
     try {
       const raw = localStorage.getItem(KEY);
@@ -165,6 +186,7 @@ export class Settings {
   }
 
   save() {
+    if (!hasStorage()) return;
     try { localStorage.setItem(KEY, JSON.stringify(this.data)); } catch { /* private mode */ }
   }
 }

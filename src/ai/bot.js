@@ -730,12 +730,16 @@ export class Bot {
     this._deadEmitted = false;
 
     this.color = null;            // set by BotManager from TEAM_COLORS
-    this.model = new BotModel(game, this.team);
-    this.model.setVisible(false);
+    // The rig is a rendering resource, not an effect, so a no-op presenter cannot make it
+    // free — it has to not be built. Every other `this.model` access in this file is
+    // already optional-chained or behind a null check, so a headless bot just has none.
+    this.model = game.present?.visual === false ? null : new BotModel(game, this.team);
+    this.model?.setVisible(false);
   }
 
   /** Rebuild the model if the bot changed teams (colourways are baked in). */
   ensureTeamModel() {
+    if (this.game.present?.visual === false) return;
     if (this.model && !this.model.disposed && this.model.team === this.team) return;
     this.model?.dispose();
     this.model = new BotModel(this.game, this.team);

@@ -971,6 +971,10 @@ export class Player {
    * difference — it never touches `game.input` or `game.settings` itself.
    */
   _pumpLocalCommand() {
+    // No local input device means nothing local to build. An authoritative server applies
+    // commands it RECEIVED, straight through `applyCommand`, and never runs this path —
+    // so its absence is the normal case there, not a failure.
+    if (!this.game.input) return;
     if (this._lookFrame === this.game.frame) return;
     this._lookFrame = this.game.frame;
     this.applyCommand(this._buildLocalCommand());
@@ -1065,6 +1069,10 @@ export class Player {
   _refreshHeldState() {
     const g = this.game;
     const h = this._held;
+    // Same as `_pumpLocalCommand`: with no input device the held state comes from the
+    // applied command instead, so leave it alone rather than clearing it — clearing it
+    // every substep would stamp out the movement a received command just asked for.
+    if (!g.input) return;
     if (g.state !== 'playing' || g.paused) { Object.assign(h, EMPTY_HELD); return; }
     const i = g.input;
     const s = g.settings;

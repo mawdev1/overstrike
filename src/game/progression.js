@@ -146,7 +146,10 @@ export class Progression {
     const fresh = makeDefaults();
     let parsed = null;
     try {
-      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(this.key) : null;
+      // Method check, not a `typeof` on the global: Node has the global without the
+      // methods, so the old test passed and the call below then threw.
+      const raw = typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function'
+        ? localStorage.getItem(this.key) : null;
       if (raw) parsed = JSON.parse(raw);
     } catch (e) {
       console.warn('[progression] unreadable save, starting fresh', e);
@@ -199,7 +202,7 @@ export class Progression {
 
   _write() {
     try {
-      if (typeof localStorage === 'undefined') return;
+      if (typeof localStorage === 'undefined' || typeof localStorage.setItem !== 'function') return;
       localStorage.setItem(this.key, JSON.stringify(this.data));
     } catch (e) {
       // Private mode / quota. Progression is a nicety, never a hard failure.

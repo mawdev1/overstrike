@@ -5,7 +5,7 @@ import { EventBus } from './events.js';
 import { Settings } from './settings.js';
 import { createRNG } from './rng.js';
 import { assets } from './assets.js';
-import { LivePresenter } from './presenter.js';
+import { LivePresenter, NullPresenter } from './presenter.js';
 import { clamp, FIXED_DT } from './mathUtils.js';
 
 import { World } from '../world/world.js';
@@ -218,6 +218,57 @@ export class Game {
   }
 
   /**
+   * Boot the simulation with no presentation layer at all.
+   *
+   * The server half of `init()`. It builds exactly the systems that decide outcomes —
+   * world, navigation, weapons, projectiles, player, bots, match — and none of the ones
+   * that show them: no Engine, renderer, scene, camera, Input, FX, audio, HUD or Menu.
+   *
+   * This is a separate method rather than a flag threaded through `init()` because the
+   * two orders genuinely differ: `init` interleaves yields for the loading bar, waits on
+   * `nextPaint()`, and links shaders. None of that means anything without a screen, and a
+   * server that paid for it would be slower to start for no reason.
+   *
+   * What makes this safe is Phase 1: every audio/fx/hud/camera call in simulation code
+   * already goes through `game.present`, so installing a NullPresenter removes the
+   * presentation layer rather than merely silencing it. The remaining `game.scene?.add`
+   * and `this.model` guards are the handful of places that build rendering RESOURCES,
+   * where a no-op call is not enough because the cost is the construction.
+   *
+   * There is no render loop: the caller drives `_fixedUpdate(FIXED_DT)` at whatever rate
+   * it likes. `start()` is deliberately not called — it wants requestAnimationFrame.
+   */
+  async initHeadless({ presenter } = {}) {
+    const tBoot = performance.now();
+    this.present = presenter || new NullPresenter();
+
+    this.world = new World(this);
+    await this.world.init();
+
+    this.nav = new NavGrid(this);
+    await this.nav.init();
+
+    this.weapons = new WeaponSystem(this);
+    await this.weapons.init();
+    this.projectiles = new ProjectileSystem(this);
+    await this.projectiles.init();
+
+    this.player = new Player(this);
+    await this.player.init();
+    this.bots = new BotManager(this);
+    await this.bots.init();
+
+    this.match = new Match(this);
+    await this.match.init();
+
+    this._systems = null;
+    this.bootProfile.totalMs = +(performance.now() - tBoot).toFixed(1);
+    this.state = 'menu';
+    this.bus.emit('ready', {});
+    return this;
+  }
+
+  /**
    * Link every shader program the game can need, at boot, where a stall is invisible.
    *
    * Without this, a program is linked the first frame its material becomes visible: the
@@ -327,15 +378,17 @@ export class Game {
     this.match.begin(opts);
     this.state = 'playing';
     this.paused = false;
-    this.engine.setFade(0);
-    this.input.requestLock();
-    this.audio.resume();
+    // Optional throughout: a headless server runs this same lifecycle with no engine,
+    // input or audio to speak to.
+    this.engine?.setFade(0);
+    this.input?.requestLock();
+    this.audio?.resume();
     this.bus.emit('matchStart', { mode: opts.mode ?? this.match.mode, scores: this.match.scores });
   }
 
   endMatch(result) {
     this.state = 'gameover';
-    this.input.exitLock();
+    this.input?.exitLock();
     this.bus.emit('matchEnd', result);
   }
 
@@ -344,8 +397,8 @@ export class Game {
     this.paused = p;
     this.state = p ? 'paused' : 'playing';
     if (p) {
-      this.input.exitLock();
-    } else {
+      this.input?.exitLock();
+    } else if (this.input) {
       // Unpausing without the pointer lock is not a resume, it is a player standing
       // still in a live match with a system cursor over the window. If the browser
       // refuses the lock (Escape is not a gesture; re-locks are throttled right after
@@ -360,7 +413,7 @@ export class Game {
   returnToMenu() {
     this.state = 'menu';
     this.paused = false;
-    this.input.exitLock();
+    this.input?.exitLock();
     this.bus.emit('toMenu', {});
   }
 

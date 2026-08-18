@@ -64,7 +64,9 @@ export class ProjectileSystem {
   }
 
   async init() {
-    this.game.scene.add(this.group);
+    // Optional: a headless server has no scene. This was the only unguarded `game.scene`
+    // left on the simulation path, so it was the first thing to throw on a Node boot.
+    this.game.scene?.add(this.group);
 
     // Shared geometry: a faceted ball for frags, a can for tacticals, a dart for rockets.
     const ball = new THREE.IcosahedronGeometry(1, 0);

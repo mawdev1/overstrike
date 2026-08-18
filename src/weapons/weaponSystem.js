@@ -945,7 +945,7 @@ export class WeaponSystem {
   /** Cone half-angle (deg) -> crosshair gap in CSS pixels at the current FOV. */
   _spreadToPixels(deg) {
     const cam = this.game.camera;
-    const h = (this.game.engine?.canvas?.clientHeight) || window.innerHeight || 1080;
+    const h = (this.game.engine?.canvas?.clientHeight) || globalThis.window?.innerHeight || 1080;
     const fov = (cam?.fov || 85) * DEG;
     const halfPlane = Math.tan(fov * 0.5);
     if (halfPlane <= 0) return 0;

@@ -28,6 +28,17 @@
  */
 
 export class LivePresenter {
+  /**
+   * True when something is actually being drawn.
+   *
+   * Systems that build RENDERING RESOURCES rather than emit effects — bot rigs are the
+   * only case — need to know whether to build them at all, and a per-call no-op cannot
+   * express that: the cost is the construction, not the call. Ask this rather than
+   * `typeof document`, which is true under jsdom and any DOM shim and so answers the
+   * wrong question in exactly the environments where it matters.
+   */
+  visual = true;
+
   constructor(game) { this.game = game; }
 
   // ── audio ──────────────────────────────────────────────────────────────────────
@@ -81,6 +92,8 @@ export class LivePresenter {
 
 /** Every method above, emptied. See the module doc for why this exists. */
 export class NullPresenter {
+  visual = false;
+
   play() {} playUI() {} setListener() {}
   muzzleFlash() {} tracer() {} impact() {} bloodSpray() {} explosion() {}
   smokeTrail() {} shellEject() {} flashbang() {} screenShake() {}

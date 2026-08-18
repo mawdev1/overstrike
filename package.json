@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OVERSTRIKE — a browser-native first-person shooter built on three.js",
+  "description": "OVERSTRIKE \u2014 a browser-native first-person shooter built on three.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -14,7 +14,8 @@
     "perfcompare": "node scripts/perfcompare.mjs",
     "simtest": "node scripts/simtest.mjs",
     "determinism": "node scripts/determinism.mjs",
-    "presenttest": "node scripts/presenttest.mjs"
+    "presenttest": "node scripts/presenttest.mjs",
+    "headless": "node scripts/headless.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"
