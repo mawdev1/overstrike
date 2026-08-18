@@ -201,7 +201,7 @@ function buildMarketHall(B) {
   // Plinth + ground floor deck.
   B.box(X0 - 0.6, 0, Z0 - 0.6, X1 + 0.6, PLINTH, Z1 + 0.6, 'concreteDark', 'concrete');
   B.deco(X0 - 0.75, 0, Z0 - 0.75, X1 + 0.75, 0.08, Z1 + 0.75, 'concreteDark');
-  B.box(X0, PLINTH - 0.02, Z0, X1, PLINTH, Z1, 'tile', 'concrete', { cast: false, collide: false });
+  B.floorFinish(X0, Z0, X1, Z1, PLINTH, 'tile');
 
   // ── ground floor shell
   const groundDoor = { y0: PLINTH, y1: 2.5, frame: 'door' };
@@ -260,7 +260,7 @@ function buildMarketHall(B) {
   // ── first floor
   B.stairs({ x0: 6.2, z0: -9.5, x1: 8.6, z1: -2.7, y0: PLINTH, y1: L1, dir: '+z', matName: 'concreteDark', surface: 'concrete', rail: true });
   B.slab(X0, Z0, X1, Z1, L1_UNDER, L1, 'concrete', 'concrete', { hole: STAIR, cast: true, receive: true });
-  B.box(X0, L1 - 0.02, Z0, X1, L1, Z1, 'tile', 'concrete', { cast: false, collide: false });
+  B.floorFinish(X0, Z0, X1, Z1, L1, 'tile');
 
   const upWin = { y0: 5.15, y1: 6.65, frame: 'window', stain: 1, ...shut };
   B.wall(X0, Z1 - T, X1, Z1, L1, L2_UNDER, 'plaster', 'concrete', {
@@ -1132,7 +1132,7 @@ function buildCustoms(B) {
   const STAIR = [17.6, 13, 20, 19.8];
 
   B.box(X0 - 0.5, 0, Z0 - 0.5, X1 + 0.5, PLINTH, Z1 + 0.5, 'concreteDark', 'concrete');
-  B.box(X0, PLINTH - 0.02, Z0, X1, PLINTH, Z1, 'tile', 'concrete', { cast: false, collide: false });
+  B.floorFinish(X0, Z0, X1, Z1, PLINTH, 'tile');
 
   B.wall(X0, Z0, X1, Z0 + T, PLINTH, L1_UNDER, 'concrete', 'concrete', {
     openings: [
@@ -1169,7 +1169,7 @@ function buildCustoms(B) {
   // First floor.
   B.stairs({ x0: 17.6, z0: 13, x1: 20, z1: 19.8, y0: PLINTH, y1: L1, dir: '+z', matName: 'concrete', surface: 'concrete', rail: true });
   B.slab(X0, Z0, X1, Z1, L1_UNDER, L1, 'concrete', 'concrete', { hole: STAIR });
-  B.box(X0, L1 - 0.02, Z0, X1, L1, Z1, 'tile', 'concrete', { cast: false, collide: false });
+  B.floorFinish(X0, Z0, X1, Z1, L1, 'tile');
 
   B.wall(X0, Z0, X1, Z0 + T, L1, ROOF_UNDER, 'plaster', 'concrete', {
     openings: [

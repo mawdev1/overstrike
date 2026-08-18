@@ -285,6 +285,25 @@ export class Builder {
   }
 
   /**
+   * Tiled/screeded floor finish laid over a structural deck whose walking surface is at
+   * `y` — the interior floor of a building, as opposed to the slab holding it up.
+   *
+   * The finish sits 8 mm proud, and that lift is the whole point. Laid flush, its top
+   * face is *exactly* coplanar with the deck top it covers, and two opaque faces in one
+   * plane z-fight: every tiled interior in the map strobed as the camera moved. With
+   * near 0.10 / far 400 and a 24-bit depth buffer the resolvable gap at 60 m is about
+   * 2 mm, so 8 mm clears the whole 86 m map with room to spare while staying half the
+   * lift `wear()` already gets away with underfoot.
+   *
+   * Visual only: the deck below keeps the collider, so the lift never moves the surface
+   * the player actually stands on.
+   */
+  floorFinish(x0, z0, x1, z1, y, matName, opts = {}) {
+    this.box(x0, y - 0.02, z0, x1, y + 0.008, z1, matName, 'concrete',
+      { ...opts, cast: false, collide: false });
+  }
+
+  /**
    * Big flat ground zone. One mesh, one `assets.tiled()` material, receive-only shadows,
    * plus a 1 m-thick collider slab beneath it carrying the correct impact surface.
    */
