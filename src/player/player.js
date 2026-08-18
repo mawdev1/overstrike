@@ -428,7 +428,6 @@ export class Player {
     this.slideDir = new THREE.Vector3(0, 0, -1);
     this.lean = 0;                 // signed metres, +right
 
-    this.adsAmount = 0;            // 0..1 (authoritative for movement speed)
     this.wantsAds = false;
     this.adsToggle = false;
     /** Backing store for `grenades` used only before the loadout exists. */
@@ -453,7 +452,6 @@ export class Player {
     this._wasFiring = false;
     this._lookFrame = -1;
     this._deathAt = 0;
-    this._lastWeaponAds = undefined;
 
     /**
      * Held-state, resolved once per rendered frame by `_buildLocalCommand` and read by
@@ -807,7 +805,6 @@ export class Player {
     this.lean = 0;
     this.sprinting = false;
     this.sprintRamp = 0;
-    this.adsAmount = 0;
     this.wantsAds = false;
     this.adsToggle = false;
     this.stats.deaths++;
@@ -815,6 +812,11 @@ export class Player {
     this._deathAt = this.game.time;
 
     this.weapon?.stopFire?.();
+    // Explicitly drop the aim as well. `_readInput` is the only other caller of `setAds`
+    // and it does not run while dead, so without this the gun stays aimed in through the
+    // death cam — previously masked by `die()` zeroing Player's own copy of `adsAmount`,
+    // which no longer exists now that the weapon owns it.
+    this.weapon?.setAds?.(false);
     this.game.present.play('death', { volume: 0.9 });
 
     const killer = info?.attacker ?? null;
@@ -880,7 +882,6 @@ export class Player {
     this.slideTimer = 0;
     this.slideAmount = 0;
     this.lean = 0;
-    this.adsAmount = 0;
     this.wantsAds = false;
     this.adsToggle = false;
     this.grenades = TUNE.GRENADE_COUNT;
@@ -918,6 +919,31 @@ export class Player {
   /** Weapon def with safe fallbacks — the weapon system may still be booting. */
   get _def() {
     return this.weapon?.def ?? WEAPON_FALLBACK;
+  }
+
+  /**
+   * How far into the sight picture we are, 0..1. Read by movement speed, look
+   * sensitivity, scope sway, camera FOV and the scope shader.
+   *
+   * Owned by the WeaponInstance, and derived here rather than stored. Player used to
+   * integrate its own copy and then reconcile against the weapon's every tick through a
+   * self-correcting handshake (`_lastWeaponAds`) that existed because nobody had decided
+   * who owned the value. The weapon always won in practice — `weapons.fixedUpdate` runs
+   * after `player.fixedUpdate`, so it recomputed `adsAmount` after every write Player
+   * made — which means this getter returns exactly what shipped, with one integrator
+   * instead of two.
+   *
+   * It has to be the weapon that owns it: bots share WeaponInstance and have no
+   * player-side integrator, and the two disagreed anyway (Player's was linear and
+   * asymmetric, the weapon's is `1-(1-raw)^2` and symmetric) while feeding different
+   * consumers, so a one-tick lag between them was observable.
+   *
+   * For snapshot/restore this is the point: `adsAmount` is now one field with one owner,
+   * appearing once in the weapon's manifest rather than twice with a handshake to keep
+   * them agreeing.
+   */
+  get adsAmount() {
+    return this.weapon ? clamp(this.weapon.adsAmount, 0, 1) : 0;
   }
 
   get adsTime() {
@@ -1249,31 +1275,10 @@ export class Player {
     this.wantsAds = !!adsHeld && !adsBlocked;
     if (adsBlocked && h.toggleAdsMode) this.adsToggle = false;
 
-    const adsRate = 1 / this.adsTime;
-    this.adsAmount = this.wantsAds
-      ? Math.min(1, this.adsAmount + adsRate * dt)
-      : Math.max(0, this.adsAmount - adsRate * dt * 1.25);
-
-    // Publish intent to the weapon system in every spelling it might read, then
-    // work out who actually OWNS `adsAmount`. If the weapon instance changes the
-    // value behind our back it is driving the transition and we follow it;
-    // otherwise we stay authoritative and write ours into it. Self-correcting,
-    // so it is right whichever way the weapon system ends up implemented.
-    const w = this.weapon;
-    if (w) {
-      w.adsWanted = this.wantsAds;
-      if (typeof w.setAds === 'function') { try { w.setAds(this.wantsAds); } catch { /* ignore */ } }
-      if (typeof w.adsAmount === 'number') {
-        if (this._lastWeaponAds !== undefined && Math.abs(w.adsAmount - this._lastWeaponAds) > 1e-6) {
-          this.adsAmount = clamp(w.adsAmount, 0, 1);
-        } else {
-          w.adsAmount = this.adsAmount;
-        }
-        this._lastWeaponAds = w.adsAmount;
-      }
-    } else {
-      this._lastWeaponAds = undefined;
-    }
+    // Intent only. The WeaponInstance owns `adsAmount` and integrates it (see the
+    // `adsAmount` getter) — the player says whether it wants to be aiming, and the gun
+    // decides how far in it actually is.
+    this.weapon?.setAds(this.wantsAds);
   }
 
   // ═════════════════════════════════════════════════════════════════ stance ══

@@ -316,6 +316,59 @@ try {
   if (alphaCheck.menuAlpha === 1) ok('accumAlpha is 1 outside state==="playing"');
   else bad('accumAlpha is 1 outside state==="playing"', `got ${alphaCheck.menuAlpha}`);
 
+  // ── adsAmount has exactly one owner ───────────────────────────────────────────────
+  //
+  // Player used to integrate its own copy and reconcile it against the weapon's every
+  // tick through a self-correcting handshake, so the same quantity existed twice with a
+  // mechanism to keep them agreeing. Snapshot/restore needs one field with one owner.
+  console.log('\nadsAmount is owned by the weapon, not mirrored on the player');
+  const adsCheck = await page.evaluate(() => {
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 21 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const p = g.player;
+    const DT = 1 / 120;
+    const inp = g.input;
+    inp.enabled = true;
+
+    // Player must not carry its own storage for it any more.
+    const ownFields = Object.keys(p);
+    const hasOwn = ownFields.includes('adsAmount');
+    const hasHandshake = ownFields.includes('_lastWeaponAds');
+
+    // Hold the aim button and confirm the player's view of ADS tracks the weapon's.
+    // Long enough to cover the initial weapon-switch, which gates ADS until it finishes;
+    // this is asserting that aim-in completes, not how fast.
+    inp.buttons[2] = true;
+    let agreeing = true;
+    for (let i = 0; i < 240; i++) {
+      g.frame++;
+      g._fixedUpdate(DT);
+      if (Math.abs(p.adsAmount - p.weapon.adsAmount) > 1e-9) agreeing = false;
+    }
+    const aimedIn = p.adsAmount;
+
+    // Dying must drop the aim: _readInput is the only other setAds caller and it does
+    // not run while dead, so the gun would otherwise stay scoped through the death cam.
+    p.die({ attacker: null });
+    for (let i = 0; i < 120; i++) { g.frame++; g._fixedUpdate(DT); }
+    const afterDeath = p.adsAmount;
+    inp.buttons[2] = false;
+
+    return { hasOwn, hasHandshake, agreeing, aimedIn, afterDeath };
+  });
+  if (!adsCheck.hasOwn) ok('player has no own adsAmount field (it is derived from the weapon)');
+  else bad('player has no own adsAmount field', 'Player still stores its own copy — two integrators for one quantity');
+  if (!adsCheck.hasHandshake) ok('the _lastWeaponAds handshake is gone');
+  else bad('the _lastWeaponAds handshake is gone', 'Player still reconciles against the weapon every tick');
+  if (adsCheck.agreeing) ok('player.adsAmount tracks weapon.adsAmount exactly, every tick');
+  else bad('player.adsAmount tracks weapon.adsAmount', 'the two disagreed during aim-in — they are not one value');
+  if (adsCheck.aimedIn > 0.9) ok(`holding aim still reaches full ADS (${adsCheck.aimedIn.toFixed(3)})`);
+  else bad('holding aim reaches full ADS', `only got to ${adsCheck.aimedIn} after 2 s`);
+  if (adsCheck.afterDeath === 0) ok('death drops the aim (setAds(false) on die)');
+  else bad('death drops the aim', `adsAmount stayed at ${adsCheck.afterDeath} while dead — scoped through the death cam`);
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point
