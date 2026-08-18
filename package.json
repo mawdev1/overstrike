@@ -13,7 +13,8 @@
     "perf": "node scripts/perf.mjs",
     "perfcompare": "node scripts/perfcompare.mjs",
     "simtest": "node scripts/simtest.mjs",
-    "determinism": "node scripts/determinism.mjs"
+    "determinism": "node scripts/determinism.mjs",
+    "presenttest": "node scripts/presenttest.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"

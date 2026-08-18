@@ -331,8 +331,8 @@ function surfaceSound(surface) {
  * hole into thin air on flesh hits, which `fx.impact()` deliberately does not do.
  */
 function spawnImpact(game, weaponId, point, normal, surface) {
-  game.fx?.impact?.(point, normal, surface);
-  game.audio?.play?.(surfaceSound(surface), { position: point, volume: 0.85 });
+  game.present.impact(point, normal, surface);
+  game.present.play(surfaceSound(surface), { position: point, volume: 0.85 });
   _evImpact.point.copy(point);
   _evImpact.normal.copy(normal);
   _evImpact.surface = surface;
@@ -357,7 +357,7 @@ function whizby(game, shooter, ox, oy, oz, dx, dy, dz, length, hitPlayer) {
   if (d2 > WHIZBY_RADIUS * WHIZBY_RADIUS) return;
   const d = Math.sqrt(d2);
   _tmp.set(ox + dx * t, oy + dy * t, oz + dz * t);
-  game.audio?.play?.('whizby', {
+  game.present.play('whizby', {
     position: _tmp,
     volume: clamp(1 - d / WHIZBY_RADIUS, 0.15, 1) * 0.9,
     rate: 0.9 + (1 - d / WHIZBY_RADIUS) * 0.35,
@@ -461,8 +461,8 @@ export function fireHitscan(game, o) {
       _tracerTo.copy(ent.point);
       endSet = true;
 
-      game.fx?.bloodSpray?.(ent.point, ent.normal, clamp(amount / 45, 0.3, 2.2));
-      game.audio?.play?.(headshot ? 'headshot' : 'fleshHit', { position: ent.point, volume: 0.95 });
+      game.present.bloodSpray(ent.point, ent.normal, clamp(amount / 45, 0.3, 2.2));
+      game.present.play(headshot ? 'headshot' : 'fleshHit', { position: ent.point, volume: 0.95 });
 
       _evHit.shooter = shooter;
       _evHit.target = target;
@@ -532,7 +532,7 @@ export function fireHitscan(game, o) {
   if (!endSet) _tracerTo.copy(res.point);
 
   if (o.tracer) {
-    game.fx?.tracer?.(
+    game.present.tracer(
       _tracerFrom, _tracerTo,
       o.tracerSpeed ?? 340,
       o.tracerWidth ?? 0.02,
@@ -695,8 +695,8 @@ export function applyMeleeDamage(game, attacker, hit, amount, weaponId) {
   const target = hit.entity;
   amount *= damageScale(game, attacker, target);
   if (amount <= 0) return 0;
-  game.fx?.bloodSpray?.(hit.point, hit.normal, 2.0);
-  game.audio?.play?.('fleshHit', { position: hit.point, volume: 1.0 });
+  game.present.bloodSpray(hit.point, hit.normal, 2.0);
+  game.present.play('fleshHit', { position: hit.point, volume: 1.0 });
 
   _evHit.shooter = attacker;
   _evHit.target = target;

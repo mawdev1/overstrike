@@ -176,7 +176,7 @@ export class ProjectileSystem {
     p.mesh.position.copy(p.pos);
     p.mesh.visible = true;
 
-    this.game.audio?.play?.('pinPull', { position: origin, volume: 0.8 });
+    this.game.present.play('pinPull', { position: origin, volume: 0.8 });
     return true;
   }
 
@@ -293,10 +293,11 @@ export class ProjectileSystem {
             p.angVel.multiplyScalar(0.72);
 
             if (impact > 1.2) {
-              this.game.audio?.play?.('grenadeBounce', {
+              // Audio pitch variance only — presentation, drawn from fxRng.
+              this.game.present.play('grenadeBounce', {
                 position: p.pos,
                 volume: clamp(impact / 12, 0.18, 0.9),
-                rate: 0.9 + this.game.rng() * 0.3,
+                rate: 0.9 + this.game.fxRng() * 0.3,
               });
               this.game.bus?.emit('grenadeBounce', { position: p.pos, surface, kind: p.kind });
             }
@@ -326,9 +327,9 @@ export class ProjectileSystem {
       // blended quads in the game and they sit right in front of the camera. One puff
       // per TRAIL_STEP metres is the density smokeTrail() itself was written for, and
       // it makes the trail resolution independent of frame rate as a bonus.
-      if (p.kind === 'rocket' && this.game.fx?.smokeTrail) {
+      if (p.kind === 'rocket') {
         if (p.trailFrom.distanceToSquared(p.pos) >= TRAIL_STEP * TRAIL_STEP) {
-          this.game.fx.smokeTrail(p.trailFrom, p.pos);
+          this.game.present.smokeTrail(p.trailFrom, p.pos);
           p.trailFrom.copy(p.pos);
         }
       }
@@ -405,7 +406,7 @@ export class ProjectileSystem {
     // fx.explosion() already lays the scorch decal on the real ground it probes for
     // (fx.js), so no second decal here — that one landed at the burst's mid-air origin
     // and cost a second slot of the 256-slot ring per detonation.
-    game.fx?.explosion?.(p.pos, pr.radius);
+    game.present.explosion(p.pos, pr.radius);
     // No `audio.play('explosion')` here either. `applyExplosionDamage()` above emits the
     // canonical `explosion` bus event unconditionally, and the audio engine's handler
     // plays the boom off it at priority 100 — louder and better defended than this call
@@ -420,8 +421,8 @@ export class ProjectileSystem {
       const d = _eye.distanceTo(p.pos);
       const falloff = clamp(1 - d / (pr.radius * 2.6), 0, 1);
       if (falloff > 0.01) {
-        game.fx?.screenShake?.(pr.shakeAmount * falloff, pr.shakeDuration);
-        game.engine?.flashDamage?.(falloff * 0.25);
+        game.present.screenShake(pr.shakeAmount * falloff, pr.shakeDuration);
+        game.present.flashDamage(falloff * 0.25);
       }
     }
   }
@@ -431,8 +432,8 @@ export class ProjectileSystem {
     const game = this.game;
     const world = game.world;
 
-    game.fx?.explosion?.(p.pos, pr.radius * 0.25);
-    game.audio?.play?.('explosion', { position: p.pos, volume: 0.9, rate: 1.7 });
+    game.present.explosion(p.pos, pr.radius * 0.25);
+    game.present.play('explosion', { position: p.pos, volume: 0.9, rate: 1.7 });
 
     // Small concussive damage so a flash at your feet is not entirely free.
     if (pr.damage > 0) {
@@ -473,8 +474,8 @@ export class ProjectileSystem {
         _flashEvt.duration = blind;
         _flashEvt.position.copy(p.pos);
         game.bus?.emit('flashbang', _flashEvt);
-        game.fx?.flashbang?.(clamp(t, 0, 1), blind);
-        game.audio?.play?.('explosion', { position: _eye, volume: 0.5, rate: 0.35 });
+        game.present.flashbang(clamp(t, 0, 1), blind);
+        game.present.play('explosion', { position: _eye, volume: 0.5, rate: 0.35 });
       }
     }
   }
@@ -500,7 +501,7 @@ export class ProjectileSystem {
     cloud.owner = p.owner;
     cloud.puffRate = pr.puffRate || 6;
 
-    this.game.audio?.play?.('explosion', { position: p.pos, volume: 0.35, rate: 0.4 });
+    this.game.present.play('explosion', { position: p.pos, volume: 0.35, rate: 0.4 });
     _smokeEvt.id = cloud.id;
     _smokeEvt.position.copy(cloud.position);
     _smokeEvt.radius = cloud.targetRadius;
@@ -509,7 +510,6 @@ export class ProjectileSystem {
   }
 
   _updateSmoke(dt) {
-    const fx = this.game.fx;
     for (const c of this.smokeClouds) {
       if (!c.active) continue;
       c.t += dt;
@@ -517,21 +517,21 @@ export class ProjectileSystem {
       const fade = clamp((c.duration - c.t) / 2.5, 0, 1);
       c.radius = c.targetRadius * grow * (0.35 + fade * 0.65);
 
-      if (fx?.smokeTrail) {
-        c.puffAccum += dt * c.puffRate * fade;
-        while (c.puffAccum >= 1) {
-          c.puffAccum -= 1;
-          const rng = this.game.rng;
-          const r = c.radius * 0.8;
-          _a.set(
-            c.position.x + rng.range(-r, r),
-            c.position.y + rng.range(-r * 0.4, r * 0.7),
-            c.position.z + rng.range(-r, r),
-          );
-          _b.copy(_a);
-          _b.y += 0.6;
-          fx.smokeTrail(_a, _b);
-        }
+      // Puff position spread is presentation-only (visual scatter, no gameplay effect),
+      // so it draws from fxRng rather than the gameplay stream.
+      c.puffAccum += dt * c.puffRate * fade;
+      while (c.puffAccum >= 1) {
+        c.puffAccum -= 1;
+        const rng = this.game.fxRng;
+        const r = c.radius * 0.8;
+        _a.set(
+          c.position.x + rng.range(-r, r),
+          c.position.y + rng.range(-r * 0.4, r * 0.7),
+          c.position.z + rng.range(-r, r),
+        );
+        _b.copy(_a);
+        _b.y += 0.6;
+        this.game.present.smokeTrail(_a, _b);
       }
 
       if (c.t >= c.duration) {

@@ -302,7 +302,7 @@ const GUNGAME = {
     if (a.alive) equipWeapon(match.game, a, id);
     if (a.isPlayer) {
       match.notice('PROMOTED', `${weaponName(match.game, id)}  ·  ${tier + 1}/${st.ladder.length}`, 1.5);
-      match.game.audio?.play('switch', { volume: 0.8 });
+      match.game.present.play('switch', { volume: 0.8 });
     }
   },
 
@@ -617,8 +617,8 @@ const DOMINATION = {
       mine ? 'Objective secured' : 'The enemy took the point',
       1.6,
     );
-    match.game.audio?.play(mine ? 'killConfirm' : 'lowAmmo', { volume: 0.7 });
-    if (prevOwner === -1 && !mine) match.game.fx?.screenShake?.(0.05, 0.2);
+    match.game.present.play(mine ? 'killConfirm' : 'lowAmmo', { volume: 0.7 });
+    if (prevOwner === -1 && !mine) match.game.present.screenShake(0.05, 0.2);
   },
 
   _syncGfx(match, zones) {
@@ -770,12 +770,12 @@ const KILLCONFIRMED = {
       match.addTeamScore(team, 1);
       match.addScore(entity, 50, 'CONFIRMED');
       if (stats) stats.confirms = (stats.confirms || 0) + 1;
-      if (entity.isPlayer) match.game.audio?.play('killConfirm', { volume: 0.9 });
-      else if (isMine) match.game.audio?.play('killConfirm', { volume: 0.35, position: entity.position });
+      if (entity.isPlayer) match.game.present.play('killConfirm', { volume: 0.9 });
+      else if (isMine) match.game.present.play('killConfirm', { volume: 0.35, position: entity.position });
     } else {
       match.addScore(entity, 75, 'DENIED');
       if (stats) stats.denies = (stats.denies || 0) + 1;
-      if (entity.isPlayer) match.game.audio?.play('hitmarker', { volume: 0.8, rate: 0.8 });
+      if (entity.isPlayer) match.game.present.play('hitmarker', { volume: 0.8, rate: 0.8 });
     }
   },
 

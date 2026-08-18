@@ -5,6 +5,7 @@ import { EventBus } from './events.js';
 import { Settings } from './settings.js';
 import { createRNG } from './rng.js';
 import { assets } from './assets.js';
+import { LivePresenter } from './presenter.js';
 import { clamp, FIXED_DT } from './mathUtils.js';
 
 import { World } from '../world/world.js';
@@ -57,9 +58,18 @@ export class Game {
     this.settings = new Settings();
     this.bus = new EventBus();
     this.rng = createRNG(0xC0FFEE);
+    /**
+     * Presentation-only draws (audio pitch variance, particle spread) — never read by
+     * anything that affects an outcome. Kept off `rng` because a shared stream makes a
+     * gameplay draw's position depend on how many presentation draws happened to
+     * precede it, which varies with whether audio/fx even exist (headless vs browser).
+     */
+    this.fxRng = createRNG(0xFEEDFACE);
     /** Seed of the current match. Replaced by startMatch(); see `mixSeed`. */
     this.matchSeed = 0xC0FFEE;
     this.assets = assets;
+    /** Presentation port — see core/presenter.js. Swapped to NullPresenter headless. */
+    this.present = new LivePresenter(this);
 
     /** Simulation clock. Integer; `time` is derived from it — see the getter. */
     this.tick = 0;

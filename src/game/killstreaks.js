@@ -355,7 +355,7 @@ export class Killstreaks {
       if (run.timer < 0) continue;
       if (!run.announced) {
         run.announced = true;
-        this.game.fx?.screenShake?.(0.08, 0.5);
+        this.game.present.screenShake(0.08, 0.5);
       }
       while (run.active && run.timer >= run.index * AIRSTRIKE_INTERVAL) {
         const step = run.index;
@@ -372,7 +372,7 @@ export class Killstreaks {
   }
 
   _detonate(point, radius, damage, attacker, weaponId) {
-    this.game.fx?.explosion?.(point, radius);
+    this.game.present.explosion(point, radius);
     // NO audio here. Every path out of this method raises the canonical `explosion` bus
     // event — `ballistics.applyExplosionDamage()` emits it unconditionally, so does the
     // projectile system's, and so does the fallback at the bottom — and the audio
@@ -384,7 +384,7 @@ export class Killstreaks {
     const player = this.game.player;
     if (player?.position) {
       const d = player.position.distanceTo(point);
-      if (d < radius * 3.5) this.game.fx?.screenShake?.(Math.max(0.05, 0.55 * (1 - d / (radius * 3.5))), 0.4);
+      if (d < radius * 3.5) this.game.present.screenShake(Math.max(0.05, 0.55 * (1 - d / (radius * 3.5))), 0.4);
     }
 
     // Ballistics owns radius damage (falloff, cover checks, the `explosion` event).
@@ -531,7 +531,7 @@ export class Killstreaks {
     s.target = null;
     s.mesh.visible = false;
     if (explode) {
-      this.game.fx?.explosion?.(s.position, 3.2);
+      this.game.present.explosion(s.position, 3.2);
       // This one STAYS. Unlike `_detonate()`, a sentry wreck does no radius damage and
       // therefore never raises the `explosion` bus event, so the audio engine's handler
       // is never reached on this path — removing the play would make a destroyed turret
@@ -650,7 +650,7 @@ export class Killstreaks {
       2.2,
     );
     this._sfx('chopper', 'matchStart', { volume: mine ? 0.8 : 0.9 });
-    this.game.fx?.screenShake?.(0.12, 0.8);
+    this.game.present.screenShake(0.12, 0.8);
     return true;
   }
 
@@ -695,7 +695,7 @@ export class Killstreaks {
       this._eyeOf(t, _eye);
       this._fireAt(c, c.position, _eye, CHOPPER_DAMAGE, 'chopper', 0.045);
       this._sfx('chopper', 'lmg', { position: c.position, volume: 0.5 });
-      if (t.isPlayer) this.game.fx?.screenShake?.(0.08, 0.18);
+      if (t.isPlayer) this.game.present.screenShake(0.08, 0.18);
     }
   }
 
@@ -761,7 +761,7 @@ export class Killstreaks {
     const world = this.game.world;
     const hit = world?.raycast?.(from, _dir, dist);
     _v3.copy(from).addScaledVector(_dir, hit?.distance ?? dist);
-    this.game.fx?.tracer?.(from, _v3, 420, 0.035, 0xffd9a0);
+    this.game.present.tracer(from, _v3, 420, 0.035, 0xffd9a0);
     if (hit && hit.distance < dist - 0.6) {
       this.game.bus?.emit('impact', { point: hit.point, normal: hit.normal, surface: hit.surface, weaponId });
       return;
@@ -804,7 +804,7 @@ export class Killstreaks {
     const def = this._weaponDef(p.weaponId);
     const dmg = def?.damage ?? 30;
     _v1.copy(p.origin).addScaledVector(p.dir, hitDist);
-    this.game.fx?.impact?.(_v1, p.dir, 'metal');
+    this.game.present.impact(_v1, p.dir, 'metal');
     this.game.bus?.emit('hit', {
       shooter, target: hitS, point: _v1, normal: p.dir, headshot: false, surface: 'metal',
     });
@@ -935,14 +935,21 @@ export class Killstreaks {
     return out.set(entity.position.x, entity.position.y + (entity.eyeHeight || 1.62), entity.position.z);
   }
 
-  /** Play `preferred` if the audio engine knows it, otherwise a guaranteed §9 name. */
+  /**
+   * Play `preferred` if the audio engine knows it, otherwise a guaranteed §9 name.
+   *
+   * The name-fallback lookup genuinely needs the real audio engine (it introspects its
+   * sound table), so it stays local rather than growing the presenter's surface for a
+   * single caller — but it self-guards and does nothing when there is none, which is
+   * exactly a null presenter's behaviour. The actual side effect goes through the port.
+   */
   _sfx(preferred, fallback, opts) {
     const a = this.game.audio;
     if (!a?.play) return;
     let name = fallback;
     if (typeof a.has === 'function') { if (a.has(preferred)) name = preferred; }
     else if (a.sounds && (a.sounds instanceof Map ? a.sounds.has(preferred) : a.sounds[preferred])) name = preferred;
-    try { a.play(name, opts); } catch { /* audio must never break the sim */ }
+    try { this.game.present.play(name, opts); } catch { /* audio must never break the sim */ }
   }
 
   dispose() {

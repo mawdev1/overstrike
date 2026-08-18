@@ -498,9 +498,9 @@ export class Player {
     }
 
     this.game.bus?.emit('playerDamaged', { amount: dmg, dirWorld });
-    this.game.engine?.flashDamage?.(clamp(dmg / 55, 0.12, 1));
-    this.camera.damageKick(dirWorld, clamp(dmg / 40, 0.15, 1.4));
-    this.game.audio?.play?.('hurt', { volume: clamp(0.45 + dmg / 90, 0.45, 1) });
+    this.game.present.flashDamage(clamp(dmg / 55, 0.12, 1));
+    this.game.present.cameraDamageKick(this, dirWorld, clamp(dmg / 40, 0.15, 1.4));
+    this.game.present.play('hurt', { volume: clamp(0.45 + dmg / 90, 0.45, 1) });
 
     if (this.health <= 0) {
       this.health = 0;
@@ -528,10 +528,10 @@ export class Player {
     this._deathAt = this.game.time;
 
     this.weapon?.stopFire?.();
-    this.game.audio?.play?.('death', { volume: 0.9 });
+    this.game.present.play('death', { volume: 0.9 });
 
     const killer = info?.attacker ?? null;
-    this.camera.startDeathCam(killer && killer !== this ? killer.position : null);
+    this.game.present.cameraStartDeathCam(this, killer && killer !== this ? killer.position : null);
 
     // The match owns respawn/score rules. Tell it both ways it may be listening.
     callAny(this.game.match, M_DEATH, this, info);
@@ -609,7 +609,7 @@ export class Player {
     this._sprintInterrupted = false;
     this._wasFiring = false;
 
-    this.camera.endDeathCam();
+    this.game.present.cameraEndDeathCam(this);
     this.camera.setAngles(this.yaw, this.pitch);
     this._updateHitboxes();
     this._refreshWeapon(true);
@@ -923,8 +923,8 @@ export class Player {
     // through addLandImpact(), which floors below LAND_MIN_IMPACT and would swallow it.
     this.eyeLandVel += TUNE.SLIDE_ENTRY_DIP;
 
-    this.camera.startSlide();
-    this.game.audio?.play?.('footstepConcrete', {
+    this.game.present.cameraStartSlide(this);
+    this.game.present.play('footstepConcrete', {
       position: this.position, volume: 0.85, rate: 0.42,
     });
     this._emitNoise(0.85);
@@ -997,7 +997,7 @@ export class Player {
       this._endSlide(true);
       this._leaveGround();
       this._jumpBufferAt = -99;
-      this.game.audio?.play?.('jump', { position: this.position, volume: 0.75 });
+      this.game.present.play('jump', { position: this.position, volume: 0.75 });
       this._emitNoise(0.7);
       return;
     }
@@ -1007,7 +1007,7 @@ export class Player {
       this.velocity.y = TUNE.JUMP_SPEED;
       this._leaveGround();
       this._jumpBufferAt = -99;
-      this.game.audio?.play?.('jump', { position: this.position, volume: 0.6 });
+      this.game.present.play('jump', { position: this.position, volume: 0.6 });
       this._emitNoise(0.6);
     }
   }
@@ -1074,9 +1074,9 @@ export class Player {
     this._mantleUsedInAir = true;
     this.weapon?.stopFire?.();
 
-    this.camera.startMantle(TUNE.MANTLE_TIME, h);
+    this.game.present.cameraStartMantle(this, TUNE.MANTLE_TIME, h);
     this.game.bus?.emit('mantle', { entity: this, height: h, duration: TUNE.MANTLE_TIME });
-    this.game.audio?.play?.('land', { position: this.position, volume: 0.35, rate: 1.35 });
+    this.game.present.play('land', { position: this.position, volume: 0.35, rate: 1.35 });
     this._emitNoise(0.6);
     return true;
   }
@@ -1232,7 +1232,7 @@ export class Player {
 
     this.addLandImpact(impact);
     if (impact > 1.4) {
-      this.game.audio?.play?.('land', {
+      this.game.present.play('land', {
         position: this.position,
         volume: clamp(0.25 + impact / 16, 0.25, 1),
         rate: 1 - clamp(impact / 60, 0, 0.2),
@@ -1286,9 +1286,10 @@ export class Player {
     const volume = crouched ? 0.20 : sprinting ? 1.0 : 0.62;
     const loudness = crouched ? 0 : sprinting ? 1.0 : 0.55;
 
-    const rng = this.game.rng;
-    const rate = 0.94 + (rng ? rng() : Math.random()) * 0.12;
-    this.game.audio?.play?.(name, { position: this.position, volume, rate });
+    // Audio pitch variance only — presentation, so it draws from fxRng rather than
+    // the gameplay stream. `_emitNoise` below is the sim-relevant part of a footstep.
+    const rate = 0.94 + this.game.fxRng() * 0.12;
+    this.game.present.play(name, { position: this.position, volume, rate });
 
     if (loudness > 0) this._emitNoise(loudness);
   }
@@ -1405,7 +1406,7 @@ export class Player {
     if (!ws.throwGrenade(this, 'lethal', 1)) return;
 
     this._grenadeReadyAt = t + TUNE.GRENADE_COOLDOWN;
-    this.game.audio?.play?.('pinPull', { volume: 0.8 });
+    this.game.present.play('pinPull', { volume: 0.8 });
     this.game.bus?.emit('grenadeThrow', { entity: this, remaining: this.grenades });
   }
 
@@ -1428,7 +1429,7 @@ export class Player {
     this._fireReadyAt = Math.max(this._fireReadyAt, t + TUNE.MELEE_LOCKOUT);
 
     this.game.bus?.emit('melee', { entity: this, shooter: this });
-    this.camera.meleeKick();
+    this.game.present.cameraMeleeKick(this);
 
     // Audio, viewmodel swing and the gated hit all live behind this one call.
     if (typeof this.game.weapons?.meleeAttack === 'function') {
@@ -1441,7 +1442,7 @@ export class Player {
     this.getAimDirection(_dirScratch);
     const hit = this.game.world?.raycast(_v1, _dirScratch, TUNE.MELEE_RANGE);
     if (hit) {
-      this.game.fx?.impact?.(hit.point, hit.normal, hit.surface);
+      this.game.present.impact(hit.point, hit.normal, hit.surface);
       this.game.bus?.emit('impact', {
         point: hit.point, normal: hit.normal, surface: hit.surface, weaponId: 'melee',
       });

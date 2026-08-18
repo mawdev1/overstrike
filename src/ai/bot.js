@@ -1588,8 +1588,8 @@ export class Bot {
     game.bus?.emit('shot', pl);
 
     // Only when WE ran the shot — otherwise the weapon system owns presentation.
-    game.fx?.muzzleFlash?.(origin, dir, 0.9);
-    game.audio?.play?.(def.audio?.fire ?? 'rifle', { position: origin, volume: 0.9 });
+    game.present.muzzleFlash(origin, dir, 0.9);
+    game.present.play(def.audio?.fire ?? 'rifle', { position: origin, volume: 0.9 });
     game.nav?.addDanger?.(this.position, 0.5, 5);
   }
 

@@ -275,8 +275,8 @@ export class WeaponInstance {
       // The viewmodel owns the staged audio so magOut/magIn land on the animation.
       this.viewmodel.onReloadStart(this.stateDuration, this.reloadIsEmpty);
     } else {
-      this.game.audio?.play?.('magOut', { position: this._ownerPos(_tmp), volume: 0.7 });
-      this.game.audio?.play?.('magIn', {
+      this.game.present.play('magOut', { position: this._ownerPos(_tmp), volume: 0.7 });
+      this.game.present.play('magIn', {
         position: this._ownerPos(_tmp), volume: 0.7, delay: this.stateDuration * 0.55,
       });
     }
@@ -394,7 +394,7 @@ export class WeaponInstance {
   _dryFire() {
     if (this._dryTimer > 0) return;
     this._dryTimer = 0.25;
-    this.game.audio?.play?.('dryfire', { position: this._ownerPos(_tmp), volume: 0.7 });
+    this.game.present.play('dryfire', { position: this._ownerPos(_tmp), volume: 0.7 });
     if (this.reserve > 0 && this.def.magSize > 0) this.reload();
   }
 
@@ -407,9 +407,9 @@ export class WeaponInstance {
     this.state = this.ammo > 0 ? STATE_IDLE : STATE_EMPTY;
     this.stateTimer = 0;
     this.reloadProgress = 1;
-    this.game.audio?.play?.('reloadTail', { position: this._ownerPos(_tmp), volume: 0.6 });
+    this.game.present.play('reloadTail', { position: this._ownerPos(_tmp), volume: 0.6 });
     this.game.bus?.emit('reloadEnd', { shooter: this.owner, weaponId: d.id, cancelled: false });
-    if (this.owner?.isPlayer) this.game.hud?.setAmmo?.(this.ammo, this.reserve);
+    if (this.owner?.isPlayer) this.game.present.setAmmo(this.ammo, this.reserve);
   }
 
   /**
@@ -471,8 +471,8 @@ export class WeaponInstance {
       });
 
       if (r.hitEntity && owner?.isPlayer) {
-        game.hud?.hitmarker?.(r.headshot);
-        game.audio?.playUI?.(r.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
+        game.present.hitmarker(r.headshot);
+        game.present.playUI(r.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
       }
     }
 
@@ -480,9 +480,9 @@ export class WeaponInstance {
     this._feedback(hasMuzzle);
 
     if (owner?.isPlayer) {
-      game.hud?.setAmmo?.(this.ammo, this.reserve);
+      game.present.setAmmo(this.ammo, this.reserve);
       if (this.ammo > 0 && this.ammo <= Math.max(3, Math.floor(d.magSize * 0.15))) {
-        game.audio?.playUI?.('lowAmmo', { volume: 0.35 });
+        game.present.playUI('lowAmmo', { volume: 0.35 });
       }
     }
   }
@@ -519,8 +519,10 @@ export class WeaponInstance {
     if (this.owner?.isPlayer) {
       // PlayerCamera.addRecoil takes DEGREES for the kicks and METRES for the punch,
       // and converts internally — passing radians here made recoil ~57x too weak.
-      const cam = this.game.player?.camera;
-      cam?.addRecoil?.(pitchDeg, yawDeg, rc.kick, rc.recovery);
+      // `jitter` above is sim-critical (it is baked into `recoilPitch`/`recoilYaw`,
+      // which bots read) and stays on `game.rng`; only the camera kick itself is
+      // presentation, so only this one call routes through the presenter.
+      this.game.present.cameraAddRecoil(this.owner, pitchDeg, yawDeg, rc.kick, rc.recovery);
     }
 
     this.bloom = Math.min(
@@ -535,24 +537,25 @@ export class WeaponInstance {
     const d = this.def;
 
     if (hasMuzzle) {
-      game.fx?.muzzleFlash?.(_muzzle, _dir, d.class === 'sniper' || d.class === 'lmg' ? 1.35 : 1.0);
+      game.present.muzzleFlash(_muzzle, _dir, d.class === 'sniper' || d.class === 'lmg' ? 1.35 : 1.0);
     }
 
-    game.audio?.play?.(d.audio.fire, {
+    // Audio pitch variance only — presentation, drawn from fxRng, not the gameplay stream.
+    game.present.play(d.audio.fire, {
       position: hasMuzzle ? _muzzle : _origin,
       volume: 1,
-      rate: 0.97 + game.rng() * 0.06,
+      rate: 0.97 + game.fxRng() * 0.06,
     });
 
     if (this.viewmodel) {
       this.viewmodel.onFire(1);
       if (this.viewmodel.getEjectWorldPosition(_eject)) {
-        game.fx?.shellEject?.(_eject, _dir, d.viewmodel?.shell || 'rifle');
+        game.present.shellEject(_eject, _dir, d.viewmodel?.shell || 'rifle');
       }
     } else {
       // Bots still throw brass so a firefight reads from across the map.
       this.system.getEjectWorld(this, _eject);
-      game.fx?.shellEject?.(_eject, _dir, d.viewmodel?.shell || 'rifle');
+      game.present.shellEject(_eject, _dir, d.viewmodel?.shell || 'rifle');
     }
   }
 
@@ -664,12 +667,12 @@ export class WeaponSystem {
       if (entity.isPlayer) {
         next.viewmodel = this.viewmodel;
         this.viewmodel?.setWeapon(next.def);
-        this.game.hud?.setWeapon?.(next.def);
-        this.game.hud?.setAmmo?.(next.ammo, next.reserve);
+        this.game.present.setWeapon(next.def);
+        this.game.present.setAmmo(next.ammo, next.reserve);
       }
       next.onEquip();
       this.game.bus?.emit('weaponSwitch', { shooter: entity, weaponId: next.def.id });
-      this.game.audio?.play?.('switch', { position: entity.position, volume: 0.7 });
+      this.game.present.play('switch', { position: entity.position, volume: 0.7 });
     };
 
     if (instant || !prev) {
@@ -794,7 +797,7 @@ export class WeaponSystem {
     if (!ok) return false;
     lo.equipment[countKey]--;
     this.viewmodel?.onThrow?.();
-    if (entity.isPlayer) this.game.hud?.setEquipment?.(lo.equipment.lethalCount, lo.equipment.tacticalCount);
+    if (entity.isPlayer) this.game.present.setEquipment(lo.equipment.lethalCount, lo.equipment.tacticalCount);
     return true;
   }
 
@@ -816,7 +819,7 @@ export class WeaponSystem {
     this._meleeTimer = d.meleeDuration;
     this._meleeEntity = entity;
     if (entity.isPlayer) this.viewmodel?.onMelee(d.meleeDuration);
-    this.game.audio?.play?.('switch', { position: entity.position, volume: 0.55, rate: 1.5 });
+    this.game.present.play('switch', { position: entity.position, volume: 0.55, rate: 1.5 });
     this._resolveMelee(entity);
     return true;
   }
@@ -834,8 +837,8 @@ export class WeaponSystem {
     if (!hit) return;
     applyMeleeDamage(this.game, entity, hit, d.damage, d.id);
     if (entity.isPlayer) {
-      this.game.hud?.hitmarker?.(false);
-      this.game.audio?.playUI?.('hitmarker', { volume: 0.7 });
+      this.game.present.hitmarker(false);
+      this.game.present.playUI('hitmarker', { volume: 0.7 });
     }
   }
 
@@ -844,7 +847,7 @@ export class WeaponSystem {
     const inst = this.current(entity);
     if (!inst) return;
     inst.addAmmo(Math.ceil(inst.def.magSize * 0.5));
-    if (entity.isPlayer) this.game.hud?.setAmmo?.(inst.ammo, inst.reserve);
+    if (entity.isPlayer) this.game.present.setAmmo(inst.ammo, inst.reserve);
   }
 
   // ------------------------------------------------------------- lifecycle

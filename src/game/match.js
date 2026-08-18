@@ -219,7 +219,7 @@ export class Match {
     this._lastCountdownShown = -1;
 
     this.notice(this.mode.name, this.mode.hudLabels?.objective || this.mode.description, 2.6);
-    this.game.audio?.play?.('matchStart', { volume: 0.9 });
+    this.game.present.play('matchStart', { volume: 0.9 });
     this._pushHud(true);
   }
 
@@ -564,7 +564,7 @@ export class Match {
     const player = this.game.player;
     // The killfeed resolves names/teams off the entity refs and falls back to the
     // explicit strings, so send both.
-    hud.killfeed({
+    this.game.present.killfeed({
       attacker: suicide ? null : attacker,
       victim,
       killer: suicide ? null : (ast?.name || attacker?.name || 'UNKNOWN'),
@@ -637,8 +637,7 @@ export class Match {
       killerName: killer && killer !== entity ? (this._book.get(killer.id)?.name || killer.name || '') : '',
     });
     if (isPlayer) {
-      const hud = this.game.hud;
-      hud?.deathScreen?.({
+      this.game.present.deathScreen({
         killer: killer && killer !== entity ? killer : null,
         killerName: killer ? (this._book.get(killer.id)?.name || killer.name || '') : '',
         killerHealth: killer?.health ?? 0,
@@ -673,7 +672,7 @@ export class Match {
       if (!e.isPlayer) this._rebalanceOnRespawn(e);
       this.spawner.spawnEntity(e);
       spawned++;
-      if (e.isPlayer) this.game.hud?.deathScreen?.(null);
+      if (e.isPlayer) this.game.present.deathScreen(null);
     }
   }
 
@@ -765,7 +764,7 @@ export class Match {
   useKillstreak(entity = this.game.player) {
     if (!entity?.alive || this.phase !== 'live') return false;
     const ok = this.killstreaks.activate(entity);
-    if (!ok && entity.isPlayer) this.game.audio?.play?.('dryfire', { volume: 0.5 });
+    if (!ok && entity.isPlayer) this.game.present.play('dryfire', { volume: 0.5 });
     return ok;
   }
 
@@ -819,12 +818,12 @@ export class Match {
       if (whole !== this._lastCountdownShown && whole > 0) {
         this._lastCountdownShown = whole;
         this.notice(String(whole), '', 0.9);
-        this.game.audio?.play?.('uiClick', { volume: 0.5, rate: 1 + (3 - whole) * 0.12 });
+        this.game.present.play('uiClick', { volume: 0.5, rate: 1 + (3 - whole) * 0.12 });
       }
       if (this.countdown <= 0) {
         this.phase = 'live';
         this.notice('ENGAGE', this.mode.hudLabels?.objective || '', 1.2);
-        this.game.audio?.play?.('matchStart', { volume: 0.7, rate: 1.25 });
+        this.game.present.play('matchStart', { volume: 0.7, rate: 1.25 });
       }
       // Everything below is live-only; hardware and modes stay frozen during the count.
       return;
@@ -907,7 +906,7 @@ export class Match {
       result.winnerName ? `${result.winnerName} wins` : '',
       4,
     );
-    this.game.audio?.play?.('matchEnd', { volume: 0.9 });
+    this.game.present.play('matchEnd', { volume: 0.9 });
     this.mode.cleanup?.(this);
 
     // Game.endMatch() emits the canonical `matchEnd` with this payload.
