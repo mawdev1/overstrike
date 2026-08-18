@@ -73,10 +73,16 @@ try {
     const cd = new V(); g.camera.getWorldDirection(cd);
     const aim = g.player.getAimDirection(new V());
     res.aimAngleDeg = Math.acos(Math.min(1, cd.dot(aim))) * 180 / Math.PI;
-    // fire origin vs eye
+    // Fire origin vs eye is now 0 by construction (getFireOrigin IS getEyePosition), so
+    // it can no longer detect anything. What can regress is the RENDER camera drifting
+    // off that point: the eye springs live in the sim precisely so it does not, and if
+    // one ever migrates back to PlayerCamera this is what catches it. Only decorative
+    // bob/shake/punch may differ, and all three are small.
     const o = new V(); g.weapons.getFireOrigin(g.player, o);
     const eye = g.player.getEyePosition(new V());
     res.originVsEye = o.distanceTo(eye);
+    const cam = new V(); g.camera.getWorldPosition(cam);
+    res.camVsOrigin = cam.distanceTo(o);
     // pitch clamp holds with sway added
     c.basePitch = 1.5533; c.recoilPitch = 0; c._writeAngles();
     res.pitchWithSway = g.player.pitch;

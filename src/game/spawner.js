@@ -114,6 +114,12 @@ export class Spawner {
     this._claims.length = 0;
     this._deaths.clear();
     for (const p of this.points) p.lastUsed = -999;
+    // The open-space sweep has its own fixed stream (see the constructor) so it cannot
+    // be perturbed by gameplay draws — but it still has to be rewound per match, or a
+    // sweep that misses the cache (a mode asking for more points than the last one did)
+    // runs from wherever the previous match left the stream and places objectives
+    // somewhere a fresh process never would.
+    this._sampleRng.reseed(0x5A17B0FF);
   }
 
   get now() { return this.match?.elapsed ?? this.game.time ?? 0; }

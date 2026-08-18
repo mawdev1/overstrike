@@ -11,13 +11,16 @@
     "check": "node scripts/check.mjs",
     "smoke": "node scripts/smoke.mjs",
     "perf": "node scripts/perf.mjs",
-    "perfcompare": "node scripts/perfcompare.mjs"
+    "perfcompare": "node scripts/perfcompare.mjs",
+    "simtest": "node scripts/simtest.mjs",
+    "determinism": "node scripts/determinism.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"
   },
   "devDependencies": {
     "playwright": "^1.57.0",
+    "pngjs": "^7.0.0",
     "vite": "^8.2.1"
   }
 }

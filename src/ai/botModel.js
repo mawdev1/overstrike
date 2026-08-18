@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { assets } from '../core/assets.js';
 import { clamp, lerp, damp, angleDelta, moveAngleTowards } from '../core/mathUtils.js';
+import { createRNG, mixSeed } from '../core/rng.js';
 
 /**
  * Procedural soldier — geometry, rig and animation, no external assets.
@@ -430,6 +431,13 @@ export class BotModel {
   constructor(game, team) {
     this.game = game;
     this.team = team === 1 ? 1 : 0;
+    // The model's own stream. Gait phase and limp sprawl are pure decoration, but
+    // `respawn()` runs on the SIMULATION path (Bot.spawn calls it), so drawing them
+    // from `game.rng` moved the shared stream by two per bot life — and only when a
+    // model existed. A headless server, which builds no models, would then be two
+    // draws per spawn out of step with every client. Its own stream cannot desync
+    // anything, and is seeded so a replayed match still looks identical.
+    this._rng = createRNG(mixSeed(game?.matchSeed ?? 0, RIG.live * 2654435761));
     // `slot` is not stable for the lifetime of the model: releaseSlot() compacts the
     // pool and may move this model down into another model's slot. Nothing outside this
     // file reads it, and every read inside it goes through `this.slot`.
@@ -503,9 +511,9 @@ export class BotModel {
   respawn(yaw = 0) {
     // Per-life randomisation: gait phase so a squad's legs are out of step, and
     // the limp seed that gives each ragdoll its own sprawl.
-    const rng = this.game.rng;
-    this.gait = rng ? rng() * Math.PI * 2 : 0;
-    this._limpSeed = rng ? rng() : 0.5;
+    const rng = this._rng;
+    this.gait = rng() * Math.PI * 2;
+    this._limpSeed = rng();
     this.legYaw = yaw;
     this.deathT = 0;
     this.flinch = 0;

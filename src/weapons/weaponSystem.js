@@ -710,14 +710,22 @@ export class WeaponSystem {
   // ------------------------------------------------------------- geometry
 
   /**
-   * Where a shot starts. For the local player this is the render camera itself so the
-   * bullet leaves exactly where the crosshair is looking; for everyone else it is the
-   * contract eye position.
+   * Where a shot starts: the contract eye position (§4), for every entity including the
+   * local player.
+   *
+   * This used to read `game.camera` for the player, so the bullet left exactly where the
+   * crosshair was looking. The intent was right and the mechanism was backwards: the
+   * render camera is composed from bob, step, land and shake, all integrated on the
+   * VARIABLE frame clock, so the shot origin was frame-rate dependent — two clients at
+   * 60 and 240 fps fired from different heights mid-landing — and no headless simulation
+   * can reproduce it, because it has no camera.
+   *
+   * The dependency is now inverted. The bullet leaves from the simulated eye, and
+   * `PlayerCamera` fades its positional feel terms out as the sight picture arrives so
+   * the camera converges onto exactly this point — the same treatment, and for the same
+   * reason, that the angular feel terms already get.
    */
   getFireOrigin(entity, out) {
-    if (entity?.isPlayer && this.game.camera) {
-      return this.game.camera.getWorldPosition(out);
-    }
     if (entity && typeof entity.getEyePosition === 'function') return entity.getEyePosition(out);
     return out.copy(entity?.position || _tmp.set(0, 0, 0));
   }

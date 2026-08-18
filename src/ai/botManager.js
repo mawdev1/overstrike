@@ -3,9 +3,10 @@ import { Bot, DIFFICULTY, PERSONALITY_NAMES } from './bot.js';
 import { disposeBotRigs } from './botModel.js';
 import { BOT_NAMES } from './botNames.js';
 import { clamp } from '../core/mathUtils.js';
+import { createRNG, mixSeed } from '../core/rng.js';
 
 /**
- * BotManager — roster, respawns, and the frame budget.
+ * BotManager — roster, respawns, and the tick budget.
  *
  * The expensive part of AI is not the state machine, it is the raycasts: line
  * of sight and A*. Both are throttled here rather than inside Bot so the cost
@@ -13,17 +14,19 @@ import { clamp } from '../core/mathUtils.js';
  *
  *   • think() (senses + LOS + transitions) runs on a per-bot stride of 8 fixed
  *     steps out of combat and 4 in combat, phase-offset by roster index. With
- *     12 bots and stride 8 that is ~1.5 bots thinking per fixed step. The pass
- *     itself runs at most ONCE per rendered frame (see fixedUpdate).
- *   • findPath() is capped at PATH_BUDGET searches per RENDERED FRAME, served
- *     round-robin so no bot can starve. Per-frame, not per-step: a frame only ever
- *     takes several substeps when it is already late, so a per-step budget scaled
- *     the AI cost up by 6x on exactly the frames that had no room for it.
+ *     12 bots and stride 8 that is ~1.5 bots thinking per fixed step, and the
+ *     phase offsets spread them across the stride rather than bunching them.
+ *   • findPath() is capped at PATH_BUDGET searches every PATH_INTERVAL ticks,
+ *     served round-robin so no bot can starve.
  *   • fixedUpdate() (steering + one world.move) runs for every bot every step;
  *     it is the same per-entity cost the player pays.
  *
- * Measured shape of the budget at 120 fps (1 substep/frame, 12 bots):
- *   12 x world.move + ~1.5 x (LOS pair) + <=2 x A* ≈ well under 1.5 ms.
+ * Everything here is budgeted on the SIMULATION clock, never on `game.frame`.
+ * Keying AI to a render counter makes bot behaviour a function of frame rate and
+ * leaves a headless server — which has no frames — with no cadence at all.
+ *
+ * Measured shape of the budget at 120 Hz (12 bots):
+ *   12 x world.move + ~1.5 x (LOS pair) + <=1 x A* ≈ well under 1.5 ms.
  */
 
 /**
@@ -35,13 +38,15 @@ import { clamp } from '../core/mathUtils.js';
  * jitter pushed past 3.5 s came back on the one step where the fallback fired.
  */
 const RESPAWN_DELAY = 4.0;
-// One A* per RENDERED FRAME. At 120 fps that serves 120 searches/s against a demand of
-// roughly 10/s for 12 bots, and it hard-bounds the worst frame: a single cross-layer
-// search (~1.2 ms) can never be doubled up, not even on a frame that took six substeps.
+// One A* every PATH_INTERVAL ticks: 60 searches/s at the 120 Hz fixed step, against a
+// demand of roughly 10/s for 12 bots, so the round-robin still clears its queue with
+// five times the headroom. The old budget was per RENDERED FRAME, which meant it
+// delivered 60/s on a 60 fps client and 144/s on a 144 Hz one — the AI literally got
+// smarter on better hardware. Keying it to the simulation clock costs a 144 Hz client
+// some of that surplus and buys a bot roster that behaves identically everywhere,
+// including on a server with no frames at all.
 const PATH_BUDGET = 1;
-// Mirrors MAX_SUBSTEPS in core/game.js. Only used to recognise a headless harness that
-// drives _fixedUpdate() directly and therefore never advances `game.frame`.
-const MAX_STEPS_PER_FRAME = 6;
+const PATH_INTERVAL = 2;
 const MAX_BOTS = 24;
 // Mirrors MAX_SPAWNS_PER_STEP in game/match.js.
 const MAX_FALLBACK_SPAWNS_PER_STEP = 2;
@@ -108,11 +113,6 @@ export class BotManager {
     this._unsub = [];
     this._tick = 0;
     this._pathCursor = 0;
-    // Per-rendered-frame budget bookkeeping — see fixedUpdate().
-    this._budgetFrame = -1;
-    this._stepsThisFrame = 0;
-    this._pathsThisFrame = 0;
-    this._thinkTick = 0;
     this._namePool = [];
     this._nameCursor = 0;
     this._spawnScratch = [];
@@ -167,16 +167,22 @@ export class BotManager {
     this._resizeRoster(count);
     this._configureRoster();
     this._tick = 0;
-    this._thinkTick = 0;
-    this._budgetFrame = -1;
-    this._stepsThisFrame = 0;
-    this._pathsThisFrame = 0;
+    // The A* round-robin cursor is match state, not manager state. Left running, the
+    // first match of a session served paths in a different order from every match after
+    // it — same seed, different bots — because the cursor carried its residue over.
+    this._pathCursor = 0;
+    this._pathCount = 0;
+    this._statTimer = 0;
   }
 
   /**
-   * Match tells us the roster size it booked. Idempotent, and consumes no RNG
-   * beyond the name pool cursor, so calling it right after reset() with the same
-   * number is free.
+   * Match tells us the roster size it booked. Idempotent: it early-returns when the
+   * count already matches, which is what makes the call right after reset() free.
+   *
+   * It is NOT free when the count differs — `_configureRoster` re-derives every bot's
+   * RNG stream from its slot index, so a mid-match resize rewinds each surviving bot's
+   * draws to the start of its stream. That is deterministic, but it is a rewind; do not
+   * call this mid-match expecting continuity.
    */
   setCount(n) {
     const count = clamp(Math.round(n ?? this.bots.length), 0, MAX_BOTS);
@@ -198,6 +204,11 @@ export class BotManager {
       b.color = TEAM_COLORS[b.team];
       b.thinkPhase = i % 8;
       b.thinkStride = 8;
+      // Its own stream, derived from the match seed and roster slot. Sharing `game.rng`
+      // made every bot's draws depend on how many draws the bots before it happened to
+      // make that tick, so behaviour varied with think scheduling — and therefore with
+      // frame rate. Independent streams are reproducible and individually snapshottable.
+      b.rng = createRNG(mixSeed(game.matchSeed, i));
       b.setPersonality(PERSONALITY_NAMES[(i + offset) % PERSONALITY_NAMES.length]);
       b._poiClaim = -1;
       b.stats.kills = 0;
@@ -298,7 +309,7 @@ export class BotManager {
     if (n === 0 || !out) return false;
     const board = this.boards[bot.team & 1];
     const now = this.game.time;
-    const rng = this.game.rng;
+    const rng = bot.rng ?? this.game.rng;
     const sweep = bot.persona.sweep * (bot.cfg.sweepUrgency ?? 1);
     const hot = now - board.contactTime < CONTACT_MEMORY ? board.contactStrength : 0;
 
@@ -461,7 +472,7 @@ export class BotManager {
         b ? (b.min.z + b.max.z) * 0.5 : 0,
       );
       const p = nav?.randomPointNear?.(_v1, 25, _v2) || _v1;
-      bot.spawn(p, this.game.rng.range(-Math.PI, Math.PI));
+      bot.spawn(p, (bot.rng ?? this.game.rng).range(-Math.PI, Math.PI));
     }
     bot._lastThinkTime = this.game.time;
   }
@@ -476,7 +487,7 @@ export class BotManager {
     const points = world?.spawnPoints;
     if (!points || points.length === 0) return null;
 
-    const rng = this.game.rng;
+    const rng = bot.rng ?? this.game.rng;
     const ents = this.game.entities;
     // Snapshot the hostile list — game.entities returns a shared array.
     const hostiles = this._spawnScratch;
@@ -527,38 +538,36 @@ export class BotManager {
     const tick = ++this._tick;
     const now = game.time;
 
-    // ---- the frame budget -----------------------------------------------------
+    // ---- the budget -----------------------------------------------------------
     //
-    // think() and A* are budgeted per RENDERED FRAME, not per fixed step. The engine
-    // takes up to MAX_SUBSTEPS=6 substeps in one frame, and it only ever takes more
-    // than one when that frame is ALREADY LATE — so a per-step budget multiplied the
-    // most expensive AI work by up to 6x at exactly the moment it had to shrink. That
-    // is what turned one dropped frame into a visible multi-frame stutter (measured
-    // ~7.2 ms of A* on a 6-substep frame against ~1.2 ms on a normal one).
+    // think() and A* are budgeted per TICK. They used to be budgeted per rendered
+    // frame, keyed off `game.frame`, for a real reason: the engine takes up to
+    // MAX_SUBSTEPS=6 substeps in one frame and only ever takes more than one when that
+    // frame is ALREADY LATE, so a naive per-step budget multiplied the most expensive
+    // AI work by 6 at exactly the moment it had to shrink (measured ~7.2 ms of A* on a
+    // 6-substep frame against ~1.2 ms on a normal one).
     //
-    // `game.frame` identifies the frame. The offline harnesses in scripts/ drive
-    // `game._fixedUpdate()` in a tight loop with no rAF at all, so `frame` never
-    // advances there; after MAX_STEPS_PER_FRAME steps carrying the same frame id we
-    // re-arm and treat it as a new frame. The real loop can never exceed that count,
-    // so the fallback is inert in the game and keeps the harnesses honest.
-    const frame = game.frame;
-    let firstStepOfFrame = false;
-    if (frame !== this._budgetFrame || this._stepsThisFrame >= MAX_STEPS_PER_FRAME) {
-      this._budgetFrame = frame;
-      this._stepsThisFrame = 0;
-      this._pathsThisFrame = 0;
-      firstStepOfFrame = true;
-    }
-    this._stepsThisFrame++;
+    // But keying anything in the simulation to a RENDER counter makes bot behaviour a
+    // function of frame rate: two clients at 60 and 144 fps collapse a different number
+    // of ticks into each think pass, so the same seed produces different bots. A
+    // headless server has no frames at all. That is fatal for an authoritative
+    // simulation, and no re-arm fallback fixes it — it just invents a third cadence.
+    //
+    // Evaluating each bot's stride per tick is a straight win for think(): a bot with
+    // stride 8 thinks every 8 ticks whatever the frame rate, and because the phases are
+    // spread over the stride only a fraction of the roster thinks on any one tick —
+    // where the old pass fired every due bot on the first step of a frame, which is
+    // where the burst came from in the first place.
+    //
+    // The A* budget is an honest trade, not a win. PATH_BUDGET searches every
+    // PATH_INTERVAL ticks cannot bound cost per FRAME, because the sim does not know
+    // what a frame is — a late 6-substep frame now carries up to 3 searches (~3.6 ms)
+    // where the old per-frame cap guaranteed 1 (~1.2 ms). That is the price of a
+    // simulation that runs identically on a server, and it is bounded: MAX_SUBSTEPS
+    // caps the burst at 3, and `game.js` drops the backlog rather than spiralling.
 
     // 1) staggered thinking + respawn timers
     //
-    // The think pass runs once per frame. A bot is due when its stride boundary falls
-    // anywhere in the ticks since the previous pass, so the stride still means "every
-    // N fixed steps" and no phase can starve — a 6-substep frame just collapses the six
-    // opportunities into the single think() the bot would have wanted anyway.
-    const prevTick = this._thinkTick;
-    if (firstStepOfFrame) this._thinkTick = tick;
     // Same ceiling Match applies: a scored spawn is the most expensive thing either
     // class does, so the safety net must never turn into a burst of its own.
     let fallbackSpawns = 0;
@@ -572,10 +581,8 @@ export class BotManager {
         if (now - b.deathTime >= RESPAWN_DELAY) { this._spawnBot(b); fallbackSpawns++; }
         continue;
       }
-      if (!firstStepOfFrame) continue;
       const stride = b.thinkStride || 8;
-      const ph = b.thinkPhase;
-      if (Math.floor((tick + ph) / stride) !== Math.floor((prevTick + ph) / stride)) {
+      if ((tick + b.thinkPhase) % stride === 0) {
         const last = b._lastThinkTime ?? now;
         b._lastThinkTime = now;
         b.think(clamp(now - last, dt, 0.25));
@@ -583,13 +590,16 @@ export class BotManager {
     }
 
     // 2) global A* budget, round-robin so nobody starves
-    for (let n = 0; n < bots.length && this._pathsThisFrame < PATH_BUDGET; n++) {
-      const b = bots[this._pathCursor % bots.length];
-      this._pathCursor++;
-      if (b.alive && b.pathPending) {
-        b.servicePath();
-        this._pathsThisFrame++;
-        this._pathCount++;
+    if (tick % PATH_INTERVAL === 0) {
+      let served = 0;
+      for (let n = 0; n < bots.length && served < PATH_BUDGET; n++) {
+        const b = bots[this._pathCursor % bots.length];
+        this._pathCursor++;
+        if (b.alive && b.pathPending) {
+          b.servicePath();
+          served++;
+          this._pathCount++;
+        }
       }
     }
 

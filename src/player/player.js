@@ -179,6 +179,30 @@ const TUNE = {
   GRENADE_COUNT: 2,
 
   RADIUS: 0.36,
+
+  // ── eye springs ───────────────────────────────────────────────────────────────────
+  // These used to live in PlayerCamera and were integrated on the render clock. They
+  // are not decoration: they are how the eye catches up with things the SOLVER did —
+  // a stair step-up is an instantaneous vertical teleport, a landing is an impact
+  // speed, a crouch is a height change. The eye has to lag them or the view snaps.
+  //
+  // They live here now because the eye is where bullets come from (`getEyePosition`,
+  // and `weaponSystem.getFireOrigin` through it). Left in the camera, the shot origin
+  // either ignored them — so the bullet left from a point up to 0.24 m from the one
+  // the player was looking through, at every range, since the offset is a parallel
+  // translation of the ray — or had to be read back off the render camera, which is
+  // frame-rate dependent and does not exist on a server. Integrated here on the fixed
+  // step they are deterministic, and the camera and the bullet agree by construction.
+  EYE_SMOOTH: 18,           // 1/s — crouch/stand eye-height catch-up
+  STEP_SMOOTH: 33,          // 1/s — a stair step-up is hidden and caught up
+  STEP_MAX: 0.55,           // m — matches the solver's MAX_STEP_HEIGHT
+  LAND_K: 165,              // landing spring stiffness
+  LAND_C: 18.5,             // ...and damping — critically-ish damped
+  LAND_GAIN: 0.36,          // spring velocity per (m/s) of impact
+  LAND_MAX: 0.24,           // m — cap on the landing dip
+  LAND_MIN_IMPACT: 1.4,     // m/s below which a landing does not register
+  SLIDE_DIP: 0.13,          // m — extra eye drop while sliding
+  SLIDE_ENTRY_DIP: 1.1,     // spring velocity injected when a slide starts
 };
 
 /** Fallbacks used when no weapon is equipped or a def field is missing. */
@@ -281,6 +305,13 @@ export class Player {
     this.height = TUNE.STAND_HEIGHT;
     this.radius = TUNE.RADIUS;
     this.eyeHeight = TUNE.STAND_EYE;
+
+    // Eye springs — see TUNE. `eyeSmooth` trails `eyeHeight`; `eyeStep` and `eyeLand`
+    // are subtracted from it. `getEyePosition()` is the only thing that composes them.
+    this.eyeSmooth = TUNE.STAND_EYE;
+    this.eyeStep = 0;
+    this.eyeLand = 0;
+    this.eyeLandVel = 0;
 
     this.health = TUNE.MAX_HEALTH;
     this.maxHealth = TUNE.MAX_HEALTH;
@@ -391,13 +422,43 @@ export class Player {
     if (lo) lo.equipment.lethalCount = v;
   }
 
+  /**
+   * The eye: where the player looks from, and where their bullets leave from. Includes
+   * the eye springs, so it is the same point the camera renders from — see TUNE.
+   */
   getEyePosition(out) {
     const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
     return out.set(
       this.position.x + rx * this.lean,
-      this.position.y + this.eyeHeight,
+      this.position.y + this.eyeSmooth - this.eyeStep - this.eyeLand - this.slideDip,
       this.position.z + rz * this.lean,
     );
+  }
+
+  /** Extra eye drop while sliding. Pure function of sim state, so nothing to integrate. */
+  get slideDip() { return TUNE.SLIDE_DIP * this.slideAmount; }
+
+  /** Stair step-up/down hiding. `dy` is the vertical teleport the solver just did. */
+  addEyeStep(dy) {
+    this.eyeStep = clamp(this.eyeStep + dy, -TUNE.STEP_MAX, TUNE.STEP_MAX);
+  }
+
+  /** Kick the landing spring. `impactSpeed` is the downward speed at touchdown. */
+  addLandImpact(impactSpeed) {
+    if (impactSpeed < TUNE.LAND_MIN_IMPACT) return;
+    this.eyeLandVel += impactSpeed * TUNE.LAND_GAIN;
+  }
+
+  /**
+   * Integrate the eye springs. Runs on the fixed step for everyone, alive or dead, so
+   * the eye is a pure function of the tick sequence.
+   */
+  _updateEyeSprings(dt) {
+    this.eyeSmooth = damp(this.eyeSmooth, this.eyeHeight, TUNE.EYE_SMOOTH, dt);
+    this.eyeLandVel += (-TUNE.LAND_K * this.eyeLand - TUNE.LAND_C * this.eyeLandVel) * dt;
+    this.eyeLand = clamp(this.eyeLand + this.eyeLandVel * dt, -0.06, TUNE.LAND_MAX);
+    this.eyeStep = damp(this.eyeStep, 0, TUNE.STEP_SMOOTH, dt);
+    if (Math.abs(this.eyeStep) < 1e-4) this.eyeStep = 0;
   }
 
   getAimDirection(out) {
@@ -515,6 +576,12 @@ export class Player {
     this.velocity.set(0, 0, 0);
     this.height = TUNE.STAND_HEIGHT;
     this.eyeHeight = TUNE.STAND_EYE;
+    // Springs start settled: a respawn must not damp the eye up from wherever the
+    // corpse left it, or you spawn looking out of your own knees.
+    this.eyeSmooth = TUNE.STAND_EYE;
+    this.eyeStep = 0;
+    this.eyeLand = 0;
+    this.eyeLandVel = 0;
     this.crouchHeld = false;
     this.crouchFrac = 0;
     this.moveState = 'air';
@@ -641,6 +708,7 @@ export class Player {
 
     if (!this.alive) {
       this._deadFixedUpdate(dt);
+      this._updateEyeSprings(dt);
       this.camera.fixedUpdate(dt);
       this._clearEdges();
       return;
@@ -659,6 +727,7 @@ export class Player {
     this._updateLean(dt);
     this._updateWeapon();
     this._updateHealth(dt);
+    this._updateEyeSprings(dt);
     this._updateHitboxes();
     this.camera.fixedUpdate(dt);
     this._clearEdges();
@@ -1114,9 +1183,9 @@ export class Player {
     // the visual eye behind it and catches up over ~90 ms.
     const dy = this.position.y - prevY;
     if (res.steppedUp) {
-      this.camera.addStepOffset(dy);
+      this.addEyeStep(dy);
     } else if (wasGrounded && this.grounded && dy < -0.02 && dy > -0.6) {
-      this.camera.addStepOffset(dy);
+      this.addEyeStep(dy);
     }
 
     if (this.grounded) {
@@ -1155,7 +1224,7 @@ export class Player {
     const impact = Math.max(0, -impactVy);
     const fall = Math.max(0, this._airPeakY - Math.min(prevY, this.position.y));
 
-    this.camera.land(impact);
+    this.addLandImpact(impact);
     if (impact > 1.4) {
       this.game.audio?.play?.('land', {
         position: this.position,

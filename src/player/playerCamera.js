@@ -63,12 +63,9 @@ import {
      SHAKE_POS        0.060 m and SHAKE_ROLL 0.900° at amount 1.0, quadratic decay.
 
    IMPACT / STANCE
-     LAND_K         165 / LAND_C 18.5   critically-ish damped landing spring
-     LAND_GAIN        0.360 spring velocity per (m/s) of impact → a 6 m fall
-                               dips the eye ~0.17 m; LAND_MAX 0.240 caps it
-     STEP_SMOOTH     33.0      1/s — a stair step-up is hidden and caught up
-                               over ~90 ms so the eye never jolts
-     SLIDE_DIP        0.130 m extra camera drop while sliding
+     The landing spring, the stair-step smoothing, the crouch eye-height catch-up
+     and the slide dip are NOT here — they moved to `player.js` TUNE, because they
+     move the EYE, and the eye is where bullets come from. See the note there.
      SLIDE_ROLL       6.500°  roll carved into the slide direction
      SLIDE_FOV        4.000°  fov widen at full slide
      SPRINT_ROLL      1.150°
@@ -123,16 +120,6 @@ const T = {
   SHAKE_POS: 0.06,
   SHAKE_ROLL: 0.9,
 
-  LAND_K: 165,
-  LAND_C: 18.5,
-  LAND_GAIN: 0.36,
-  LAND_MAX: 0.24,
-  LAND_MIN_IMPACT: 1.4,
-
-  STEP_SMOOTH: 33,
-  STEP_MAX: 0.55,
-
-  SLIDE_DIP: 0.13,
   SLIDE_ROLL: 6.5,
   SLIDE_FOV: 4,
   SPRINT_ROLL: 1.15,
@@ -242,9 +229,6 @@ export class PlayerCamera {
     this.shakeDur = 1;
     this.shakeSeed = 0;
 
-    this.landOffset = 0;
-    this.landVel = 0;
-    this.stepOffset = 0;
 
     this.slideTilt = 0;
     this.strafeRoll = 0;
@@ -294,7 +278,6 @@ export class PlayerCamera {
     this.deathTarget = new THREE.Vector3();
     this.hasKiller = false;
 
-    this._eyeVisual = player.eyeHeight;
   }
 
   reset() {
@@ -309,8 +292,6 @@ export class PlayerCamera {
     this.bobAmp = 0;
     this.shakeAmp = 0;
     this.shakeTime = 0;
-    this.landOffset = this.landVel = 0;
-    this.stepOffset = 0;
     this.slideTilt = 0;
     this.strafeRoll = 0;
     this.leanRoll = 0;
@@ -326,7 +307,7 @@ export class PlayerCamera {
     this.fovWiden = 0;
     this.viewFov = T.VIEW_FOV_BASE;
     this.endDeathCam();
-    this._eyeVisual = this.player.eyeHeight;
+    this.swayTime = 0;
   }
 
   setAngles(yaw, pitch) {
@@ -445,18 +426,9 @@ export class PlayerCamera {
   /** Alias so `fx.screenShake()` can route here verbatim. */
   screenShake(amount, duration) { this.shake(amount, duration); }
 
-  /** Stair step-up/down hiding. `dy` is the vertical teleport the solver did. */
-  addStepOffset(dy) {
-    this.stepOffset = clamp(this.stepOffset + dy, -T.STEP_MAX, T.STEP_MAX);
-  }
-
-  land(impactSpeed) {
-    if (impactSpeed < T.LAND_MIN_IMPACT) return;
-    this.landVel += impactSpeed * T.LAND_GAIN;
-  }
-
   startSlide() {
-    this.landVel += 1.1;               // a small dip as you drop into it
+    // The dip as you drop into it is an eye spring and lives on the player; this is
+    // just the kick that goes with it.
     this.shake(0.12, 0.18);
   }
 
@@ -568,15 +540,6 @@ export class PlayerCamera {
     const bobRoll = Math.sin(this.bobPhase) * T.BOB_ROLL * DEG * bobK;
     const bobPitch = Math.sin(this.bobPhase * 2) * T.BOB_PITCH * DEG * bobK;
 
-    // ── landing spring + slide dip ──
-    this.landVel += (-T.LAND_K * this.landOffset - T.LAND_C * this.landVel) * dt;
-    this.landOffset = clamp(this.landOffset + this.landVel * dt, -0.06, T.LAND_MAX);
-    const slideDip = T.SLIDE_DIP * p.slideAmount;
-
-    // ── stair smoothing ──
-    this.stepOffset = damp(this.stepOffset, 0, T.STEP_SMOOTH, dt);
-    if (Math.abs(this.stepOffset) < 1e-4) this.stepOffset = 0;
-
     // ── recoil punch spring (camera pushed back along its own -forward) ──
     this.punchVel += (-T.PUNCH_K * this.punch - T.PUNCH_C * this.punchVel) * dt;
     this.punch = clamp(this.punch + this.punchVel * dt, -T.PUNCH_MAX, T.PUNCH_MAX);
@@ -649,15 +612,17 @@ export class PlayerCamera {
     const roll = this.leanRoll + this.slideTilt + this.strafeRoll + bobRoll
       + shakeRoll + mantleRoll + meleeRoll;
 
-    // Visual eye height gets its own smoothing on top of the simulated one so a
-    // crouch transition reads as a body movement, not a teleport.
-    this._eyeVisual = damp(this._eyeVisual, p.eyeHeight, 18, dt);
-
-    _pos.set(
-      p.position.x + rx * p.lean,
-      p.position.y + this._eyeVisual - this.stepOffset - this.landOffset - slideDip,
-      p.position.z + rz * p.lean,
-    );
+    // The eye itself is simulation, not presentation: `Player` integrates the crouch
+    // smoothing, the stair step and the landing spring on the fixed step, and
+    // `getEyePosition()` composes them. Rendering from exactly that point is what makes
+    // the crosshair honest — it is also where `weaponSystem.getFireOrigin` starts the
+    // bullet, so the two cannot disagree.
+    //
+    // What is left below is the genuinely decorative part — bob, shake, mantle shift and
+    // punch — which stays camera-only and never moves the bullet. Bob and shake already
+    // scale down with ADS (BOB_ADS_CUT, adsCut), so the disagreement is smallest exactly
+    // when precision matters.
+    p.getEyePosition(_pos);
 
     _e.set(pitch, yaw, roll, 'YXZ');
     _q.setFromEuler(_e);

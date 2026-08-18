@@ -28,3 +28,19 @@ export function createRNG(seed = 0x9e3779b9) {
   rng.reseed = (s) => { a = s >>> 0; spare = null; };
   return rng;
 }
+
+/**
+ * Derive an independent stream seed from a base seed and an index.
+ *
+ * Used to give each actor its own RNG rather than sharing one. A shared stream makes
+ * every consumer's draws depend on how many draws *everyone else* made first, so
+ * behaviour becomes a function of scheduling — which a networked simulation cannot
+ * reproduce and a replay cannot rewind. Independent streams are also individually
+ * snapshottable, where one interleaved stream is not.
+ */
+export function mixSeed(seed, index) {
+  let h = ((seed >>> 0) ^ 0x9e3779b9) >>> 0;
+  h = Math.imul(h ^ ((index + 0x85ebca6b) | 0), 0xcc9e2d51) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 0x1b873593) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
+}

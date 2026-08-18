@@ -307,6 +307,22 @@ export class World {
   // ────────────────────────────────────────────────────────────────── broadphase
 
   /**
+   * Next visit stamp for the per-query "have I already considered this box" test.
+   *
+   * `_stamp` is an Int32Array but `_tick` is a plain number, so past 2^31 the store
+   * truncates to negative while the counter keeps climbing — `stamp[bi] === tick` can
+   * then never match again and the dedup is broken *permanently*, not transiently.
+   * Every box in a touched cell gets reconsidered once per cell, and `_cand` (sized to
+   * the box count) silently drops the overflow. A tab never runs long enough to see it;
+   * a server process serving a full match does, in a matter of hours. Resetting costs
+   * one fill of a ~1000-entry array, once per 2^31 queries.
+   */
+  _nextStamp() {
+    if (this._tick >= 0x7ffffffe) { this._stamp.fill(0); this._tick = 0; }
+    return ++this._tick;
+  }
+
+  /**
    * Gather every box index whose AABB overlaps the query volume into `this._cand`.
    * @returns candidate count. Allocation-free; results are valid until the next query.
    */
@@ -326,7 +342,7 @@ export class World {
     if (iy1 > g.ny - 1) iy1 = g.ny - 1;
     if (iz1 > g.nz - 1) iz1 = g.nz - 1;
 
-    const tick = ++this._tick;
+    const tick = this._nextStamp();
     const bx = this._bx, stamp = this._stamp, cand = this._cand;
     const start = g.start, items = g.items, nx = g.nx, nz = g.nz;
     let count = 0;
@@ -756,7 +772,7 @@ export class World {
       tMaxZ = (g.minz + (iz + (dz > 0 ? 1 : 0)) * CELL - oz) / dz;
     }
 
-    const tick = ++this._tick;
+    const tick = this._nextStamp();
     const bx = this._bx, stamp = this._stamp, start = g.start, items = g.items;
     const nx = g.nx, nz = g.nz;
     let best = -1;

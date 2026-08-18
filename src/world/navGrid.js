@@ -141,20 +141,32 @@ export class NavGrid {
 
   reset() {
     if (this.danger) this.danger.fill(0);
+    // Which slice decays first is part of the simulation — see fixedUpdate. Left
+    // running, it leaked across matches.
+    this._decayCursor = 0;
     this.stats.searches = 0;
     this.stats.expansions = 0;
     this.stats.partials = 0;
   }
 
-  /** Visual-only tick: bleed off danger a slice at a time so it costs nothing. */
-  update(dtFrame) {
+  /**
+   * Bleed off danger a slice at a time so it costs nothing.
+   *
+   * This is SIMULATION, despite looking like housekeeping: `danger` is an A* step cost
+   * (see `_search`) and a cover-scoring term, so how fast it decays changes where bots
+   * go. It used to run in `update(dtFrame)` on the render clock, which meant danger
+   * persisted longer on a slow client than a fast one — and on a headless server, where
+   * `update()` is never called at all, it never decayed, so bots progressively refused
+   * to path anywhere a shot had ever been fired.
+   */
+  fixedUpdate(dt) {
     if (!this.ready) return;
     const d = this.danger;
     const n = d.length;
     const slice = Math.min(n, Math.max(1024, (n / 8) | 0));
-    // Each cell is visited every n/slice frames, so scale the rate to match and
-    // the decay stays frame-rate independent regardless of grid size.
-    const k = Math.exp(-0.55 * dtFrame * (n / slice));
+    // Each cell is visited every n/slice ticks, so scale the rate to match and the
+    // decay stays independent of grid size.
+    const k = Math.exp(-0.55 * dt * (n / slice));
     let i = this._decayCursor;
     for (let c = 0; c < slice; c++) {
       const v = d[i];
@@ -164,6 +176,10 @@ export class NavGrid {
       if (i >= n) i = 0;
     }
     this._decayCursor = i;
+  }
+
+  /** Render-only: the debug overlay tints by live danger. */
+  update() {
     if (this._debugOn) this._updateDebug();
   }
 

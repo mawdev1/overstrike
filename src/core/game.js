@@ -58,9 +58,12 @@ export class Game {
     this.settings = new Settings();
     this.bus = new EventBus();
     this.rng = createRNG(0xC0FFEE);
+    /** Seed of the current match. Replaced by startMatch(); see `mixSeed`. */
+    this.matchSeed = 0xC0FFEE;
     this.assets = assets;
 
-    this.time = 0;
+    /** Simulation clock. Integer; `time` is derived from it — see the getter. */
+    this.tick = 0;
     this.frame = 0;
     this.paused = false;
     this.state = 'boot';
@@ -77,6 +80,24 @@ export class Game {
     /** Per-phase boot timings in ms. Read by the perf harnesses via `__GAME__`. */
     this.bootProfile = { phases: [], totalMs: 0 };
   }
+
+  /**
+   * Seconds of simulation since the match began.
+   *
+   * DERIVED from the integer tick, never accumulated. `time += dt` at 120 Hz drifts by a
+   * different amount depending on how many additions got you there, so a state saved at
+   * tick T and replayed forward would not land on the same clock it had the first time —
+   * and every deadline in the game (coyote time, fire cooldowns, slide and mantle
+   * cooldowns, bot reaction and memory windows) is a comparison against this value. One
+   * float epsilon on the coyote-time test at player.js is the difference between a jump
+   * being allowed and denied, which is a whole jump arc of divergence.
+   *
+   * Deliberately getter-only. Every module in the game is an ES module and therefore
+   * strict, so a stray `game.time = …` throws rather than silently desynchronising the
+   * clock from the tick; from sloppy-mode callers (a devtools console, a test harness's
+   * `page.evaluate`) it is a no-op instead. Neither can move the clock.
+   */
+  get time() { return this.tick * FIXED_DT; }
 
   /**
    * Build every system, reporting honest progress and yielding between phases so the
@@ -254,8 +275,11 @@ export class Game {
   }
 
   startMatch(opts = {}) {
-    this.time = 0;
-    this.rng.reseed(opts.seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0));
+    this.tick = 0;
+    // Kept, not just consumed: per-actor streams are derived from it (see `mixSeed`), and
+    // a networked match has to be able to hand the same seed to every peer.
+    this.matchSeed = (opts.seed ?? (Math.floor(Math.random() * 0xffffffff) >>> 0)) >>> 0;
+    this.rng.reseed(this.matchSeed);
 
     // Options are written into settings BEFORE systems reset, because subsystems build
     // themselves from settings during reset(). Passing `botCount` only in `opts` meant
@@ -405,10 +429,12 @@ export class Game {
     // thinking, reaction delays and target memory off `game.time`; if it only ticked
     // when the renderer happened to drive the step, anything else driving the
     // simulation (headless tests, a replay, a catch-up) would silently freeze the AI.
-    this.time += dt;
+    this.tick++;
 
-    // Order matters: input-driven actors, then AI, then projectiles, then rules.
-    // Each is isolated so a fault in the AI cannot stop the match clock.
+    // Order matters: the nav danger field decays first so the AI paths over this
+    // tick's cost surface, then input-driven actors, then AI, then projectiles, then
+    // rules. Each is isolated so a fault in the AI cannot stop the match clock.
+    this._safe('nav', 'fixed', this.nav, 'fixedUpdate', dt);
     this._safe('player', 'fixed', this.player, 'fixedUpdate', dt);
     this._safe('bots', 'fixed', this.bots, 'fixedUpdate', dt);
     this._safe('weapons', 'fixed', this.weapons, 'fixedUpdate', dt);
