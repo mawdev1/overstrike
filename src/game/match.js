@@ -658,10 +658,12 @@ export class Match {
       const e = r.entity;
       if (!e) { this._respawns.splice(i, 1); continue; }
       let go = now >= r.at;
-      // `_edge.respawnSkip` (fire pressed, latched by Player.applyCommand) rather than
+      // `_firePressedThisFrame` (latched by Player._buildLocalCommand) rather than
       // reading game.input directly — the player controller is the only thing allowed
-      // to touch input; everything downstream reads its resolved command instead.
-      if (!go && e.isPlayer && now >= r.minAt && e._edge?.respawnSkip) go = true;
+      // to touch input; everything downstream reads its resolved command instead. This
+      // must NOT be `_edge`, which Player clears at the end of every fixed SUBSTEP —
+      // Match runs after Player in the same substep and would never see it.
+      if (!go && e.isPlayer && now >= r.minAt && e._firePressedThisFrame) go = true;
       if (!go) continue;
       // Budget is spent only by entries that will actually reach spawnEntity(); an
       // already-alive entity below is dropped for free and must not consume it.

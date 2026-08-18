@@ -204,6 +204,58 @@ try {
   if (frozen.ammoAfter100 !== null && frozen.ammoAfter100 < 30) ok(`weapon fired under held trigger (ammo ${frozen.ammoAfter100}/30 at tick 100)`);
   else bad('weapon fired under held trigger', `ammo still ${frozen.ammoAfter100} at tick 100 — fire input froze`);
 
+  // ── fire-to-skip-respawn reaches Match in the same tick it's pressed ─────────────
+  //
+  // A real regression, caught by review: `respawnSkip`/`airstrikeConfirm` were first
+  // routed through `Player._edge`, which is cleared at the end of EVERY FIXED SUBSTEP —
+  // before Match/Killstreaks (which run after Player in game._fixedUpdate's system
+  // order) get a turn in that same substep. They silently never saw it true, so holding
+  // fire stopped cutting the respawn wait short. Fixed by using a frame-scoped field
+  // instead (`_firePressedThisFrame`) that matches `input.firePressed`'s original
+  // lifetime. Prove the fix: kill the player, wait past the 1.5s skip-eligible window,
+  // hold fire, and confirm respawn happens well before the full 4s timer.
+  console.log('\nfire-to-skip-respawn reaches Match in the same tick');
+  const skip = await page.evaluate(() => {
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 11 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const DT = 1 / 120;
+
+    g.player.applyDamage(9999, { attacker: null, hitPart: 'torso', weaponId: 'test' });
+    if (g.player.alive) return { error: 'player did not die' };
+
+    const inp = g.input;
+    inp.enabled = true;
+    // `firePressed` is the EDGE (`buttonsPressed[0]`, set by the real mousedown handler
+    // and cleared by `Input.endFrame()`), not the held state (`buttons[0]`) — the
+    // feature is "press fire after this to cut the wait short", not "hold it". Fire
+    // one press at tick 200 (past the 1.5s/180-tick eligible window) and leave it —
+    // this harness never calls `endFrame()`, so it stays "pressed" from then on, which
+    // is a superset of the real one-frame edge and is fine for proving it's SEEN at all.
+    let ticksToRespawn = -1;
+    let sawFirePressedTrue = false;
+    for (let i = 0; i < 600; i++) {   // 5s ceiling — well past the 4s no-skip timer
+      g.frame++;   // this test is about tick ORDERING, not frame-freezing — see above
+      if (i === 200) inp.buttonsPressed[0] = true;
+      g._fixedUpdate(DT);
+      if (g.player._firePressedThisFrame) sawFirePressedTrue = true;
+      if (g.player.alive) { ticksToRespawn = i; break; }
+    }
+    return {
+      ticksToRespawn, sawFirePressedTrue,
+      gameState: g.state, gamePaused: g.paused,
+      inputEnabled: g.input.enabled, inputFirePressedNow: g.input.firePressed,
+    };
+  });
+
+  if (skip.error) bad('fire-to-skip-respawn reaches Match in the same tick', skip.error);
+  else if (skip.ticksToRespawn < 0) bad('fire-to-skip-respawn reaches Match in the same tick', 'never respawned within 5s — the full 4s timer or longer ran, meaning fire was not seen at all');
+  // 1.5s (180 ticks) is the earliest fire is even eligible to skip; 4.0s (480 ticks) is
+  // the un-skipped timer. Landing meaningfully before 480 proves the skip fired.
+  else if (skip.ticksToRespawn < 400) ok(`respawned at tick ${skip.ticksToRespawn} — held fire cut the wait short`);
+  else bad('fire-to-skip-respawn reaches Match in the same tick', `respawned at tick ${skip.ticksToRespawn} — that's the un-skipped ~480-tick timer, fire was not seen`);
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point

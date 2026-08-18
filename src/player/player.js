@@ -237,7 +237,7 @@ const EMPTY_COMMAND = {
   jump: false, reload: false, melee: false, grenade: false, interact: false,
   inspect: false, killstreak: false, lastWeapon: false, slot: -1,
   sprintDown: false, sprintUp: false, wheel: 0,
-  firePressed: false, aimButtonPressed: false, respawnSkip: false, airstrikeConfirm: false,
+  firePressed: false, aimButtonPressed: false,
   deltaYaw: 0, deltaPitch: 0,
 };
 
@@ -407,8 +407,15 @@ export class Player {
       fireHeld: false, aimButtonHeld: false,
       leanKeyHeld: false, leanRightKeyHeld: false,
     };
-    /** Local-only, client-side bookkeeping for the crouch toggle — see `_buildLocalCommand`. */
+    /**
+     * Local-only, client-side bookkeeping for the crouch/ADS toggle SETTINGS — see
+     * `_buildLocalCommand`. `_localCrouchToggle` is the actual flip-flop state;
+     * `_localToggleAdsMode` just caches `settings.get('toggleAds')` once per frame
+     * (instead of `_refreshHeldState` re-reading `game.settings` every substep) so both
+     * settings-dependent held values are resolved on the same cadence.
+     */
     this._localCrouchToggle = false;
+    this._localToggleAdsMode = false;
 
     /** Edge-triggered input latched once per frame — see `applyCommand`. */
     this._edge = {
@@ -416,8 +423,19 @@ export class Player {
       interact: false, inspect: false, killstreak: false, lastWeapon: false,
       slot: -1, sprintDown: false, sprintUp: false,
       fire: false, aim: false, wheel: 0,
-      respawnSkip: false, airstrikeConfirm: false,
     };
+    /**
+     * Was fire pressed THIS RENDERED FRAME — read by Match (skip the respawn
+     * countdown) and Killstreaks (confirm an airstrike mark), both of which run AFTER
+     * Player in game._fixedUpdate's system order (nav, player, bots, weapons,
+     * projectiles, match). It must NOT live in `_edge`: that is cleared at the end of
+     * EVERY substep, before those two systems get a turn in the SAME substep, so they
+     * would never see it. `input.firePressed` (what they read before this refactor) is
+     * itself frame-scoped — cleared once per rendered frame by `Input.endFrame()` — so
+     * this field matches that lifetime: overwritten fresh every frame in
+     * `_buildLocalCommand`, never cleared mid-frame.
+     */
+    this._firePressedThisFrame = false;
 
     this.camera = new PlayerCamera(game, this);
   }
@@ -715,6 +733,7 @@ export class Player {
     if (g.state !== 'playing' || g.paused) {
       g.input.consumeWheel?.();
       Object.assign(cmd, EMPTY_COMMAND);
+      this._firePressedThisFrame = false;
       return cmd;
     }
     const i = g.input;
@@ -743,8 +762,7 @@ export class Player {
     cmd.wheel = i.consumeWheel?.() ?? 0;
     cmd.firePressed = i.firePressed;
     cmd.aimButtonPressed = i.aimPressed;
-    cmd.respawnSkip = i.firePressed;
-    cmd.airstrikeConfirm = i.firePressed;
+    this._firePressedThisFrame = i.firePressed;
 
     // Crouch's "just engaged" edge (drives slide entry). The toggle FLIP has to happen
     // here, once per frame, because it is driven by `wasPressed` — a genuinely
@@ -758,6 +776,8 @@ export class Player {
     } else {
       cmd.crouchPressed = crouchKeyPressed;
     }
+
+    this._localToggleAdsMode = s.get('toggleAds');
 
     cmd.deltaYaw = 0;
     cmd.deltaPitch = 0;
@@ -807,8 +827,10 @@ export class Player {
 
     // See `_buildLocalCommand`'s comment: the ADS toggle flip/clear needs THIS tick's
     // sim state (adsBlocked), so only the mode + raw button are resolved here; the
-    // flip itself happens in `_readInput`.
-    h.toggleAdsMode = s.get('toggleAds');
+    // flip itself happens in `_readInput`. `_localToggleAdsMode` is cached once per
+    // frame in `_buildLocalCommand`, not re-read from `game.settings` here, so this
+    // matches `_localCrouchToggle`'s cadence exactly.
+    h.toggleAdsMode = this._localToggleAdsMode;
     h.aimButtonHeld = i.aim;
 
     h.fireHeld = i.fire;
@@ -866,7 +888,6 @@ export class Player {
     e.slot = cmd.slot; e.sprintDown = cmd.sprintDown; e.sprintUp = cmd.sprintUp;
     e.fire = cmd.firePressed; e.aim = cmd.aimButtonPressed;
     e.wheel += cmd.wheel;
-    e.respawnSkip = cmd.respawnSkip; e.airstrikeConfirm = cmd.airstrikeConfirm;
   }
 
   _clearEdges() {
@@ -875,7 +896,6 @@ export class Player {
     e.grenade = false; e.interact = false; e.inspect = false; e.killstreak = false;
     e.lastWeapon = false; e.slot = -1; e.sprintDown = false; e.sprintUp = false;
     e.fire = false; e.aim = false; e.wheel = 0;
-    e.respawnSkip = false; e.airstrikeConfirm = false;
   }
 
   fixedUpdate(dt) {

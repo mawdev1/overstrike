@@ -871,10 +871,11 @@ export class Killstreaks {
     // and can never double-fire on a single press. The one thing we do watch is the
     // trigger, which confirms an airstrike heading.
     if (this._marking) {
-      // `_edge.airstrikeConfirm` (fire pressed, latched by Player.applyCommand) rather
-      // than reading game.input directly — see match.js's respawnSkip for the same rule.
+      // `_firePressedThisFrame` (latched by Player._buildLocalCommand) rather than
+      // reading game.input directly — see match.js's respawn-skip for the same rule,
+      // including why this cannot be `_edge` (cleared before this system's turn).
       const p = this.game.player;
-      if (p?._edge?.airstrikeConfirm || this.now - this._marking.at > AIRSTRIKE_MARK_TIMEOUT) {
+      if (p?._firePressedThisFrame || this.now - this._marking.at > AIRSTRIKE_MARK_TIMEOUT) {
         this._confirmAirstrikeMark();
       }
     }

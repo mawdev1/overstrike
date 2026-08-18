@@ -173,7 +173,6 @@ const _fwd = new THREE.Vector3();
 const _up = new THREE.Vector3();
 const _look = new THREE.Vector3();
 const _angles = { yaw: 0, pitch: 0 };
-const _lookDelta = { x: 0, y: 0 };
 
 /** Snappy ease used for ADS — fast off the mark, settles into the sight. */
 const adsEase = (t) => 1 - Math.pow(1 - t, T.ADS_POW);
@@ -184,12 +183,10 @@ const adsEase = (t) => 1 - Math.pow(1 - t, T.ADS_POW);
  * `game.camera` and `engine.viewCamera`.
  *
  * Split of responsibilities:
- *  - `updateLook()`   — called exactly ONCE per rendered frame (pumped from the
- *                       first fixed substep by Player so that the same frame's
- *                       simulation already sees the new yaw). Mouse deltas are
- *                       therefore never divided across substeps and never
- *                       quantised to 120 Hz; a 500 Hz mouse's full accumulated
- *                       delta lands in one integration.
+ *  - Mouse look is resolved by `Player._lookDeltaToRadians` (once per rendered frame,
+ *    at full mouse resolution — never divided across fixed substeps) and applied here
+ *    only via `_writeAngles()`, called from `Player.applyCommand`. This class does not
+ *    read `game.input` itself.
  *  - `fixedUpdate(dt)`— recoil integration only. It runs at 1/120 alongside the
  *                       weapon that produced the kick, so spray patterns are
  *                       deterministic regardless of frame rate.
@@ -320,47 +317,14 @@ export class PlayerCamera {
   }
 
   // ═══════════════════════════════════════════════════════════════════ look ══
-
-  /**
-   * Integrate mouse movement. Called once per rendered frame — never per fixed
-   * step — so the input is applied at full mouse resolution.
-   */
-  updateLook() {
-    const game = this.game;
-    const input = game.input;
-    input.consumeLook(_lookDelta);
-
-    const playable = game.state === 'playing' && !game.paused && input.locked && this.player.alive;
-    if (!playable) {
-      // Drain and discard: re-entering the game must not replay stale motion.
-      this._writeAngles();
-      return;
-    }
-
-    const s = game.settings;
-    // Zoom-compensated sensitivity. The ratio uses the ADS-only fov so that the
-    // sprint/slide fov widen never changes how aiming feels.
-    const baseFov = s.get('fov');
-    const ratio = Math.tan(this.adsFovOnly * 0.5 * DEG) / Math.tan(baseFov * 0.5 * DEG);
-    const adsMul = lerp(1, s.get('adsSensitivity'), clamp(this.player.adsAmount, 0, 1));
-    const sens = T.SENS_BASE * s.get('sensitivity') * adsMul * ratio;
-
-    const dYaw = -_lookDelta.x * sens;
-    const dPitch = (s.get('invertY') ? _lookDelta.y : -_lookDelta.y) * sens;
-
-    this.baseYaw += dYaw;
-    this.basePitch = clamp(this.basePitch + dPitch, -PITCH_LIMIT, PITCH_LIMIT);
-
-    // Keep yaw in a sane range so long sessions never lose float precision.
-    if (this.baseYaw > Math.PI * 4) this.baseYaw -= Math.PI * 4;
-    else if (this.baseYaw < -Math.PI * 4) this.baseYaw += Math.PI * 4;
-
-    // Banked for the sway/lag pass, consumed once in update().
-    this._lookDX += dYaw;
-    this._lookDY += dPitch;
-
-    this._writeAngles();
-  }
+  //
+  // Mouse integration used to live here as `updateLook()`, reading `game.input`/
+  // `game.settings` directly. It moved to `Player._lookDeltaToRadians`, which computes
+  // the identical transform but writes the result into a command instead of mutating
+  // `baseYaw`/`basePitch` itself — `Player.applyCommand` does that now, from
+  // `cmd.deltaYaw`/`cmd.deltaPitch`, so a remote player's command (once one exists) is
+  // indistinguishable from a local one by the time it reaches this class. Nothing here
+  // reads `game.input`/`game.settings` any more.
 
   /** player.yaw/pitch = player intent + un-recovered recoil + scope sway. */
   _writeAngles() {
