@@ -300,7 +300,8 @@ try {
     g.stop();
     g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 13 });
     g.match.phase = 'live'; g.match.countdown = 0;
-    const playingAlpha = g.accumAlpha;                 // mid-tick, should be in [0,1]
+    g._accum = g._accum + (1 / 120) * 0.5;             // force a real fractional mid-tick position
+    const playingAlpha = g.accumAlpha;                 // should reflect that fraction, not be pinned
     g.paused = true;
     const pausedAlpha = g.accumAlpha;
     g.paused = false;
@@ -308,6 +309,8 @@ try {
     const menuAlpha = g.accumAlpha;
     return { playingAlpha, pausedAlpha, menuAlpha };
   });
+  if (Math.abs(alphaCheck.playingAlpha - 0.5) < 1e-6) ok(`accumAlpha reflects the real mid-tick fraction while simulating (${alphaCheck.playingAlpha.toFixed(3)})`);
+  else bad('accumAlpha reflects the real mid-tick fraction while simulating', `expected ~0.5, got ${alphaCheck.playingAlpha} — a regression that pins accumAlpha to 1 unconditionally would slip past the paused-only checks below`);
   if (alphaCheck.pausedAlpha === 1) ok('accumAlpha is 1 while paused (renders the latest tick, not a stale blend)');
   else bad('accumAlpha is 1 while paused', `got ${alphaCheck.pausedAlpha} — a pause right after a shot would render one tick of stale recoil`);
   if (alphaCheck.menuAlpha === 1) ok('accumAlpha is 1 outside state==="playing"');
