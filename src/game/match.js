@@ -649,7 +649,6 @@ export class Match {
   _updateRespawns(dt) {
     if (this._respawns.length === 0) return;
     const now = this.elapsed;
-    const input = this.game.input;
     // Scored spawning is the single most expensive thing this class does (a full
     // candidate sweep with LOS marches per point). Never run more than
     // MAX_SPAWNS_PER_STEP of them on one 1/120 s step, whatever the deadlines say.
@@ -659,7 +658,10 @@ export class Match {
       const e = r.entity;
       if (!e) { this._respawns.splice(i, 1); continue; }
       let go = now >= r.at;
-      if (!go && e.isPlayer && now >= r.minAt && input?.firePressed) go = true;
+      // `_edge.respawnSkip` (fire pressed, latched by Player.applyCommand) rather than
+      // reading game.input directly — the player controller is the only thing allowed
+      // to touch input; everything downstream reads its resolved command instead.
+      if (!go && e.isPlayer && now >= r.minAt && e._edge?.respawnSkip) go = true;
       if (!go) continue;
       // Budget is spent only by entries that will actually reach spawnEntity(); an
       // already-alive entity below is dropped for free and must not consume it.

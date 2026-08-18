@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { clamp, lerp, damp, dirFromAngles } from '../core/mathUtils.js';
-import { PlayerCamera } from './playerCamera.js';
+import { clamp, lerp, damp, dirFromAngles, PITCH_LIMIT } from '../core/mathUtils.js';
+import { PlayerCamera, CAMERA_TUNE } from './playerCamera.js';
 
 /* ════════════════════════════════════════════════════════════════════════════
    TUNING TABLE — every number that shapes movement feel lives here.
@@ -226,6 +226,29 @@ const _lookOut = { x: 0, y: 0 };
 const _PROBE_X = [0, 0.72, -0.72, 0, 0];
 const _PROBE_Z = [0, 0, 0, 0.72, -0.72];
 
+/**
+ * What `_buildLocalCommand` returns while not playing (menu, paused): every edge and
+ * look delta off. Held state is a SEPARATE object — see `EMPTY_HELD` and
+ * `_refreshHeldState` — because held state is refreshed every fixed substep, not
+ * frame-gated like this one.
+ */
+const EMPTY_COMMAND = {
+  crouchPressed: false,
+  jump: false, reload: false, melee: false, grenade: false, interact: false,
+  inspect: false, killstreak: false, lastWeapon: false, slot: -1,
+  sprintDown: false, sprintUp: false, wheel: 0,
+  firePressed: false, aimButtonPressed: false, respawnSkip: false, airstrikeConfirm: false,
+  deltaYaw: 0, deltaPitch: 0,
+};
+
+/** What `_refreshHeldState` sets while not playing (menu, paused). Everything off. */
+const EMPTY_HELD = {
+  wishForward: 0, wishRight: 0,
+  crouchHeld: false, toggleAdsMode: false, aimButtonHeld: false,
+  fireHeld: false, sprintKeyHeld: false, breathHold: false,
+  leanKeyHeld: false, leanRightKeyHeld: false,
+};
+
 // Candidate method names on systems written by other engineers. We never assume
 // a single spelling — the first callable match wins, missing ones degrade to no-op.
 const M_SWITCH = ['switchTo', 'switchSlot', 'equipSlot', 'selectSlot', 'equip'];
@@ -283,7 +306,7 @@ function accelerate(vel, wx, wz, wishSpeed, accel, dt) {
  * Simulation lives in `fixedUpdate(dt)` (always 1/120). Mouse look and every
  * visual are handled by `PlayerCamera`, driven from `update(dtFrame)` — except
  * that the look integration is *pulled forward* to the first fixed substep of
- * each frame (see `_pumpLook`) so the very step that moves you already knows
+ * each frame (see `_pumpLocalCommand`) so the very step that moves you already knows
  * where you are aiming. Look is still applied exactly once per frame, so it is
  * never quantised to the 120 Hz grid.
  */
@@ -371,12 +394,29 @@ export class Player {
     this._deathAt = 0;
     this._lastWeaponAds = undefined;
 
-    /** Edge-triggered input latched once per frame — see `_latchEdges`. */
+    /**
+     * Held-state, resolved once per rendered frame by `_buildLocalCommand` and read by
+     * every fixed substep of that frame — see `applyCommand`. Values are stable across
+     * a frame's substeps regardless (the JS event loop cannot change `game.input`
+     * mid-frame), so caching them here instead of re-reading `game.input` per substep
+     * changes nothing about behaviour; it only moves the read out of simulation code.
+     */
+    this._held = {
+      wishForward: 0, wishRight: 0,
+      crouchHeld: false, toggleAdsMode: false, sprintKeyHeld: false, breathHold: false,
+      fireHeld: false, aimButtonHeld: false,
+      leanKeyHeld: false, leanRightKeyHeld: false,
+    };
+    /** Local-only, client-side bookkeeping for the crouch toggle — see `_buildLocalCommand`. */
+    this._localCrouchToggle = false;
+
+    /** Edge-triggered input latched once per frame — see `applyCommand`. */
     this._edge = {
       jump: false, crouch: false, reload: false, melee: false, grenade: false,
       interact: false, inspect: false, killstreak: false, lastWeapon: false,
       slot: -1, sprintDown: false, sprintUp: false,
       fire: false, aim: false, wheel: 0,
+      respawnSkip: false, airstrikeConfirm: false,
     };
 
     this.camera = new PlayerCamera(game, this);
@@ -384,12 +424,6 @@ export class Player {
 
   async init() {
     this._resolveSpawn();
-    // SINGLE INPUT OWNER. `WeaponSystem` ships its own local-player input pump and
-    // documents this flag as the seam for a controller that would rather drive the
-    // weapon itself. We do — Player is the only place that knows about the sprint-out
-    // delay, the mantle lockout and the melee lockout — so we take the seam. Without
-    // this both pumps consume the same edge and one grenade key throws two grenades.
-    if (this.game.weapons) this.game.weapons.autoInput = false;
     this.camera.reset();
     this._refreshWeapon(true);
   }
@@ -583,6 +617,7 @@ export class Player {
     this.eyeLand = 0;
     this.eyeLandVel = 0;
     this.crouchHeld = false;
+    this._localCrouchToggle = false;
     this.crouchFrac = 0;
     this.moveState = 'air';
     this.grounded = false;
@@ -645,53 +680,193 @@ export class Player {
   // ══════════════════════════════════════════════════════ frame entrypoints ══
 
   /**
-   * Mouse look is integrated exactly once per rendered frame. We pump it from
-   * the first fixed substep so movement in that same frame uses the fresh yaw
-   * (zero added latency), and from `update()` as a fallback for frames that ran
-   * no substep at all (>120 fps, or while paused).
+   * Build and apply this tick's command exactly once per rendered frame. Pumped from
+   * the first fixed substep so movement in that same frame uses fresh input (zero added
+   * latency), and from `update()` as a fallback for frames that ran no substep at all
+   * (>120 fps, or while paused).
+   *
+   * This is the ONLY place local input is read. `_buildLocalCommand` is the seam a
+   * networked build replaces: a remote player's command arrives over the wire instead
+   * of being built from `game.input` here, and `applyCommand` cannot tell the
+   * difference — it never touches `game.input` or `game.settings` itself.
    */
-  _pumpLook() {
+  _pumpLocalCommand() {
     if (this._lookFrame === this.game.frame) return;
     this._lookFrame = this.game.frame;
-    this._latchEdges();
-    this.camera.updateLook();
+    this.applyCommand(this._buildLocalCommand());
   }
 
   /**
-   * `input.pressed/released` and the mouse-button edge flags are cleared once
-   * per RENDERED frame, but `fixedUpdate` can run up to six times in that same
-   * frame — reading them directly would fire a "tap" once per substep (which
-   * would, for example, toggle crouch twice and cancel itself out). So we latch
-   * every edge exactly once per frame here and let the next substep consume it.
-   * Latching also means an edge that arrives on a frame with zero substeps is
-   * held rather than lost.
+   * Resolve this tick's local input into a command. Every settings-dependent
+   * button→intent mapping (toggle vs hold, autoSprint) is decided HERE, not in
+   * `applyCommand` — `game.settings` is this machine's own settings, meaningless for a
+   * remote player's command, so the resolution has to happen before the command exists.
+   *
+   * The look delta is likewise resolved to radians here (sensitivity, ADS zoom
+   * compensation, invertY) rather than sent as raw pixels — see `_lookDeltaToRadians`.
+   *
+   * `firePressed` doubles as the resolve-respawn-early and confirm-airstrike-mark input
+   * (see `applyCommand`'s edge dispatch and `Match._updateRespawns`/`Killstreaks`, which
+   * used to read `game.input.firePressed` directly): one raw edge, several consumers.
    */
-  _latchEdges() {
+  _buildLocalCommand() {
     const g = this.game;
-    const e = this._edge;
+    const cmd = this._cmdScratch || (this._cmdScratch = {});
     if (g.state !== 'playing' || g.paused) {
-      this._clearEdges();
       g.input.consumeWheel?.();
-      return;
+      Object.assign(cmd, EMPTY_COMMAND);
+      return cmd;
     }
     const i = g.input;
-    if (i.wasPressed('jump')) e.jump = true;
-    if (i.wasPressed('crouch')) e.crouch = true;
-    if (i.wasPressed('reload')) e.reload = true;
-    if (i.wasPressed('melee')) e.melee = true;
-    if (i.wasPressed('grenade')) e.grenade = true;
-    if (i.wasPressed('interact')) e.interact = true;
-    if (i.wasPressed('inspect')) e.inspect = true;
-    if (i.wasPressed('killstreak')) e.killstreak = true;
-    if (i.wasPressed('lastWeapon')) e.lastWeapon = true;
-    if (i.wasPressed('weapon1')) e.slot = 0;
-    if (i.wasPressed('weapon2')) e.slot = 1;
-    if (i.wasPressed('weapon3')) e.slot = 2;
-    if (i.wasPressed('sprint')) e.sprintDown = true;
-    if (i.wasReleased('sprint')) e.sprintUp = true;
-    if (i.firePressed) e.fire = true;
-    if (i.aimPressed) e.aim = true;
-    e.wheel += i.consumeWheel?.() ?? 0;
+    const s = g.settings;
+
+    let mf = 0, mr = 0;
+    if (i.isDown('forward')) mf += 1;
+    if (i.isDown('back')) mf -= 1;
+    if (i.isDown('right')) mr += 1;
+    if (i.isDown('left')) mr -= 1;
+    if (mf !== 0 && mr !== 0) { const k = Math.SQRT1_2; mf *= k; mr *= k; }
+    cmd.wishForward = mf;
+    cmd.wishRight = mr;
+
+    cmd.jump = i.wasPressed('jump');
+    cmd.reload = i.wasPressed('reload');
+    cmd.melee = i.wasPressed('melee');
+    cmd.grenade = i.wasPressed('grenade');
+    cmd.interact = i.wasPressed('interact');
+    cmd.inspect = i.wasPressed('inspect');
+    cmd.killstreak = i.wasPressed('killstreak');
+    cmd.lastWeapon = i.wasPressed('lastWeapon');
+    cmd.slot = i.wasPressed('weapon1') ? 0 : i.wasPressed('weapon2') ? 1 : i.wasPressed('weapon3') ? 2 : -1;
+    cmd.sprintDown = i.wasPressed('sprint');
+    cmd.sprintUp = i.wasReleased('sprint');
+    cmd.wheel = i.consumeWheel?.() ?? 0;
+    cmd.firePressed = i.firePressed;
+    cmd.aimButtonPressed = i.aimPressed;
+    cmd.respawnSkip = i.firePressed;
+    cmd.airstrikeConfirm = i.firePressed;
+
+    // Crouch's "just engaged" edge (drives slide entry). The toggle FLIP has to happen
+    // here, once per frame, because it is driven by `wasPressed` — a genuinely
+    // frame-scoped edge (see the class doc on `Input`). `_refreshHeldState` below only
+    // READS `_localCrouchToggle` every substep; it must not also flip it, or a 6-substep
+    // frame would flip the toggle up to six times instead of once.
+    const crouchKeyPressed = i.wasPressed('crouch');
+    if (s.get('toggleCrouch')) {
+      if (crouchKeyPressed) this._localCrouchToggle = !this._localCrouchToggle;
+      cmd.crouchPressed = crouchKeyPressed && this._localCrouchToggle;
+    } else {
+      cmd.crouchPressed = crouchKeyPressed;
+    }
+
+    cmd.deltaYaw = 0;
+    cmd.deltaPitch = 0;
+    this._lookDeltaToRadians(cmd);
+
+    return cmd;
+  }
+
+  /**
+   * Held button/axis state, refreshed every FIXED SUBSTEP (not frame-gated like
+   * `_buildLocalCommand`). `game.input` is a live, always-current source with no
+   * staleness to worry about — re-deriving `wishForward` six times in one rendered
+   * frame produces the same value each time, so there is no reason to cache it behind
+   * the frame gate the way edges and mouse-look genuinely require:
+   *   - Edges (`wasPressed`) are cleared once per RENDERED frame by `Input.endFrame()`,
+   *     so reading them every substep would fire one action per substep instead of once.
+   *   - Mouse look is deliberately consumed once per frame at full resolution.
+   * Held state has neither problem, and reading it once per frame instead of every
+   * substep is actively wrong on a server or test harness that drives `_fixedUpdate`
+   * without a render loop incrementing `game.frame` — the frame gate would then never
+   * open again after the first tick, freezing movement and fire input.
+   */
+  _refreshHeldState() {
+    const g = this.game;
+    const h = this._held;
+    if (g.state !== 'playing' || g.paused) { Object.assign(h, EMPTY_HELD); return; }
+    const i = g.input;
+    const s = g.settings;
+
+    let mf = 0, mr = 0;
+    if (i.isDown('forward')) mf += 1;
+    if (i.isDown('back')) mf -= 1;
+    if (i.isDown('right')) mr += 1;
+    if (i.isDown('left')) mr -= 1;
+    if (mf !== 0 && mr !== 0) { const k = Math.SQRT1_2; mf *= k; mr *= k; }
+    h.wishForward = mf;
+    h.wishRight = mr;
+
+    if (s.get('toggleCrouch')) {
+      // The toggle itself only flips on the press EDGE, so it lives in
+      // `_buildLocalCommand` (frame-gated, sees `wasPressed` exactly once) — this just
+      // reads the current toggle state every substep, same as any other held value.
+      h.crouchHeld = this._localCrouchToggle;
+    } else {
+      h.crouchHeld = i.isDown('crouch');
+    }
+
+    // See `_buildLocalCommand`'s comment: the ADS toggle flip/clear needs THIS tick's
+    // sim state (adsBlocked), so only the mode + raw button are resolved here; the
+    // flip itself happens in `_readInput`.
+    h.toggleAdsMode = s.get('toggleAds');
+    h.aimButtonHeld = i.aim;
+
+    h.fireHeld = i.fire;
+    h.sprintKeyHeld = s.get('autoSprint') ? true : i.isDown('sprint');
+    h.breathHold = i.isDown('sprint');
+    h.leanKeyHeld = i.isDown('lean');
+    h.leanRightKeyHeld = i.isDown('right');
+  }
+
+  /**
+   * Raw mouse pixels → yaw/pitch radians for this tick, written into `cmd.deltaYaw`/
+   * `cmd.deltaPitch`. Exactly the transform `PlayerCamera.updateLook()` used to do
+   * inline; moved here so the camera never reads `game.input`/`game.settings` itself.
+   */
+  _lookDeltaToRadians(cmd) {
+    const g = this.game;
+    const input = g.input;
+    input.consumeLook(_lookOut);
+
+    const playable = g.state === 'playing' && !g.paused && input.locked && this.alive;
+    if (!playable) return;   // drain and discard — re-entering the game must not replay stale motion
+
+    const s = g.settings;
+    const cam = this.camera;
+    // Zoom-compensated sensitivity. The ratio uses the ADS-only fov so that the
+    // sprint/slide fov widen never changes how aiming feels.
+    const baseFov = s.get('fov');
+    const ratio = Math.tan(cam.adsFovOnly * 0.5 * DEG) / Math.tan(baseFov * 0.5 * DEG);
+    const adsMul = lerp(1, s.get('adsSensitivity'), clamp(this.adsAmount, 0, 1));
+    const sens = CAMERA_TUNE.SENS_BASE * s.get('sensitivity') * adsMul * ratio;
+
+    cmd.deltaYaw = -_lookOut.x * sens;
+    cmd.deltaPitch = (s.get('invertY') ? _lookOut.y : -_lookOut.y) * sens;
+  }
+
+  /**
+   * Apply one command's EDGES and LOOK delta. Called once per rendered frame (see
+   * `_pumpLocalCommand`) — held state is a separate, per-substep concern, refreshed by
+   * `_refreshHeldState` for exactly the reasons explained there. Between them, nothing
+   * else in `fixedUpdate` reads `game.input`.
+   */
+  applyCommand(cmd) {
+    this.camera.baseYaw += cmd.deltaYaw;
+    this.camera.basePitch = clamp(this.camera.basePitch + cmd.deltaPitch, -PITCH_LIMIT, PITCH_LIMIT);
+    if (this.camera.baseYaw > Math.PI * 4) this.camera.baseYaw -= Math.PI * 4;
+    else if (this.camera.baseYaw < -Math.PI * 4) this.camera.baseYaw += Math.PI * 4;
+    this.camera._lookDX += cmd.deltaYaw;
+    this.camera._lookDY += cmd.deltaPitch;
+    this.camera._writeAngles();
+
+    const e = this._edge;
+    e.jump = cmd.jump; e.crouch = cmd.crouchPressed; e.reload = cmd.reload;
+    e.melee = cmd.melee; e.grenade = cmd.grenade; e.interact = cmd.interact;
+    e.inspect = cmd.inspect; e.killstreak = cmd.killstreak; e.lastWeapon = cmd.lastWeapon;
+    e.slot = cmd.slot; e.sprintDown = cmd.sprintDown; e.sprintUp = cmd.sprintUp;
+    e.fire = cmd.firePressed; e.aim = cmd.aimButtonPressed;
+    e.wheel += cmd.wheel;
+    e.respawnSkip = cmd.respawnSkip; e.airstrikeConfirm = cmd.airstrikeConfirm;
   }
 
   _clearEdges() {
@@ -700,10 +875,12 @@ export class Player {
     e.grenade = false; e.interact = false; e.inspect = false; e.killstreak = false;
     e.lastWeapon = false; e.slot = -1; e.sprintDown = false; e.sprintUp = false;
     e.fire = false; e.aim = false; e.wheel = 0;
+    e.respawnSkip = false; e.airstrikeConfirm = false;
   }
 
   fixedUpdate(dt) {
-    this._pumpLook();
+    this._pumpLocalCommand();
+    this._refreshHeldState();
     if (!this.game.world) return;
 
     if (!this.alive) {
@@ -734,7 +911,7 @@ export class Player {
   }
 
   update(dtFrame) {
-    this._pumpLook();
+    this._pumpLocalCommand();
     this.camera.update(dtFrame);
   }
 
@@ -753,40 +930,38 @@ export class Player {
 
   // ══════════════════════════════════════════════════════════════════ input ══
 
+  /**
+   * Consume this frame's command (latched into `this._held`/`this._edge` by
+   * `applyCommand`) every fixed substep. No `game.input`/`game.settings` reads below —
+   * everything settings-dependent (toggle/hold mapping) was already resolved when the
+   * command was built; what's left here is arbitration that needs THIS TICK's sim
+   * state (sprint/ADS mutual exclusion, ADS blocked by sprinting/mantling/dying), which
+   * the command builder cannot know in advance.
+   */
   _readInput(dt) {
-    const input = this.game.input;
-    const settings = this.game.settings;
+    const h = this._held;
     const e = this._edge;
 
-    let mf = 0, mr = 0;
-    if (input.isDown('forward')) mf += 1;
-    if (input.isDown('back')) mf -= 1;
-    if (input.isDown('right')) mr += 1;
-    if (input.isDown('left')) mr -= 1;
-    if (mf !== 0 && mr !== 0) { const k = Math.SQRT1_2; mf *= k; mr *= k; }
+    let mf = h.wishForward, mr = h.wishRight;
     this.wishForward = mf;
     this.wishRight = mr;
 
-    // ── crouch (respects settings.toggleCrouch) ──
-    if (settings.get('toggleCrouch')) {
-      if (e.crouch) this.crouchHeld = !this.crouchHeld;
-    } else {
-      this.crouchHeld = input.isDown('crouch');
-    }
+    // ── crouch — already fully resolved by the command builder ──
+    this.crouchHeld = h.crouchHeld;
 
     // ── sprint arbitration ──
     // Sprint and ADS are mutually exclusive; the most recent intent wins.
-    if (settings.get('toggleAds') && e.aim) this.adsToggle = !this.adsToggle;
+    if (h.toggleAdsMode && e.aim) this.adsToggle = !this.adsToggle;
     if (e.aim || e.fire) this._sprintInterrupted = true;
     if (e.sprintDown || e.sprintUp) this._sprintInterrupted = false;
     // Once the trigger and the aim button are both released, sprinting is free
     // again without demanding a fresh key press.
-    if (this._sprintInterrupted && !input.fire && !input.aim &&
-        !(settings.get('toggleAds') && this.adsToggle)) {
+    if (this._sprintInterrupted && !h.fireHeld && !h.aimButtonHeld &&
+        !(h.toggleAdsMode && this.adsToggle)) {
       this._sprintInterrupted = false;
     }
 
-    const sprintKey = settings.get('autoSprint') ? true : input.isDown('sprint');
+    const sprintKey = h.sprintKeyHeld;
     const wasSprinting = this.sprinting;
     this.sprinting =
       this.alive &&
@@ -808,15 +983,14 @@ export class Player {
       this.sprintRamp = Math.max(0, this.sprintRamp - dt / (TUNE.SPRINT_RAMP * 0.55));
     }
 
-    // ── slide entry ──
-    const crouchPressed = settings.get('toggleCrouch') ? (e.crouch && this.crouchHeld) : e.crouch;
-    if (crouchPressed) this._tryStartSlide();
+    // ── slide entry — `e.crouch` is already the "just engaged" edge ──
+    if (e.crouch) this._tryStartSlide();
 
     // ── ADS ──
-    const adsHeld = settings.get('toggleAds') ? this.adsToggle : input.aim;
+    const adsHeld = h.toggleAdsMode ? this.adsToggle : h.aimButtonHeld;
     const adsBlocked = this.sprinting || this.moveState === 'mantle' || !this.alive;
     this.wantsAds = !!adsHeld && !adsBlocked;
-    if (adsBlocked && settings.get('toggleAds')) this.adsToggle = false;
+    if (adsBlocked && h.toggleAdsMode) this.adsToggle = false;
 
     const adsRate = 1 / this.adsTime;
     this.adsAmount = this.wantsAds
@@ -1313,13 +1487,13 @@ export class Player {
   // ═══════════════════════════════════════════════════════════════════ lean ══
 
   _updateLean(dt) {
-    const input = this.game.input;
+    const h = this._held;
     let dir = 0;
     const blocked = this.sprinting || this.moveState === 'slide' || this.moveState === 'mantle';
-    if (!blocked && input.isDown('lean')) {
+    if (!blocked && h.leanKeyHeld) {
       // One bind, two directions: the strafe keys pick the side while Q is held
       // (left is the default, matching the muscle memory of a single peek key).
-      dir = input.isDown('right') ? 1 : -1;
+      dir = h.leanRightKeyHeld ? 1 : -1;
     }
 
     let allowed = TUNE.LEAN_DIST;
@@ -1338,7 +1512,7 @@ export class Player {
   // ════════════════════════════════════════════════════════ weapon handling ══
 
   _updateWeapon() {
-    const input = this.game.input;
+    const h = this._held;
     const t = this.game.time;
     const e = this._edge;
     this._refreshWeapon(false);
@@ -1363,10 +1537,10 @@ export class Player {
       !this.sprinting &&
       t >= this._fireReadyAt;
 
-    if (input.fire && canFire) {
+    if (h.fireHeld && canFire) {
       w.tryFire?.();
       this._wasFiring = true;
-    } else if (this._wasFiring && !input.fire) {
+    } else if (this._wasFiring && !h.fireHeld) {
       w.stopFire?.();
       this._wasFiring = false;
     } else if (!canFire && this._wasFiring) {

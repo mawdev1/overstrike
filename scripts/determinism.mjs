@@ -10,10 +10,11 @@
  * varies only how `game.frame` advances underneath it, so anything in the simulation
  * that reads the render counter shows up as a divergence.
  *
- * Its blind spot is input: it injects none, so a frame-gated INPUT path cannot diverge
- * here however wrong it is. `Player._pumpLook()` still gates on `game.frame` and is
- * invisible to this harness for exactly that reason — it is covered by the command
- * refactor, not by this file.
+ * Its blind spot is bot/world state: it injects no PLAYER input, so a frame-gated
+ * player-input path wouldn't diverge here even if broken. The player-input command
+ * pipeline (`Player._pumpLocalCommand`/`_refreshHeldState`) has its own coverage below
+ * — "player input survives a frame-frozen server" — precisely because this suite found
+ * that exact class of bug once already.
  *
  * Usage: node scripts/determinism.mjs [--ticks=2400] [--headed]
  */
@@ -160,6 +161,49 @@ try {
   if (clock.survivedWrite) ok('game.time cannot be assigned away from the tick');
   else bad('game.time cannot be assigned away from the tick', 'a plain assignment changed it — the clock is not derived');
 
+  // ── player input survives a frame-frozen server ──────────────────────────────────
+  //
+  // Phase 2 found a real bug of exactly this shape: held-state (movement, fire) was
+  // cached behind the same once-per-rendered-frame gate as edges and mouse look. On a
+  // real client `game.frame` always advances, so it was invisible in play — but a
+  // headless server (or this very harness, which drives `_fixedUpdate` without ever
+  // touching `game.frame`) never advances it, so the gate opened once and never again,
+  // freezing movement and fire input after the first tick. Prove player input still
+  // works after many ticks with `game.frame` completely static.
+  console.log('\nplayer input under a frozen game.frame (no render loop)');
+  const frozen = await page.evaluate(() => {
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 9 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const frameAtStart = g.frame;
+
+    const inp = g.input;
+    inp.enabled = true;
+    inp.actions.add('forward');
+    inp.buttons[0] = true;               // hold fire
+    const DT = 1 / 120;
+    const startPos = g.player.position.clone();
+    let ammoAfter100 = null;
+    for (let i = 0; i < 400; i++) {
+      g._fixedUpdate(DT);                // game.frame is NEVER touched in this loop
+      if (i === 99) ammoAfter100 = g.player.weapon?.ammo;
+    }
+    return {
+      frameUnchanged: g.frame === frameAtStart,
+      moved: g.player.position.distanceTo(startPos),
+      ammoAfter100, ammoFinal: g.player.weapon?.ammo,
+      weaponState: g.player.weapon?.state,
+    };
+  });
+
+  if (!frozen.frameUnchanged) bad('game.frame really was frozen (test precondition)', 'harness bug, not a sim bug');
+  else ok('game.frame stayed frozen for the whole run (test precondition holds)');
+  if (frozen.moved > 0.5) ok(`player moved under held forward (${frozen.moved.toFixed(2)} m)`);
+  else bad('player moved under held forward', `only ${frozen.moved.toFixed(3)} m in 400 frozen-frame ticks`);
+  if (frozen.ammoAfter100 !== null && frozen.ammoAfter100 < 30) ok(`weapon fired under held trigger (ammo ${frozen.ammoAfter100}/30 at tick 100)`);
+  else bad('weapon fired under held trigger', `ammo still ${frozen.ammoAfter100} at tick 100 — fire input froze`);
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point
@@ -171,7 +215,18 @@ try {
   const eye = await page.evaluate(() => {
     const g = window.__GAME__;
     g.stop();
-    g.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 7 });
+    // Zero bots deliberately: this test only needs player state, and a live bot can
+    // land a hit over 1500 ticks, triggering damageKick's punch spring — a real,
+    // legitimate, but UNRELATED source of camera/eye disagreement (punch is deliberately
+    // unfaded, since it displaces along the aim axis) that would make this test flaky
+    // for a reason that has nothing to do with what it is checking.
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 7 });
+    // Camera-only feel state (punch, bob, shake, lag) is NOT reset by respawn — only by
+    // PlayerCamera.reset(), which runs once at boot — so it can carry over from an
+    // earlier test block in this same page session (e.g. the frozen-frame test above,
+    // which fires the weapon). Zero it explicitly rather than either
+    // loosening the tolerance below or getting a false failure from a previous block.
+    g.player.camera.punch = 0; g.player.camera.punchVel = 0;
     const THREE = g.player.position.constructor;
     const o = new THREE(); const e = new THREE();
     let worstOriginVsEye = 0, worstCamVsOrigin = 0, sawStep = 0, sawLand = 0, sawSlide = 0;
@@ -184,6 +239,11 @@ try {
       g.player.slideAmount = (i % 300 >= 240 && i % 300 < 280) ? 1 : 0;
       g.frame++;
       g._fixedUpdate(1 / 120);
+      // Punch is not what this test checks (see the note above the earlier explicit
+      // zero) and, on the real map, the repeated position.y += 5 above can compound
+      // with genuine terrain into a fall deep enough to trigger fall damage — a real
+      // but unrelated source of punch. Zero every tick, not just once at the start.
+      g.player.camera.punch = 0; g.player.camera.punchVel = 0;
       g.player.camera.update(1 / 120);          // compose the render camera
       g.weapons.getFireOrigin(g.player, o);
       g.player.getEyePosition(e);

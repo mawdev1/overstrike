@@ -578,10 +578,6 @@ export class WeaponSystem {
     this.loadouts = new Map();
 
     this.viewmodel = null;
-    /** Set false if the player controller wants to drive weapon actions itself. */
-    this.autoInput = true;
-
-    this._pressFrames = Object.create(null);
     this._switchPending = null;   // { entity, idx, timer, commit }
     this._meleeTimer = 0;
     this._meleeEntity = null;
@@ -602,8 +598,8 @@ export class WeaponSystem {
     this._unsub.push(bus.on('kill', (e) => {
       if (e.attacker && e.attacker !== e.victim) this.grantKillAmmo(e.attacker);
     }));
-    // Inspect is announced on the bus by whoever owns input (Player sets
-    // `autoInput = false` and drives it), so the animation has one trigger either way.
+    // Inspect is announced on the bus by Player.applyCommand, so the animation has
+    // exactly one trigger.
     this._unsub.push(bus.on('inspect', (e) => {
       if (!e || !e.entity || e.entity.isPlayer) this.viewmodel?.onInspect();
     }));
@@ -891,52 +887,9 @@ export class WeaponSystem {
     // --- melee re-swing lock (the hit itself resolved on the button)
     if (this._meleeTimer > 0) this._meleeTimer -= dt;
 
-    if (this.autoInput) this._playerInput(dt);
-
     for (const lo of this.loadouts.values()) {
       const inst = lo.index >= 0 ? lo.weapons[lo.index] : null;
       if (inst) inst.fixedUpdate(dt);
-    }
-  }
-
-  /**
-   * Local player weapon input. Every action here also exists as a public method, so a
-   * player controller that prefers to own input can set `game.weapons.autoInput = false`
-   * and call the same entry points — the weapon never knows the difference.
-   */
-  _playerInput() {
-    const game = this.game;
-    const p = game.player;
-    if (!p || !p.alive || game.state !== 'playing' || game.paused) return;
-    const input = game.input;
-    if (!input || !input.enabled) return;
-    const inst = this.current(p);
-    if (!inst) return;
-
-    // Fire / release.
-    if (input.fire) inst.tryFire();
-    else inst.stopFire();
-
-    // Aim down sights (hold, or toggle if the player prefers).
-    if (game.settings.get('toggleAds')) {
-      if (this._edge('adsToggle', input.aimPressed)) inst.setAds(!inst.wantAds);
-    } else {
-      inst.setAds(input.aim);
-    }
-
-    if (this._edge('reload', input.wasPressed('reload'))) inst.reload();
-    if (this._edge('melee', input.wasPressed('melee'))) this.meleeAttack(p);
-    if (this._edge('grenade', input.wasPressed('grenade'))) this.throwGrenade(p, 'lethal', 1);
-    if (this._edge('inspect', input.wasPressed('inspect'))) this.viewmodel?.onInspect();
-    if (this._edge('lastWeapon', input.wasPressed('lastWeapon'))) this.lastWeapon(p);
-    if (this._edge('weapon1', input.wasPressed('weapon1'))) this._slot(p, 0);
-    if (this._edge('weapon2', input.wasPressed('weapon2'))) this._slot(p, 1);
-    if (this._edge('weapon3', input.wasPressed('weapon3'))) this._slot(p, 2);
-
-    const wheel = input.wheelDelta;
-    if (wheel !== 0 && this._edge('wheel', true)) {
-      input.consumeWheel();
-      if (wheel > 0) this.nextWeapon(p); else this.prevWeapon(p);
     }
   }
 
@@ -945,14 +898,6 @@ export class WeaponSystem {
     const lo = this.loadouts.get(entity);
     if (!lo || idx >= lo.weapons.length) return false;
     return this.switchTo(entity, idx);
-  }
-
-  /** One-shot per rendered frame: `pressed` sets survive several fixed substeps. */
-  _edge(key, condition) {
-    if (!condition) return false;
-    if (this._pressFrames[key] === this.game.frame) return false;
-    this._pressFrames[key] = this.game.frame;
-    return true;
   }
 
   /** Visual-only: viewmodel animation and the dynamic crosshair. */
