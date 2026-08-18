@@ -11,6 +11,7 @@
 import * as THREE from 'three';
 import { World } from '../src/world/world.js';
 import { createRNG, mixSeed } from '../src/core/rng.js';
+import { defineSnapshot } from '../src/core/snapshot.js';
 
 let passed = 0;
 const failures = [];
@@ -223,6 +224,160 @@ test('mixSeed gives each index an independent stream', () => {
     firstDraws.add(createRNG(seed)());
   }
   assertEq(firstDraws.size, 32, 'two indices produced the same first draw — streams are not independent');
+});
+
+// ══════════════════════════════════════════════════ snapshot manifest machinery ══
+//
+// Save/restore is generated from a declared field list rather than hand-written, because
+// a Player carries ~70 mutable fields and a missed one does not fail loudly — it produces
+// rare rubber-banding under conditions nobody can reproduce. These tests cover the
+// machinery; the manifests themselves are audited separately against live instances.
+
+console.log('\nsnapshot manifest machinery');
+
+const makeSpec = () => defineSnapshot('Thing', {
+  scalars: ['health', 'alive', 'name'],
+  vec3s: ['position'],
+  objects: { held: ['fwd', 'jump'] },
+  ignore: ['game'],
+});
+
+const makeThing = () => ({
+  health: 100,
+  alive: true,
+  name: 'a',
+  position: { x: 1, y: 2, z: 3 },
+  held: { fwd: 1, jump: false },
+  game: { huge: true },
+});
+
+test('save then restore round-trips every declared field', () => {
+  const m = makeSpec();
+  const t = makeThing();
+  const snap = m.save(t);
+  t.health = 5; t.alive = false; t.name = 'b';
+  t.position.x = 99; t.position.y = 98; t.position.z = 97;
+  t.held.fwd = -1; t.held.jump = true;
+  m.restore(t, snap);
+  assertEq(t.health, 100, 'scalar not restored');
+  assertEq(t.alive, true, 'bool not restored');
+  assertEq(t.name, 'a', 'string not restored');
+  assertEq(t.position.x, 1, 'vec3.x not restored');
+  assertEq(t.position.z, 3, 'vec3.z not restored');
+  assertEq(t.held.fwd, 1, 'nested field not restored');
+  assertEq(t.held.jump, false, 'nested bool not restored');
+});
+
+test('a vec3 snapshot does not alias the live entity', () => {
+  // The bug this prevents: assigning the reference instead of copying components means
+  // the "snapshot" IS the entity's vector, so mutating the entity silently rewrites
+  // history and restore becomes a no-op.
+  const m = makeSpec();
+  const t = makeThing();
+  const snap = m.save(t);
+  t.position.x = 42;
+  assertEq(snap.position.x, 1, 'the snapshot tracked the live vector — it aliases');
+  m.restore(t, snap);
+  assertEq(t.position.x, 1, 'restore did not undo the mutation');
+});
+
+test('a nested object snapshot does not alias the live entity', () => {
+  const m = makeSpec();
+  const t = makeThing();
+  const snap = m.save(t);
+  t.held.fwd = 42;
+  assertEq(snap.held.fwd, 1, 'the snapshot tracked the live sub-object — it aliases');
+});
+
+test('restore writes into the existing vec3 rather than replacing it', () => {
+  // Player.position is handed to systems that keep the reference (hitboxes, bots reading
+  // a noise origin). Replacing the object on restore would leave them pointing at the
+  // pre-restore vector, so the entity would move while its hitboxes did not.
+  const m = makeSpec();
+  const t = makeThing();
+  const snap = m.save(t);
+  const held = t.position;
+  t.position.x = 9;
+  m.restore(t, snap);
+  assert(t.position === held, 'restore replaced the Vector3 instead of writing into it');
+});
+
+test('save reuses a provided out-object', () => {
+  const m = makeSpec();
+  const t = makeThing();
+  const out = {};
+  const a = m.save(t, out);
+  assert(a === out, 'save did not return the out-object it was given');
+  const vec = out.position;
+  t.position.x = 7;
+  m.save(t, out);
+  assert(out.position === vec, 'save reallocated the nested vec3 instead of reusing it');
+  assertEq(out.position.x, 7, 'the reused out-object was not updated');
+});
+
+test('diff names the fields that actually differ', () => {
+  const m = makeSpec();
+  const a = m.save(makeThing());
+  const t2 = makeThing();
+  t2.health = 50;
+  t2.position.z = 0;
+  t2.held.jump = true;
+  const b = m.save(t2);
+  const d = m.diff(a, b);
+  assert(d.includes('health'), `diff missed health: ${d}`);
+  assert(d.includes('position'), `diff missed position: ${d}`);
+  assert(d.includes('held.jump'), `diff missed held.jump: ${d}`);
+  assertEq(d.length, 3, `diff reported extra fields: ${d}`);
+});
+
+test('diff is empty for identical states', () => {
+  const m = makeSpec();
+  assertEq(m.diff(m.save(makeThing()), m.save(makeThing())).length, 0,
+    'two identical entities compared as divergent');
+});
+
+test('diff treats NaN as agreement and -0 as divergence', () => {
+  // NaN on both sides is the same state; +0 vs -0 is not, because it flips the sign of
+  // anything that divides by it.
+  const m = makeSpec();
+  const a = makeThing(); a.health = NaN;
+  const b = makeThing(); b.health = NaN;
+  assertEq(m.diff(m.save(a), m.save(b)).length, 0, 'NaN vs NaN reported as divergence');
+  const c = makeThing(); c.health = 0;
+  const d = makeThing(); d.health = -0;
+  assert(m.diff(m.save(c), m.save(d)).includes('health'), '+0 vs -0 reported as agreement');
+});
+
+test('audit reports a field that is neither captured nor ignored', () => {
+  // The forgotten-field guard: this is what fails on the branch of whoever adds a field
+  // to Player without thinking about reconciliation.
+  const m = makeSpec();
+  const t = makeThing();
+  t.newlyAddedField = 3;
+  const missing = m.audit(t);
+  assertEq(missing.length, 1, `expected exactly one uncovered field, got ${missing}`);
+  assertEq(missing[0], 'newlyAddedField', 'audit named the wrong field');
+});
+
+test('audit is silent for a fully declared instance', () => {
+  const m = makeSpec();
+  assertEq(m.audit(makeThing()).length, 0, 'audit flagged a declared field');
+});
+
+test('audit ignores prototype getters', () => {
+  // Derived values have nothing to restore, and a manifest should not have to list them.
+  const m = makeSpec();
+  const proto = { get derived() { return 1; } };
+  const t = Object.assign(Object.create(proto), makeThing());
+  assertEq(m.audit(t).length, 0, 'audit flagged a prototype getter');
+});
+
+test('declaring a field twice throws at definition time', () => {
+  let threw = false;
+  try {
+    defineSnapshot('Bad', { scalars: ['a'], ignore: ['a'] });
+  } catch { threw = true; }
+  assert(threw, 'a field declared as both captured and ignored was accepted');
 });
 
 // ══════════════════════════════════════════════════════════════════════════ report ══
