@@ -99,14 +99,11 @@ for (const s of SHOTS) {
     const p = g.player;
     p.position.set(shot.pos[0], shot.pos[1], shot.pos[2]);
     p.velocity.set(0, 0, 0);
-    p.yaw = shot.yaw;
-    p.pitch = shot.pitch;
-    if (p.camera) {
-      p.camera.baseYaw = shot.yaw;
-      p.camera.basePitch = shot.pitch;
-      p.recoilPitch = p.recoilYaw = 0;
-      p.recoilPitchTarget = p.recoilYawTarget = 0;
-    }
+    // setAngles is the only correct way to point the player since Phase 2b: it sets
+    // baseYaw/basePitch and zeroes recoil and sway together. Writing p.yaw alone does
+    // nothing lasting — _writeAngles() recomposes it from baseYaw on the very next tick,
+    // so every shot used to be framed from whatever heading the player already had.
+    p.setAngles(shot.yaw, shot.pitch);
     // Hold the trigger off and let a couple of frames settle the camera rig.
     g.input.actions.clear();
     g.input.buttons[0] = g.input.buttons[2] = false;

@@ -383,25 +383,17 @@ test('audit flags a manifest name that is not on the instance', () => {
   assertEq(stale[0], 'helth', 'audit named the wrong stale field');
 });
 
-test('a null vec3 survives save and restore instead of throwing', () => {
-  // Nothing enforces that a declared vec3 is non-null. A field that goes null mid-match
-  // must not turn the snapshot into a crash inside the fixed step.
+test('a null vec3 is refused loudly at save, naming the field', () => {
+  // Nullable vectors are not supported, and the refusal is the feature. `restore` writes
+  // into the existing object so the references other systems hold stay valid; if a field
+  // can be null there is nothing to write into, and handing back a plain {x,y,z} would
+  // break the first `.copy()` the fixed step makes — moving the crash one tick later
+  // rather than preventing it. Fail where the message can name the field.
   const m = defineSnapshot('Nullable', { vec3s: ['target'] });
-  const t = { target: null };
-  let snap;
-  try { snap = m.save(t); } catch (e) { throw new Error(`save threw on a null vec3: ${e.message}`); }
-  t.target = { x: 1, y: 2, z: 3 };
-  m.restore(t, snap);
-  assertEq(t.target, null, 'a null vec3 did not restore as null');
-});
-
-test('restoring a vec3 onto a currently-null field does not throw', () => {
-  const m = defineSnapshot('Nullable', { vec3s: ['target'] });
-  const t = { target: { x: 4, y: 5, z: 6 } };
-  const snap = m.save(t);
-  t.target = null;
-  m.restore(t, snap);
-  assertEq(t.target.x, 4, 'the value was not restored onto a null field');
+  let msg = '';
+  try { m.save({ target: null }); } catch (e) { msg = e.message; }
+  assert(msg.includes('target'), `expected the error to name the field, got: ${msg || '(no throw)'}`);
+  assert(msg.includes('Nullable'), `expected the error to name the manifest, got: ${msg}`);
 });
 
 test('diff reports every differing key of a nested object, not just the first', () => {

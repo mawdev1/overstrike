@@ -57,11 +57,16 @@ export function defineSnapshot(className, spec) {
     for (let i = 0; i < vec3s.length; i++) {
       const k = vec3s[i];
       const v = inst[k];
-      const t = o[k] || (o[k] = { x: 0, y: 0, z: 0, _null: false });
-      // A nullable vec3 must not turn a snapshot into a mid-tick crash. Record the
-      // absence instead, so restore can reproduce it.
-      if (v == null) { t._null = true; t.x = t.y = t.z = 0; continue; }
-      t._null = false;
+      // Nullable vectors are refused rather than half-supported. `restore` writes into
+      // the existing object precisely so the references other systems hold stay valid;
+      // if the field can be null there is nothing to write into, and handing back a
+      // plain {x,y,z} would break the first `.copy()`/`.set()` the fixed step makes —
+      // moving the crash one tick later instead of preventing it. Fail here, where the
+      // message can say which field and which manifest.
+      if (v == null) {
+        throw new Error(`${className} snapshot: vec3 "${k}" was null. Nullable vectors are not supported — keep the vector and track emptiness in a separate flag.`);
+      }
+      const t = o[k] || (o[k] = { x: 0, y: 0, z: 0 });
       t.x = v.x; t.y = v.y; t.z = v.z;
     }
     for (let i = 0; i < objectNames.length; i++) {
@@ -83,11 +88,7 @@ export function defineSnapshot(className, spec) {
     for (let i = 0; i < vec3s.length; i++) {
       const k = vec3s[i];
       const s = snap[k];
-      if (s._null) { inst[k] = null; continue; }
       const v = inst[k];
-      // The field may have been null when this snapshot was taken over; there is no
-      // Vector3 to write into, so hand back a plain carrier rather than throwing.
-      if (v == null) { inst[k] = { x: s.x, y: s.y, z: s.z }; continue; }
       v.x = s.x; v.y = s.y; v.z = s.z;
     }
     for (let i = 0; i < objectNames.length; i++) {
@@ -119,8 +120,7 @@ export function defineSnapshot(className, spec) {
     for (let i = 0; i < vec3s.length; i++) {
       const k = vec3s[i];
       const x = a[k], y = b[k];
-      if (!Object.is(x._null, y._null) || !Object.is(x.x, y.x)
-        || !Object.is(x.y, y.y) || !Object.is(x.z, y.z)) list.push(k);
+      if (!Object.is(x.x, y.x) || !Object.is(x.y, y.y) || !Object.is(x.z, y.z)) list.push(k);
     }
     for (let i = 0; i < objectNames.length; i++) {
       const k = objectNames[i];
@@ -157,7 +157,10 @@ export function defineSnapshot(className, spec) {
     // the manifest reads as though the field were covered.
     const stale = [];
     for (let i = 0; i < captured.length; i++) {
-      if (!(captured[i] in inst)) stale.push(captured[i]);
+      // hasOwnProperty, not `in`: a prototype accessor satisfies `in` while being
+      // exactly the thing that must not be declared — `save` would record the derived
+      // value and `restore` would assign to a getter-only property and throw.
+      if (!Object.prototype.hasOwnProperty.call(inst, captured[i])) stale.push(captured[i]);
     }
     return { missing, stale, ok: missing.length === 0 && stale.length === 0 };
   }
@@ -173,6 +176,16 @@ export function defineSnapshot(className, spec) {
     const absent = [];
     for (let i = 0; i < captured.length; i++) {
       if (snap[captured[i]] === undefined) absent.push(captured[i]);
+    }
+    // A vec3 that loses a single component across the wire would otherwise pass whole-key
+    // presence and then write `undefined` into x, y or z.
+    for (let i = 0; i < vec3s.length; i++) {
+      const k = vec3s[i];
+      const v = snap[k];
+      if (!v) continue;
+      if (v.x === undefined) absent.push(`${k}.x`);
+      if (v.y === undefined) absent.push(`${k}.y`);
+      if (v.z === undefined) absent.push(`${k}.z`);
     }
     for (let i = 0; i < objectNames.length; i++) {
       const k = objectNames[i];

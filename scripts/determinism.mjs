@@ -432,12 +432,157 @@ try {
   // The manifest being complete is necessary but not sufficient — it also has to restore
   // faithfully enough that re-running the same ticks lands in the same place. This is the
   // shape the bit-equality harness will take in Phase 6, at one tick.
-  console.log('\nsave / restore rewinds the player, weapon and loadout exactly');
+  // ── restore actually returns the entity to its captured state ───────────────────
+  //
+  // The strongest completeness check, and deliberately NOT a behavioural one. The replay
+  // test below can only catch a dropped field if that field's stale value happens to
+  // change behaviour inside the replay window — a reviewer demonstrated that by deleting
+  // `_fireReadyAt` from the manifest and watching the whole suite still pass. Which
+  // fields a script covers is an accident of the script.
+  //
+  // This asks the question directly instead: dump every own field, run, restore, dump
+  // again. Anything that did not come back is a field the manifest failed to restore,
+  // whatever the reason — dropped, mistyped, or captured but not written back.
+  //
+  // Crucially the exclusion list belongs to the TEST, not to the manifest. If it read the
+  // manifest's own `ignore` list, moving a field there would silence this check, which is
+  // exactly the escape hatch that made the earlier guard weak. Duplicating it here means
+  // dropping a field takes two deliberate edits in two files, and the second one is this
+  // conspicuous list.
+  console.log('\nrestore returns the entity to exactly its captured state');
+  const roundTrip = await page.evaluate(async () => {
+    const g = window.__GAME__;
+    const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
+    const { WEAPON_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 91 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const p = g.player;
+    const DT = 1 / 120;
+    const inp = g.input;
+    inp.enabled = true;
+
+    // Legitimately not restored, each for a stated reason. Anything not on this list is
+    // expected to come back exactly.
+    const PLAYER_EXEMPT = new Set([
+      'game', 'camera',        // system / presentation references
+      'weapon',                // reference; the loadout index decides it
+      'hitboxes',              // recomputed from height + lean every live tick
+      '_cmdScratch',           // reused scratch buffer for the local command
+      '_lookFrame',            // gate against game.frame, meaningless in a replay
+      'id', 'isPlayer', 'name', 'radius', 'maxHealth',   // identity and constants
+    ]);
+    const WEAPON_EXEMPT = new Set(['system', 'game', 'owner', 'def', 'viewmodel', 'interval']);
+
+    // A comparable digest of every own enumerable field, built without consulting the
+    // manifest at all.
+    const dump = (o, exempt) => {
+      const out = {};
+      for (const k of Object.keys(o)) {
+        if (exempt.has(k)) continue;
+        const v = o[k];
+        if (v === null || v === undefined) { out[k] = String(v); continue; }
+        if (typeof v === 'object') {
+          if ('x' in v && 'y' in v && 'z' in v) { out[k] = `${v.x},${v.y},${v.z}`; continue; }
+          const sub = {};
+          for (const kk of Object.keys(v)) {
+            const vv = v[kk];
+            if (vv === null || typeof vv !== 'object') sub[kk] = vv;
+          }
+          out[k] = JSON.stringify(sub);
+          continue;
+        }
+        out[k] = v;
+      }
+      return out;
+    };
+
+    inp.actions.add('forward');
+    for (let i = 0; i < 90; i++) { g.frame++; g._fixedUpdate(DT); }
+    inp.actions.clear();
+
+    const before = { p: dump(p, PLAYER_EXEMPT), w: dump(p.weapon, WEAPON_EXEMPT) };
+    const pSnap = PLAYER_SNAPSHOT.save(p);
+    const wSnap = WEAPON_SNAPSHOT.save(p.weapon);
+
+    /**
+     * Scribble over every own field, then restore.
+     *
+     * Deliberately not "run the sim and see what comes back". Fields that happen to
+     * CONVERGE to their captured value — sprintRamp decaying to 0, crouchFrac returning
+     * to standing, a timer expiring — are invisible to a before/after comparison, so a
+     * gameplay-driven version of this test silently covered only the fields whose values
+     * happened to still differ at the end. Corrupting everything removes the dependence
+     * on gameplay entirely: after a restore, every captured field must be back, and any
+     * field the manifest does not carry is still wearing its scribble.
+     */
+    const scribble = (o, exempt) => {
+      for (const k of Object.keys(o)) {
+        if (exempt.has(k)) continue;
+        const v = o[k];
+        if (typeof v === 'number') o[k] = v + 12345.678;
+        else if (typeof v === 'boolean') o[k] = !v;
+        else if (typeof v === 'string') o[k] = `${v}~scribbled`;
+        else if (v && typeof v === 'object') {
+          if ('x' in v && 'y' in v && 'z' in v) { v.x += 999; v.y += 999; v.z += 999; continue; }
+          for (const kk of Object.keys(v)) {
+            const vv = v[kk];
+            if (typeof vv === 'number') v[kk] = vv + 12345.678;
+            else if (typeof vv === 'boolean') v[kk] = !vv;
+            else if (typeof vv === 'string') v[kk] = `${vv}~scribbled`;
+          }
+        }
+      }
+    };
+    scribble(p, PLAYER_EXEMPT);
+    scribble(p.weapon, WEAPON_EXEMPT);
+    const scribbled = { p: dump(p, PLAYER_EXEMPT), w: dump(p.weapon, WEAPON_EXEMPT) };
+
+    PLAYER_SNAPSHOT.restore(p, pSnap);
+    WEAPON_SNAPSHOT.restore(p.weapon, wSnap);
+    const after = { p: dump(p, PLAYER_EXEMPT), w: dump(p.weapon, WEAPON_EXEMPT) };
+
+    const compare = (a, b) => {
+      const bad = [];
+      for (const k of Object.keys(a)) if (!Object.is(a[k], b[k])) bad.push(k);
+      for (const k of Object.keys(b)) if (!(k in a)) bad.push(`${k} (appeared)`);
+      return bad;
+    };
+    // Every field must actually have been scribbled, or a green result could just mean
+    // the corruption never landed.
+    const missedByScribble = compare(before.p, scribbled.p).length;
+    return {
+      playerBad: compare(before.p, after.p),
+      weaponBad: compare(before.w, after.w),
+      playerFields: Object.keys(before.p).length,
+      weaponFields: Object.keys(before.w).length,
+      scribbledCount: missedByScribble,
+    };
+  });
+  if (roundTrip.scribbledCount === roundTrip.playerFields) {
+    ok(`all ${roundTrip.playerFields} player fields were corrupted before the restore (the check can bite)`);
+  } else {
+    bad('every player field was corrupted before the restore',
+      `only ${roundTrip.scribbledCount} of ${roundTrip.playerFields} changed — the rest were not scribbled, so restoring them proves nothing`);
+  }
+  if (roundTrip.playerBad.length === 0) {
+    ok(`every one of the player's ${roundTrip.playerFields} own fields comes back exactly`);
+  } else {
+    bad('every own player field comes back after restore',
+      `not restored: ${roundTrip.playerBad.join(', ')}`);
+  }
+  if (roundTrip.weaponBad.length === 0) {
+    ok(`every one of the weapon's ${roundTrip.weaponFields} own fields comes back exactly`);
+  } else {
+    bad('every own weapon field comes back after restore',
+      `not restored: ${roundTrip.weaponBad.join(', ')}`);
+  }
+
+  console.log('\nsave / restore replays bit-identically, every tick');
   const rewind = await page.evaluate(async () => {
     const g = window.__GAME__;
     const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
-    const { WEAPON_SNAPSHOT, saveLoadout, restoreLoadout, diffLoadout } =
-      await import('/src/weapons/weaponSystem.js');
+    const { saveLoadout, restoreLoadout, diffLoadout } = await import('/src/weapons/weaponSystem.js');
     g.stop();
     g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 77 });
     g.match.phase = 'live'; g.match.countdown = 0;
@@ -445,86 +590,169 @@ try {
     const DT = 1 / 120;
     const inp = g.input;
     inp.enabled = true;
-    inp.actions.add('forward');
-    for (let i = 0; i < 120; i++) { g.frame++; g._fixedUpdate(DT); }
+
+    // Park the player in the most open spot on the map. An earlier version of this test
+    // just held `forward` from spawn, which walked him into a wall — he was then
+    // bit-identically motionless for the whole run, so no movement field ever diverged
+    // and removing one from the manifest changed nothing. A rewind test only covers the
+    // fields its script actually moves.
+    // Pick the spawn with the most room in EVERY direction — the widest minimum, not the
+    // longest single sightline. A corridor scores well on "longest" and is useless here:
+    // the script strafes and walks backwards, so it needs open floor all round.
+    let best = null;
+    const V = p.position.constructor;
+    const eye = new V(), dir = new V();
+    for (const sp of g.world.spawnPoints) {
+      let worst = Infinity;
+      for (let i = 0; i < 16; i++) {
+        const yaw = (i / 16) * Math.PI * 2;
+        eye.set(sp.position.x, sp.position.y + 1.0, sp.position.z);
+        dir.set(-Math.sin(yaw), 0, -Math.cos(yaw));
+        const hit = g.world.raycast(eye, dir, 60);
+        worst = Math.min(worst, hit ? hit.distance : 60);
+      }
+      if (!best || worst > best.open) best = { pos: sp.position.clone(), yaw: 0, open: worst };
+    }
+
+    const reseat = () => {
+      p.position.copy(best.pos);
+      p.velocity.set(0, 0, 0);
+      p.setAngles(best.yaw, -0.02);
+    };
+    reseat();
+    for (let i = 0; i < 60; i++) { g.frame++; g._fixedUpdate(DT); }
 
     const lo = g.weapons.getLoadout(p);
     const startFrame = g.frame;
-
-    // Capture, including the RNG position — a firing tick draws from it for spread and
-    // recoil jitter, so replaying without rewinding the stream gives different bullets.
     const pSnap = PLAYER_SNAPSHOT.save(p);
     const loSnap = saveLoadout(lo);
     const rngState = g.rng.getState();
     const startTick = g.tick;
 
+    // Projectiles are NOT snapshotted — there is no manifest for them, and a grenade in
+    // flight is world state a full rollback would have to carry. This harness sidesteps
+    // that by restoring the projectile system to empty, which is a FAITHFUL restore only
+    // because nothing is in flight at capture time. Assert that rather than assume it, so
+    // this stays honest if the warm-up ever changes.
+    //
+    // Left deliberately open: Phase 6 cannot reconcile a tick containing a live grenade
+    // until projectiles are snapshotted too. This test found that by diverging on
+    // `health`/`_lastDamageAt` when run 1's grenade detonated during run 2.
+    const activeAtCapture = g.projectiles.pool.filter((x) => x.active).length
+      + g.projectiles.smokeClouds.filter((c) => c.active).length;
+
     /**
-     * A deliberately BUSY script. An earlier version held forward and fire for 60 ticks,
-     * and a reviewer showed it still passed with `_fireReadyAt` deleted from the manifest
-     * — nothing in that script ever sprinted out or meleed, so the field never diverged.
-     * A rewind test only covers the fields its script actually moves, so this one throws
-     * a grenade, melees, sprints, switches weapon and reloads as well as moving and
-     * firing.
+     * A script that actually moves the whole entity: walk, strafe, jump (so the landing
+     * springs and `_airPeakY` fire), crouch and slide, sprint, fire, melee, throw a
+     * grenade, switch weapon mid-flight and reload.
      */
-    const run = () => {
-      inp.actions.clear();
-      inp.actions.add('forward');
-      for (let t = 0; t < 260; t++) {
-        inp.buttons[0] = (t > 10 && t < 40);              // fire
-        if (t === 45) inp.actions.add('sprint');          // sprint -> fire delay
-        if (t === 70) inp.actions.delete('sprint');
-        if (t === 80) inp.buttonsPressed[1] = true;       // melee (edge)
-        if (t === 110) inp.pressed?.add?.('KeyG');        // grenade, if bound this way
-        if (t === 120) g.weapons.throwGrenade?.(p);       // and directly, to be sure
-        if (t === 150) g.weapons.switchTo(p, 1);          // holster -> raise, mid-flight
-        if (t === 200) g.weapons.switchTo(p, 0);
-        if (t === 230) p.weapon?.reload?.();
+    const TICKS = 300;
+    const script = (t) => {
+      const a = inp.actions;
+      a.clear();
+      if (t < 40 || (t > 90 && t < 140)) a.add('forward');
+      if (t >= 40 && t < 60) a.add('left');
+      if (t >= 60 && t < 90) a.add('back');
+      if (t > 140 && t < 190) { a.add('forward'); a.add('sprint'); }
+      if (t > 200 && t < 240) a.add('right');
+      inp.buttons[0] = (t > 15 && t < 45) || (t > 250 && t < 270);
+      // Edges live in `input.pressed`, which `wasPressed()` reads; there is no
+      // `actionsPressed`, so an earlier version of this script silently never jumped.
+      inp.pressed.clear();
+      if (t === 30 || t === 120 || t === 210) inp.pressed.add('jump');
+      if (t === 95 || t === 195 || t === 175) inp.pressed.add('crouch');
+      if (t === 80) inp.buttonsPressed[1] = true;               // melee
+      if (t === 110) g.weapons.throwGrenade?.(p);
+      if (t === 150) g.weapons.switchTo(p, 1);                  // holster -> raise
+      if (t === 230) g.weapons.switchTo(p, 0);
+      if (t === 280) p.weapon?.reload?.();
+    };
+
+    /**
+     * Run the script, capturing the FULL state after every single tick.
+     *
+     * End-state comparison is far too weak: anything that converges before the last tick
+     * — bloom decaying to its floor, a spring settling, a timer expiring — is invisible,
+     * so a field can diverge for 200 ticks and still compare equal at the end. Comparing
+     * per tick is what "bit-equality" in the plan actually means, and it reports the tick
+     * where the two runs first parted company.
+     */
+    const trace = () => {
+      const out = [];
+      for (let t = 0; t < TICKS; t++) {
+        script(t);
         g.frame++;
         g._fixedUpdate(DT);
+        out.push({ p: PLAYER_SNAPSHOT.save(p, {}), lo: saveLoadout(lo, {}) });
       }
       inp.buttons[0] = false;
       inp.actions.clear();
-      return { p: PLAYER_SNAPSHOT.save(p, {}), lo: saveLoadout(lo, {}) };
+      return out;
     };
 
-    const first = run();
+    const first = trace();
 
-    // Rewind everything the replay depends on and run the identical script again.
     PLAYER_SNAPSHOT.restore(p, pSnap);
     restoreLoadout(lo, loSnap);
-    // `entity.weapon` is a reference the loadout index decides; re-point it so a replay
-    // that started mid-switch holds the same gun it did the first time.
-    p.weapon = lo.index >= 0 ? lo.weapons[lo.index] : null;
+    g.projectiles.reset();
     g.rng.setState(rngState);
     g.tick = startTick;
     g.frame = startFrame;
-    const second = run();
+    const second = trace();
+
+    // First tick at which the two runs disagree, and on what.
+    let firstBad = -1, badFields = [];
+    for (let t = 0; t < TICKS; t++) {
+      const d = PLAYER_SNAPSHOT.diff(first[t].p, second[t].p)
+        .concat(diffLoadout(first[t].lo, second[t].lo));
+      if (d.length) { firstBad = t; badFields = d; break; }
+    }
+
+    // Coverage: how many DISTINCT fields the script moved at any point during the run,
+    // not merely how many differ at the end. This is the number that says whether the
+    // test can catch a removed field at all.
+    const touched = new Set();
+    // Path length, not net displacement: the script deliberately walks out and back, so
+    // it can travel a long way and finish near where it started.
+    let pathMetres = 0;
+    for (let t = 1; t < TICKS; t++) {
+      for (const f of PLAYER_SNAPSHOT.diff(first[t - 1].p, first[t].p)) touched.add(f);
+      for (const f of diffLoadout(first[t - 1].lo, first[t].lo)) touched.add(`lo.${f}`);
+      pathMetres += Math.hypot(
+        first[t].p.position.x - first[t - 1].p.position.x,
+        first[t].p.position.y - first[t - 1].p.position.y,
+        first[t].p.position.z - first[t - 1].p.position.z,
+      );
+    }
 
     return {
-      playerDiff: PLAYER_SNAPSHOT.diff(first.p, second.p),
-      loadoutDiff: diffLoadout(first.lo, second.lo),
-      // How much state the replayed stretch actually moved. Without this the whole test
-      // could pass by replaying ticks in which nothing happened — two identical no-ops
-      // match perfectly and prove nothing.
-      playerAdvanced: PLAYER_SNAPSHOT.diff(pSnap, first.p).length,
-      loadoutAdvanced: diffLoadout(loSnap, first.lo).length,
-      // Evidence the busy script really reached the paths it is meant to cover.
-      grenadesSpent: loSnap.equipment.lethalCount - first.lo.equipment.lethalCount,
-      switched: loSnap.index !== first.lo.index || first.lo.weapons.length > 1,
+      firstBad,
+      badFields: badFields.slice(0, 14),
+      touchedCount: touched.size,
+      capturedCount: PLAYER_SNAPSHOT.captured.length,
+      grenadesSpent: loSnap.equipment.lethalCount - first[TICKS - 1].lo.equipment.lethalCount,
+      activeAtCapture,
+      pathMetres,
     };
   });
-  if (rewind.playerAdvanced >= 10 && rewind.loadoutAdvanced >= 5) {
-    ok(`the replayed stretch does real work (${rewind.playerAdvanced} player / ${rewind.loadoutAdvanced} loadout fields changed)`);
-  } else {
-    bad('the replayed stretch does real work',
-      `only ${rewind.playerAdvanced} player / ${rewind.loadoutAdvanced} loadout fields changed — a no-op replay matches trivially`);
-  }
-  if (rewind.grenadesSpent > 0) ok(`the script spends a grenade (${rewind.grenadesSpent}), so the loadout counter is exercised`);
-  else bad('the script spends a grenade', 'lethalCount never moved — the grenade path this test exists to cover was not reached');
-  if (rewind.playerDiff.length === 0) ok('player state after replay is identical, field for field');
-  else bad('player state after replay is identical', `diverged: ${rewind.playerDiff.join(', ')}`);
-  if (rewind.loadoutDiff.length === 0) ok('loadout, every weapon and the pending switch replay identically');
-  else bad('loadout replays identically', `diverged: ${rewind.loadoutDiff.join(', ')}`);
+  // The coverage figure is the honest measure of this test's power: it can only catch a
+  // field being dropped from the manifest if the script moves that field.
+  if (rewind.touchedCount >= 40) ok(`the script exercises ${rewind.touchedCount} distinct player/loadout fields`);
+  else bad('the script exercises enough state to be meaningful',
+    `only ${rewind.touchedCount} fields ever changed during the run (of ${rewind.capturedCount} captured) — a field the script never moves cannot be caught if it is dropped from the manifest`);
+  // ~230 of the 300 ticks hold a movement key, so a free-running player covers roughly
+  // 10 m. Well under that means he is jammed against geometry and the movement fields
+  // never vary, which is the failure mode that made an earlier version of this test
+  // vacuous.
+  if (rewind.pathMetres > 8) ok(`the player actually moves (${rewind.pathMetres.toFixed(1)} m travelled)`);
+  else bad('the player actually moves', `only ${rewind.pathMetres.toFixed(2)} m travelled — jammed against geometry, so movement state never varies`);
+  if (rewind.grenadesSpent > 0) ok(`a grenade is spent (${rewind.grenadesSpent}), so the loadout counter is exercised`);
+  else bad('a grenade is spent', 'lethalCount never moved');
+  if (rewind.activeAtCapture === 0) ok('nothing is in flight at capture, so resetting projectiles on restore is faithful');
+  else bad('nothing is in flight at capture',
+    `${rewind.activeAtCapture} projectile(s) live when the snapshot was taken — resetting them on restore is no longer a faithful rewind, and projectiles have no manifest`);
+  if (rewind.firstBad === -1) ok('every tick of the replay is identical, field for field');
+  else bad('every tick of the replay is identical', `first divergence at tick ${rewind.firstBad}: ${rewind.badFields.join(', ')}`);
 
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //

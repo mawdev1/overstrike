@@ -96,9 +96,9 @@ const out = await page.evaluate(async () => {
   // Aim precisely at the enemy torso.
   p.getEyePosition(pEye);
   dir.copy(eEye).sub(pEye).normalize();
-  p.pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
-  p.yaw = Math.atan2(-dir.x, -dir.z);
-  if (p.camera) { p.camera.baseYaw = p.yaw; p.camera.basePitch = p.pitch; }
+  // setAngles, not a bare p.yaw write: _writeAngles() recomposes yaw/pitch from
+  // baseYaw/basePitch every tick, so assigning p.yaw is undone immediately.
+  p.setAngles(Math.atan2(-dir.x, -dir.z), Math.asin(Math.max(-1, Math.min(1, dir.y))));
   g.camera.position.copy(pEye);
   g.camera.rotation.set(p.pitch, p.yaw, 0);
   g.camera.updateMatrixWorld(true);
@@ -123,9 +123,7 @@ const out = await page.evaluate(async () => {
     p.getEyePosition(pEye);
     eEye.set(enemy.position.x, enemy.position.y + 1.0, enemy.position.z);
     dir.copy(eEye).sub(pEye).normalize();
-    p.pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
-    p.yaw = Math.atan2(-dir.x, -dir.z);
-    if (p.camera) { p.camera.baseYaw = p.yaw; p.camera.basePitch = p.pitch; }
+    p.setAngles(Math.atan2(-dir.x, -dir.z), Math.asin(Math.max(-1, Math.min(1, dir.y))));
     g.camera.position.copy(pEye);
     g.camera.rotation.set(p.pitch, p.yaw, 0);
     g.camera.updateMatrixWorld(true);

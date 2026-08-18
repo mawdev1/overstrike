@@ -1065,12 +1065,30 @@ export function saveLoadout(lo, out) {
   return o;
 }
 
-/** Inverse of `saveLoadout`. Instances are written in place, never replaced. */
+/**
+ * Inverse of `saveLoadout`. Instances are written in place, never replaced.
+ *
+ * Also re-points `entity.weapon`, which is not optional bookkeeping: `lo.index` decides
+ * which instance is equipped, but most of the game reads `entity.weapon` rather than
+ * calling `current()`. Restoring one without the other leaves the entity holding a gun
+ * the loadout says it is not holding, and nothing fails loudly.
+ */
 export function restoreLoadout(lo, snap) {
+  // A length mismatch means this snapshot came from a different loadout. Half-applying it
+  // would leave `index` pointing at a weapon that does not exist, so refuse it instead —
+  // silently restoring 2 of 3 weapons is the kind of thing that surfaces as an
+  // unreproducible desync rather than as an error.
+  if (lo.weapons.length !== snap.weapons.length) {
+    throw new Error(`Loadout restore: snapshot has ${snap.weapons.length} weapons, loadout has ${lo.weapons.length} — this snapshot is not from this loadout`);
+  }
   LOADOUT_SNAPSHOT.restore(lo, snap);
-  const n = Math.min(lo.weapons.length, snap.weapons.length);
+  const n = lo.weapons.length;
   for (let i = 0; i < n; i++) WEAPON_SNAPSHOT.restore(lo.weapons[i], snap.weapons[i]);
   if (lo.melee && snap.melee) WEAPON_SNAPSHOT.restore(lo.melee, snap.melee);
+
+  // The instances carry their owner, so this needs no extra argument.
+  const owner = lo.weapons[0]?.owner;
+  if (owner) owner.weapon = lo.index >= 0 ? lo.weapons[lo.index] : null;
 
   const s = snap.switchPending;
   if (!s || !s.active) lo.switchPending = null;
