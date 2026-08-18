@@ -160,10 +160,14 @@ export class ProjectileSystem {
     p.vel.y += speed * (pr.upBias || 0);
     // Inherit the thrower's momentum — sprinting throws go further, as they should.
     if (owner?.velocity) p.vel.addScaledVector(owner.velocity, 0.55);
+    // Tumble is mesh rotation only (see the fixedUpdate loop below) — never read by
+    // position, velocity, bounce or damage — so it draws from fxRng, not the gameplay
+    // stream. Originally left on game.rng on the mistaken assumption that "physics-
+    // shaped" meant sim-critical; it is cosmetic exactly like the fire-sound pitch.
     p.angVel.set(
-      (this.game.rng() - 0.5) * (pr.spin || 10),
-      (this.game.rng() - 0.5) * (pr.spin || 10),
-      (this.game.rng() - 0.5) * (pr.spin || 10),
+      (this.game.fxRng() - 0.5) * (pr.spin || 10),
+      (this.game.fxRng() - 0.5) * (pr.spin || 10),
+      (this.game.fxRng() - 0.5) * (pr.spin || 10),
     );
     p.fuse = Math.max(0.08, (pr.fuse || 3) - cooked);
     p.age = 0;

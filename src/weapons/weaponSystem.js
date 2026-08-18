@@ -968,7 +968,7 @@ export class WeaponSystem {
       const px = this._spreadToPixels(inst.getCurrentSpread());
       if (Math.abs(px - this._crosshairPx) > 0.4) {
         this._crosshairPx = px;
-        this.game.hud.setCrosshairSpread(px);
+        this.game.present.setCrosshairSpread(px);
       }
     }
   }
