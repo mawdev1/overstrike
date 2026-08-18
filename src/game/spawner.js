@@ -374,7 +374,13 @@ export class Spawner {
     }
 
     // --- tiebreak
-    const rng = this.game.rng;
+    //
+    // The ENTITY's own stream where it has one. Drawn from `game.rng`, the number of
+    // draws depended on how many candidate points this spawn happened to score, so one
+    // bot's spawn shifted the stream for every entity spawned after it in the same tick.
+    // `Math.random()` is a last resort that must never be reached in the game; it exists
+    // so a bare harness constructing a Spawner without a game cannot hard-fail.
+    const rng = entity?.rng ?? this.game.rng;
     score += (typeof rng === 'function' ? rng() : Math.random()) * W.jitter;
     return score;
   }

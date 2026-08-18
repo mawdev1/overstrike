@@ -720,10 +720,11 @@ export class WeaponSystem {
    * 60 and 240 fps fired from different heights mid-landing — and no headless simulation
    * can reproduce it, because it has no camera.
    *
-   * The dependency is now inverted. The bullet leaves from the simulated eye, and
-   * `PlayerCamera` fades its positional feel terms out as the sight picture arrives so
-   * the camera converges onto exactly this point — the same treatment, and for the same
-   * reason, that the angular feel terms already get.
+   * The dependency is now inverted. The eye springs that used to displace the camera —
+   * crouch smoothing, stair step-up, the landing spring, the slide dip — are simulation
+   * and live on `Player`, integrated on the fixed step, so `getEyePosition()` already
+   * includes them. `PlayerCamera` renders from exactly this point and adds only bob,
+   * shake and punch, which are decoration and never move a bullet.
    */
   getFireOrigin(entity, out) {
     if (entity && typeof entity.getEyePosition === 'function') return entity.getEyePosition(out);

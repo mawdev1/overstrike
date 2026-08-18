@@ -524,10 +524,15 @@ export class NavGrid {
     return null;
   }
 
-  /** A random reachable-looking point within `radius` of `pos`. Returns `out` or null. */
-  randomPointNear(pos, radius, out = _scratchPoint) {
+  /**
+   * A random reachable-looking point within `radius` of `pos`. Returns `out` or null.
+   *
+   * `rng` is the CALLER's stream. Drawing from `game.rng` here made one bot's patrol
+   * destination depend on how many draws every other bot had made first, which is the
+   * coupling per-bot streams exist to remove.
+   */
+  randomPointNear(pos, radius, out = _scratchPoint, rng = this.game.rng) {
     if (!this.ready) return null;
-    const rng = this.game.rng;
     const cells = Math.max(1, Math.round(radius / CELL));
     const cx0 = Math.floor((pos.x - this.originX) / CELL);
     const cz0 = Math.floor((pos.z - this.originZ) / CELL);

@@ -232,6 +232,11 @@ const BOUND_UNBOUNDED = 1e6;
 
 const RIG = {
   material: null,
+  // Monotonic counter, purely for deriving each model's decoration RNG. It must NOT be
+  // `live`, which is a live *count*: releasing one model and building another reuses the
+  // number, and two models sharing a seed means two soldiers walking in perfect lockstep
+  // with identical death sprawls.
+  serial: 0,
   geos: [null, null],
   meshes: [null, null],
   // The pool is kept EXACTLY packed: slots 0..count-1 are occupied, nothing above is.
@@ -436,8 +441,10 @@ export class BotModel {
     // from `game.rng` moved the shared stream by two per bot life — and only when a
     // model existed. A headless server, which builds no models, would then be two
     // draws per spawn out of step with every client. Its own stream cannot desync
-    // anything, and is seeded so a replayed match still looks identical.
-    this._rng = createRNG(mixSeed(game?.matchSeed ?? 0, RIG.live * 2654435761));
+    // anything. It is seeded from a monotonic serial, so it is stable for the life of
+    // a model but deliberately NOT reproducible across sessions — nothing it feeds is
+    // simulation, and a per-match seed would be a lie about what this stream is for.
+    this._rng = createRNG(mixSeed(game?.matchSeed ?? 0, RIG.serial++));
     // `slot` is not stable for the lifetime of the model: releaseSlot() compacts the
     // pool and may move this model down into another model's slot. Nothing outside this
     // file reads it, and every read inside it goes through `this.slot`.

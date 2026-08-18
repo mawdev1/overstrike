@@ -4,6 +4,7 @@ import {
   dirFromAngles, yawTo, spreadDir, DEG, PITCH_LIMIT,
 } from '../core/mathUtils.js';
 import { BotModel } from './botModel.js';
+import { createRNG, mixSeed } from '../core/rng.js';
 
 // Systems written in parallel — namespace imports so a missing named export
 // degrades to `undefined` instead of exploding the whole module graph.
@@ -588,11 +589,15 @@ const STATES = {
 export class Bot {
   constructor(game, team = 1, name = 'BOT') {
     this.game = game;
-    this.rng = game.rng;
 
     // ---- §4 entity contract
     this.id = _nextEntityId++;
     this.isPlayer = false;
+    // Its own stream from the outset. Aliasing `game.rng` here meant a bot that somehow
+    // missed `_configureRoster` would silently share the global stream — the exact
+    // coupling per-bot streams exist to prevent, and invisible because it still works.
+    // BotManager re-seeds this from the match seed and roster slot; this is the floor.
+    this.rng = createRNG(mixSeed(game?.matchSeed ?? 0, this.id));
     this.team = team === 0 ? 0 : 1;
     this.alive = false;
     this.name = name;
@@ -1892,7 +1897,7 @@ export class Bot {
     const nav = this.game.nav;
     if (!nav?.ready) { this.hasDestination = false; return; }
     const anchor = this.investigateConfidence > 0.2 ? this.investigatePoint : this.position;
-    const p = nav.randomPointNear(anchor, this.rng.range(18, 34), _v4);
+    const p = nav.randomPointNear(anchor, this.rng.range(18, 34), _v4, this.rng);
     if (p) this.setDestination(p, 1.8);
     else this.hasDestination = false;
   }
@@ -1900,7 +1905,7 @@ export class Bot {
   pickRepositionDestination() {
     const nav = this.game.nav;
     if (!nav?.ready) { this.hasDestination = false; return; }
-    const p = nav.randomPointNear(this.position, this.rng.range(4, 10), _v4);
+    const p = nav.randomPointNear(this.position, this.rng.range(4, 10), _v4, this.rng);
     if (p) this.setDestination(p, 1.2);
     else this.hasDestination = false;
   }
@@ -1914,7 +1919,7 @@ export class Bot {
     if (_v5.lengthSq() < 0.01) _v5.set(this.rng.range(-1, 1), 0, this.rng.range(-1, 1));
     _v5.normalize().multiplyScalar(this.rng.range(12, 20));
     _v6.copy(this.position).add(_v5);
-    const p = nav.nearestWalkable(_v6, _v4) || nav.randomPointNear(this.position, 14, _v4);
+    const p = nav.nearestWalkable(_v6, _v4) || nav.randomPointNear(this.position, 14, _v4, this.rng);
     if (p) this.setDestination(p, 1.8);
     else this.hasDestination = false;
   }

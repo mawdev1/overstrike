@@ -7,8 +7,13 @@
  * bit-identical state from the same seed.
  *
  * This drives `game._fixedUpdate()` directly, which is what the server will do, and
- * varies only how `game.frame` advances underneath it. Anything in the simulation that
- * still reads the render counter shows up here as a divergence.
+ * varies only how `game.frame` advances underneath it, so anything in the simulation
+ * that reads the render counter shows up as a divergence.
+ *
+ * Its blind spot is input: it injects none, so a frame-gated INPUT path cannot diverge
+ * here however wrong it is. `Player._pumpLook()` still gates on `game.frame` and is
+ * invisible to this harness for exactly that reason — it is covered by the command
+ * refactor, not by this file.
  *
  * Usage: node scripts/determinism.mjs [--ticks=2400] [--headed]
  */
@@ -169,13 +174,14 @@ try {
     g.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 7 });
     const THREE = g.player.position.constructor;
     const o = new THREE(); const e = new THREE();
-    let worstOriginVsEye = 0, worstCamVsOrigin = 0, sawStep = 0, sawLand = 0;
+    let worstOriginVsEye = 0, worstCamVsOrigin = 0, sawStep = 0, sawLand = 0, sawSlide = 0;
     for (let i = 0; i < 1500; i++) {
-      // Drop the player periodically so the landing spring actually fires, and kick the
-      // stair spring directly (walking onto stairs needs input plumbing that does not
-      // exist until the command refactor).
+      // Every eye term has to actually move, or the two checks below prove nothing.
+      // Walking onto stairs and sliding both need input plumbing that does not exist
+      // until the command refactor, so those two are driven directly.
       if (i % 300 === 50) { g.player.position.y += 5; g.player.velocity.set(0, 0, 0); }
       if (i % 300 === 200) g.player.addEyeStep(0.25);
+      g.player.slideAmount = (i % 300 >= 240 && i % 300 < 280) ? 1 : 0;
       g.frame++;
       g._fixedUpdate(1 / 120);
       g.player.camera.update(1 / 120);          // compose the render camera
@@ -186,21 +192,28 @@ try {
       worstCamVsOrigin = Math.max(worstCamVsOrigin, o.distanceTo(e));
       sawStep = Math.max(sawStep, Math.abs(g.player.eyeStep));
       sawLand = Math.max(sawLand, Math.abs(g.player.eyeLand));
+      sawSlide = Math.max(sawSlide, Math.abs(g.player.slideDip));
     }
-    return { worstOriginVsEye, worstCamVsOrigin, sawStep, sawLand };
+    return { worstOriginVsEye, worstCamVsOrigin, sawStep, sawLand, sawSlide };
   });
 
   if (eye.worstOriginVsEye < 1e-9) ok('the fire origin IS the simulated eye');
   else bad('the fire origin IS the simulated eye', `diverged by ${eye.worstOriginVsEye}`);
 
-  // Bob/shake/punch are the only permitted disagreement. Bob peaks at ~3 cm and punch
-  // at 14 cm along the aim axis, so anything past ~25 cm means a spring escaped again.
-  if (eye.worstCamVsOrigin < 0.25) ok(`camera sits on the eye to within ${(eye.worstCamVsOrigin * 100).toFixed(1)} cm (decorative only)`);
-  else bad('camera sits on the eye', `worst disagreement ${(eye.worstCamVsOrigin * 100).toFixed(1)} cm — an eye spring is being applied to the camera but not the eye`);
+  // Bob/shake/punch are the only permitted disagreement, and this probe never moves or
+  // fires, so all three are ~0 here. The threshold is set well below the smallest eye
+  // term (slideDip, 13 cm) so that a spring escaping back onto the camera fails loudly
+  // rather than hiding under a slack bound.
+  const CAM_TOL = 0.05;
+  if (eye.worstCamVsOrigin < CAM_TOL) ok(`camera sits on the eye to within ${(eye.worstCamVsOrigin * 100).toFixed(2)} cm (decorative only)`);
+  else bad('camera sits on the eye', `worst disagreement ${(eye.worstCamVsOrigin * 100).toFixed(2)} cm — an eye term is on the camera but not in the eye`);
 
-  // The springs must actually have moved, or the two checks above are vacuous.
-  if (eye.sawStep > 1e-4 || eye.sawLand > 1e-4) ok(`eye springs exercised (step ${eye.sawStep.toFixed(3)} m, land ${eye.sawLand.toFixed(3)} m)`);
-  else bad('eye springs exercised', 'neither spring moved during the run — the checks above proved nothing');
+  // EVERY eye term must have moved, or the checks above are vacuous for the ones that
+  // did not. Deliberately AND, not OR: an OR here let the landing half be entirely dead.
+  const moved = [['step', eye.sawStep], ['land', eye.sawLand], ['slide dip', eye.sawSlide]];
+  const dead = moved.filter(([, v]) => v <= 1e-4).map(([n]) => n);
+  if (!dead.length) ok(`every eye term exercised (${moved.map(([n, v]) => `${n} ${v.toFixed(3)} m`).join(', ')})`);
+  else bad('every eye term exercised', `never moved: ${dead.join(', ')} — untested for those terms`);
 } finally {
   await browser?.close();
   await server?.close();

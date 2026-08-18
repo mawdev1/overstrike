@@ -4,6 +4,14 @@ export const DEG = Math.PI / 180;
 export const RAD = 180 / Math.PI;
 export const PITCH_LIMIT = 1.5533; // 89°
 
+/**
+ * The simulation step. ARCHITECTURE.md §1: `dt` passed to `fixedUpdate` is ALWAYS this.
+ * It lives here rather than in core/game.js so the systems that derive clocks from it
+ * (Game.time, Match.elapsed) can share one definition without importing the Game module
+ * that imports them.
+ */
+export const FIXED_DT = 1 / 120;
+
 export const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 export const lerp = (a, b, t) => a + (b - a) * t;
 export const invLerp = (a, b, v) => (b === a ? 0 : (v - a) / (b - a));

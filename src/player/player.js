@@ -917,6 +917,12 @@ export class Player {
     this.velocity.x = this.slideDir.x * boost;
     this.velocity.z = this.slideDir.z * boost;
 
+    // Follow-through on the entry. `slideAmount` snaps 0 → 1 in a single tick, so
+    // `slideDip` teleports the eye down 13 cm; this impulse is what makes that read as a
+    // body dropping into the slide rather than a cut. Injected directly rather than
+    // through addLandImpact(), which floors below LAND_MIN_IMPACT and would swallow it.
+    this.eyeLandVel += TUNE.SLIDE_ENTRY_DIP;
+
     this.camera.startSlide();
     this.game.audio?.play?.('footstepConcrete', {
       position: this.position, volume: 0.85, rate: 0.42,

@@ -5,7 +5,7 @@ import { EventBus } from './events.js';
 import { Settings } from './settings.js';
 import { createRNG } from './rng.js';
 import { assets } from './assets.js';
-import { clamp } from './mathUtils.js';
+import { clamp, FIXED_DT } from './mathUtils.js';
 
 import { World } from '../world/world.js';
 import { NavGrid } from '../world/navGrid.js';
@@ -21,7 +21,6 @@ import { Match } from '../game/match.js';
 import { WEAPON_LIST } from '../weapons/weaponDefs.js';
 import { BotModel } from '../ai/botModel.js';
 
-const FIXED_DT = 1 / 120;
 const MAX_SUBSTEPS = 6;
 
 /**

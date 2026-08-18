@@ -309,7 +309,7 @@ export class BotManager {
     if (n === 0 || !out) return false;
     const board = this.boards[bot.team & 1];
     const now = this.game.time;
-    const rng = bot.rng ?? this.game.rng;
+    const rng = bot.rng;
     const sweep = bot.persona.sweep * (bot.cfg.sweepUrgency ?? 1);
     const hot = now - board.contactTime < CONTACT_MEMORY ? board.contactStrength : 0;
 
@@ -471,8 +471,8 @@ export class BotManager {
         b ? b.min.y : 0,
         b ? (b.min.z + b.max.z) * 0.5 : 0,
       );
-      const p = nav?.randomPointNear?.(_v1, 25, _v2) || _v1;
-      bot.spawn(p, (bot.rng ?? this.game.rng).range(-Math.PI, Math.PI));
+      const p = nav?.randomPointNear?.(_v1, 25, _v2, bot.rng) || _v1;
+      bot.spawn(p, bot.rng.range(-Math.PI, Math.PI));
     }
     bot._lastThinkTime = this.game.time;
   }
@@ -487,7 +487,7 @@ export class BotManager {
     const points = world?.spawnPoints;
     if (!points || points.length === 0) return null;
 
-    const rng = bot.rng ?? this.game.rng;
+    const rng = bot.rng;
     const ents = this.game.entities;
     // Snapshot the hostile list — game.entities returns a shared array.
     const hostiles = this._spawnScratch;

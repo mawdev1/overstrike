@@ -2,6 +2,7 @@ import { MODES, MODE_LIST, getMode, DEFAULT_MODE, TEAM_NAMES, getWeaponDefs } fr
 import { Spawner, SPAWN_PROTECTION } from './spawner.js';
 import { Killstreaks } from './killstreaks.js';
 import { progression } from './progression.js';
+import { FIXED_DT } from '../core/mathUtils.js';
 
 /**
  * OVERSTRIKE — the referee.
@@ -69,7 +70,7 @@ export class Match {
     /** Team scores. Index === team for team modes. */
     this.scores = [0, 0];
     this.phase = 'idle';        // 'idle' | 'countdown' | 'live' | 'ended'
-    this.elapsed = 0;
+    this._elapsedTicks = 0;
     this.timeLimit = 600;
     this.countdown = 0;
     this.playerTeam = 0;
@@ -150,7 +151,7 @@ export class Match {
     this.scores[0] = 0;
     this.scores[1] = 0;
     this.phase = 'idle';
-    this.elapsed = 0;
+    this._elapsedTicks = 0;
     this.countdown = 0;
     this.result = null;
     this.lastProgression = null;
@@ -184,7 +185,7 @@ export class Match {
 
     this.scores[0] = 0;
     this.scores[1] = 0;
-    this.elapsed = 0;
+    this._elapsedTicks = 0;
     this.result = null;
     this.lastProgression = null;
     this._book.clear();
@@ -794,6 +795,17 @@ export class Match {
 
   // -------------------------------------------------------------------- clock
 
+  /**
+   * Seconds of LIVE match time — frozen through the countdown and after the final
+   * whistle, which is why it is its own clock and not `game.time`.
+   *
+   * Counted in whole ticks and multiplied out, never accumulated: spawn protection,
+   * respawn deadlines, the death guard and the round timer are all comparisons against
+   * this, and an accumulated float lands somewhere fractionally different depending on
+   * how many additions got it there — which a replayed or rewound match must not do.
+   */
+  get elapsed() { return this._elapsedTicks * FIXED_DT; }
+
   get timeRemaining() {
     return Math.max(0, this.timeLimit - this.elapsed);
   }
@@ -818,7 +830,7 @@ export class Match {
       return;
     }
 
-    this.elapsed += dt;
+    this._elapsedTicks++;
 
     this._updateRespawns(dt);
     this.killstreaks.fixedUpdate(dt);
