@@ -87,11 +87,11 @@ function unitBox() {
 }
 
 /** Cylinders are cached by (radiusTop, radiusBottom, segments) at unit height. */
-function unitCyl(rt, rb, seg) {
-  const key = `${rt.toFixed(4)}|${rb.toFixed(4)}|${seg}`;
+function unitCyl(rt, rb, seg, open = false) {
+  const key = `${rt.toFixed(4)}|${rb.toFixed(4)}|${seg}|${open ? 'o' : 'c'}`;
   let g = _cylCache.get(key);
   if (!g) {
-    g = new THREE.CylinderGeometry(rt, rb, 1, seg, 1, false);
+    g = new THREE.CylinderGeometry(rt, rb, 1, seg, 1, open);
     _cylCache.set(key, g);
   }
   return g;
@@ -129,10 +129,22 @@ class Batch {
   }
 
   /** Cylinder along an axis: 'x' | 'y' | 'z'. `r2` tapers the far end. */
-  cyl(matName, r, len, axis, x, y, z, seg = 8, r2 = r) {
+  /**
+   * `open` drops the end caps, leaving a hollow shell.
+   *
+   * This is what makes a sight a sight. An optic body built from a capped cylinder is a
+   * SOLID bar of metal: aiming down it puts you nose-to-nose with a flat end cap, and no
+   * amount of transparency on the lens disc in front of it can help, because the tube
+   * behind the lens is filled in. Every red dot, holo and scope in the game was blocking
+   * the middle of the screen for exactly this reason. Open-ended, you see down the bore.
+   *
+   * Backface culling does the rest: the far inner wall is culled, so the bore reads as a
+   * clean aperture rather than as the inside of a pipe.
+   */
+  cyl(matName, r, len, axis, x, y, z, seg = 8, r2 = r, open = false) {
     const rx = axis === 'z' ? Math.PI / 2 : 0;
     const rz = axis === 'x' ? Math.PI / 2 : 0;
-    return this._push(matName, unitCyl(r, r2, seg), 1, len, 1, x, y, z, rx, 0, rz);
+    return this._push(matName, unitCyl(r, r2, seg, open), 1, len, 1, x, y, z, rx, 0, rz);
   }
 
   /** Picatinny: a solid base strip plus evenly spaced ribs. */
@@ -752,10 +764,11 @@ export class Viewmodel {
     const z = upperZ;
 
     if (op.type === 'scope') {
-      B.cyl(m, w / 2, L * 0.62, 'z', 0, y, z, 8);
-      B.cyl(m, w / 2 + 0.007, L * 0.20, 'z', 0, y, z - L * 0.40, 8);           // objective bell
-      B.cyl(m, w / 2 + 0.005, L * 0.17, 'z', 0, y, z + L * 0.41, 8);           // ocular
-      B.cyl(DK, w / 2 + 0.008, 0.012, 'z', 0, y, z + L * 0.30, 8);             // mag ring
+      // Hollow: the sight line runs straight down the bore. See `cyl`'s `open` note.
+      B.cyl(m, w / 2, L * 0.62, 'z', 0, y, z, 8, w / 2, true);
+      B.cyl(m, w / 2 + 0.007, L * 0.20, 'z', 0, y, z - L * 0.40, 8, w / 2 + 0.007, true); // objective bell
+      B.cyl(m, w / 2 + 0.005, L * 0.17, 'z', 0, y, z + L * 0.41, 8, w / 2 + 0.005, true); // ocular
+      B.cyl(DK, w / 2 + 0.008, 0.012, 'z', 0, y, z + L * 0.30, 8, w / 2 + 0.008, true);   // mag ring
       B.cyl(metal, 0.010, 0.016, 'y', 0, y + w / 2 + 0.006, z - L * 0.06, 6);  // elevation turret
       B.cyl(metal, 0.009, 0.014, 'x', w / 2 + 0.006, y, z - L * 0.06, 6);      // windage turret
       B.box(m, 0.016, h * 0.92, 0.020, 0, opticBase + h * 0.46, z - L * 0.26); // rings
@@ -780,9 +793,10 @@ export class Viewmodel {
       return { y: y - h * 0.12, z: rz };
     }
     if (op.type === 'reddot') {
-      B.cyl(m, w / 2, L, 'z', 0, y, z, 8);
-      B.cyl(DK, w / 2 + 0.002, 0.006, 'z', 0, y, z - L * 0.30, 8);
-      B.cyl(DK, w / 2 + 0.002, 0.006, 'z', 0, y, z + L * 0.30, 8);
+      // Hollow, for the same reason the scope is — this is the tube you look down.
+      B.cyl(m, w / 2, L, 'z', 0, y, z, 8, w / 2, true);
+      B.cyl(DK, w / 2 + 0.002, 0.006, 'z', 0, y, z - L * 0.30, 8, w / 2 + 0.002, true);
+      B.cyl(DK, w / 2 + 0.002, 0.006, 'z', 0, y, z + L * 0.30, 8, w / 2 + 0.002, true);
       B.box(m, 0.014, h, 0.020, 0, opticBase + h * 0.5, z + L * 0.20);
       B.box(m, 0.014, h, 0.020, 0, opticBase + h * 0.5, z - L * 0.20);
       B.box(DK, 0.020, 0.007, 0.026, 0, opticBase + h * 0.05, z);

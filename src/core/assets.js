@@ -1019,8 +1019,22 @@ export class Assets {
     this.materials.set('gunPolymer', new THREE.MeshStandardMaterial({ color: 0x30343a, roughness: 0.72, metalness: 0.05 }));
     this.materials.set('gunTan', new THREE.MeshStandardMaterial({ color: 0x93805f, roughness: 0.68, metalness: 0.06 }));
     this.materials.set('brass', new THREE.MeshStandardMaterial({ color: 0xc9a227, roughness: 0.26, metalness: 1.0 }));
+    // Optic glass. This MUST be transparent, and it was not: an opaque lens turns every
+    // red dot, holo and scope ocular into a solid disc that you aim *at* rather than
+    // *through*. Aiming down sights blanked the middle of the screen.
+    //
+    // `depthWrite: false` matters as much as the opacity — the ocular sits between the
+    // eye and the reticle marks (which are separate `brass` geometry a few millimetres
+    // further down the tube), so a depth-writing lens would occlude the very reticle it
+    // is supposed to be showing. Transparent draws after opaque, so the tint lands on
+    // top of both the reticle and the world behind it, which is the correct order.
+    //
+    // Opacity is low on purpose: coated optical glass passes most of the light. The
+    // faint teal and the emissive lift are what make it read as a lens rather than a
+    // hole, and at 0.16 they tint the sight picture without hiding anything in it.
     this.materials.set('glassOptic', new THREE.MeshStandardMaterial({
       color: 0x1a3f4d, roughness: 0.08, metalness: 0.4, emissive: 0x0a2530, emissiveIntensity: 0.6,
+      transparent: true, opacity: 0.16, depthWrite: false,
     }));
 
     // Every library material gets the macro/aerial-perspective hook. Non-surface
