@@ -3,6 +3,7 @@ import { clamp, damp, DEG, spreadDir } from '../core/mathUtils.js';
 import { WEAPONS, getWeapon, DEFAULT_LOADOUT, MELEE, fireInterval } from './weaponDefs.js';
 import { fireHitscan, meleeSweep, applyMeleeDamage } from './ballistics.js';
 import { Viewmodel } from './viewmodel.js';
+import { defineSnapshot } from '../core/snapshot.js';
 
 /**
  * OVERSTRIKE — weapon system.  (ARCHITECTURE.md §7)
@@ -937,3 +938,56 @@ export class WeaponSystem {
     this.loadouts.clear();
   }
 }
+
+/**
+ * What has to be saved to replay a tick on a weapon.
+ *
+ * Timing is the reason this exists. One tick of slip changes `patternIndex`, and the
+ * hand-authored spray pattern the player memorised stops working — which reads as the gun
+ * being broken rather than as a network artefact. Every timer here is carried for the same
+ * reason: `fireTimer` accumulates a sub-tick remainder, so it cannot be reconstructed from
+ * the tick number alone.
+ *
+ * Add a field to WeaponInstance, add it here. `audit()` in scripts/determinism.mjs fails
+ * on any field that is neither captured nor ignored.
+ */
+export const WEAPON_SNAPSHOT = defineSnapshot('WeaponInstance', {
+  scalars: [
+    'ammo', 'reserve', 'state', 'equipped',
+
+    // ADS. Sole owner of this quantity since the Player-side handshake was deleted:
+    // `adsRaw` is the linear integrator, `adsAmount` the eased curve read by spread,
+    // recoil scale, movement speed, sensitivity, camera FOV and the scope shader.
+    'adsAmount', 'adsRaw', 'wantAds',
+
+    // Timers, all seconds. `fireTimer` carries a remainder across ticks; `rechamberTimer`
+    // gates canFire; `stateTimer`/`stateDuration` are the reload and switch clocks.
+    'fireTimer', 'stateTimer', 'stateDuration', 'rechamberTimer', '_dryTimer',
+
+    // Trigger state. `_triggerLatched` is the semi/burst fresh-pull latch — lose it on a
+    // replay and a semi-auto fires twice for one click.
+    'triggerDown', '_triggerLatched', 'burstRemaining', 'burstTimer',
+
+    'reloadIsEmpty', 'reloadProgress',
+
+    // Accuracy state. `bloom` feeds the spread cone and `patternIndex` indexes the recoil
+    // pattern, so these two decide where a bullet goes.
+    'bloom', 'patternIndex', 'sinceLastShot', 'shotsThisTrigger',
+
+    // Carried recoil, which bots add to their aim via getAimOffset.
+    'recoilPitch', 'recoilYaw',
+
+    // Neither of these currently changes an outcome — `_lastFireTime` is written and read
+    // nowhere, and `shotsFired` only picks which shots get a tracer. Carried anyway: they
+    // are cheap, they make a replay bit-identical rather than merely equivalent, and the
+    // day someone reads one it is already correct.
+    '_lastFireTime', 'shotsFired',
+  ],
+
+  ignore: [
+    'system', 'game', 'owner',   // references
+    'def',                       // shared immutable weapon definition
+    'viewmodel',                 // presentation
+    'interval',                  // derived constant, fireInterval(def)
+  ],
+});

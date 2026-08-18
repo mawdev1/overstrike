@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { clamp, lerp, damp, dirFromAngles, PITCH_LIMIT, DEG } from '../core/mathUtils.js';
 import { PlayerCamera, CAMERA_TUNE } from './playerCamera.js';
+import { defineSnapshot } from '../core/snapshot.js';
 
 /* ════════════════════════════════════════════════════════════════════════════
    TUNING TABLE — every number that shapes movement feel lives here.
@@ -1925,3 +1926,88 @@ export class Player {
 }
 
 export { TUNE as PLAYER_TUNE };
+
+/**
+ * What has to be saved to replay a tick on this player.
+ *
+ * Kept next to the class deliberately: the manifest only works if it is updated when a
+ * field is added, and the odds of that improve when the two are in the same file. If you
+ * add a field to the constructor, add it here too — and if you are not sure which list it
+ * belongs in, `ignore` with a reason is a real answer, but silence is not. `audit()` in
+ * scripts/determinism.mjs fails on any field that appears in neither.
+ */
+export const PLAYER_SNAPSHOT = defineSnapshot('Player', {
+  vec3s: [
+    'position', 'velocity', 'groundNormal', 'slideDir',
+    // The mantle is a scripted interpolation between two fixed points; drop them and a
+    // rewound mantle finishes somewhere else.
+    '_mantleFrom', '_mantleTo', '_mantleDir',
+  ],
+
+  objects: {
+    // Reused in place, so they must be copied key-by-key rather than by reference.
+    stats: ['kills', 'deaths', 'score', 'streak'],
+    _held: [
+      'wishForward', 'wishRight', 'crouchHeld', 'toggleAdsMode', 'sprintKeyHeld',
+      'breathHold', 'fireHeld', 'aimButtonHeld', 'leanKeyHeld', 'leanRightKeyHeld',
+    ],
+    _edge: [
+      'jump', 'crouch', 'reload', 'melee', 'grenade', 'interact', 'inspect', 'killstreak',
+      'lastWeapon', 'slot', 'sprintDown', 'sprintUp', 'fire', 'aim', 'wheel',
+    ],
+  },
+
+  scalars: [
+    'team', 'alive', 'health', 'armor',
+
+    // Aim. `yaw`/`pitch` are recomposed by `_writeAngles` from the three below them, but
+    // are stored anyway: they are what ballistics reads, and a restore that leaves them
+    // stale for even one tick fires a bullet along the wrong line.
+    'yaw', 'pitch',
+    'baseYaw', 'basePitch',
+    'recoilPitch', 'recoilYaw', 'recoilPitchTarget', 'recoilYawTarget',
+    'scopeSwayYaw', 'scopeSwayPitch',
+    'breath', 'breathHolding', 'breathGasp', 'scopeAim',
+    // The interpolation endpoints. Only the renderer reads them, but they are written by
+    // the tick, so a replay that skipped them would render differently from the original.
+    'prevRecoilYaw', 'prevRecoilPitch', 'prevScopeSwayYaw', 'prevScopeSwayPitch',
+
+    // Stance and the eye springs. The springs are simulation, not decoration: the eye
+    // position IS the fire origin, so a missed spring moves where bullets come from.
+    'height', 'eyeHeight', 'eyeSmooth', 'eyeStep', 'eyeLand', 'eyeLandVel',
+
+    // Movement. `moveSpeed` and `crouchFrac` are recomputed every LIVE tick but not on
+    // the dead path, and `moveSpeed` is force-zeroed while mantling, so they are state.
+    'moveState', 'grounded', 'moveSpeed', 'wishForward', 'wishRight',
+    'sprinting', 'sprintRamp', 'crouchHeld', 'crouchFrac',
+    'slideAmount', 'slideTimer', 'lean',
+    'wantsAds', 'adsToggle',
+    '_grenadeFallback',
+
+    // Deadlines. Floats in seconds compared against `game.time`, which is derived from
+    // the integer tick and so is exactly reproducible. Coyote time turns on an epsilon
+    // here — mispredict `_lastGroundedAt` and the player gets or loses a whole jump.
+    '_lastGroundedAt', '_jumpBufferAt', '_slideCooldownUntil', '_mantleCooldownUntil',
+    '_lastDamageAt', '_meleeReadyAt', '_grenadeReadyAt', '_fireReadyAt', '_deathAt',
+    '_mantleUsedInAir', '_mantleT', '_airPeakY', '_stepAccum',
+
+    '_sprintInterrupted', '_wasFiring',
+
+    // Command bookkeeping. `_firePressedThisFrame` is genuinely sim-visible: Match reads
+    // it to skip the respawn countdown and Killstreaks to confirm an airstrike, both
+    // later in the same tick.
+    '_localCrouchToggle', '_localToggleAdsMode', '_firePressedThisFrame',
+  ],
+
+  ignore: [
+    'game',                 // system reference
+    'camera',               // PlayerCamera — presentation only, never touches sim state
+    'id', 'isPlayer', 'name',
+    'radius', 'maxHealth',  // constants
+    'hitboxes',             // recomputed from height + lean by _updateHitboxes each tick
+    'weapon',               // a WeaponInstance reference; its state is WEAPON_SNAPSHOT,
+                            // and which one is equipped lives in the loadout index
+    '_cmdScratch',          // reused scratch for the locally built command
+    '_lookFrame',           // gate against game.frame, which does not advance in a replay
+  ],
+});

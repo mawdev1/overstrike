@@ -369,6 +369,125 @@ try {
   if (adsCheck.afterDeath === 0) ok('death drops the aim (setAds(false) on die)');
   else bad('death drops the aim', `adsAmount stayed at ${adsCheck.afterDeath} while dead — scoped through the death cam`);
 
+  // ── the snapshot manifests cover every live field ────────────────────────────────
+  //
+  // This is the test the manifest exists for. Someone adding a field to Player or
+  // WeaponInstance will not be thinking about reconciliation, and nothing about their
+  // change will look wrong — the desync surfaces later as rare rubber-banding. Auditing a
+  // LIVE instance (not the constructor) catches fields that other systems monkey-patch on
+  // too, which reading the source would miss.
+  console.log('\nsnapshot manifests cover every field on a live instance');
+  const manifest = await page.evaluate(async () => {
+    const g = window.__GAME__;
+    const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
+    const { WEAPON_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 31 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const p = g.player;
+    const DT = 1 / 120;
+    const inp = g.input;
+    inp.enabled = true;
+    inp.actions.add('forward');
+    inp.buttons[0] = true;
+    // Exercise the entity first: fields are only present once something has assigned
+    // them, so auditing a freshly constructed player would miss anything lazily added.
+    for (let i = 0; i < 300; i++) { g.frame++; g._fixedUpdate(DT); }
+    inp.buttons[0] = false;
+
+    const playerMissing = PLAYER_SNAPSHOT.audit(p);
+    const weaponMissing = WEAPON_SNAPSHOT.audit(p.weapon);
+
+    // Negative control. An audit that cannot fail is worth nothing, and this one passing
+    // is only meaningful if it would have caught the field somebody forgets. Plant one,
+    // confirm it is reported, remove it.
+    p._plantedUndeclaredField = 1;
+    const caught = PLAYER_SNAPSHOT.audit(p).includes('_plantedUndeclaredField');
+    delete p._plantedUndeclaredField;
+
+    return {
+      playerMissing,
+      weaponMissing,
+      caught,
+      playerFields: PLAYER_SNAPSHOT.captured.length,
+      weaponFields: WEAPON_SNAPSHOT.captured.length,
+    };
+  });
+  if (manifest.caught) ok('the audit catches a planted undeclared field (the guard is live)');
+  else bad('the audit catches a planted undeclared field', 'audit() reported nothing for a field it should have flagged — the manifest checks below prove nothing');
+  if (manifest.playerMissing.length === 0) ok(`Player manifest covers every live field (${manifest.playerFields} captured)`);
+  else bad('Player manifest covers every live field', `undeclared: ${manifest.playerMissing.join(', ')}`);
+  if (manifest.weaponMissing.length === 0) ok(`WeaponInstance manifest covers every live field (${manifest.weaponFields} captured)`);
+  else bad('WeaponInstance manifest covers every live field', `undeclared: ${manifest.weaponMissing.join(', ')}`);
+
+  // ── save / restore actually rewinds the simulation ───────────────────────────────
+  //
+  // The manifest being complete is necessary but not sufficient — it also has to restore
+  // faithfully enough that re-running the same ticks lands in the same place. This is the
+  // shape the bit-equality harness will take in Phase 6, at one tick.
+  console.log('\nsave / restore rewinds the player and weapon exactly');
+  const rewind = await page.evaluate(async () => {
+    const g = window.__GAME__;
+    const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
+    const { WEAPON_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 77 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const p = g.player;
+    const DT = 1 / 120;
+    const inp = g.input;
+    inp.enabled = true;
+    inp.actions.add('forward');
+    for (let i = 0; i < 120; i++) { g.frame++; g._fixedUpdate(DT); }
+
+    // Capture, including the RNG position — a firing tick draws from it for spread and
+    // recoil jitter, so replaying without rewinding the stream gives different bullets.
+    const pSnap = PLAYER_SNAPSHOT.save(p);
+    const wSnap = WEAPON_SNAPSHOT.save(p.weapon);
+    const rngState = g.rng.getState();
+    const startTick = g.tick;
+
+    const run = () => {
+      inp.buttons[0] = true;                   // fire, so the weapon state moves too
+      inp.actions.add('forward');
+      for (let i = 0; i < 60; i++) { g.frame++; g._fixedUpdate(DT); }
+      inp.buttons[0] = false;
+      return {
+        p: PLAYER_SNAPSHOT.save(p, {}),
+        w: WEAPON_SNAPSHOT.save(p.weapon, {}),
+      };
+    };
+
+    const first = run();
+
+    // Rewind everything the replay depends on and run the identical 60 ticks again.
+    PLAYER_SNAPSHOT.restore(p, pSnap);
+    WEAPON_SNAPSHOT.restore(p.weapon, wSnap);
+    g.rng.setState(rngState);
+    g.tick = startTick;
+    const second = run();
+
+    return {
+      playerDiff: PLAYER_SNAPSHOT.diff(first.p, second.p),
+      weaponDiff: WEAPON_SNAPSHOT.diff(first.w, second.w),
+      // How much state the replayed stretch actually moved. Without this the whole test
+      // could pass by replaying 60 ticks in which nothing happened — two identical
+      // no-ops match perfectly and prove nothing.
+      playerAdvanced: PLAYER_SNAPSHOT.diff(pSnap, first.p).length,
+      weaponAdvanced: WEAPON_SNAPSHOT.diff(wSnap, first.w).length,
+    };
+  });
+  if (rewind.playerAdvanced >= 5 && rewind.weaponAdvanced >= 3) {
+    ok(`the replayed stretch does real work (${rewind.playerAdvanced} player / ${rewind.weaponAdvanced} weapon fields changed)`);
+  } else {
+    bad('the replayed stretch does real work',
+      `only ${rewind.playerAdvanced} player / ${rewind.weaponAdvanced} weapon fields changed — a no-op replay matches trivially`);
+  }
+  if (rewind.playerDiff.length === 0) ok('player state after replay is identical, field for field');
+  else bad('player state after replay is identical', `diverged: ${rewind.playerDiff.join(', ')}`);
+  if (rewind.weaponDiff.length === 0) ok('weapon state after replay is identical, field for field');
+  else bad('weapon state after replay is identical', `diverged: ${rewind.weaponDiff.join(', ')}`);
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point
