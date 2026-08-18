@@ -1,0 +1,17 @@
+app = "overstrike"
+primary_region = "iad"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Static nginx costs nothing to restart, so let idle machines stop. First hit after
+  # an idle period pays a cold start of a second or so.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
