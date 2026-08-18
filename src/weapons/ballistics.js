@@ -593,49 +593,43 @@ export function applyExplosionDamage(game, o) {
     const dist = _expCenter.distanceTo(point);
     if (dist > radius) continue;
 
-    // Exposure, probed cheapest-first. Three unconditional `losClear` marches per entity
-    // is the entire cost of a detonation: 25 entities in radius = 75 marches, and four
-    // frags in one frame = 300, which is the grenade hitch. The chest probe is the gate:
+    // Three `losClear` marches per entity is the bulk of a detonation's cost: 25
+    // entities in radius = 75 marches, and four frags in one frame ≈ 300.
     //
-    //   • chest blocked, and far out       -> in cover, no damage. 1 march.
-    //   • chest blocked, inside 60% radius -> one head probe, because a low crate leaving
-    //                                         only the head exposed is exactly the case
-    //                                         that makes crouching readable. 2 marches.
-    //   • chest clear, inside 60% radius   -> full 3-probe granularity, unchanged.
-    //   • chest clear, beyond 60% radius   -> 0.75, the midpoint of what the two extra
-    //                                         probes could have returned. The falloff
-    //                                         multiplier out there is <= 0.28, so the
-    //                                         worst-case error is a few HP. 1 march.
+    // An earlier pass tried to cut that with coarse approximations — skipping the head
+    // and feet probes beyond 60% of the radius and calling exposure 0.75, and treating a
+    // blocked chest out there as "in cover, no damage". Both were reasoned to be worth
+    // "a few HP". A parity harness against the pre-optimisation implementation
+    // (`scripts/review_ballistics_parity.mjs`) measured what they actually cost:
+    // 702 of 3000 blast cases diverged, total explosion damage fell 5.93%, the worst
+    // single-entity swing was 14.49 HP, and **81 entities that used to be hurt took zero**.
+    // Grenades got quietly weaker. That is a gameplay change, not an optimisation, so
+    // the exact probe set is restored.
     //
-    // Note the coarse branches can only ever LOWER exposure relative to "fully exposed";
-    // nobody fully behind a wall can start taking damage, because a blocked chest never
-    // grants more than the 0.25 a clear head earns.
-    const near = dist < radius * 0.6;
+    // What IS kept is a saving that cannot change the outcome: if a fully exposed entity
+    // at this distance would still land under the 1 HP floor applied below, no
+    // combination of probe results can produce damage, so skip the marches entirely.
+    // This is exact by construction — same damage, same events, fewer probes.
+    const t = clamp(dist / radius, 0, 1);
+    const falloff = Math.pow(1 - t, pow);
+    // Self-damage is always allowed (that is what selfMul is for); everything else
+    // goes through the shared gate so spawn protection and friendly fire hold.
+    const scale = e === attacker ? selfMul : damageScale(game, attacker, e);
+    if (baseDamage * falloff * scale < 1) continue;
+
     let exposure = 0;
     if (!world || typeof world.losClear !== 'function') {
       exposure = 1;
-    } else if (world.losClear(point, _expCenter)) {
-      if (near) {
-        _expHead.set(e.position.x, e.position.y + h * 0.92, e.position.z);
-        _expFeet.set(e.position.x, e.position.y + 0.18, e.position.z);
-        exposure = 0.5;
-        if (world.losClear(point, _expHead)) exposure += 0.25;
-        if (world.losClear(point, _expFeet)) exposure += 0.25;
-      } else {
-        exposure = 0.75;
-      }
-    } else if (near) {
+    } else {
       _expHead.set(e.position.x, e.position.y + h * 0.92, e.position.z);
-      if (world.losClear(point, _expHead)) exposure = 0.25;
+      _expFeet.set(e.position.x, e.position.y + 0.18, e.position.z);
+      if (world.losClear(point, _expCenter)) exposure += 0.5;
+      if (world.losClear(point, _expHead)) exposure += 0.25;
+      if (world.losClear(point, _expFeet)) exposure += 0.25;
     }
     if (exposure <= 0) continue;
 
-    const t = clamp(dist / radius, 0, 1);
-    let amount = baseDamage * Math.pow(1 - t, pow) * exposure;
-    // Self-damage is always allowed (that is what selfMul is for); everything else
-    // goes through the shared gate so spawn protection and friendly fire hold.
-    if (e === attacker) amount *= selfMul;
-    else amount *= damageScale(game, attacker, e);
+    const amount = baseDamage * falloff * exposure * scale;
     if (amount < 1) continue;
 
     _expDirWorld.copy(_expCenter).sub(point);
