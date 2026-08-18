@@ -454,12 +454,17 @@ export class PlayerCamera {
     // past the last tick (`game.accumAlpha`). `baseYaw`/`basePitch` (mouse) are added
     // fresh, at full resolution, un-interpolated.
     //
-    // Scoped weapons render un-interpolated (alpha=1): a sniper's recoil is one large
-    // kick, not a spray, so the un-smoothed tick value is invisible as a stair-step and
-    // sway is slow enough that 120 Hz sampling is already smooth — while an
-    // interpolated reticle would visibly disagree with the impact through the scope,
-    // which is exactly the lie `feel` above exists to prevent.
-    const alpha = this.player.weapon?.def?.scoped ? 1 : game.accumAlpha;
+    // No scoped-weapon exception: unlike the `feel` terms above (bob, shake, idle
+    // drift), which are decorative and never represent the true aim, this is a blend of
+    // two GENUINELY correct tick-accurate aim values — the end of the previous tick and
+    // the end of this one — so it never disagrees with where a bullet fired at either
+    // endpoint would go, only smooths the sub-tick instant between them. An earlier
+    // version special-cased alpha=1 for scoped weapons on the theory that a sniper's
+    // kick is "one shot, not a spray" — true for the 45 rpm bolt-action REAVER, false
+    // for the 200 rpm semi-auto MERIDIAN, whose recoil pop was measured at ~45-50 px
+    // through its scope at full trigger speed specifically BECAUSE it rendered
+    // un-interpolated. Interpolating uniformly fixes that without a per-weapon carve-out.
+    const alpha = game.accumAlpha;
     const aimYaw = p.baseYaw + lerp(p.prevRecoilYaw + p.prevScopeSwayYaw, p.recoilYaw + p.scopeSwayYaw, alpha);
     const aimPitch = clamp(
       p.basePitch + lerp(p.prevRecoilPitch + p.prevScopeSwayPitch, p.recoilPitch + p.scopeSwayPitch, alpha),

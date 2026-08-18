@@ -287,6 +287,32 @@ try {
   else if (headlessRecoil.movedPitch && headlessRecoil.movedYaw) ok(`addRecoil moved the aim under NullPresenter (yaw ${headlessRecoil.yaw.toFixed(4)}, pitch ${headlessRecoil.pitch.toFixed(4)})`);
   else bad('player aim recoil runs without a camera/presenter', 'aim did not move — recoil is still gated behind a live presenter somewhere');
 
+  // ── accumAlpha never renders a stale tick ─────────────────────────────────────────
+  //
+  // A real bug found by review: while the sim is not advancing (paused), `_loop` zeroes
+  // `_accum` every frame, so a naive `_accum / FIXED_DT` reads 0 forever — the camera
+  // would render `lerp(prev, cur, 0)`, frozen on whatever recoil/sway looked like ONE
+  // TICK before the pause, for as long as the pause lasts. `accumAlpha` must force 1
+  // (render the latest tick, nothing to interpolate toward) whenever not simulating.
+  console.log('\naccumAlpha never renders a stale tick while paused');
+  const alphaCheck = await page.evaluate(() => {
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 13 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const playingAlpha = g.accumAlpha;                 // mid-tick, should be in [0,1]
+    g.paused = true;
+    const pausedAlpha = g.accumAlpha;
+    g.paused = false;
+    g.state = 'menu';
+    const menuAlpha = g.accumAlpha;
+    return { playingAlpha, pausedAlpha, menuAlpha };
+  });
+  if (alphaCheck.pausedAlpha === 1) ok('accumAlpha is 1 while paused (renders the latest tick, not a stale blend)');
+  else bad('accumAlpha is 1 while paused', `got ${alphaCheck.pausedAlpha} — a pause right after a shot would render one tick of stale recoil`);
+  if (alphaCheck.menuAlpha === 1) ok('accumAlpha is 1 outside state==="playing"');
+  else bad('accumAlpha is 1 outside state==="playing"', `got ${alphaCheck.menuAlpha}`);
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point

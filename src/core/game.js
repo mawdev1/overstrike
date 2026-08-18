@@ -119,8 +119,19 @@ export class Game {
    * this — they already update every frame at full mouse resolution, so lerping them
    * would add tick-period latency to the local player's own crosshair. Only the parts
    * that genuinely move on the fixed clock benefit.
+   *
+   * Forced to `1` (render the latest tick, never a blend) whenever the sim is not
+   * advancing: `_loop` zeroes `_accum` every frame while not `simulating` (paused, or
+   * off `state === 'playing'`), so reading it raw would render `lerp(prev, cur, 0)` —
+   * frozen on whatever the tick BEFORE the pause looked like — for as long as the pause
+   * lasts, up to one full tick stale. There is no "next tick" being awaited while
+   * paused, so `cur` is unambiguously the freshest truth and interpolation has nothing
+   * left to smooth toward.
    */
-  get accumAlpha() { return clamp(this._accum / FIXED_DT, 0, 1); }
+  get accumAlpha() {
+    if (!(this.state === 'playing' && !this.paused)) return 1;
+    return clamp(this._accum / FIXED_DT, 0, 1);
+  }
 
   /**
    * Build every system, reporting honest progress and yielding between phases so the
