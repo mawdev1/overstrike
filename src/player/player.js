@@ -2012,7 +2012,14 @@ export const PLAYER_SNAPSHOT = defineSnapshot('Player', {
     'camera',               // PlayerCamera — presentation only, never touches sim state
     'id', 'isPlayer', 'name',
     'radius', 'maxHealth',  // constants
-    'hitboxes',             // recomputed from height + lean by _updateHitboxes each tick
+    // Derived from height + lean — but NOT continuously: `_updateHitboxes` runs at the
+    // end of a LIVE fixedUpdate only, so a corpse keeps standing-height boxes while
+    // `_deadFixedUpdate` goes on shrinking `height`. Restoring height without recomputing
+    // therefore leaves the boxes describing the wrong body. Harmless today (rayVsEntity
+    // bails on !alive, and respawn recomputes), but a Phase 7 lag-comp rewind that
+    // restores and immediately raycasts would test the current tick's volumes against a
+    // rewound transform. Whoever rewinds must call `_updateHitboxes()` after restoring.
+    'hitboxes',
     'weapon',               // a WeaponInstance reference; its state is WEAPON_SNAPSHOT,
                             // and which one is equipped lives in the loadout index
     '_cmdScratch',          // reused scratch for the locally built command

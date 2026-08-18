@@ -453,7 +453,7 @@ try {
   const roundTrip = await page.evaluate(async () => {
     const g = window.__GAME__;
     const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
-    const { WEAPON_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
+    const { WEAPON_SNAPSHOT, saveLoadout, restoreLoadout } = await import('/src/weapons/weaponSystem.js');
     g.stop();
     g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 91 });
     g.match.phase = 'live'; g.match.countdown = 0;
@@ -473,6 +473,11 @@ try {
       'id', 'isPlayer', 'name', 'radius', 'maxHealth',   // identity and constants
     ]);
     const WEAPON_EXEMPT = new Set(['system', 'game', 'owner', 'def', 'viewmodel', 'interval']);
+    // The loadout carries the grenade counters, which gun is equipped, and every
+    // holstered instance. Its manifest had no completeness test at all: `audit` reads the
+    // manifest's own `ignore`, and `diffLoadout` only compares fields the manifest already
+    // carries, so a dropped field there was structurally unseeable by the whole suite.
+    const LOADOUT_EXEMPT = new Set(['weapons', 'melee', 'switchPending']);
 
     // A comparable digest of every own enumerable field, built without consulting the
     // manifest at all.
@@ -484,12 +489,11 @@ try {
         if (v === null || v === undefined) { out[k] = String(v); continue; }
         if (typeof v === 'object') {
           if ('x' in v && 'y' in v && 'z' in v) { out[k] = `${v.x},${v.y},${v.z}`; continue; }
-          const sub = {};
-          for (const kk of Object.keys(v)) {
-            const vv = v[kk];
-            if (vv === null || typeof vv !== 'object') sub[kk] = vv;
-          }
-          out[k] = JSON.stringify(sub);
+          // Whole structure, recursively. An earlier version kept only scalar sub-keys,
+          // so an object-valued key nested inside `stats` or `_held` was invisible to
+          // both the dump and the scribble and would "restore" without ever being
+          // carried. These records are flat today; this makes them stay honest if not.
+          out[k] = JSON.stringify(v);
           continue;
         }
         out[k] = v;
@@ -501,9 +505,19 @@ try {
     for (let i = 0; i < 90; i++) { g.frame++; g._fixedUpdate(DT); }
     inp.actions.clear();
 
-    const before = { p: dump(p, PLAYER_EXEMPT), w: dump(p.weapon, WEAPON_EXEMPT) };
+    const lo = g.weapons.getLoadout(p);
+    const dumpAll = () => ({
+      p: dump(p, PLAYER_EXEMPT),
+      w: dump(p.weapon, WEAPON_EXEMPT),
+      lo: dump(lo, LOADOUT_EXEMPT),
+      // Each instance in the loadout, including the holstered ones and melee, which are
+      // mutated by switching even though fixedUpdate only ticks the equipped weapon.
+      guns: lo.weapons.map((w) => dump(w, WEAPON_EXEMPT)).concat([dump(lo.melee, WEAPON_EXEMPT)]),
+    });
+    const before = dumpAll();
     const pSnap = PLAYER_SNAPSHOT.save(p);
     const wSnap = WEAPON_SNAPSHOT.save(p.weapon);
+    const loSnap = saveLoadout(lo);
 
     /**
      * Scribble over every own field, then restore.
@@ -516,6 +530,16 @@ try {
      * on gameplay entirely: after a restore, every captured field must be back, and any
      * field the manifest does not carry is still wearing its scribble.
      */
+    // Recursive, so a nested record's own sub-objects are corrupted too.
+    const scribbleInto = (v) => {
+      for (const kk of Object.keys(v)) {
+        const vv = v[kk];
+        if (typeof vv === 'number') v[kk] = vv + 12345.678;
+        else if (typeof vv === 'boolean') v[kk] = !vv;
+        else if (typeof vv === 'string') v[kk] = `${vv}~scribbled`;
+        else if (vv && typeof vv === 'object') scribbleInto(vv);
+      }
+    };
     const scribble = (o, exempt) => {
       for (const k of Object.keys(o)) {
         if (exempt.has(k)) continue;
@@ -525,22 +549,20 @@ try {
         else if (typeof v === 'string') o[k] = `${v}~scribbled`;
         else if (v && typeof v === 'object') {
           if ('x' in v && 'y' in v && 'z' in v) { v.x += 999; v.y += 999; v.z += 999; continue; }
-          for (const kk of Object.keys(v)) {
-            const vv = v[kk];
-            if (typeof vv === 'number') v[kk] = vv + 12345.678;
-            else if (typeof vv === 'boolean') v[kk] = !vv;
-            else if (typeof vv === 'string') v[kk] = `${vv}~scribbled`;
-          }
+          scribbleInto(v);
         }
       }
     };
     scribble(p, PLAYER_EXEMPT);
-    scribble(p.weapon, WEAPON_EXEMPT);
-    const scribbled = { p: dump(p, PLAYER_EXEMPT), w: dump(p.weapon, WEAPON_EXEMPT) };
+    scribble(lo, LOADOUT_EXEMPT);
+    for (const w of lo.weapons) scribble(w, WEAPON_EXEMPT);
+    scribble(lo.melee, WEAPON_EXEMPT);
+    const scribbled = dumpAll();
 
     PLAYER_SNAPSHOT.restore(p, pSnap);
+    restoreLoadout(lo, loSnap);
     WEAPON_SNAPSHOT.restore(p.weapon, wSnap);
-    const after = { p: dump(p, PLAYER_EXEMPT), w: dump(p.weapon, WEAPON_EXEMPT) };
+    const after = dumpAll();
 
     const compare = (a, b) => {
       const bad = [];
@@ -550,13 +572,25 @@ try {
     };
     // Every field must actually have been scribbled, or a green result could just mean
     // the corruption never landed.
-    const missedByScribble = compare(before.p, scribbled.p).length;
+    const gunsBad = [];
+    for (let i = 0; i < before.guns.length; i++) {
+      for (const f of compare(before.guns[i], after.guns[i])) gunsBad.push(`weapons[${i}].${f}`);
+    }
+    let gunFields = 0, gunScribbled = 0;
+    for (let i = 0; i < before.guns.length; i++) {
+      gunFields += Object.keys(before.guns[i]).length;
+      gunScribbled += compare(before.guns[i], scribbled.guns[i]).length;
+    }
     return {
       playerBad: compare(before.p, after.p),
       weaponBad: compare(before.w, after.w),
+      loadoutBad: compare(before.lo, after.lo).concat(gunsBad),
       playerFields: Object.keys(before.p).length,
       weaponFields: Object.keys(before.w).length,
-      scribbledCount: missedByScribble,
+      loadoutFields: Object.keys(before.lo).length + gunFields,
+      scribbledCount: compare(before.p, scribbled.p).length,
+      weaponScribbled: compare(before.w, scribbled.w).length,
+      loadoutScribbled: compare(before.lo, scribbled.lo).length + gunScribbled,
     };
   });
   if (roundTrip.scribbledCount === roundTrip.playerFields) {
@@ -576,6 +610,20 @@ try {
   } else {
     bad('every own weapon field comes back after restore',
       `not restored: ${roundTrip.weaponBad.join(', ')}`);
+  }
+  // The weapon and loadout need their own corruption assertions: a field that is null or
+  // NaN at scribble time cannot be corrupted, and would then "restore" for free.
+  if (roundTrip.weaponScribbled === roundTrip.weaponFields
+    && roundTrip.loadoutScribbled === roundTrip.loadoutFields) {
+    ok(`all ${roundTrip.weaponFields} weapon and ${roundTrip.loadoutFields} loadout fields were corrupted first`);
+  } else {
+    bad('every weapon and loadout field was corrupted before the restore',
+      `weapon ${roundTrip.weaponScribbled}/${roundTrip.weaponFields}, loadout ${roundTrip.loadoutScribbled}/${roundTrip.loadoutFields}`);
+  }
+  if (roundTrip.loadoutBad.length === 0) {
+    ok(`the loadout and all ${roundTrip.loadoutFields} fields of its weapons come back exactly`);
+  } else {
+    bad('the loadout comes back after restore', `not restored: ${roundTrip.loadoutBad.join(', ')}`);
   }
 
   console.log('\nsave / restore replays bit-identically, every tick');

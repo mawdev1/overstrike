@@ -1025,9 +1025,11 @@ export const WEAPON_SNAPSHOT = defineSnapshot('WeaponInstance', {
 export const LOADOUT_SNAPSHOT = defineSnapshot('Loadout', {
   scalars: ['index', 'lastIndex'],
   objects: {
-    // `lethal`/`tactical` are equipment ids, fixed for the life of the loadout; only the
-    // counts are consumed during a tick.
-    equipment: ['lethalCount', 'tacticalCount'],
+    // The counts are what a tick consumes. The `lethal`/`tactical` ids are fixed for the
+    // life of the loadout and were originally left out for that reason — but "does not
+    // change today" is a weaker guarantee than carrying two strings, and leaving them out
+    // meant a restored loadout was not actually equal to the captured one. Carry them.
+    equipment: ['lethal', 'lethalCount', 'tactical', 'tacticalCount'],
   },
   ignore: [
     'weapons', 'melee',     // arrays / instances — handled by saveLoadout below
@@ -1084,7 +1086,12 @@ export function restoreLoadout(lo, snap) {
   LOADOUT_SNAPSHOT.restore(lo, snap);
   const n = lo.weapons.length;
   for (let i = 0; i < n; i++) WEAPON_SNAPSHOT.restore(lo.weapons[i], snap.weapons[i]);
-  if (lo.melee && snap.melee) WEAPON_SNAPSHOT.restore(lo.melee, snap.melee);
+  // Symmetric with the length check above: silently skipping when only one side has a
+  // melee instance would restore a loadout that is not the one captured.
+  if (!lo.melee !== !snap.melee) {
+    throw new Error('Loadout restore: melee instance present on one side only — this snapshot is not from this loadout');
+  }
+  if (lo.melee) WEAPON_SNAPSHOT.restore(lo.melee, snap.melee);
 
   // The instances carry their owner, so this needs no extra argument.
   const owner = lo.weapons[0]?.owner;
