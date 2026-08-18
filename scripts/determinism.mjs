@@ -256,6 +256,37 @@ try {
   else if (skip.ticksToRespawn < 400) ok(`respawned at tick ${skip.ticksToRespawn} — held fire cut the wait short`);
   else bad('fire-to-skip-respawn reaches Match in the same tick', `respawned at tick ${skip.ticksToRespawn} — that's the un-skipped ~480-tick timer, fire was not seen`);
 
+  // ── player aim recoil runs without a camera/presenter ────────────────────────────
+  //
+  // Phase 2b moved recoil integration off PlayerCamera onto Player, specifically so it
+  // runs on a headless server that has no camera at all — it moves player.yaw/pitch,
+  // which ballistics fires along, so it cannot be presentation-gated. Prove it directly:
+  // call Player.addRecoil with the presenter swapped to NullPresenter (the shape a
+  // headless server actually runs in) and confirm the aim moved anyway.
+  console.log('\nplayer aim recoil runs without a camera/presenter');
+  const headlessRecoil = await page.evaluate(async () => {
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 5 });
+    const { NullPresenter } = await import('/src/core/presenter.js');
+    const before = g.present;
+    g.present = new NullPresenter();
+    const p = g.player;
+    p.setAngles(0, 0);
+    let threw = null;
+    try {
+      p.addRecoil(2, 1, 0.1);   // pitch deg, yaw deg, punch metres
+    } catch (e) { threw = String(e); }
+    const movedPitch = p.pitch !== 0;
+    const movedYaw = p.yaw !== 0;
+    g.present = before;
+    return { threw, movedPitch, movedYaw, yaw: p.yaw, pitch: p.pitch };
+  });
+
+  if (headlessRecoil.threw) bad('player aim recoil runs without a camera/presenter', headlessRecoil.threw);
+  else if (headlessRecoil.movedPitch && headlessRecoil.movedYaw) ok(`addRecoil moved the aim under NullPresenter (yaw ${headlessRecoil.yaw.toFixed(4)}, pitch ${headlessRecoil.pitch.toFixed(4)})`);
+  else bad('player aim recoil runs without a camera/presenter', 'aim did not move — recoil is still gated behind a live presenter somewhere');
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point

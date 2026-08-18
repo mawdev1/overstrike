@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { clamp, lerp, damp, dirFromAngles, PITCH_LIMIT } from '../core/mathUtils.js';
+import { clamp, lerp, damp, dirFromAngles, PITCH_LIMIT, DEG } from '../core/mathUtils.js';
 import { PlayerCamera, CAMERA_TUNE } from './playerCamera.js';
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -203,6 +203,30 @@ const TUNE = {
   LAND_MIN_IMPACT: 1.4,     // m/s below which a landing does not register
   SLIDE_DIP: 0.13,          // m — extra eye drop while sliding
   SLIDE_ENTRY_DIP: 1.1,     // spring velocity injected when a slide starts
+
+  // ── aim state ─────────────────────────────────────────────────────────────────────
+  // Recoil and scope sway. These used to live entirely on PlayerCamera, integrated on
+  // the render clock — moved here for the same reason the eye springs were: they move
+  // player.yaw/pitch, which ballistics fires along, so they must run on a headless
+  // server with no camera/render clock at all. What PlayerCamera keeps is only the
+  // genuinely decorative remainder: the recoil PUNCH spring (camera pushed back along
+  // its own -forward, never moves the aim) and damage shake.
+  RECOIL_SCALE: 2.9,        // global multiplier
+  RECOIL_SNAP: 38,          // 1/s — how fast the view reaches the new kick
+  RECOIL_RECOVER: 7.5,      // default 1/s return (overridden by def.recoil.recovery)
+  RECOIL_PERMANENT: 0.12,   // fraction of every kick that is NEVER recovered
+  RECOIL_MAX_DEG: 22,       // per-call sanity clamp
+  DAMAGE_PITCH: 2.6,        // degrees, flinch — see damageKick()
+  DAMAGE_YAW: 2.2,
+  // SCOPE — see `_updateScopeSway`. Amplitude is in DEGREES at full magnification and
+  // is scaled per weapon by `def.scopeSwayMul`.
+  SCOPE_SWAY: 0.36,
+  SCOPE_SWAY_RATE: 8,
+  SCOPE_ADS_IN: 0.40,        // adsAmount at which scope sway starts to come in
+  BREATH_HOLD_MUL: 0.13,     // sway multiplier while the breath is held
+  BREATH_GASP_MUL: 2.10,     // and immediately after it runs out
+  BREATH_GASP_TIME: 1.10,
+  BREATH_REFILL: 0.60,       // refill rate as a fraction of the drain rate
 };
 
 /** Fallbacks used when no weapon is equipped or a def field is missing. */
@@ -325,6 +349,43 @@ export class Player {
     this.velocity = new THREE.Vector3(0, 0, 0);
     this.yaw = 0;
     this.pitch = 0;
+
+    // Aim state — see TUNE. `yaw`/`pitch` above (the §4 contract fields ballistics
+    // fires along) are ALWAYS `baseYaw/basePitch + recoil + scopeSway`, written by
+    // `_writeAngles()`. `baseYaw`/`basePitch` is the mouse-driven part, updated once
+    // per frame at full resolution by `applyCommand`; recoil and sway are simulation,
+    // integrated on the fixed clock by `_updateAim`.
+    this.baseYaw = 0;
+    this.basePitch = 0;
+    this.recoilPitch = 0;
+    this.recoilYaw = 0;
+    this.recoilPitchTarget = 0;
+    this.recoilYawTarget = 0;
+    this.scopeSwayYaw = 0;
+    this.scopeSwayPitch = 0;
+    /** 1 = full lungful, 0 = out of breath. Published for the HUD's breath meter. */
+    this.breath = 1;
+    this.breathHolding = false;
+    this.breathGasp = 0;
+    /**
+     * 0..1 — how much of the sight picture is up. Published for PlayerCamera's `feel`
+     * fade (positional/angular camera lies fade out as truth-through-a-scope arrives)
+     * and for the render-aim interpolation alpha override — see `PlayerCamera.update`.
+     */
+    this.scopeAim = 0;
+    /**
+     * Snapshotted at the top of every fixed tick, BEFORE this tick touches recoil or
+     * sway — i.e. they hold the END of the PREVIOUS tick's values. `PlayerCamera`
+     * interpolates between these and the current values by the render clock's fraction
+     * of a tick, so recoil/sway are smooth at any refresh rate without adding latency
+     * to `baseYaw`/`basePitch` (which are never interpolated — they already update
+     * every frame at full mouse resolution).
+     */
+    this.prevRecoilYaw = 0;
+    this.prevRecoilPitch = 0;
+    this.prevScopeSwayYaw = 0;
+    this.prevScopeSwayPitch = 0;
+
     this.height = TUNE.STAND_HEIGHT;
     this.radius = TUNE.RADIUS;
     this.eyeHeight = TUNE.STAND_EYE;
@@ -517,6 +578,178 @@ export class Player {
     return dirFromAngles(this.yaw, this.pitch, out);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════ aim ══
+
+  /** Snap the aim to an absolute yaw/pitch — spawn/respawn only. Clears all recoil/sway. */
+  setAngles(yaw, pitch) {
+    this.baseYaw = yaw;
+    this.basePitch = clamp(pitch, -PITCH_LIMIT, PITCH_LIMIT);
+    this.recoilPitch = this.recoilYaw = 0;
+    this.recoilPitchTarget = this.recoilYawTarget = 0;
+    this.scopeSwayYaw = this.scopeSwayPitch = 0;
+    this.prevRecoilYaw = this.prevRecoilPitch = 0;
+    this.prevScopeSwayYaw = this.prevScopeSwayPitch = 0;
+    this._writeAngles();
+  }
+
+  /** yaw/pitch = mouse intent + un-recovered recoil + scope sway. */
+  _writeAngles() {
+    this.yaw = this.baseYaw + this.recoilYaw + this.scopeSwayYaw;
+    this.pitch = clamp(this.basePitch + this.recoilPitch + this.scopeSwayPitch, -PITCH_LIMIT, PITCH_LIMIT);
+  }
+
+  get _recoilRecovery() {
+    const r = this.weapon?.def?.recoil?.recovery;
+    return (typeof r === 'number' && r > 0.1) ? r : TUNE.RECOIL_RECOVER;
+  }
+
+  /**
+   * @param {number} pitchKick upward kick in DEGREES (weaponDefs `recoil.up`)
+   * @param {number} yawKick   sideways kick in DEGREES (`recoil.side`, signed)
+   * @param {number} punch     view punch in METRES (`recoil.kick`) — camera-only, see
+   *                           `game.present.cameraRecoilPunch`.
+   */
+  addRecoil(pitchKick, yawKick, punch = 0) {
+    const maxK = TUNE.RECOIL_MAX_DEG;
+    const p = clamp(pitchKick || 0, -maxK, maxK) * DEG * TUNE.RECOIL_SCALE;
+    const y = clamp(yawKick || 0, -maxK, maxK) * DEG * TUNE.RECOIL_SCALE;
+    this._addRecoilRad(p, y, TUNE.RECOIL_PERMANENT);
+    if (punch) this.game.present.cameraRecoilPunch(this, clamp(punch, -0.5, 0.5));
+  }
+
+  /**
+   * `permanentFrac` of the kick is written straight into the base aim angles and
+   * therefore never recovers; the remainder decays back to zero, returning the aim to
+   * exactly where the player was pointing.
+   */
+  _addRecoilRad(pitchRad, yawRad, permanentFrac) {
+    const f = clamp(permanentFrac, 0, 1);
+    if (f > 0) {
+      this.basePitch = clamp(this.basePitch + pitchRad * f, -PITCH_LIMIT, PITCH_LIMIT);
+      this.baseYaw += yawRad * f;
+    }
+    this.recoilPitchTarget += pitchRad * (1 - f);
+    this.recoilYawTarget += yawRad * (1 - f);
+    // Never let a pathological burst throw the aim past the pitch limit.
+    this.recoilPitchTarget = clamp(this.recoilPitchTarget, -0.6, 0.6);
+    this.recoilYawTarget = clamp(this.recoilYawTarget, -0.6, 0.6);
+    this._writeAngles();
+  }
+
+  /**
+   * Flinch. Routed through the recoil system with ZERO permanent component, so it
+   * genuinely moves the player's aim (they can fight it) and then returns exactly to
+   * where they were pointing. The visual punch/shake reaction is presentation.
+   */
+  damageKick(dirWorld, magnitude = 1) {
+    const m = clamp(magnitude, 0, 1.6);
+    // Lateral component of the attacker direction, in view space.
+    const rx = Math.cos(this.baseYaw), rz = -Math.sin(this.baseYaw);
+    const side = dirWorld ? clamp(dirWorld.x * rx + dirWorld.z * rz, -1, 1) : 0;
+    // Punched AWAY from the damage: hit from the left, the aim snaps right.
+    this._addRecoilRad(TUNE.DAMAGE_PITCH * DEG * m, -side * TUNE.DAMAGE_YAW * DEG * m, 0);
+    this.game.present.cameraDamageFlinch(this, m);
+  }
+
+  /** Called first thing in `fixedUpdate`, before anything this tick can touch aim. */
+  _snapshotAim() {
+    this.prevRecoilYaw = this.recoilYaw;
+    this.prevRecoilPitch = this.recoilPitch;
+    this.prevScopeSwayYaw = this.scopeSwayYaw;
+    this.prevScopeSwayPitch = this.scopeSwayPitch;
+  }
+
+  /**
+   * Recoil decay + scope sway, on the fixed clock. Called after `_updateWeapon()` so
+   * this tick's fire (if any) has already pushed the recoil TARGET via `addRecoil`
+   * before the decay step chases it — the snapshot taken in `_snapshotAim()` at the top
+   * of the tick is what makes that kick visible as "current" rather than "previous" to
+   * the render-side interpolation.
+   */
+  _updateAim(dt) {
+    const rec = this._recoilRecovery;
+    this.recoilPitch = damp(this.recoilPitch, this.recoilPitchTarget, TUNE.RECOIL_SNAP, dt);
+    this.recoilYaw = damp(this.recoilYaw, this.recoilYawTarget, TUNE.RECOIL_SNAP, dt);
+    this.recoilPitchTarget = damp(this.recoilPitchTarget, 0, rec, dt);
+    this.recoilYawTarget = damp(this.recoilYawTarget, 0, rec, dt);
+    if (Math.abs(this.recoilPitchTarget) < 1e-5) this.recoilPitchTarget = 0;
+    if (Math.abs(this.recoilYawTarget) < 1e-5) this.recoilYawTarget = 0;
+
+    this._updateScopeSway(dt);
+    this._writeAngles();
+  }
+
+  /**
+   * Scoped-weapon hold: the low-frequency wander of a rifle held against a shoulder,
+   * and the breath you hold to stop it.
+   *
+   * `weaponDefs` carries `scopeSwayMul`/`breathHoldTime`; this is what reads them.
+   * Amplitude is deliberately modest — at the REAVER's 22° field of view, 0.36° x 1.6 is
+   * about 2% of the screen height, enough to make a 200 m headshot a decision rather
+   * than a formality, small enough that it never feels like the rifle is fighting you.
+   *
+   * `breathHold` comes from the command (`_held.breathHold`, resolved from the sprint
+   * key while scoped — sprinting cancels ADS, so the key is otherwise dead in this
+   * state), never read from `game.input` directly. Run the lungs dry and you gasp: sway
+   * spikes above baseline for a second, so spamming it is worse than timing it.
+   *
+   * This used to run on the render clock (`PlayerCamera.update(dtFrame)`), using
+   * `camera.swayTime += dtFrame` as the waveform's time base. Moved to the fixed clock
+   * because it writes into `yaw`/`pitch` — ballistics fires along it — so it must be
+   * deterministic and must run without a render loop. `game.time` (tick-derived) is the
+   * waveform's time base now; the one behavioural change is that sway now genuinely
+   * freezes while paused instead of continuing to drift, which is the more honest
+   * reading of "paused".
+   */
+  _updateScopeSway(dt) {
+    const def = this.weapon?.def;
+    const scoped = !!def?.scoped && this.alive;
+
+    // Everything below this line is scoped-only. Off the sniper it is one property
+    // chain and a compare, then a decay that reaches exact zero and stops.
+    if (!scoped) {
+      this.scopeAim = 0;
+      if (this.scopeSwayYaw === 0 && this.scopeSwayPitch === 0 && this.breath === 1
+        && this.breathGasp === 0) return;
+      this.breathHolding = false;
+      this.breathGasp = Math.max(0, this.breathGasp - dt);
+      this.breath = Math.min(1, this.breath + dt * 0.7);
+      this.scopeSwayYaw = damp(this.scopeSwayYaw, 0, TUNE.SCOPE_SWAY_RATE, dt);
+      this.scopeSwayPitch = damp(this.scopeSwayPitch, 0, TUNE.SCOPE_SWAY_RATE, dt);
+      if (Math.abs(this.scopeSwayYaw) < 1e-6) this.scopeSwayYaw = 0;
+      if (Math.abs(this.scopeSwayPitch) < 1e-6) this.scopeSwayPitch = 0;
+      return;
+    }
+
+    const amt = clamp((clamp(this.adsAmount, 0, 1) - TUNE.SCOPE_ADS_IN) / (1 - TUNE.SCOPE_ADS_IN), 0, 1);
+    this.scopeAim = amt;
+
+    // ── breath ──
+    const holdTime = Math.max(0.4, def.breathHoldTime || 2.5);
+    const wantHold = amt > 0.5 && this._held.breathHold;
+    if (wantHold && this.breath > 0) {
+      this.breathHolding = true;
+      this.breath = Math.max(0, this.breath - dt / holdTime);
+      if (this.breath <= 0) this.breathGasp = TUNE.BREATH_GASP_TIME;
+    } else {
+      this.breathHolding = false;
+      this.breath = Math.min(1, this.breath + dt * TUNE.BREATH_REFILL / holdTime);
+      this.breathGasp = Math.max(0, this.breathGasp - dt);
+    }
+
+    // ── sway ──
+    const gasp = lerp(1, TUNE.BREATH_GASP_MUL, clamp(this.breathGasp / TUNE.BREATH_GASP_TIME, 0, 1));
+    const hold = this.breathHolding ? TUNE.BREATH_HOLD_MUL : 1;
+    const a = TUNE.SCOPE_SWAY * DEG * amt * (def.scopeSwayMul ?? 1) * hold * gasp;
+    const t = this.game.time;
+    // Two incommensurable frequencies per axis: the drift never repeats, so it cannot
+    // be learned and timed the way a single sine can.
+    const ty = (Math.sin(t * 0.61) * 0.70 + Math.sin(t * 1.43 + 2.1) * 0.30) * a;
+    const tp = (Math.sin(t * 0.87 + 1.1) * 0.65 + Math.sin(t * 1.97 + 0.4) * 0.35) * a * 0.78;
+    this.scopeSwayYaw = damp(this.scopeSwayYaw, ty, TUNE.SCOPE_SWAY_RATE, dt);
+    this.scopeSwayPitch = damp(this.scopeSwayPitch, tp, TUNE.SCOPE_SWAY_RATE, dt);
+  }
+
   /**
    * @param {number} amount already multiplied by the hit-part modifier by ballistics.
    * @param {{attacker?:object, hitPart?:string, point?:THREE.Vector3, normal?:THREE.Vector3, weaponId?:string}} [info]
@@ -551,7 +784,9 @@ export class Player {
 
     this.game.bus?.emit('playerDamaged', { amount: dmg, dirWorld });
     this.game.present.flashDamage(clamp(dmg / 55, 0.12, 1));
-    this.game.present.cameraDamageKick(this, dirWorld, clamp(dmg / 40, 0.15, 1.4));
+    // Aim-moving (sim) and presentation-only (punch/shake) — see damageKick(). Called
+    // directly, not through game.present: the sim half must run without a presenter.
+    this.damageKick(dirWorld, clamp(dmg / 40, 0.15, 1.4));
     this.game.present.play('hurt', { volume: clamp(0.45 + dmg / 90, 0.45, 1) });
 
     if (this.health <= 0) {
@@ -663,7 +898,7 @@ export class Player {
     this._wasFiring = false;
 
     this.game.present.cameraEndDeathCam(this);
-    this.camera.setAngles(this.yaw, this.pitch);
+    this.setAngles(this.yaw, this.pitch);
     this._updateHitboxes();
     this._refreshWeapon(true);
     this.game.bus?.emit('spawn', { entity: this });
@@ -873,13 +1108,14 @@ export class Player {
    * else in `fixedUpdate` reads `game.input`.
    */
   applyCommand(cmd) {
-    this.camera.baseYaw += cmd.deltaYaw;
-    this.camera.basePitch = clamp(this.camera.basePitch + cmd.deltaPitch, -PITCH_LIMIT, PITCH_LIMIT);
-    if (this.camera.baseYaw > Math.PI * 4) this.camera.baseYaw -= Math.PI * 4;
-    else if (this.camera.baseYaw < -Math.PI * 4) this.camera.baseYaw += Math.PI * 4;
+    this.baseYaw += cmd.deltaYaw;
+    this.basePitch = clamp(this.basePitch + cmd.deltaPitch, -PITCH_LIMIT, PITCH_LIMIT);
+    if (this.baseYaw > Math.PI * 4) this.baseYaw -= Math.PI * 4;
+    else if (this.baseYaw < -Math.PI * 4) this.baseYaw += Math.PI * 4;
+    // Banked for the camera's sway/lag pass, consumed once in camera.update().
     this.camera._lookDX += cmd.deltaYaw;
     this.camera._lookDY += cmd.deltaPitch;
-    this.camera._writeAngles();
+    this._writeAngles();
 
     const e = this._edge;
     e.jump = cmd.jump; e.crouch = cmd.crouchPressed; e.reload = cmd.reload;
@@ -901,12 +1137,13 @@ export class Player {
   fixedUpdate(dt) {
     this._pumpLocalCommand();
     this._refreshHeldState();
+    this._snapshotAim();
     if (!this.game.world) return;
 
     if (!this.alive) {
       this._deadFixedUpdate(dt);
       this._updateEyeSprings(dt);
-      this.camera.fixedUpdate(dt);
+      this._updateAim(dt);
       this._clearEdges();
       return;
     }
@@ -926,7 +1163,7 @@ export class Player {
     this._updateHealth(dt);
     this._updateEyeSprings(dt);
     this._updateHitboxes();
-    this.camera.fixedUpdate(dt);
+    this._updateAim(dt);
     this._clearEdges();
   }
 

@@ -60,15 +60,23 @@ export class LivePresenter {
   deathScreen(evt) { this.game.hud?.deathScreen?.(evt); }
 
   // ── camera feel (player only — bots have no PlayerCamera) ────────────────────
-  cameraDamageKick(entity, dirWorld, magnitude) { entity.camera?.damageKick?.(dirWorld, magnitude); }
+  //
+  // Recoil and damage flinch USED to be entirely camera methods routed through here.
+  // Both actually move the player's AIM (baked into player.yaw/pitch, which ballistics
+  // fires along), which is simulation and must run whether or not a presenter/camera
+  // exists — so that part moved onto `Player` directly (`addRecoil`/`damageKick`,
+  // called unconditionally, never through this port). What's left here is only the
+  // genuinely decorative remainder: the camera's recoil-punch spring and its damage
+  // shake, neither of which moves a bullet.
   cameraStartDeathCam(entity, killerPos) { entity.camera?.startDeathCam?.(killerPos); }
   cameraEndDeathCam(entity) { entity.camera?.endDeathCam?.(); }
   cameraStartSlide(entity) { entity.camera?.startSlide?.(); }
   cameraStartMantle(entity, duration, height) { entity.camera?.startMantle?.(duration, height); }
   cameraMeleeKick(entity) { entity.camera?.meleeKick?.(); }
-  cameraAddRecoil(entity, pitchDeg, yawDeg, kick, recovery) {
-    entity.camera?.addRecoil?.(pitchDeg, yawDeg, kick, recovery);
-  }
+  /** Camera push-back spring only — METRES, see weaponDefs `recoil.kick`. */
+  cameraRecoilPunch(entity, punchMetres) { entity.camera?.recoilPunch?.(punchMetres); }
+  /** Camera shake-and-punch reaction to taking damage. */
+  cameraDamageFlinch(entity, magnitude) { entity.camera?.damageFlinch?.(magnitude); }
 }
 
 /** Every method above, emptied. See the module doc for why this exists. */
@@ -79,6 +87,7 @@ export class NullPresenter {
   flashDamage() {}
   hitmarker() {} setAmmo() {} setWeapon() {} setEquipment() {} setCrosshairSpread() {}
   killfeed() {} deathScreen() {}
-  cameraDamageKick() {} cameraStartDeathCam() {} cameraEndDeathCam() {}
-  cameraStartSlide() {} cameraStartMantle() {} cameraMeleeKick() {} cameraAddRecoil() {}
+  cameraStartDeathCam() {} cameraEndDeathCam() {}
+  cameraStartSlide() {} cameraStartMantle() {} cameraMeleeKick() {}
+  cameraRecoilPunch() {} cameraDamageFlinch() {}
 }

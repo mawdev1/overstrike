@@ -512,18 +512,20 @@ export class WeaponInstance {
     // +x in the pattern means the muzzle walks RIGHT; yaw increases turning LEFT (§1).
     const yawDeg = -px * rc.side * scale;
 
-    // Bots carry the kick in radians (they add it straight to their aim angles).
+    // Bots carry the kick in radians on the WEAPON instance (they add it straight to
+    // their aim angles each think() — see getAimOffset()). This is a separate, simpler
+    // accumulator from the player's own aim recoil below; bots don't need the spring/
+    // permanent-climb feel, only the raw offset.
     this.recoilPitch += pitchDeg * DEG;
     this.recoilYaw += yawDeg * DEG;
 
-    if (this.owner?.isPlayer) {
-      // PlayerCamera.addRecoil takes DEGREES for the kicks and METRES for the punch,
-      // and converts internally — passing radians here made recoil ~57x too weak.
-      // `jitter` above is sim-critical (it is baked into `recoilPitch`/`recoilYaw`,
-      // which bots read) and stays on `game.rng`; only the camera kick itself is
-      // presentation, so only this one call routes through the presenter.
-      this.game.present.cameraAddRecoil(this.owner, pitchDeg, yawDeg, rc.kick, rc.recovery);
-    }
+    // The player's AIM recoil (permanent climb + decaying spring, baked into
+    // player.yaw/pitch so ballistics fires along it) is sim-critical — it must run
+    // whether or not a camera/presenter exists, exactly like the weapon-instance
+    // accumulator above is for bots. `Player.addRecoil` runs this unconditionally and
+    // only reaches into the presenter itself for the punch, which is pure visual.
+    // Bots have no `addRecoil` method, so this is a safe no-op for them.
+    this.owner?.addRecoil?.(pitchDeg, yawDeg, rc.kick, rc.recovery);
 
     this.bloom = Math.min(
       this.def.bloomMax || 0,

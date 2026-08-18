@@ -109,10 +109,8 @@ const setup = await page.evaluate((weaponId) => {
 
   p.position.set(best.x, best.y, best.z);
   p.velocity.set(0, 0, 0);
-  p.camera.setAngles(best.yaw, -0.02);
+  p.setAngles(best.yaw, -0.02);
   p.camera.reset();
-  p.camera.baseYaw = best.yaw;
-  p.camera.basePitch = -0.02;
 
   g.weapons.giveLoadout(p, [weaponId, 'pistol_sidewinder']);
   g.weapons.switchTo(p, 0, true);
@@ -146,15 +144,17 @@ const setHold = async (on) => page.evaluate((v) => {
 
 const scopeState = async () => page.evaluate(() => {
   const s = window.__GAME__.engine.scope;
-  const c = window.__GAME__.player.camera;
+  // breath/scopeSwayYaw/scopeSwayPitch are aim state now (see player.js) — they move
+  // player.yaw/pitch, not a camera field.
+  const p = window.__GAME__.player;
   return {
     amount: +s.amount.toFixed(3),
     aperture: +s.apertureR.toFixed(3),
     shift: [+s.shiftX.toFixed(4), +s.shiftY.toFixed(4)],
     glint: +s.glintI.toFixed(3),
     ads: +window.__GAME__.player.adsAmount.toFixed(3),
-    breath: +c.breath.toFixed(3),
-    swayDeg: +((Math.hypot(c.scopeSwayYaw, c.scopeSwayPitch)) * 180 / Math.PI).toFixed(3),
+    breath: +p.breath.toFixed(3),
+    swayDeg: +((Math.hypot(p.scopeSwayYaw, p.scopeSwayPitch)) * 180 / Math.PI).toFixed(3),
     gunVisible: !!window.__GAME__.weapons.viewmodel?.current?.group?.visible,
     fov: +window.__GAME__.camera.fov.toFixed(2),
   };

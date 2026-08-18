@@ -1105,10 +1105,11 @@ export class HUD {
       el.style.transform = `translate(-50%,-50%) scale(${(1 + (1 - q) * 0.16).toFixed(3)})`;
     }
 
-    // Breath meter, on the scope body just under the glass.
-    const cam = this.game.player?.camera;
-    const b = cam ? clamp01(cam.breath) : 1;
-    const hold = !!cam?.breathHolding;
+    // Breath meter, on the scope body just under the glass. Breath is aim state (see
+    // player.js) — it moves scope sway, which moves player.yaw/pitch — not a camera field.
+    const p = this.game.player;
+    const b = p ? clamp01(p.breath) : 1;
+    const hold = !!p?.breathHolding;
     // Quantised to whole scope units: an SVG attribute write repaints the whole
     // 800-pixel overlay, and a meter that is 46 units wide cannot show more than 46
     // states anyway.

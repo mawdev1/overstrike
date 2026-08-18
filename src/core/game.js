@@ -109,6 +109,20 @@ export class Game {
   get time() { return this.tick * FIXED_DT; }
 
   /**
+   * How far the render clock has drifted past the last completed fixed tick, as a
+   * 0..1 fraction of one tick. `0` means the frame being drawn IS the latest simulated
+   * state; approaching `1` means the next tick is nearly due.
+   *
+   * Exists for interpolating render-only quantities that update on the tick clock but
+   * are looked at every frame — the recoil/sway component of aim is the first user of
+   * it. `baseYaw`/`basePitch` (the mouse-driven part) must NOT be interpolated through
+   * this — they already update every frame at full mouse resolution, so lerping them
+   * would add tick-period latency to the local player's own crosshair. Only the parts
+   * that genuinely move on the fixed clock benefit.
+   */
+  get accumAlpha() { return clamp(this._accum / FIXED_DT, 0, 1); }
+
+  /**
    * Build every system, reporting honest progress and yielding between phases so the
    * loading screen animates instead of freezing.
    *

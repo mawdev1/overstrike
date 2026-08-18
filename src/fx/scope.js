@@ -230,16 +230,18 @@ export class ScopeFX {
     // ── eye-relief shadow ────────────────────────────────────────────────────
     // The single biggest tell that a scope is real: your eye is never perfectly on the
     // optical axis, so the black ring is never perfectly concentric, and it moves.
-    const swayY = cam?.scopeSwayYaw || 0;
-    const swayP = cam?.scopeSwayPitch || 0;
+    // Sway and recoil are aim state now (see player.js) — they move player.yaw/pitch,
+    // not the camera. Only the mouse-lag term below is still a genuine camera field.
+    const swayY = p?.scopeSwayYaw || 0;
+    const swayP = p?.scopeSwayPitch || 0;
     const lagY = cam?.lagYaw || 0;
     const lagP = cam?.lagPitch || 0;
     const breath = cam ? Math.sin(cam.swayTime * 1.42) : 0;
-    const breathAmp = T.SHIFT_BREATH * (cam?.breathHolding ? 0.15 : 1);
+    const breathAmp = T.SHIFT_BREATH * (p?.breathHolding ? 0.15 : 1);
     // Un-recovered recoil throws the sight picture; on a bolt gun this is the whole
     // "you lose the target on every shot" beat.
-    const recP = cam?.recoilPitch || 0;
-    const recY = cam?.recoilYaw || 0;
+    const recP = p?.recoilPitch || 0;
+    const recY = p?.recoilYaw || 0;
 
     let tx = -(swayY * T.SHIFT_SWAY + lagY * T.SHIFT_LAG + recY * T.SHIFT_RECOIL);
     let ty = (swayP * T.SHIFT_SWAY + lagP * T.SHIFT_LAG + recP * T.SHIFT_RECOIL)

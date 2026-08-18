@@ -43,7 +43,7 @@ const live = await page.evaluate(() => {
   g.startMatch({ mode: 'tdm', botCount: 6, difficulty: 'regular', seed: 42 });
   g.match.phase = 'live'; g.match.countdown = 0;
 
-  const hit = { play: 0, muzzleFlash: 0, impact: 0, tracer: 0, setAmmo: 0, cameraAddRecoil: 0 };
+  const hit = { play: 0, muzzleFlash: 0, impact: 0, tracer: 0, setAmmo: 0, cameraRecoilPunch: 0 };
   const wrap = (obj, name, key) => {
     if (!obj || typeof obj[name] !== 'function') return;
     const orig = obj[name].bind(obj);
@@ -54,7 +54,9 @@ const live = await page.evaluate(() => {
   wrap(g.fx, 'impact', 'impact');
   wrap(g.fx, 'tracer', 'tracer');
   wrap(g.hud, 'setAmmo', 'setAmmo');
-  if (g.player.camera) wrap(g.player.camera, 'addRecoil', 'cameraAddRecoil');
+  // recoil-punch fires from Player.addRecoil (unconditional sim), which calls into
+  // the presenter itself — wrap the CAMERA method the presenter forwards to.
+  if (g.player.camera) wrap(g.player.camera, 'recoilPunch', 'cameraRecoilPunch');
 
   const inp = g.input;
   inp.enabled = true;
@@ -95,13 +97,13 @@ const nullSafe = await page.evaluate(async () => {
     () => np.shellEject({}, {}, 'rifle'), () => np.flashbang(1, 1), () => np.screenShake(1, 1),
     () => np.flashDamage(1), () => np.hitmarker(true), () => np.setAmmo(1, 1), () => np.setWeapon({}),
     () => np.setEquipment(1, 1), () => np.setCrosshairSpread(1), () => np.killfeed({}), () => np.deathScreen({}),
-    () => np.cameraDamageKick(g.player, {}, 1), () => np.cameraStartDeathCam(g.player, null),
+    () => np.cameraDamageFlinch(g.player, 1), () => np.cameraStartDeathCam(g.player, null),
     () => np.cameraEndDeathCam(g.player), () => np.cameraStartSlide(g.player),
     () => np.cameraStartMantle(g.player, 1, 1), () => np.cameraMeleeKick(g.player),
-    () => np.cameraAddRecoil(g.player, 1, 1, 1, 1),
+    () => np.cameraRecoilPunch(g.player, 0.1),
     // Called with no entity at all — a bot-fired shot has no camera; the port must not
     // assume one exists.
-    () => np.cameraAddRecoil({}, 1, 1, 1, 1), () => np.cameraDamageKick(null, {}, 1),
+    () => np.cameraRecoilPunch({}, 0.1), () => np.cameraDamageFlinch(null, 1),
   ];
   const errors = [];
   for (const call of calls) { try { call(); } catch (e) { errors.push(String(e)); } }
