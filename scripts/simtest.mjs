@@ -354,14 +354,14 @@ test('audit reports a field that is neither captured nor ignored', () => {
   const m = makeSpec();
   const t = makeThing();
   t.newlyAddedField = 3;
-  const missing = m.audit(t);
+  const { missing } = m.audit(t);
   assertEq(missing.length, 1, `expected exactly one uncovered field, got ${missing}`);
   assertEq(missing[0], 'newlyAddedField', 'audit named the wrong field');
 });
 
 test('audit is silent for a fully declared instance', () => {
   const m = makeSpec();
-  assertEq(m.audit(makeThing()).length, 0, 'audit flagged a declared field');
+  assert(m.audit(makeThing()).ok, 'audit flagged a fully declared instance');
 });
 
 test('audit ignores prototype getters', () => {
@@ -369,7 +369,59 @@ test('audit ignores prototype getters', () => {
   const m = makeSpec();
   const proto = { get derived() { return 1; } };
   const t = Object.assign(Object.create(proto), makeThing());
-  assertEq(m.audit(t).length, 0, 'audit flagged a prototype getter');
+  assert(m.audit(t).ok, 'audit flagged a prototype getter');
+});
+
+test('audit flags a manifest name that is not on the instance', () => {
+  // The mirror image of a forgotten field, and the same class of bug. A mistyped scalar
+  // is the dangerous one: save records `undefined` and restore writes it back, silently
+  // and permanently, while the manifest reads as though the field were covered.
+  const m = defineSnapshot('Typo', { scalars: ['health', 'helth'] });
+  const { stale, ok } = m.audit({ health: 1 });
+  assert(!ok, 'audit passed an instance missing a declared field');
+  assertEq(stale.length, 1, `expected one stale name, got ${stale}`);
+  assertEq(stale[0], 'helth', 'audit named the wrong stale field');
+});
+
+test('a null vec3 survives save and restore instead of throwing', () => {
+  // Nothing enforces that a declared vec3 is non-null. A field that goes null mid-match
+  // must not turn the snapshot into a crash inside the fixed step.
+  const m = defineSnapshot('Nullable', { vec3s: ['target'] });
+  const t = { target: null };
+  let snap;
+  try { snap = m.save(t); } catch (e) { throw new Error(`save threw on a null vec3: ${e.message}`); }
+  t.target = { x: 1, y: 2, z: 3 };
+  m.restore(t, snap);
+  assertEq(t.target, null, 'a null vec3 did not restore as null');
+});
+
+test('restoring a vec3 onto a currently-null field does not throw', () => {
+  const m = defineSnapshot('Nullable', { vec3s: ['target'] });
+  const t = { target: { x: 4, y: 5, z: 6 } };
+  const snap = m.save(t);
+  t.target = null;
+  m.restore(t, snap);
+  assertEq(t.target.x, 4, 'the value was not restored onto a null field');
+});
+
+test('diff reports every differing key of a nested object, not just the first', () => {
+  // `_edge` has 15 keys and `_held` 10. Stopping at the first would mean re-running to
+  // find the rest, which is the opposite of what diff is for.
+  const m = defineSnapshot('Nested', { objects: { o: ['a', 'b', 'c'] } });
+  const d = m.diff(m.save({ o: { a: 1, b: 1, c: 1 } }), m.save({ o: { a: 2, b: 1, c: 2 } }));
+  assertEq(d.length, 2, `expected both differing keys, got ${d}`);
+  assert(d.includes('o.a') && d.includes('o.c'), `wrong keys reported: ${d}`);
+});
+
+test('verify names the keys a wire-arrived snapshot is missing', () => {
+  const m = defineSnapshot('Wire', { scalars: ['a', 'b'], objects: { o: ['x'] } });
+  const good = m.save({ a: 1, b: 2, o: { x: 3 } });
+  assertEq(m.verify(good).length, 0, 'verify flagged a complete snapshot');
+  delete good.b;
+  delete good.o.x;
+  const absent = m.verify(good);
+  assert(absent.includes('b'), `verify missed the dropped scalar: ${absent}`);
+  assert(absent.includes('o.x'), `verify missed the dropped nested key: ${absent}`);
 });
 
 test('declaring a field twice throws at definition time', () => {

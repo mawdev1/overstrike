@@ -276,10 +276,10 @@ try {
     if (!res.scoped) return res;
 
     // force ADS
-    for (let i = 0; i < 90; i++) { g.player.adsAmount = 1; w.adsAmount = 1; await frame(); }
-    res.scopeAim = g.player.camera.scopeAim;
-    res.swayYaw = g.player.camera.scopeSwayYaw;
-    res.breath = g.player.camera.breath;
+    for (let i = 0; i < 90; i++) { w.adsAmount = w.adsRaw = 1; w.wantAds = true; await frame(); }
+    res.scopeAim = g.player.scopeAim;
+    res.swayYaw = g.player.scopeSwayYaw;
+    res.breath = g.player.breath;
     const el = g.hud.el.scope;
     res.scopeStyle = { op: el.style.opacity, vis: el.style.visibility, w: el.style.width };
     res.engineScope = { active: g.engine.scope?.active, amount: g.engine.scope?.amount, r: g.engine.scope?.apertureR };
@@ -293,23 +293,24 @@ try {
     res.aimAngleDeg = Math.acos(Math.min(1, camDir.dot(aim))) * 180 / Math.PI;
 
     // pause while scoped: does scopeAim snap and jolt the view?
-    const y0 = g.player.camera.scopeAim;
+    const y0 = g.player.scopeAim;
     const d0 = new V(); g.camera.getWorldDirection(d0);
     g.setPaused(true); await frame(); await frame();
     const d1 = new V(); g.camera.getWorldDirection(d1);
-    res.pauseScopeAim = [y0, g.player.camera.scopeAim];
+    res.pauseScopeAim = [y0, g.player.scopeAim];
     res.pauseJoltDeg = Math.acos(Math.min(1, d0.dot(d1))) * 180 / Math.PI;
     g.setPaused(false); await frame();
 
     // breath hold via the sprint bind while stationary
-    g.player.adsAmount = 1;
+    const forceAds = () => { const w = g.player.weapon; if (w) { w.adsAmount = w.adsRaw = 1; w.wantAds = true; } };
+    forceAds();
     const inp = g.input;
-    const before = g.player.camera.breath;
+    const before = g.player.breath;
     const realIsDown = inp.isDown.bind(inp);
     inp.isDown = (a) => (a === 'sprint' ? true : realIsDown(a));
-    for (let i = 0; i < 40; i++) { g.player.adsAmount = 1; await frame(); }
-    res.breathAfterHold = g.player.camera.breath;
-    res.holding = g.player.camera.breathHolding;
+    for (let i = 0; i < 40; i++) { forceAds(); await frame(); }
+    res.breathAfterHold = g.player.breath;
+    res.holding = g.player.breathHolding;
     res.hudBreathAttr = g.hud.el.scopeBreathFill?.getAttribute('width');
     res.hudBreathClass = g.hud.el.scopeBreath?.getAttribute('class');
     inp.isDown = realIsDown;
@@ -335,7 +336,7 @@ try {
   log('[leak] ' + JSON.stringify(leak));
 
   log('[errors] ' + JSON.stringify(errs.slice(0, 10)));
-  await page.evaluate(() => { const g = window.__GAME__; g.player.adsAmount = 1; });
+  await page.evaluate(() => { const w = window.__GAME__.player.weapon; if (w) { w.adsAmount = w.adsRaw = 1; w.wantAds = true; } });
   await waitFrames(4);
   await page.screenshot({ path: path.join(ROOT, 'shots', 'review-hud-scoped.png'), timeout: 120000 });
   await page.evaluate(() => window.__GAME__.startMatch({ mode: 'ffa', botCount: 4, seed: 3 }));

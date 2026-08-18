@@ -104,8 +104,8 @@ for (const s of SHOTS) {
     if (p.camera) {
       p.camera.baseYaw = shot.yaw;
       p.camera.basePitch = shot.pitch;
-      p.camera.recoilPitch = p.camera.recoilYaw = 0;
-      p.camera.recoilPitchTarget = p.camera.recoilYawTarget = 0;
+      p.recoilPitch = p.recoilYaw = 0;
+      p.recoilPitchTarget = p.recoilYawTarget = 0;
     }
     // Hold the trigger off and let a couple of frames settle the camera rig.
     g.input.actions.clear();

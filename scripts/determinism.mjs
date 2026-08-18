@@ -380,7 +380,7 @@ try {
   const manifest = await page.evaluate(async () => {
     const g = window.__GAME__;
     const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
-    const { WEAPON_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
+    const { WEAPON_SNAPSHOT, LOADOUT_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
     g.stop();
     g.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 31 });
     g.match.phase = 'live'; g.match.countdown = 0;
@@ -395,41 +395,49 @@ try {
     for (let i = 0; i < 300; i++) { g.frame++; g._fixedUpdate(DT); }
     inp.buttons[0] = false;
 
-    const playerMissing = PLAYER_SNAPSHOT.audit(p);
-    const weaponMissing = WEAPON_SNAPSHOT.audit(p.weapon);
+    const playerAudit = PLAYER_SNAPSHOT.audit(p);
+    const weaponAudit = WEAPON_SNAPSHOT.audit(p.weapon);
+    const loadoutAudit = LOADOUT_SNAPSHOT.audit(g.weapons.getLoadout(p));
 
     // Negative control. An audit that cannot fail is worth nothing, and this one passing
     // is only meaningful if it would have caught the field somebody forgets. Plant one,
     // confirm it is reported, remove it.
     p._plantedUndeclaredField = 1;
-    const caught = PLAYER_SNAPSHOT.audit(p).includes('_plantedUndeclaredField');
+    const caught = PLAYER_SNAPSHOT.audit(p).missing.includes('_plantedUndeclaredField');
     delete p._plantedUndeclaredField;
 
     return {
-      playerMissing,
-      weaponMissing,
-      caught,
+      playerAudit, weaponAudit, loadoutAudit, caught,
       playerFields: PLAYER_SNAPSHOT.captured.length,
       weaponFields: WEAPON_SNAPSHOT.captured.length,
     };
   });
   if (manifest.caught) ok('the audit catches a planted undeclared field (the guard is live)');
   else bad('the audit catches a planted undeclared field', 'audit() reported nothing for a field it should have flagged — the manifest checks below prove nothing');
-  if (manifest.playerMissing.length === 0) ok(`Player manifest covers every live field (${manifest.playerFields} captured)`);
-  else bad('Player manifest covers every live field', `undeclared: ${manifest.playerMissing.join(', ')}`);
-  if (manifest.weaponMissing.length === 0) ok(`WeaponInstance manifest covers every live field (${manifest.weaponFields} captured)`);
-  else bad('WeaponInstance manifest covers every live field', `undeclared: ${manifest.weaponMissing.join(', ')}`);
+  const auditOk = (label, a, extra = '') => {
+    if (a.ok) { ok(`${label}${extra}`); return; }
+    const parts = [];
+    if (a.missing.length) parts.push(`undeclared on the instance: ${a.missing.join(', ')}`);
+    // A name in the manifest that is not on the instance is the same class of bug: a
+    // mistyped scalar saves and restores `undefined` while looking covered.
+    if (a.stale.length) parts.push(`declared but absent: ${a.stale.join(', ')}`);
+    bad(label, parts.join(' | '));
+  };
+  auditOk('Player manifest covers every live field', manifest.playerAudit, ` (${manifest.playerFields} captured)`);
+  auditOk('WeaponInstance manifest covers every live field', manifest.weaponAudit, ` (${manifest.weaponFields} captured)`);
+  auditOk('Loadout manifest covers every live field', manifest.loadoutAudit);
 
   // ── save / restore actually rewinds the simulation ───────────────────────────────
   //
   // The manifest being complete is necessary but not sufficient — it also has to restore
   // faithfully enough that re-running the same ticks lands in the same place. This is the
   // shape the bit-equality harness will take in Phase 6, at one tick.
-  console.log('\nsave / restore rewinds the player and weapon exactly');
+  console.log('\nsave / restore rewinds the player, weapon and loadout exactly');
   const rewind = await page.evaluate(async () => {
     const g = window.__GAME__;
     const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
-    const { WEAPON_SNAPSHOT } = await import('/src/weapons/weaponSystem.js');
+    const { WEAPON_SNAPSHOT, saveLoadout, restoreLoadout, diffLoadout } =
+      await import('/src/weapons/weaponSystem.js');
     g.stop();
     g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 77 });
     g.match.phase = 'live'; g.match.countdown = 0;
@@ -440,53 +448,83 @@ try {
     inp.actions.add('forward');
     for (let i = 0; i < 120; i++) { g.frame++; g._fixedUpdate(DT); }
 
+    const lo = g.weapons.getLoadout(p);
+    const startFrame = g.frame;
+
     // Capture, including the RNG position — a firing tick draws from it for spread and
     // recoil jitter, so replaying without rewinding the stream gives different bullets.
     const pSnap = PLAYER_SNAPSHOT.save(p);
-    const wSnap = WEAPON_SNAPSHOT.save(p.weapon);
+    const loSnap = saveLoadout(lo);
     const rngState = g.rng.getState();
     const startTick = g.tick;
 
+    /**
+     * A deliberately BUSY script. An earlier version held forward and fire for 60 ticks,
+     * and a reviewer showed it still passed with `_fireReadyAt` deleted from the manifest
+     * — nothing in that script ever sprinted out or meleed, so the field never diverged.
+     * A rewind test only covers the fields its script actually moves, so this one throws
+     * a grenade, melees, sprints, switches weapon and reloads as well as moving and
+     * firing.
+     */
     const run = () => {
-      inp.buttons[0] = true;                   // fire, so the weapon state moves too
+      inp.actions.clear();
       inp.actions.add('forward');
-      for (let i = 0; i < 60; i++) { g.frame++; g._fixedUpdate(DT); }
+      for (let t = 0; t < 260; t++) {
+        inp.buttons[0] = (t > 10 && t < 40);              // fire
+        if (t === 45) inp.actions.add('sprint');          // sprint -> fire delay
+        if (t === 70) inp.actions.delete('sprint');
+        if (t === 80) inp.buttonsPressed[1] = true;       // melee (edge)
+        if (t === 110) inp.pressed?.add?.('KeyG');        // grenade, if bound this way
+        if (t === 120) g.weapons.throwGrenade?.(p);       // and directly, to be sure
+        if (t === 150) g.weapons.switchTo(p, 1);          // holster -> raise, mid-flight
+        if (t === 200) g.weapons.switchTo(p, 0);
+        if (t === 230) p.weapon?.reload?.();
+        g.frame++;
+        g._fixedUpdate(DT);
+      }
       inp.buttons[0] = false;
-      return {
-        p: PLAYER_SNAPSHOT.save(p, {}),
-        w: WEAPON_SNAPSHOT.save(p.weapon, {}),
-      };
+      inp.actions.clear();
+      return { p: PLAYER_SNAPSHOT.save(p, {}), lo: saveLoadout(lo, {}) };
     };
 
     const first = run();
 
-    // Rewind everything the replay depends on and run the identical 60 ticks again.
+    // Rewind everything the replay depends on and run the identical script again.
     PLAYER_SNAPSHOT.restore(p, pSnap);
-    WEAPON_SNAPSHOT.restore(p.weapon, wSnap);
+    restoreLoadout(lo, loSnap);
+    // `entity.weapon` is a reference the loadout index decides; re-point it so a replay
+    // that started mid-switch holds the same gun it did the first time.
+    p.weapon = lo.index >= 0 ? lo.weapons[lo.index] : null;
     g.rng.setState(rngState);
     g.tick = startTick;
+    g.frame = startFrame;
     const second = run();
 
     return {
       playerDiff: PLAYER_SNAPSHOT.diff(first.p, second.p),
-      weaponDiff: WEAPON_SNAPSHOT.diff(first.w, second.w),
+      loadoutDiff: diffLoadout(first.lo, second.lo),
       // How much state the replayed stretch actually moved. Without this the whole test
-      // could pass by replaying 60 ticks in which nothing happened — two identical
-      // no-ops match perfectly and prove nothing.
+      // could pass by replaying ticks in which nothing happened — two identical no-ops
+      // match perfectly and prove nothing.
       playerAdvanced: PLAYER_SNAPSHOT.diff(pSnap, first.p).length,
-      weaponAdvanced: WEAPON_SNAPSHOT.diff(wSnap, first.w).length,
+      loadoutAdvanced: diffLoadout(loSnap, first.lo).length,
+      // Evidence the busy script really reached the paths it is meant to cover.
+      grenadesSpent: loSnap.equipment.lethalCount - first.lo.equipment.lethalCount,
+      switched: loSnap.index !== first.lo.index || first.lo.weapons.length > 1,
     };
   });
-  if (rewind.playerAdvanced >= 5 && rewind.weaponAdvanced >= 3) {
-    ok(`the replayed stretch does real work (${rewind.playerAdvanced} player / ${rewind.weaponAdvanced} weapon fields changed)`);
+  if (rewind.playerAdvanced >= 10 && rewind.loadoutAdvanced >= 5) {
+    ok(`the replayed stretch does real work (${rewind.playerAdvanced} player / ${rewind.loadoutAdvanced} loadout fields changed)`);
   } else {
     bad('the replayed stretch does real work',
-      `only ${rewind.playerAdvanced} player / ${rewind.weaponAdvanced} weapon fields changed — a no-op replay matches trivially`);
+      `only ${rewind.playerAdvanced} player / ${rewind.loadoutAdvanced} loadout fields changed — a no-op replay matches trivially`);
   }
+  if (rewind.grenadesSpent > 0) ok(`the script spends a grenade (${rewind.grenadesSpent}), so the loadout counter is exercised`);
+  else bad('the script spends a grenade', 'lethalCount never moved — the grenade path this test exists to cover was not reached');
   if (rewind.playerDiff.length === 0) ok('player state after replay is identical, field for field');
   else bad('player state after replay is identical', `diverged: ${rewind.playerDiff.join(', ')}`);
-  if (rewind.weaponDiff.length === 0) ok('weapon state after replay is identical, field for field');
-  else bad('weapon state after replay is identical', `diverged: ${rewind.weaponDiff.join(', ')}`);
+  if (rewind.loadoutDiff.length === 0) ok('loadout, every weapon and the pending switch replay identically');
+  else bad('loadout replays identically', `diverged: ${rewind.loadoutDiff.join(', ')}`);
 
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //

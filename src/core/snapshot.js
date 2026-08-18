@@ -57,7 +57,11 @@ export function defineSnapshot(className, spec) {
     for (let i = 0; i < vec3s.length; i++) {
       const k = vec3s[i];
       const v = inst[k];
-      const t = o[k] || (o[k] = { x: 0, y: 0, z: 0 });
+      const t = o[k] || (o[k] = { x: 0, y: 0, z: 0, _null: false });
+      // A nullable vec3 must not turn a snapshot into a mid-tick crash. Record the
+      // absence instead, so restore can reproduce it.
+      if (v == null) { t._null = true; t.x = t.y = t.z = 0; continue; }
+      t._null = false;
       t.x = v.x; t.y = v.y; t.z = v.z;
     }
     for (let i = 0; i < objectNames.length; i++) {
@@ -79,7 +83,11 @@ export function defineSnapshot(className, spec) {
     for (let i = 0; i < vec3s.length; i++) {
       const k = vec3s[i];
       const s = snap[k];
+      if (s._null) { inst[k] = null; continue; }
       const v = inst[k];
+      // The field may have been null when this snapshot was taken over; there is no
+      // Vector3 to write into, so hand back a plain carrier rather than throwing.
+      if (v == null) { inst[k] = { x: s.x, y: s.y, z: s.z }; continue; }
       v.x = s.x; v.y = s.y; v.z = s.z;
     }
     for (let i = 0; i < objectNames.length; i++) {
@@ -111,14 +119,17 @@ export function defineSnapshot(className, spec) {
     for (let i = 0; i < vec3s.length; i++) {
       const k = vec3s[i];
       const x = a[k], y = b[k];
-      if (!Object.is(x.x, y.x) || !Object.is(x.y, y.y) || !Object.is(x.z, y.z)) list.push(k);
+      if (!Object.is(x._null, y._null) || !Object.is(x.x, y.x)
+        || !Object.is(x.y, y.y) || !Object.is(x.z, y.z)) list.push(k);
     }
     for (let i = 0; i < objectNames.length; i++) {
       const k = objectNames[i];
       const keys = objects[k];
       const x = a[k], y = b[k];
+      // Every differing key, not just the first. `_edge` has 15 and `_held` 10; stopping
+      // at one would mean re-running to find the rest, which is the opposite of the point.
       for (let j = 0; j < keys.length; j++) {
-        if (!Object.is(x[keys[j]], y[keys[j]])) { list.push(`${k}.${keys[j]}`); break; }
+        if (!Object.is(x[keys[j]], y[keys[j]])) list.push(`${k}.${keys[j]}`);
       }
     }
     return list;
@@ -140,8 +151,40 @@ export function defineSnapshot(className, spec) {
   function audit(inst) {
     const missing = [];
     for (const k of Object.keys(inst)) if (!known.has(k)) missing.push(k);
-    return missing;
+    // The mirror-image error, and the same class of bug: a name in the manifest that is
+    // not on the instance. A mistyped scalar is the dangerous one — `save` records
+    // `undefined` and `restore` writes `undefined` back, permanently and silently, while
+    // the manifest reads as though the field were covered.
+    const stale = [];
+    for (let i = 0; i < captured.length; i++) {
+      if (!(captured[i] in inst)) stale.push(captured[i]);
+    }
+    return { missing, stale, ok: missing.length === 0 && stale.length === 0 };
   }
 
-  return { className, save, restore, diff, audit, captured, known };
+  /**
+   * Keys a snapshot is missing, for data that has crossed a wire.
+   *
+   * Not called from `restore`, which runs per entity per tick and must stay a straight
+   * copy — but a snapshot arriving as JSON can lose a key to a version skew or a rename,
+   * and `restore` would then write `undefined` into a scalar without complaint.
+   */
+  function verify(snap) {
+    const absent = [];
+    for (let i = 0; i < captured.length; i++) {
+      if (snap[captured[i]] === undefined) absent.push(captured[i]);
+    }
+    for (let i = 0; i < objectNames.length; i++) {
+      const k = objectNames[i];
+      const sub = snap[k];
+      if (!sub) continue;
+      const keys = objects[k];
+      for (let j = 0; j < keys.length; j++) {
+        if (sub[keys[j]] === undefined) absent.push(`${k}.${keys[j]}`);
+      }
+    }
+    return absent;
+  }
+
+  return { className, save, restore, diff, audit, verify, captured, known };
 }

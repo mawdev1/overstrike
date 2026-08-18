@@ -581,7 +581,14 @@ export class WeaponSystem {
     this.loadouts = new Map();
 
     this.viewmodel = null;
-    this._switchPending = null;   // { entity, idx, timer, commit }
+    // A pending holster->raise lives on the LOADOUT, not here: it is per-entity state,
+    // and a single system-wide slot meant one entity starting a switch cancelled
+    // another's mid-flight. Latent today only because nothing but the player switches.
+    // `{ idx, timer }` — flat, so it can be snapshotted; see _commitSwitch.
+    //
+    // `_meleeTimer`/`_meleeEntity` are written and decremented but read by nothing:
+    // Player._meleeReadyAt owns the real cooldown. Dead state, kept only because the
+    // audit scripts poke them; deliberately NOT snapshotted.
     this._meleeTimer = 0;
     this._meleeEntity = null;
     this._crosshairPx = -1;
@@ -631,6 +638,7 @@ export class WeaponSystem {
       lastIndex: list.length > 1 ? 1 : 0,
       equipment: { lethal: 'frag', lethalCount: 2, tactical: 'flash', tacticalCount: 2 },
       melee: new WeaponInstance(this, MELEE, entity),
+      switchPending: null,          // { idx, timer } while a holster->raise is in flight
     };
     this.loadouts.set(entity, lo);
     this.switchTo(entity, 0, true);
@@ -656,27 +664,10 @@ export class WeaponSystem {
     if (idx === lo.index) return false;
 
     const prev = lo.index >= 0 ? lo.weapons[lo.index] : null;
-    const next = lo.weapons[idx];
-
-    const commit = () => {
-      if (prev) prev.onHolster();
-      lo.lastIndex = lo.index >= 0 ? lo.index : idx;
-      lo.index = idx;
-      entity.weapon = next;
-      if (entity.isPlayer) {
-        next.viewmodel = this.viewmodel;
-        this.viewmodel?.setWeapon(next.def);
-        this.game.present.setWeapon(next.def);
-        this.game.present.setAmmo(next.ammo, next.reserve);
-      }
-      next.onEquip();
-      this.game.bus?.emit('weaponSwitch', { shooter: entity, weaponId: next.def.id });
-      this.game.present.play('switch', { position: entity.position, volume: 0.7 });
-    };
 
     if (instant || !prev) {
-      this._switchPending = null;
-      commit();
+      lo.switchPending = null;
+      this._commitSwitch(entity, idx);
       return true;
     }
 
@@ -687,8 +678,39 @@ export class WeaponSystem {
     prev.wantAds = false;
     prev.triggerDown = false;
     if (prev.viewmodel) prev.viewmodel.onSwitchOut(prev.def.switchTime);
-    this._switchPending = { entity, idx, timer: prev.def.switchTime, commit };
+    lo.switchPending = { idx, timer: prev.def.switchTime };
     return true;
+  }
+
+  /**
+   * Finish a switch to slot `idx`.
+   *
+   * Used to be a closure stored on the pending record, which made the pending switch
+   * unsnapshotable — a function cannot be serialised or rebuilt from a field list, so a
+   * rewind across a weapon switch was impossible. Everything it captured (`prev`, `next`,
+   * `lo`) is derivable from `(entity, idx)`, and `prev` read from `lo.index` here is the
+   * same instance it would have captured: `index` only moves in this method, so it still
+   * holds the outgoing slot when this runs.
+   */
+  _commitSwitch(entity, idx) {
+    const lo = this.loadouts.get(entity);
+    if (!lo) return;
+    const prev = lo.index >= 0 ? lo.weapons[lo.index] : null;
+    const next = lo.weapons[idx];
+    if (!next) return;
+    if (prev) prev.onHolster();
+    lo.lastIndex = lo.index >= 0 ? lo.index : idx;
+    lo.index = idx;
+    entity.weapon = next;
+    if (entity.isPlayer) {
+      next.viewmodel = this.viewmodel;
+      this.viewmodel?.setWeapon(next.def);
+      this.game.present.setWeapon(next.def);
+      this.game.present.setAmmo(next.ammo, next.reserve);
+    }
+    next.onEquip();
+    this.game.bus?.emit('weaponSwitch', { shooter: entity, weaponId: next.def.id });
+    this.game.present.play('switch', { position: entity.position, volume: 0.7 });
   }
 
   nextWeapon(entity) {
@@ -863,8 +885,8 @@ export class WeaponSystem {
       lo.equipment.tacticalCount = 2;
       const cur = lo.index >= 0 ? lo.weapons[lo.index] : null;
       if (cur) { cur.equipped = true; cur.state = STATE_IDLE; }
+      lo.switchPending = null;
     }
-    this._switchPending = null;
     this._meleeTimer = 0;
     this._meleeEntity = null;
     this.viewmodel?.reset();
@@ -877,20 +899,19 @@ export class WeaponSystem {
   }
 
   fixedUpdate(dt) {
-    // --- pending holster -> raise
-    if (this._switchPending) {
-      this._switchPending.timer -= dt;
-      if (this._switchPending.timer <= 0) {
-        const c = this._switchPending.commit;
-        this._switchPending = null;
-        c();
-      }
-    }
-
     // --- melee re-swing lock (the hit itself resolved on the button)
     if (this._meleeTimer > 0) this._meleeTimer -= dt;
 
-    for (const lo of this.loadouts.values()) {
+    for (const [entity, lo] of this.loadouts) {
+      // --- pending holster -> raise, per entity
+      const sp = lo.switchPending;
+      if (sp) {
+        sp.timer -= dt;
+        if (sp.timer <= 0) {
+          lo.switchPending = null;
+          this._commitSwitch(entity, sp.idx);
+        }
+      }
       const inst = lo.index >= 0 ? lo.weapons[lo.index] : null;
       if (inst) inst.fixedUpdate(dt);
     }
@@ -991,3 +1012,88 @@ export const WEAPON_SNAPSHOT = defineSnapshot('WeaponInstance', {
     'interval',                  // derived constant, fireInterval(def)
   ],
 });
+
+/**
+ * The loadout's own scalars. Small, but every one of them is load-bearing.
+ *
+ * `index` decides which instance is `entity.weapon`, so losing it silently changes which
+ * gun the player is holding. `equipment.lethalCount` is the ONE grenade counter in the
+ * game — `Player.grenades` is an accessor onto it, not a field, so it is invisible to the
+ * Player manifest and would otherwise go unsnapshotted entirely: replay a tick containing
+ * a throw and the player pays for it twice.
+ */
+export const LOADOUT_SNAPSHOT = defineSnapshot('Loadout', {
+  scalars: ['index', 'lastIndex'],
+  objects: {
+    // `lethal`/`tactical` are equipment ids, fixed for the life of the loadout; only the
+    // counts are consumed during a tick.
+    equipment: ['lethalCount', 'tacticalCount'],
+  },
+  ignore: [
+    'weapons', 'melee',     // arrays / instances — handled by saveLoadout below
+    'switchPending',        // ditto: nullable sub-record
+  ],
+});
+
+/**
+ * Capture an entity's whole weapon state: the loadout scalars, EVERY instance in it, the
+ * melee instance, and any switch in flight.
+ *
+ * Snapshotting only the equipped weapon is not enough. Holstered instances are frozen by
+ * `fixedUpdate` (it ticks the current one only), but they are still MUTATED by switching:
+ * `onHolster` writes `equipped`/`wantAds`/`triggerDown`/`burstRemaining`/`state` and can
+ * cancel a reload, `onEquip` writes `state`/`stateTimer`/`stateDuration`/`_triggerLatched`
+ * /`bloom`. A replayed tick containing a switch would otherwise corrupt the other gun
+ * permanently, with nothing to restore it from.
+ */
+export function saveLoadout(lo, out) {
+  const o = out || {};
+  LOADOUT_SNAPSHOT.save(lo, o);
+
+  const arr = o.weapons || (o.weapons = []);
+  for (let i = 0; i < lo.weapons.length; i++) arr[i] = WEAPON_SNAPSHOT.save(lo.weapons[i], arr[i]);
+  arr.length = lo.weapons.length;
+
+  o.melee = lo.melee ? WEAPON_SNAPSHOT.save(lo.melee, o.melee) : null;
+
+  const sp = lo.switchPending;
+  const t = o.switchPending || (o.switchPending = { active: false, idx: 0, timer: 0 });
+  t.active = !!sp;
+  t.idx = sp ? sp.idx : 0;
+  t.timer = sp ? sp.timer : 0;
+
+  return o;
+}
+
+/** Inverse of `saveLoadout`. Instances are written in place, never replaced. */
+export function restoreLoadout(lo, snap) {
+  LOADOUT_SNAPSHOT.restore(lo, snap);
+  const n = Math.min(lo.weapons.length, snap.weapons.length);
+  for (let i = 0; i < n; i++) WEAPON_SNAPSHOT.restore(lo.weapons[i], snap.weapons[i]);
+  if (lo.melee && snap.melee) WEAPON_SNAPSHOT.restore(lo.melee, snap.melee);
+
+  const s = snap.switchPending;
+  if (!s || !s.active) lo.switchPending = null;
+  else if (lo.switchPending) { lo.switchPending.idx = s.idx; lo.switchPending.timer = s.timer; }
+  else lo.switchPending = { idx: s.idx, timer: s.timer };
+
+  return lo;
+}
+
+/** Field-by-field comparison of two loadout snapshots, for the bit-equality harness. */
+export function diffLoadout(a, b) {
+  const list = LOADOUT_SNAPSHOT.diff(a, b);
+  const n = Math.min(a.weapons.length, b.weapons.length);
+  for (let i = 0; i < n; i++) {
+    for (const f of WEAPON_SNAPSHOT.diff(a.weapons[i], b.weapons[i])) list.push(`weapons[${i}].${f}`);
+  }
+  if (a.weapons.length !== b.weapons.length) list.push('weapons.length');
+  if (a.melee && b.melee) {
+    for (const f of WEAPON_SNAPSHOT.diff(a.melee, b.melee)) list.push(`melee.${f}`);
+  }
+  const x = a.switchPending, y = b.switchPending;
+  if (x.active !== y.active || (x.active && (x.idx !== y.idx || !Object.is(x.timer, y.timer)))) {
+    list.push('switchPending');
+  }
+  return list;
+}

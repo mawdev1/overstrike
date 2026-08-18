@@ -119,12 +119,12 @@ try {
     const g = window.__GAME__; const V = g.camera.position.constructor;
     const frame = () => new Promise((r) => requestAnimationFrame(r));
     const d0 = new V(); g.camera.getWorldDirection(d0);
-    const a0 = g.player.camera.scopeAim;
+    const a0 = g.player.scopeAim;
     g.setPaused(true); await frame(); await frame(); await frame();
     const d1 = new V(); g.camera.getWorldDirection(d1);
     const el = g.hud.el.scope;
     const res = {
-      scopeAim: [a0, g.player.camera.scopeAim],
+      scopeAim: [a0, g.player.scopeAim],
       joltDeg: Math.acos(Math.min(1, d0.dot(d1))) * 180 / Math.PI,
       hudScopeVisibleWhilePaused: { op: el.style.opacity, vis: el.style.visibility },
       engineScopeActive: g.engine.scope.active,
@@ -144,7 +144,7 @@ try {
     let fired = false;
     if (realWP) inp.wasPressed = (a) => (a === 'sprint' && !fired ? (fired = true) : realWP(a));
     for (let i = 0; i < 60; i++) await frame();
-    const res = { ads: g.player.adsAmount, sprinting: g.player.sprinting, scopeAim: g.player.camera.scopeAim, breath: g.player.camera.breath };
+    const res = { ads: g.player.adsAmount, sprinting: g.player.sprinting, scopeAim: g.player.scopeAim, breath: g.player.breath };
     inp.isDown = real; if (realWP) inp.wasPressed = realWP;
     return res;
   });
