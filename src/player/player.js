@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { clamp, lerp, damp, dirFromAngles, PITCH_LIMIT, DEG } from '../core/mathUtils.js';
+import { clamp, lerp, damp, dirFromAngles, PITCH_LIMIT, DEG, ARMOR_ABSORB } from '../core/mathUtils.js';
 import { PlayerCamera, CAMERA_TUNE } from './playerCamera.js';
 import { defineSnapshot } from '../core/snapshot.js';
 
@@ -96,7 +96,7 @@ import { defineSnapshot } from '../core/snapshot.js';
      MAX_HEALTH      100
      REGEN_DELAY       4.20   s without taking damage
      REGEN_RATE       28.0    hp/s
-     ARMOR_ABSORB      0.65   fraction of incoming damage eaten by armour
+     ARMOR_ABSORB      0.65   fraction eaten by armour — shared, in core/mathUtils.js
 
    MELEE
      MELEE_COOLDOWN    0.75 s, blocks firing for 0.55 s.
@@ -170,7 +170,6 @@ const TUNE = {
   MAX_HEALTH: 100,
   REGEN_DELAY: 4.2,
   REGEN_RATE: 28,
-  ARMOR_ABSORB: 0.65,
 
   MELEE_RANGE: 2.2,
   MELEE_COOLDOWN: 0.75,
@@ -758,7 +757,7 @@ export class Player {
     // Armour eats a fraction until depleted.
     let dmg = amount;
     if (this.armor > 0) {
-      const absorbed = Math.min(this.armor, dmg * TUNE.ARMOR_ABSORB);
+      const absorbed = Math.min(this.armor, dmg * ARMOR_ABSORB);
       this.armor -= absorbed;
       dmg -= absorbed;
     }

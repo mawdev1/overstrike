@@ -61,8 +61,32 @@ const out = await page.evaluate(async () => {
    * Spawn points are guaranteed-standable, so pairing them is far more reliable than
    * sampling a ring around wherever a bot happened to wander.
    */
+  /**
+   * How much of the map a point can see, as a fraction of horizontal rays that get out.
+   *
+   * Needed because picking the FIRST valid pair in index order staged every duel of every
+   * run in the same corridor — a spawn visible from about a tenth of the standable map.
+   * That made `botsCanDamagePlayer` a coin flip on how many shots the bot ever got to
+   * take: with 3 or more aimed shots it passed 32/32, with 2 or fewer it failed 6/8.
+   * Choosing the most OPEN valid pair instead took the failure rate from 4/40 to 0/40
+   * without touching the AI. The old behaviour was measuring the map, not the bots.
+   */
+  const openness = (P) => {
+    const N = 16;
+    const from = new V(P.x, P.y + 1.25, P.z);
+    const to = new V();
+    let clear = 0;
+    for (let k = 0; k < N; k++) {
+      const a = (k / N) * Math.PI * 2;
+      to.set(P.x + Math.sin(a) * 18, P.y + 1.25, P.z + Math.cos(a) * 18);
+      if (g.world.losClear(from, to)) clear++;
+    }
+    return clear / N;
+  };
+
   const stagePair = (a, b, minD, maxD) => {
     const pts = g.world.spawnPoints;
+    let bestPair = null, bestScore = -1, bestD = 0;
     for (let i = 0; i < pts.length; i++) {
       for (let j = 0; j < pts.length; j++) {
         if (i === j) continue;
@@ -79,12 +103,15 @@ const out = await page.evaluate(async () => {
           if (!g.world.losClear(pEye, eEye)) { clear = false; break; }
         }
         if (!clear) continue;
-        a.position.set(A.x, A.y, A.z); a.velocity.set(0, 0, 0);
-        b.position.set(B.x, B.y, B.z); b.velocity.set(0, 0, 0);
-        return d;
+        const score = openness(A) + openness(B);
+        if (score > bestScore) { bestScore = score; bestPair = [A, B]; bestD = d; }
       }
     }
-    return 0;
+    if (!bestPair) return 0;
+    const [A, B] = bestPair;
+    a.position.set(A.x, A.y, A.z); a.velocity.set(0, 0, 0);
+    b.position.set(B.x, B.y, B.z); b.velocity.set(0, 0, 0);
+    return bestD;
   };
 
   p.alive = true; p.health = p.maxHealth;

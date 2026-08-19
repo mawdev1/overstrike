@@ -10,6 +10,7 @@ import { createRNG, mixSeed } from '../core/rng.js';
 // degrades to `undefined` instead of exploding the whole module graph.
 import * as Ballistics from '../weapons/ballistics.js';
 import * as WeaponDefs from '../weapons/weaponDefs.js';
+import { ARMOR_ABSORB } from '../core/mathUtils.js';
 
 /**
  * Bot — an ARCHITECTURE.md §4 entity with a layered AI.
@@ -794,7 +795,12 @@ export class Bot {
     if (!this.alive || amount <= 0) return 0;
     let dmg = amount;
     if (this.armor > 0) {
-      const absorbed = Math.min(this.armor, dmg * 0.55);
+      // The SAME constant the player's armour uses. It was 0.55 here against 0.65 there —
+      // one mechanic, two numbers, so identical armour absorbed differently depending on
+      // who was wearing it. (Armour itself is deliberate: only `hardened` and `veteran`
+      // grant any, as an opt-in difficulty lever. `regular`, which is what the dedicated
+      // server runs, gives bots none at all.)
+      const absorbed = Math.min(this.armor, dmg * ARMOR_ABSORB);
       this.armor -= absorbed;
       dmg -= absorbed;
     }

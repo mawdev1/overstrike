@@ -5,6 +5,14 @@ export const RAD = 180 / Math.PI;
 export const PITCH_LIMIT = 1.5533; // 89°
 
 /**
+ * Fraction of incoming damage that armour eats, for ANY entity wearing it.
+ *
+ * Shared because it was not: `Player.applyDamage` used 0.65 and `Bot.applyDamage` used a
+ * hardcoded 0.55, so the same armour absorbed differently depending on who was wearing it.
+ */
+export const ARMOR_ABSORB = 0.65;
+
+/**
  * The simulation step. ARCHITECTURE.md §1: `dt` passed to `fixedUpdate` is ALWAYS this.
  * It lives here rather than in core/game.js so the systems that derive clocks from it
  * (Game.time, Match.elapsed) can share one definition without importing the Game module
