@@ -1501,20 +1501,35 @@ export class Player {
     const h = top.point.y - this.position.y;
     if (h < TUNE.MANTLE_MIN_H || h > TUNE.MANTLE_MAX_H) return false;
 
-    // (c) clearance above the ledge for the body we will actually deliver.
+    // (c) clearance above the ledge for a CROUCHED body — because that is the body we
+    // now deliver.
     //
-    // This used to ask for a CROUCHED body's worth and then hand back a standing one, so
-    // a ledge with 1.3 m of headroom passed the gate and left the capsule embedded in the
-    // ceiling — measured at 1,066 of 11,072 sampled landings. `_depenetrate` recovers on
-    // the next tick, so it was never an escape, but it is a shove the player did not ask
-    // for at the exact moment they were committing to a climb.
+    // The original defect was real: this gate asked for crouch clearance and then handed
+    // back a standing capsule, so a ledge with 1.3 m of headroom left the body embedded
+    // in the ceiling (1,066 of 11,072 sampled landings) for `_depenetrate` to shove out.
     //
-    // Requiring standing clearance costs mantling into crawlspaces, which nothing in the
-    // map is built around, and buys landings that are always immediately valid.
+    // Raising the gate to STAND_HEIGHT fixed that and cost far more than it looked:
+    // MERIDIAN's window openings are 1.35 m tall, so it silently deleted every
+    // window-vault route on the map — 27 ledges, ten ground sills, ten first-floor sills,
+    // the warehouse sills and the market-stall roofs. The map is built around those; the
+    // author cut and glazed the openings deliberately.
+    //
+    // So keep the crouch gate and fix the real bug at the other end: crouch on commit
+    // (see below). You pull through the window crouched and stand up when there is room,
+    // which is what this threshold was always trying to express.
     _v3.set(top.point.x, top.point.y + 0.06, top.point.z);
-    if (world.raycast(_v3, _UP, TUNE.STAND_HEIGHT + 0.05)) return false;
+    if (world.raycast(_v3, _UP, TUNE.CROUCH_HEIGHT + 0.15)) return false;
 
-    // Commit.
+    // Commit — crouched.
+    //
+    // This is the half that was actually broken. The gate above only ever promised a
+    // crouched body's worth of headroom, and `_mantleStep` never touched `height`, so the
+    // climb delivered a 1.8 m capsule into a space cleared for 1.25 m. Crouching on
+    // commit makes the delivered body match the space that was checked; `_updateStance`
+    // and `_canStand` already handle standing back up the moment there is room, so this
+    // costs nothing where the ledge is open and is exactly right where it is not.
+    this.height = TUNE.CROUCH_HEIGHT;
+    this.eyeHeight = this._eyeForHeight(this.height);
     this.moveState = 'mantle';
     this._mantleT = 0;
     this._mantleFrom.copy(this.position);

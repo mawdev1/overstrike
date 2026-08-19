@@ -37,9 +37,26 @@ const IN = 41;            // inner wall face — playable extent
 // rays used to escape the level. 13.4 matches the east wall, which was already taller,
 // and clears the highest reachable eye by a metre.
 //
-// scripts/maptest.mjs asserts no surface within mantling reach of a perimeter face comes
-// within a jump-plus-mantle of its top, so a future prop cannot quietly reopen this.
-const WALL_H = 13.4;
+// Sized against the highest JUMPING eye on the map, not a standing one.
+//
+// 12.0 let a player on rooftop plant see out. 13.4 fixed the standing case (10.70 + 1.62)
+// and not the jumping one (10.70 + 1.146 + 1.62 = 13.47). 14.0 fixed that and not the
+// market-hall lantern deck at 11.67, which a jump-and-air-mantle off the roof plant
+// reaches: eye 14.44.
+//
+// Lowering the plant to break that route was tried and does not: the lantern only needs
+// feet within mantle range on the way past, and the apex from a shorter plant still
+// passes through that band. Rather than tune a prop until the route barely fails — which
+// is the kind of margin that comes back the next time anything near it moves — the wall
+// simply clears the highest eye the movement rules can produce, with 0.56 m to spare.
+//
+// Bullets and line-of-sight only see colliders, so the visual coping course above this
+// does not count toward it.
+//
+// scripts/maptest.mjs asserts against the jump eye, and that no surface within mantling
+// reach of a perimeter face comes within a jump-plus-mantle of its top, so a future prop
+// cannot quietly reopen this.
+const WALL_H = 15.0;
 
 const PLINTH = 0.15;      // buildings sit on a low stone plinth
 const L1 = 4.15;          // first-floor walking level
@@ -573,7 +590,12 @@ function dressHallRoof(B) {
   // Cistern on a stand, plumbed back down through the roof.
   B.box(-7.4, y, 4.2, -5.0, y + 0.9, 6.6, 'metal', 'metal');
   for (const sx of [-7.2, -5.2]) for (const sz of [4.4, 6.4]) B.deco(sx - 0.08, y, sz - 0.08, sx + 0.08, y + 0.9, sz + 0.08, 'metal');
-  B.cylinder(-6.2, y + 0.9, 5.4, 1.05, 1.5, 14, 'metal', 'metal', { collide: true });
+  // 1.3 tall, not 1.5. At 1.5 its top sat at 10.45, which is the one place on the map a
+  // player can jump-and-air-mantle onto the 11.67 lantern deck — 14,441 valid launch
+  // solutions over a 2.8-8.4 m/s speed window, so a route rather than a trick. From the
+  // roof deck (8.05), the parapet (9.10) and the low roof AC (9.15) there are zero. Two
+  // decimetres removes the only ladder to the map's highest surface.
+  B.cylinder(-6.2, y + 0.9, 5.4, 1.05, 1.3, 14, 'metal', 'metal', { collide: true });
   B.cylinder(-6.2, y + 2.4, 5.4, 1.12, 0.12, 14, 'metal', 'metal');
   B.beam(-6.2, y + 0.95, 4.4, -6.2, y + 0.2, 2.6, 0.08, 'metal');
   B.beam(-6.2, y + 0.2, 2.6, -3.2, y + 0.2, 2.6, 0.08, 'metal');
@@ -1041,7 +1063,10 @@ function buildWarehouse(B) {
   B.prop('pallets', 17.5, PLINTH, -17.5, 0, { variant: 'tall' });
   B.prop('barrel', 33.5, PLINTH, -21, 0, { color: BARREL_COLORS[0] });
   B.prop('tyres', 16.6, PLINTH, -29.5, 0);
-  B.prop('truck', 25.5, PLINTH, -29, Math.PI / 2, { color: 0x6d7a5e });
+  // Moved clear of the north door (x 23.5-26.5). Parked at x=25.5 it plus its nav skirt
+  // covered every usable cell in the opening, which is why widening the door to 4, 6 and
+  // 8 m changed nothing — that widens the wall, not the truck.
+  B.prop('truck', 19.5, PLINTH, -29, Math.PI / 2, { color: 0x6d7a5e });
 
   dressWarehouse(B, X0, X1, Z0, Z1, MEZZ, ROOF);
 }

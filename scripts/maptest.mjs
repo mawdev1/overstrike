@@ -76,6 +76,7 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   // Deterministic sweep: a fixed lattice of eye positions and directions, so a failure is
   // reproducible and a fix is verifiable.
   let tested = 0, leaks = 0, worst = 0, worstAt = null;
+  const bySurface = {};
   const shooter = { id: 999999, isPlayer: false, alive: true, team: 0, position: new THREE.Vector3() };
 
   const STEP = 3.0;
@@ -87,8 +88,13 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
         if (w.pointInSolid(x, eyeY, z)) continue;
         for (let d = 0; d < DIRS; d++) {
           const a = (d / DIRS) * Math.PI * 2;
+          // Pitched, not just horizontal. A horizontal-only sweep cannot see a leak
+          // through a wall/floor seam or a shot taken at a downward angle, and the
+          // lattice is aligned to the map's own integer coordinates so it systematically
+          // misses everything in between.
+          const pitch = ((d % 5) - 2) * 0.14;
           origin.set(x, eyeY, z);
-          dir.set(Math.cos(a), 0, Math.sin(a));
+          dir.set(Math.cos(a) * Math.cos(pitch), Math.sin(pitch), Math.sin(a) * Math.cos(pitch));
           shooter.position.set(x, 0, z);
 
           const hit = w.raycast(origin, dir, 120);
@@ -108,6 +114,10 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
             shooter, weaponId: 'ar_vector', origin, dir,
             damage: 30, range: 120, penetration: 0.62,
           });
+          const surf = hit.surface || 'unknown';
+          const rec = bySurface[surf] || (bySurface[surf] = { hits: 0, pen: 0 });
+          rec.hits++;
+          if (res?.penetrated) rec.pen++;
           if (res?.penetrated && run > PENETRATION_BUDGET + 0.02) {
             leaks++;
             if (run > worst) { worst = run; worstAt = `(${x},${eyeY},${z}) dir ${a.toFixed(2)} through ${run.toFixed(2)} m`; }
@@ -122,6 +132,27 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   else {
     bad('shots only pass through penetrable thickness',
       `${leaks} of ${tested} wall hits leaked (${(leaks / tested * 100).toFixed(2)}%), worst ${worst.toFixed(2)} m at ${worstAt}`);
+  }
+
+  // The other half of the contract, and the half a "make walls stop bullets" change is
+  // most likely to break. Every check above is satisfied by `probeExit` returning false
+  // unconditionally — which would pass the suite and delete the mechanic.
+  const glassPen = bySurface.glass ? bySurface.glass.pen / bySurface.glass.hits : 0;
+  if (bySurface.glass && glassPen > 0.95) {
+    ok(`glass is still shootable through (${(glassPen * 100).toFixed(1)}% of ${bySurface.glass.hits} hits)`);
+  } else {
+    bad('glass is still shootable through',
+      `${bySurface.glass ? (glassPen * 100).toFixed(1) + '%' : 'no glass was hit'} — penetration has been broken, not fixed`);
+  }
+  const totalPen = Object.values(bySurface).reduce((a, x) => a + x.pen, 0);
+  const rate = totalPen / tested;
+  if (rate > 0.02) {
+    const brk = Object.entries(bySurface)
+      .sort((p, q) => q[1].hits - p[1].hits)
+      .map(([k, v]) => `${k} ${(v.pen / v.hits * 100).toFixed(1)}%`).join(' · ');
+    ok(`penetration still works overall (${(rate * 100).toFixed(2)}% of hits): ${brk}`);
+  } else {
+    bad('penetration still works', `only ${(rate * 100).toFixed(2)}% of wall hits penetrate — the mechanic is effectively off`);
   }
 }
 
@@ -159,10 +190,24 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
 // kill volume. A perch tall enough to mantle the perimeter is therefore an instant
 // out-of-map exploit, so the margin is the thing to protect.
 {
-  const JUMP = 1.146;          // apex from TUNE: v^2 / 2g
-  const MANTLE = 1.35;
-  const REACH = 0.91;          // player radius + mantle reach
+  // Imported, not hardcoded — this file's own comment argues that hardcoding is the
+  // failure a regression test can least afford, and then hardcoded these.
+  const { PLAYER_TUNE } = await import('../src/player/player.js');
+  // GRAVITY is stored NEGATIVE (-22). Forgetting that made JUMP negative, which made
+  // `climb` 0.20 m and quietly collapsed the reachable set from 701 surfaces to 215 —
+  // a check that still printed "ok" while testing almost nothing.
+  const G = Math.abs(PLAYER_TUNE.GRAVITY);
+  const JUMP = (PLAYER_TUNE.JUMP_SPEED ** 2) / (2 * G);
+  const MANTLE = PLAYER_TUNE.MANTLE_MAX_H;
+  const REACH = PLAYER_TUNE.RADIUS + PLAYER_TUNE.MANTLE_REACH;
   const climb = JUMP + MANTLE;
+  // How far a jump CARRIES. The reachability flood previously used `REACH` (0.91 m) as
+  // its horizontal pad, which is the distance you can lean — not the distance you can
+  // jump. That is why it rated the market-hall lantern unreachable across a 2.2 m gap
+  // while 14,441 valid launch solutions existed.
+  // Horizontal distance covered by the time the jump reaches its apex — which is where
+  // an air-mantle happens, so it is the reach that matters for "can they get up there".
+  const JUMP_REACH = PLAYER_TUNE.SPRINT_SPEED * (PLAYER_TUNE.JUMP_SPEED / G);
 
   // Wall tops are MEASURED, not assumed. Hardcoding them meant the check kept testing
   // against the old heights after the level changed, which is the failure mode a
@@ -210,7 +255,7 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
       for (const from of reachable) {
         if (bx.max.y - from.max.y > climb) continue;
         if (bx.max.y < from.max.y - 6) continue;                       // a drop, fine
-        if (!overlapsXZ(bx, from, REACH)) continue;
+        if (!overlapsXZ(bx, from, JUMP_REACH)) continue;
         reachable.add(bx); added++; break;
       }
     }
@@ -224,7 +269,7 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
         ? Math.min(Math.abs(b.min.x - wall.at), Math.abs(b.max.x - wall.at))
         : Math.min(Math.abs(b.min.z - wall.at), Math.abs(b.max.z - wall.at));
       if (near > REACH + 1) continue;
-      if (b.max.y >= wall.top - 1.0) continue;         // part of the wall assembly
+        if (b.max.y >= wall.top - 0.2) continue;       // the wall's own coping
       if (b.max.y + climb >= wall.top) {
         risky.push(`${wall.name}: reachable surface at y=${b.max.y.toFixed(2)} + ${climb.toFixed(2)} climb >= wall top ${wall.top.toFixed(2)}`);
       }
@@ -240,13 +285,18 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   // Climbing the wall is one failure; SEEING over it is the other, and it is the one that
   // actually happened. Two rooftop props put the eye at 12.07 and 12.32 against a 12.0 m
   // wall, and 65% of horizontal rays from them escaped into the void.
-  const EYE = 1.62;
+  // A jumping eye, not a standing one: 13.4 cleared a standing eye from the highest
+  // perch (12.32) and not a jumping one (13.47), and 60% of horizontal rays escaped from
+  // the top of a jump.
+  const EYE = 1.62 + JUMP;
   const minTop = Math.min(...walls.map((x) => x.top));
   let highest = 0, highestAt = null;
   for (const bx of reachable) {
     if (Math.abs(bx.max.x) > 41 || Math.abs(bx.min.x) > 41) continue;
     if (Math.abs(bx.max.z) > 41 || Math.abs(bx.min.z) > 41) continue;
-    if (bx.max.y > 13) continue;                       // the perimeter itself
+    // No blanket height exemption. Skipping "anything above 13 m" quietly excused
+    // exactly the perches this check exists to find; the perimeter is excluded by being
+    // outside the play area, which the bounds test above already does.
     if (bx.max.y > highest) {
       highest = bx.max.y;
       highestAt = `(${((bx.min.x + bx.max.x) / 2).toFixed(1)}, ${bx.max.y.toFixed(2)}, ${((bx.min.z + bx.max.z) / 2).toFixed(1)})`;

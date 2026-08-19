@@ -920,7 +920,11 @@ export class World {
       if (!ok || tmax <= 0) continue;
       spans[count++] = tmin;
       spans[count++] = tmax;
-      if (count >= spans.length - 1) break;      // absurd overlap; the cap is the answer
+      // Fail CLOSED. Truncating the span list drops intervals, which puts a hole in the
+      // union, which SHORTENS the measured run — so an over-capped wall would read as
+      // thin and become penetrable. Returning the cap says "at least this thick", which
+      // is the safe direction to be wrong in.
+      if (count >= spans.length - 1) return maxDepth;
     }
     if (count === 0) return 0;
 
