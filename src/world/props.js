@@ -97,6 +97,9 @@ export function scaleCylUV(geo, radius, h, uv = UV) {
  * map would then be built from different randomness — with no error and no test to catch
  * it beyond the collider hash in scripts/headless.mjs.
  */
+/** Must match World's MAX_STEP_HEIGHT — a lip below this is a step, not a barrier. */
+const MAX_STEP = 0.55;
+
 let COLLIDERS_ONLY = false;
 export function setCollidersOnly(v) { COLLIDERS_ONLY = !!v; }
 
@@ -634,7 +637,17 @@ export class Builder {
     const bz0 = alongX ? z0 - t / 2 : z0, bz1 = alongX ? z0 + t / 2 : z1;
     const ax0 = alongX ? x0 : z0, ax1 = alongX ? x1 : z1;
     const gaps = (opts.gaps || []).slice().sort((p, q) => p[0] - q[0]);
-    const gapY = opts.gapY ?? y + h * 0.42;
+    // A crenellation must be a firing slit, not a doorway.
+    //
+    // `h * 0.42` is 0.44 m on a 1.05 m parapet, and `World`'s MAX_STEP_HEIGHT is 0.55 —
+    // so every crenel on the map was something a player walks straight over while holding
+    // forward. Seven of the market hall's eight gaps, the warehouse roof's north gap and
+    // the north balcony were all 8 m falls waiting for someone to strafe into them. Some
+    // had sandbags in front, which is what had been holding them: those colliders clear
+    // the step by 2 cm.
+    //
+    // 0.62 m clears the step with margin and still reads as a crenel from either side.
+    const gapY = opts.gapY ?? Math.max(y + h * 0.42, y + MAX_STEP + 0.07);
 
     const seg = (a0, a1, top) => {
       if (a1 - a0 < 1e-3) return;

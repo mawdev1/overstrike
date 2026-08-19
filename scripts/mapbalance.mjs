@@ -43,7 +43,15 @@ console.log(`\nmap balance (${w.boxes.length} colliders, ${w.spawnPoints.length}
 // about the map. Central objectives sit on the centreline; anything lane-specific is
 // measured against its mirror so the comparison is like for like.
 const OBJECTIVES = [
-  { name: 'market hall roof', at: new THREE.Vector3(0, 8.05, 0), central: true },
+  // NOT (0, 8.05, 0) — that point is inside the lantern base collider, so `nodeAt` fails,
+  // `nearestWalkable` snaps to the FIRST FLOOR, and the roof row silently reported L1's
+  // numbers. The two rows printing identical values was the tell, and I read it as the
+  // roof and L1 genuinely being equidistant.
+  // Centred on the deck. The surface test in the travel loop skips the lantern base, so
+  // an unstandable centre point is no longer a problem — what matters is that the sample
+  // grid covers the whole deck, since a team reaches "the roof" at whichever corner is
+  // nearest them.
+  { name: 'market hall roof', at: new THREE.Vector3(0, 8.05, 0), central: true, extent: 9 },
   { name: 'market hall L1', at: new THREE.Vector3(0, 4.15, 0), central: true },
   { name: 'market hall ground', at: new THREE.Vector3(0, 0.15, 0), central: true },
   { name: 'plaza centre', at: new THREE.Vector3(0, 0, 22) },
@@ -52,13 +60,18 @@ const OBJECTIVES = [
   { name: 'customs floor', at: new THREE.Vector3(25, 0.15, 20), forwardFor: 0 },
   { name: 'warehouse mezzanine', at: new THREE.Vector3(25, 4.0, -30), forwardFor: 1 },
   { name: 'customs L1', at: new THREE.Vector3(25, 4.15, 20), forwardFor: 0 },
-  { name: 'old town rampart', at: new THREE.Vector3(-27, 3.95, -8) },
+  // The rampart runs x -41..-36; -27 is 9 m east of it, out in the courtyard, so this
+  // measured the floor and attributed its numbers to the rampart.
+  { name: 'old town rampart', at: new THREE.Vector3(-38, 3.95, -8) },
+  { name: 'old town terrace A', at: new THREE.Vector3(-23, 5.0, -16) },
+  { name: 'old town terrace B', at: new THREE.Vector3(-23, 5.0, 16) },
 ];
 
 // `findPath` fills an ARRAY of Vector3-like waypoints and grows it as needed — not a
 // packed Float32Array. Handing it a typed array silently returns 0 for every query, which
 // reads as "the whole map is unreachable" rather than as a type error.
 const path = [];
+const probe = new THREE.Vector3();
 /** Geodesic path length over the nav mesh, or Infinity if unreachable. */
 function pathLen(from, to) {
   const n = nav.findPath(from, to, path);
@@ -112,11 +125,29 @@ function pathLen(from, to) {
   let worstName = null, worstDelta = 0;
   const forward = { 0: null, 1: null };
   for (const obj of OBJECTIVES) {
+    // Distance to the REGION, not to one point in it.
+    //
+    // A team reaches "the roof" when they get onto any part of it, so a single probe
+    // measures the corner nearest whoever is closer to that corner. Probing (-6, 8.05, 6)
+    // reported the roof favouring team 0 by 2.1 s; probing the whole deck says 0.1 s. The
+    // earlier centre probe was worse still — it landed inside the lantern base collider
+    // and silently reported the FIRST FLOOR's numbers under the roof's name.
     const best = [Infinity, Infinity];
     for (const t of [0, 1]) {
       for (const from of byTeam[t]) {
-        const d = pathLen(from, obj.at);
-        if (d < best[t]) best[t] = d;
+        const ext = obj.extent ?? 6;
+        for (let ox = -ext; ox <= ext; ox += 3) {
+          for (let oz = -ext; oz <= ext; oz += 3) {
+            probe.set(obj.at.x + ox, obj.at.y, obj.at.z + oz);
+            // Only sample where the objective's own surface actually is, or the grid
+            // wanders off the roof and measures the street below it.
+            const surf = w.sampleGroundHeight(probe.x, probe.z, obj.at.y + 1.0);
+            if (surf === null || Math.abs(surf - obj.at.y) > 0.8) continue;
+            probe.y = surf + 0.1;
+            const d = pathLen(from, probe);
+            if (d < best[t]) best[t] = d;
+          }
+        }
       }
     }
     if (!Number.isFinite(best[0]) && !Number.isFinite(best[1])) {

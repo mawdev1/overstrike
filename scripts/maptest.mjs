@@ -184,6 +184,10 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   else bad('solidRun matches point sampling', `${wrong} of ${checked} runs contained a gap`);
 }
 
+/** Surfaces a player can actually get to. Filled by the containment check below, and
+ *  reused by the walk-off check — a barrier on a deck nobody can reach is not a defect. */
+let reachable = new Set();
+
 // ── the player cannot leave ──────────────────────────────────────────────────────────
 //
 // Geometry is the ONLY containment here: nothing clamps to `world.bounds` and there is no
@@ -239,14 +243,21 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   // Area, not a minimum in each axis: a staircase tread is 2.4 m x 0.38 m and is very
   // much standable, and excluding it breaks every route that goes up stairs — which
   // collapsed the reachable set from 10.7 m to 5.4 m and made the whole check vacuous.
-  const standable = (bx) => (bx.max.x - bx.min.x) >= 0.3 && (bx.max.z - bx.min.z) >= 0.3
-    && (bx.max.x - bx.min.x) * (bx.max.z - bx.min.z) >= 0.5;
+  // Area only — NO per-axis minimum.
+  //
+  // Requiring 0.3 m in both axes was demonstrably wrong: the map's own 0.26 m parapets are
+  // provably standable, and a constructed 0.20 m-thick rung ladder up the inside of the
+  // perimeter passed this gate while the real controller climbed it to the top of the wall,
+  // from which 75.8% of rays leave the level. A surface is standable if a 0.36 m-radius
+  // body can be supported on it, which is about area and support, not about being square.
+  const standable = (bx) => (bx.max.x - bx.min.x) * (bx.max.z - bx.min.z) >= 0.05
+    && Math.max(bx.max.x - bx.min.x, bx.max.z - bx.min.z) >= 0.25;
   const surfaces = boxes.filter(standable);
 
   const overlapsXZ = (a, c, pad) => a.min.x - pad <= c.max.x && a.max.x + pad >= c.min.x
     && a.min.z - pad <= c.max.z && a.max.z + pad >= c.min.z;
 
-  const reachable = new Set();
+  reachable = new Set();
   for (const bx of surfaces) if (bx.max.y <= 1.4) reachable.add(bx);   // walk-on from ground
   for (let pass = 0; pass < 12; pass++) {
     let added = 0;
@@ -307,6 +318,73 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   } else {
     bad('nothing reachable can see over the perimeter',
       `standable surface at ${highest.toFixed(2)} m ${highestAt} gives eye ${(highest + EYE).toFixed(2)} vs wall top ${minTop}`);
+  }
+}
+
+// ── no walking off a roof by accident ────────────────────────────────────────────────
+//
+// The highest-frequency player-facing defect on this map, and nothing was looking for it.
+// A parapet's crenellation gaps are meant to be firing slits; if the sill is below
+// MAX_STEP_HEIGHT the player walks straight over it while holding forward, and on a roof
+// that is an 8 m fall. Every crenel on the map was one.
+{
+  const MAX_STEP = 0.55;
+  const offenders = [];
+  // Any surface a player can stand on, high enough that falling off it matters.
+  for (const deck of boxes) {
+    if (deck.max.y < 3.0) continue;
+    if ((deck.max.x - deck.min.x) * (deck.max.z - deck.min.z) < 6) continue;   // a real deck
+    // Only decks a player can reach. The first version flagged the west gate tower top at
+    // 14.6 m, which is part of the perimeter assembly and 9 m above anything anyone can
+    // climb to — a barrier nobody can walk off is not a defect.
+    if (!reachable.has(deck)) continue;
+    // Walk the deck's perimeter looking for a spot where the tallest thing standing on
+    // the edge is a step rather than a barrier.
+    for (const [ax, az] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const ex = ax !== 0 ? (ax > 0 ? deck.max.x : deck.min.x) : (deck.min.x + deck.max.x) / 2;
+      const ez = az !== 0 ? (az > 0 ? deck.max.z : deck.min.z) : (deck.min.z + deck.max.z) / 2;
+      const span = ax !== 0 ? deck.max.z - deck.min.z : deck.max.x - deck.min.x;
+
+      // Sample the whole edge, then judge it as a whole.
+      //
+      // What matters is INCONSISTENCY, not lip height. A uniformly low kerb over a drop
+      // is a deliberate drop-down route and every good map has them; what traps a player
+      // is an edge that is mostly a barrier — so it reads as safe — with one section they
+      // walk straight through. That is exactly what a crenellation gap below step height
+      // is, and it is what an earlier version of this check could not tell apart from a
+      // ledge you are meant to hop off.
+      const samples = [];
+      for (let t = -span / 2 + 0.5; t < span / 2; t += 0.5) {
+        const px = ax !== 0 ? ex : ex + t;
+        const pz = az !== 0 ? ez : ez + t;
+        let lip = deck.max.y;
+        for (const b2 of boxes) {
+          if (b2 === deck) continue;
+          if (b2.max.y <= deck.max.y || b2.min.y > deck.max.y + 0.05) continue;
+          if (px < b2.min.x - 0.2 || px > b2.max.x + 0.2) continue;
+          if (pz < b2.min.z - 0.2 || pz > b2.max.z + 0.2) continue;
+          if (b2.max.y > lip) lip = b2.max.y;
+        }
+        const beyond = w.sampleGroundHeight(px + ax * 0.8, pz + az * 0.8, deck.max.y + 0.5);
+        samples.push({ px, pz, rise: lip - deck.max.y, drop: deck.max.y - (beyond === null ? -10 : beyond) });
+      }
+      if (samples.length < 4) continue;
+
+      const barriered = samples.filter((q) => q.rise > MAX_STEP).length / samples.length;
+      if (barriered < 0.6) continue;                 // an open edge, deliberately
+
+      for (const q of samples) {
+        if (q.rise > MAX_STEP || q.drop < 2.5) continue;
+        offenders.push(`deck y=${deck.max.y.toFixed(2)} at (${q.px.toFixed(1)}, ${q.pz.toFixed(1)}): ${(barriered * 100).toFixed(0)}% of this edge is a barrier, here the lip is ${q.rise.toFixed(2)} m over a ${q.drop.toFixed(1)} m drop`);
+      }
+    }
+  }
+
+  const unique = [...new Set(offenders.map((o) => o.replace(/\(.*\)/, '')))];
+  if (offenders.length === 0) ok('no roof edge has a barrier low enough to walk over');
+  else {
+    bad('roof barriers are either absent or high enough to stop you',
+      `${offenders.length} spots, ${unique.length} distinct decks:\n       ${offenders.slice(0, 5).join('\n       ')}`);
   }
 }
 
