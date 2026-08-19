@@ -16,6 +16,8 @@ import { NetClient, INTERP_DELAY_MS } from './client.js';
 import { WebSocketTransport } from './transport.js';
 import { Prediction } from './prediction.js';
 import { quantiseCommand, F_ALIVE, F_CROUCH, F_SPRINT } from './protocol.js';
+import { FIXED_DT } from '../core/mathUtils.js';
+import { RemoteAvatars } from './avatars.js';
 
 export class MultiplayerSession {
   constructor(game, transport) {
@@ -36,6 +38,8 @@ export class MultiplayerSession {
      * can be found to interpolate against — the tick numbers do not even overlap.
      */
     this.synced = false;
+    /** Rigs for everyone this client does not simulate. Built lazily, browser only. */
+    this.avatars = null;
     this.stats = { commandsSent: 0, joinCorrectionM: 0 };
 
     this.net.onSnapshot((snap) => this._onSnapshot(snap));
@@ -97,6 +101,31 @@ export class MultiplayerSession {
     return sent;
   }
 
+  /**
+   * One simulation step, in multiplayer.
+   *
+   * Called by `Game._loop` in place of `_fixedUpdate` — prediction runs the step itself,
+   * so doing both would simulate every tick twice.
+   *
+   * The command is built from the local input exactly as single player builds it, which
+   * is the point of the Phase 2 command work: the same `_buildLocalCommand` resolves
+   * settings-dependent intent (toggle-vs-hold crouch, autoSprint, sensitivity) here as
+   * there, so the server receives resolved intent it could not have derived itself.
+   */
+  step() {
+    const p = this.game.player;
+    if (!this.connected || !p) { this.game._fixedUpdate(FIXED_DT); return; }
+
+    // Held state has to be refreshed from the live input every step, not once a frame —
+    // the same reason `_refreshHeldState` exists on the single-player path.
+    p._refreshHeldState?.();
+    const cmd = p._buildLocalCommand();
+    // A fresh object per command: `_cmdScratch` is reused in place, and the unacked
+    // queue keeps commands for resending and replay, so handing it the scratch would
+    // give every queued command the newest command's contents.
+    this.sendCommand({ ...cmd });
+  }
+
   _onSnapshot(snap) {
     if (!this.synced) { this._syncToServer(snap); return; }
     this.prediction?.reconcile(snap);
@@ -131,6 +160,17 @@ export class MultiplayerSession {
       p._updateHitboxes?.();
     }
     g.tick = snap.tick;
+
+    // Stand the local bot roster down. In multiplayer the server owns every bot, and they
+    // arrive as snapshots like any other remote entity; a local roster would be a second
+    // set of AI running independently — ghosts the player could see and shoot at that
+    // nobody else has, and that the server would never agree existed.
+    if (g.bots?.bots?.length) {
+      g.bots.setCount?.(0);
+      if (g.bots.bots.length) g.bots.bots.length = 0;
+      g.rosterChanged();
+    }
+
     this.synced = true;
     // Discard the join snap so it is not reported as a prediction failure — it is not
     // one, and leaving it in makes the worst-error metric meaningless forever after.
@@ -184,8 +224,22 @@ export class MultiplayerSession {
     return this.remotes;
   }
 
+  /**
+   * Draw everyone else. Called once per rendered frame, not per tick — this is
+   * presentation, and it interpolates against the wall clock rather than the sim clock.
+   */
+  render(dt) {
+    if (!this.connected) return;
+    if (!this.avatars && this.game.present?.visual !== false) {
+      this.avatars = new RemoteAvatars(this.game);
+    }
+    this.avatars?.update(this.updateRemotes(), dt);
+  }
+
   close() {
     this.connected = false;
+    this.avatars?.dispose();
+    this.avatars = null;
     this.transport.close();
   }
 }

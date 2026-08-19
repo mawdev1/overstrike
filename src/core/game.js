@@ -500,7 +500,12 @@ export class Game {
       while (this._accum >= FIXED_DT && steps < MAX_SUBSTEPS) {
         this._accum -= FIXED_DT;
         steps++;
-        this._fixedUpdate(FIXED_DT);
+        // In multiplayer the session owns the step: it builds the local command, sends
+        // it, and predicts it — and prediction itself calls `_fixedUpdate`, so calling
+        // both here would run the simulation twice per tick. Single player is unchanged
+        // and does not know any of this exists.
+        if (this.net) this.net.step();
+        else this._fixedUpdate(FIXED_DT);
       }
       // If we blew the substep budget, drop the backlog rather than spiralling.
       if (steps === MAX_SUBSTEPS) this._accum = 0;
@@ -510,6 +515,9 @@ export class Game {
 
     try {
       this._update(dtFrame);
+      // Remote players are drawn per FRAME, from interpolated state — presentation, not
+      // simulation, so it belongs here rather than in the fixed step.
+      this.net?.render(dtFrame);
     } finally {
       // Rendering and input draining live in `finally` deliberately. If a system
       // throws, the game must degrade to "one subsystem is broken", never to a black

@@ -969,6 +969,11 @@ export class Player {
    * difference — it never touches `game.input` or `game.settings` itself.
    */
   _pumpLocalCommand() {
+    // In multiplayer the SESSION builds and applies the command, once per tick, and then
+    // runs the step. Building another one here from the same input would apply the frame's
+    // mouse delta a second time — the look would move at double rate, and only in
+    // multiplayer, which is a miserable thing to track down.
+    if (this.game.net) return;
     // No local input device means nothing local to build. An authoritative server applies
     // commands it RECEIVED, straight through `applyCommand`, and never runs this path —
     // so its absence is the normal case there, not a failure.

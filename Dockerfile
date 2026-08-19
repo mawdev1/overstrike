@@ -1,8 +1,18 @@
-## Build the static bundle, then serve it from nginx. Nothing in OVERSTRIKE runs
-## server-side — the whole game is the client — so the runtime image carries no node.
+## Build the static bundle, then serve it from nginx. This image is the CLIENT only —
+## the dedicated game server is a separate app with its own image (Dockerfile.gameserver),
+## so this runtime carries no node.
+##
+## VITE_SERVER_URL is baked in at build time and decides whether the shipped client looks
+## for a server at all. Empty means single player: the game simulates in the tab exactly
+## as it always did, so the offline experience never depends on the server being up.
+##
+##   fly deploy --build-arg VITE_SERVER_URL=wss://overstrike-gs.fly.dev
 
 FROM node:22-alpine AS build
 WORKDIR /app
+
+ARG VITE_SERVER_URL=""
+ENV VITE_SERVER_URL=$VITE_SERVER_URL
 
 COPY package.json package-lock.json ./
 RUN npm ci

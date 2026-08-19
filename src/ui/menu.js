@@ -585,9 +585,43 @@ export class Menu {
       // startMatch is synchronous and has already spawned the player with the
       // weapon system's DEFAULT_LOADOUT; put the chosen kit in their hands now.
       this._equipLoadout();
+      // Join a dedicated server if this build was given one. Deliberately after the
+      // match has started and NOT awaited: the game is already playable locally, and the
+      // session takes over the step when it connects. If the server is unreachable the
+      // player keeps playing single player rather than staring at a connect screen.
+      this._joinServerIfConfigured();
     } catch (err) {
       console.error('[menu] startMatch failed', err);
       this.open('main');
+    }
+  }
+
+  /**
+   * Connect to a dedicated server, if one is configured.
+   *
+   * Fire-and-forget on purpose. A build with no server URL does nothing here, and a
+   * build whose server is down degrades to single player with a notice rather than
+   * blocking — the offline game must never depend on the netcode being reachable.
+   */
+  async _joinServerIfConfigured() {
+    const g = this.game;
+    if (g.net) return;
+    let url = '';
+    try {
+      const { resolveServerUrl } = await import('../net/config.js');
+      url = resolveServerUrl();
+    } catch { return; }
+    if (!url) return;
+
+    try {
+      const { MultiplayerSession } = await import('../net/session.js');
+      const session = await MultiplayerSession.connect(g, url);
+      g.net = session;
+      g.hud?.notice?.('CONNECTED', url.replace(/^wss?:\/\//, ''), 2.5);
+      console.log(`[net] joined ${url} as entity ${session.net.entityId}`);
+    } catch (err) {
+      console.warn('[net] could not join, staying offline:', err.message);
+      g.hud?.notice?.('OFFLINE', 'server unreachable', 3);
     }
   }
 
