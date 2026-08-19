@@ -409,8 +409,18 @@ export class Builder {
   _glassPane(alongX, a0, a1, y0, y1, b0, b1) {
     const bc = (b0 + b1) / 2, t = 0.05;
     const opt = { cast: false, receive: false, collide: true };
-    if (alongX) this.box(a0 + 0.06, y0 + 0.05, bc - t / 2, a1 - 0.06, y1 - 0.05, bc + t / 2, 'glass', 'glass', opt);
-    else this.box(bc - t / 2, y0 + 0.05, a0 + 0.06, bc + t / 2, y1 - 0.05, a1 - 0.06, 'glass', 'glass', opt);
+    // The pane FILLS its opening, and laps 1 cm into the wall on every side.
+    //
+    // It used to be inset 0.06 m at the jambs and 0.05 m at head and sill inside a hole
+    // that goes all the way through, which left an open slot around all four edges of
+    // every glazed opening on the map — 32 panes, 257 m of open perimeter, about 10 m2 of
+    // aperture. Every one of them leaked sightline, shot and sound straight past the glass,
+    // which is the one thing a window is supposed to stop. The lap is hidden inside the
+    // wall and behind the reveal trim, which is `deco` and does not collide, so nothing
+    // here can z-fight.
+    const L = 0.01;
+    if (alongX) this.box(a0 - L, y0 - L, bc - t / 2, a1 + L, y1 + L, bc + t / 2, 'glass', 'glass', opt);
+    else this.box(bc - t / 2, y0 - L, a0 - L, bc + t / 2, y1 + L, a1 + L, 'glass', 'glass', opt);
   }
 
   /**

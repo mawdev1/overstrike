@@ -355,7 +355,14 @@ function buildMarketHall(B) {
 
   // South, with the exterior stair up from the plaza.
   B.slab(-8, Z1, 8, 13.6, L1_UNDER, L1, 'concrete', 'concrete');
-  B.parapet(-8, 13.6, 8, 13.6, L1, 1.0, 'plaster', 'concrete', { gaps: [[-2.2, 0.4], [4, 6.5]] });
+  // Split, rather than a `gaps` entry at the stair mouth. `Builder.parapet` does not OPEN
+  // a gap — it lowers that span to `y + MAX_STEP + 0.07`, which is a crenel you shoot over,
+  // not a doorway. When the crenel-safety pass raised that from 0.44 to 0.62 it crossed
+  // MAX_STEP (0.55), and a 0.62 m bar appeared across the full width of this staircase's
+  // head. The stair has been impassable in both directions ever since, silently: the
+  // player just stops. The crenel at [4, 6.5] is a genuine firing position and stays.
+  B.parapet(-8, 13.6, -2.2, 13.6, L1, 1.0, 'plaster', 'concrete');
+  B.parapet(0.4, 13.6, 8, 13.6, L1, 1.0, 'plaster', 'concrete', { gaps: [[4, 6.5]] });
   B.parapet(-8, Z1, -8, 13.6, L1, 1.0, 'plaster', 'concrete');
   B.parapet(8, Z1, 8, 13.6, L1, 1.0, 'plaster', 'concrete');
   for (const x of [-8, 8]) B.deco(x - 0.2, PLINTH, Z1, x + 0.2, L1_UNDER, 13.6, 'plaster');
@@ -588,17 +595,22 @@ function dressMarketInterior(B) {
 function dressHallRoof(B) {
   const y = L2;
   // Cistern on a stand, plumbed back down through the roof.
-  B.box(-7.4, y, 4.2, -5.0, y + 0.9, 6.6, 'metal', 'metal');
-  for (const sx of [-7.2, -5.2]) for (const sz of [4.4, 6.4]) B.deco(sx - 0.08, y, sz - 0.08, sx + 0.08, y + 0.9, sz + 0.08, 'metal');
+  // Slid 1.2 m east, clear of ROOF_STAIR's well (x -8.6..-6.2). It used to overlap half
+  // the 2.40 m width with its underside at 8.05 over treads topping out at 6.32-7.18 —
+  // 0.87 m of headroom, so a standing player was stopped and only the narrow west lane
+  // walked. The height below is what matters for the launch geometry, not the x, so
+  // sliding it does not reopen that.
+  B.box(-6.2, y, 4.2, -3.8, y + 0.9, 6.6, 'metal', 'metal');
+  for (const sx of [-6.0, -4.0]) for (const sz of [4.4, 6.4]) B.deco(sx - 0.08, y, sz - 0.08, sx + 0.08, y + 0.9, sz + 0.08, 'metal');
   // 1.3 tall, not 1.5. At 1.5 its top sat at 10.45, which is the one place on the map a
   // player can jump-and-air-mantle onto the 11.67 lantern deck — 14,441 valid launch
   // solutions over a 2.8-8.4 m/s speed window, so a route rather than a trick. From the
   // roof deck (8.05), the parapet (9.10) and the low roof AC (9.15) there are zero. Two
   // decimetres removes the only ladder to the map's highest surface.
-  B.cylinder(-6.2, y + 0.9, 5.4, 1.05, 1.3, 14, 'metal', 'metal', { collide: true });
-  B.cylinder(-6.2, y + 2.4, 5.4, 1.12, 0.12, 14, 'metal', 'metal');
-  B.beam(-6.2, y + 0.95, 4.4, -6.2, y + 0.2, 2.6, 0.08, 'metal');
-  B.beam(-6.2, y + 0.2, 2.6, -3.2, y + 0.2, 2.6, 0.08, 'metal');
+  B.cylinder(-5.0, y + 0.9, 5.4, 1.05, 1.3, 14, 'metal', 'metal', { collide: true });
+  B.cylinder(-5.0, y + 2.4, 5.4, 1.12, 0.12, 14, 'metal', 'metal');
+  B.beam(-5.0, y + 0.95, 4.4, -5.0, y + 0.2, 2.6, 0.08, 'metal');
+  B.beam(-5.0, y + 0.2, 2.6, -2.0, y + 0.2, 2.6, 0.08, 'metal');
 
   // Aerial mast with guys, and a dish — cheap, tall, and it breaks the roofline.
   B.cylinder(7.6, y, -8.6, 0.08, 4.4, 6, 'metal', 'metal');
@@ -825,7 +837,7 @@ function oldTownBlock(B, z0, z1, tag) {
   B.prop('crate', -28.5, PLINTH, mid - 5.5, 0.5);
   B.prop('crate', -27.6, PLINTH, mid - 6.2, -0.3, { variant: 'small' });
   B.prop('pallets', -36.5, PLINTH, mid + 5.5, 0.2);
-  B.prop('barrel', -24.5, PLINTH, mid + 4.5, 0, { color: BARREL_COLORS[3] });
+  B.prop('barrel', -24.5, PLINTH, mid + (tag === 'A' ? 4.5 : -4.5), 0, { color: BARREL_COLORS[3] });
 
   dressOldTownBlock(B, z0, z1, mid, tag);
 }
@@ -1060,7 +1072,7 @@ function buildWarehouse(B) {
   B.prop('crate', 26.5, PLINTH, -22.5, 0.2);
   B.prop('crate', 27.4, PLINTH, -21.6, -0.6);
   B.prop('crate', 26.9, PLINTH + 0.94, -22.1, 0.4);
-  B.prop('pallets', 17.5, PLINTH, -17.5, 0, { variant: 'tall' });
+  B.prop('pallets', 17.5, PLINTH, -16.8, 0, { variant: 'tall' });   // clear of the mezzanine stair foot
   B.prop('barrel', 33.5, PLINTH, -21, 0, { color: BARREL_COLORS[0] });
   B.prop('tyres', 16.6, PLINTH, -29.5, 0);
   // Moved clear of the north door (x 23.5-26.5). Parked at x=25.5 it plus its nav skirt
@@ -1169,7 +1181,7 @@ function dressWarehouse(B, X0, X1, Z0, Z1, MEZZ, ROOF) {
 function buildCustoms(B) {
   const X0 = 17, X1 = 33, Z0 = 12, Z1 = 28, T = 0.4;
   const ROOF = 7.9, ROOF_UNDER = 7.6;
-  const STAIR = [17.6, 13, 20, 19.8];
+  const STAIR = [17.6, 14.2, 20, 19.8];
 
   B.box(X0 - 0.5, 0, Z0 - 0.5, X1 + 0.5, PLINTH, Z1 + 0.5, 'concreteDark', 'concrete');
   B.floorFinish(X0, Z0, X1, Z1, PLINTH, 'tile');
@@ -1207,7 +1219,10 @@ function buildCustoms(B) {
   });
 
   // First floor.
-  B.stairs({ x0: 17.6, z0: 13, x1: 20, z1: 19.8, y0: PLINTH, y1: L1, dir: '+z', matName: 'concrete', surface: 'concrete', rail: true });
+  // Foot at 14.2, not 13.0. The north wall's inner face is at z 12.40, so a run starting
+  // at 13.0 left 0.60 m of standing room in front of the bottom tread against a 0.72 m
+  // player — there was nowhere to stand to begin the climb.
+  B.stairs({ x0: 17.6, z0: 14.2, x1: 20, z1: 19.8, y0: PLINTH, y1: L1, dir: '+z', matName: 'concrete', surface: 'concrete', rail: true });
   B.slab(X0, Z0, X1, Z1, L1_UNDER, L1, 'concrete', 'concrete', { hole: STAIR });
   B.floorFinish(X0, Z0, X1, Z1, L1, 'tile');
 
@@ -1323,13 +1338,16 @@ function dressCustoms(B, X0, X1, Z0, Z1, ROOF) {
     for (const sy of [0.34, 0.9]) B.deco(31.34, PLINTH + sy, z - 0.44, 31.4, PLINTH + sy + 0.06, z + 0.44, 'metal', { cast: false });
   }
   B.prop('crate', 21.5, PLINTH, 18.8, 0.3, { variant: 'small' });
-  B.prop('sandbags', 19.0, PLINTH, 14.2, 0);
+  B.prop('sandbags', 19.0, PLINTH, 11.4, 0);      // clear of the stairwell foot at z 14.2
   board(B, 25.3, 2.1, 20.74, 0, 1.9, 0.9, HAZARD);
   board(B, 30.0, 1.9, 21.26, Math.PI, 1.4, 1.0, 0xdad2c0);
 
   // Upstairs: a desk at the window that overlooks the road, and worn traffic lines.
-  B.box(17.6, L1, 18.0, 18.8, L1 + 0.78, 20.6, 'wood', 'wood');
-  B.deco(17.5, L1 + 0.78, 17.9, 18.9, L1 + 0.86, 20.7, 'concreteDark');
+  // Clear of the stairwell. It used to stand over it — x 17.60-18.80 of the 2.40 m well —
+  // with its underside at 4.15 above treads topping out at 3.49-3.93, leaving 0.22 m of
+  // headroom over the last two metres of the climb.
+  B.box(20.4, L1, 18.0, 21.6, L1 + 0.78, 20.6, 'wood', 'wood');
+  B.deco(20.3, L1 + 0.78, 17.9, 21.7, L1 + 0.86, 20.7, 'concreteDark');
   B.prop('sandbags', 18.2, L1, 23.4, 0);
   B.wear(19.6, 13.0, 22.4, 27.4, PLINTH, 'concreteDark');
   B.wear(19.6, 19.4, 32.4, 22.0, PLINTH, 'concreteDark');
@@ -1431,7 +1449,7 @@ function dressPlaza(B, rng) {
   B.debris(10.4, -20.6, 1.1, 8, 0, { mats: ['wood', 'rubber', 'concreteDark'] });
   B.prop('crate', 1.2, 0, 21.6, 0.4, { variant: 'small' });
   B.prop('barrel', 12.6, 0, 15.4, 0.2, { color: BARREL_COLORS[2] });
-  B.prop('pallets', -12.2, 0, 12.4, 0.3);
+  B.prop('pallets', -12.2, 0, 13.9, 0.3);         // 0.64 m from the stair foot was inside it
 
   // Main desire lines through the square, north to south past the hall.
   B.wear(-12.4, -30.0, -10.2, -22.0);
@@ -1462,7 +1480,10 @@ function buildHarbour(B, rng) {
   // Ramp onto the western container of the barricade — a small piece of verticality on
   // the road that lets you shoot over the whole barricade, counterable from both
   // buildings and from the plaza arcade.
-  B.ramp({ x0: 14.6, z0: 0.22, x1: 18.4, z1: 4.6, y0: 0, y1: 2.6, dir: '-z', matName: 'metal', surface: 'metal' });
+  // y1 matches the container top (2.61), not 2.60. `_tryStepUp` refuses any rise under
+  // MIN_STEP_HEIGHT (0.02 m), so a 1 cm lip is not a small step — it is a wall. The ramp
+  // was a one-way trap: you could come down it and never go up.
+  B.ramp({ x0: 14.6, z0: 0.22, x1: 18.4, z1: 4.6, y0: 0, y1: 2.61, dir: '-z', matName: 'metal', surface: 'metal' });
   B.prop('jersey', 13.6, 0, 2.4, Math.PI / 2);
   B.prop('jersey', 19.4, 0, 2.4, Math.PI / 2);
   B.prop('sandbags', 15.4, 2.6, -1.9, 0);
@@ -1473,8 +1494,12 @@ function buildHarbour(B, rng) {
   for (let z = -34; z <= 36; z += 7) B.prop('bollard', 40.2, 0, z, 0);
   B.railing(40.6, -38, 40.6, -12, 0, { height: 1.05 });
   B.railing(40.6, 4, 40.6, 38, 0, { height: 1.05 });
-  B.prop('container', 38, 0, -26, Math.PI / 2, { color: CONTAINER_COLORS[2] });
-  B.prop('container', 38, 2.6, -26, Math.PI / 2, { color: CONTAINER_COLORS[5] });
+  // At z -36, not -26. The stack is 2.44 x 6.20 m, so at -26 it ran from z -29.13 to
+  // -22.93 and straight through the warehouse's external switchback (x 35.2-37.6): it
+  // overlapped the landing by 0.82 m, cut into nine treads of the upper flight, and
+  // entombed the landing railing completely. Descending the lower flight stalled on it.
+  B.prop('container', 38, 0, -36, Math.PI / 2, { color: CONTAINER_COLORS[2] });
+  B.prop('container', 38, 2.6, -36, Math.PI / 2, { color: CONTAINER_COLORS[5] });
   B.prop('container', 38, 0, 12, Math.PI / 2, { color: CONTAINER_COLORS[4] });
   B.prop('container', 38, 0, 20, Math.PI / 2, { color: CONTAINER_COLORS[1] });
   B.prop('container', 38, 2.6, 20, Math.PI / 2, { color: CONTAINER_COLORS[0] });
@@ -1541,7 +1566,10 @@ function dressHarbour(B, rng) {
   }
   B.prop('crate', 34.6, 0, 3.4, 0.4);
   B.prop('crate', 35.4, 0, 4.3, -0.3, { variant: 'small' });
-  B.prop('pallets', 36.4, 0, -16.5, 0.2);
+  // Beside the external stair, not in its mouth. At z -16.5 it stood ON treads 1-2; at
+  // -15.2 it merely stood 0.29 m in front of them, which is the same problem one step
+  // removed — descending, you step off the bottom tread onto a 0.45 m pallet.
+  B.prop('pallets', 39.0, 0, -16.5, 0.2);
   B.prop('barrel', 15.6, 0, 12.4, 0.3, { color: BARREL_COLORS[1] });
   B.prop('barrel', 16.4, 0, 13.2, 0.9, { color: BARREL_COLORS[3] });
   B.prop('tyres', 21.0, 0, 30.0, 0.2);
