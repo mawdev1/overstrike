@@ -20,10 +20,12 @@
  */
 import { FIXED_DT, PITCH_LIMIT } from '../core/mathUtils.js';
 import {
-  MSG_COMMANDS, MSG_WELCOME, decodeCommands, encodeSnapshot, entityToWire, EV_SPATIAL,
+  MSG_COMMANDS, MSG_WELCOME, MSG_LOADOUT, decodeCommands, decodeLoadout, encodeSnapshot,
+  entityToWire, EV_SPATIAL,
 } from './protocol.js';
 import { LagCompensation } from './lagcomp.js';
 import { INTERP_DELAY_MS } from './client.js';
+import { WEAPON_BY_WIRE_IDX, WEAPONS } from '../weapons/weaponDefs.js';
 
 /** Snapshots at 30 Hz against a 120 Hz simulation. */
 export const SNAPSHOT_INTERVAL = 4;
@@ -125,6 +127,8 @@ class ClientSession {
     this.baseline = null;
     this.baseTick = 0;
     this.pendingBaselines = new Map();
+    /** Weapon ids this client chose, so a respawn does not silently rearm them. */
+    this.loadout = null;
     this.stats = {
       commands: 0, duplicates: 0, dropped: 0, snapshots: 0, resyncs: 0, backlogTrimmed: 0,
     };
@@ -143,6 +147,16 @@ export class GameServer {
     this._nextClientId = 1;
     this._snapCounter = 0;
     this.lag = new LagCompensation(game);
+
+    // `Player.respawn` re-gives the DEFAULT loadout, so a client's chosen guns would
+    // survive exactly until its first death. Re-arm it every time it comes back.
+    game.bus?.on('spawn', (p) => {
+      const e = p?.entity;
+      if (!e) return;
+      for (const session of this.clients.values()) {
+        if (session.entity === e) { this.reapplyLoadout(session); return; }
+      }
+    });
 
     // Kills and damage come off the BUS, not off the presenter.
     //
@@ -236,6 +250,7 @@ export class GameServer {
 
   _onMessage(session, data) {
     const v = new DataView(data);
+    if (v.getUint8(0) === MSG_LOADOUT) { this._applyLoadout(session, data); return; }
     if (v.getUint8(0) !== MSG_COMMANDS) return;
 
     for (const cmd of decodeCommands(data)) {
@@ -283,6 +298,29 @@ export class GameServer {
     for (const k of session.pendingBaselines.keys()) {
       if (k < t) session.pendingBaselines.delete(k);
     }
+  }
+
+  /**
+   * Arm this client with the guns it actually picked.
+   *
+   * Applied immediately AND remembered, because `Player.respawn` re-gives the default
+   * loadout: without storing it the choice would survive exactly until the first death.
+   */
+  _applyLoadout(session, data) {
+    const pair = decodeLoadout(data);
+    const e = session.entity;
+    if (!pair || !e) return;
+    const ids = pair
+      .map((i) => WEAPON_BY_WIRE_IDX[i]?.id)
+      .filter((id) => id && WEAPONS[id]?.class !== 'grenade');
+    if (ids.length === 0) return;
+    session.loadout = ids;
+    this.game.weapons?.giveLoadout?.(e, ids);
+  }
+
+  /** Re-arm a client with its chosen guns. Called after anything that re-equips them. */
+  reapplyLoadout(session) {
+    if (session.loadout) this.game.weapons?.giveLoadout?.(session.entity, session.loadout);
   }
 
   /** Buffer one feedback event for the next snapshot, respecting the cap. */

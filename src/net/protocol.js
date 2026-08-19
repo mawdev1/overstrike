@@ -28,6 +28,35 @@
 export const MSG_COMMANDS = 1;
 export const MSG_SNAPSHOT = 2;
 export const MSG_WELCOME = 3;
+/**
+ * Client -> server: which two guns this player picked.
+ *
+ * Nothing carried the loadout, so the server armed every client with the default
+ * `ar_vector` no matter what they chose in the armoury. Once the trigger reached the
+ * server that became the visible bug: pick the DMR and the client shows one aimed shot
+ * while the server empties 34 full-auto rounds — wrong damage, wrong fire rate, wrong
+ * falloff, wrong magazine, and a crosshair up to 4.2 degrees off the authoritative gun
+ * (110 cm at 15 m).
+ *
+ * Two bytes of weapon index, sent on join and whenever the pick changes. Not folded into
+ * the command, which goes out 120 times a second and would carry it for no reason.
+ */
+export const MSG_LOADOUT = 4;
+
+export function encodeLoadout(primaryIdx, secondaryIdx) {
+  const buf = new ArrayBuffer(3);
+  const v = new DataView(buf);
+  v.setUint8(0, MSG_LOADOUT);
+  v.setUint8(1, primaryIdx & 0xff);
+  v.setUint8(2, secondaryIdx & 0xff);
+  return buf;
+}
+
+export function decodeLoadout(buf) {
+  const v = new DataView(buf);
+  if (v.getUint8(0) !== MSG_LOADOUT) return null;
+  return [v.getUint8(1), v.getUint8(2)];
+}
 
 /** Edge fields, in bit order. Order is part of the wire format — append, never insert. */
 export const EDGE_BITS = [
@@ -337,7 +366,7 @@ export function encodeSnapshot(snap, baseline) {
     v.setUint8(o, code); o += 1;
     // bit 0 is the headshot flag; bits 1-5 carry a weapon index on a gunshot, so a remote
     // rifle, shotgun and sniper do not all play the same sound. Free — the byte was there.
-    v.setUint8(o, (ev.headshot ? 1 : 0) | (((ev.weaponIdx ?? 0) & 0x1f) << 1)); o += 1;
+    v.setUint8(o, (ev.headshot ? 1 : 0) | (((ev.weaponIdx ?? 0) & 0x1f) << 1) | (ev.absorbed ? 0x40 : 0)); o += 1;
     v.setUint32(o, (ev.entityId ?? ev.killerId ?? 0) >>> 0, true); o += 4;
     v.setUint32(o, (ev.victimId ?? 0) >>> 0, true); o += 4;
     v.setUint16(o, Math.max(0, Math.min(65535, ev.amount ?? 0)), true); o += 2;
@@ -397,10 +426,11 @@ export function decodeSnapshot(buf, baseline) {
       const fl = v.getUint8(o); o += 1;
       const headshot = (fl & 1) === 1;
       const weaponIdx = (fl >> 1) & 0x1f;
+      const absorbed = (fl & 0x40) !== 0;
       const a = v.getUint32(o, true); o += 4;
       const victimId = v.getUint32(o, true); o += 4;
       const amount = v.getUint16(o, true); o += 2;
-      const ev = { kind: EV_KINDS[code] ?? 'unknown', headshot, weaponIdx, victimId, amount };
+      const ev = { kind: EV_KINDS[code] ?? 'unknown', headshot, weaponIdx, absorbed, victimId, amount };
       if (EV_VEC3.has(code)) {
         ev.entityId = a;
         ev.x = v.getFloat32(o, true); o += 4;

@@ -496,7 +496,9 @@ export class HUD {
       if (!p) return;
       const me = this.game?.player;
       if (p.shooter && me && p.shooter !== me) return;
-      this.hitmarker(!!p.headshot);
+      // An absorbed round hit a spawn-protected enemy and did nothing. It still gets a
+      // marker — the aim WAS good — but never the normal one, or it reads as damage dealt.
+      this.hitmarker(!!p.headshot && !p.absorbed);
     });
 
     on('damage', (p) => {

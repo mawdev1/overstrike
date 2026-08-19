@@ -208,20 +208,52 @@ export function raycastEntity(entity, origin, dir, maxDist) {
  * @returns {null | {entity, distance, part, point, normal}} POOLED
  */
 /**
- * Entities this shooter's round should pass straight through, as a predicate.
+ * Entities this shooter's round passes straight through.
  *
- * Teammates (and anyone else who cannot be hurt at all) are invisible to the ray, which is
- * what "friendly fire is off" has to mean geometrically. A spawn-protected ENEMY is NOT in
- * this set — the round stops on them and reports `absorbed`, because the shooter needs to
- * learn the difference between "I missed" and "they are briefly invulnerable".
+ * Teammates are invisible to the ray, which is what "friendly fire is off" has to mean
+ * geometrically — the alternative, discarding the hit after the raycast, ended the trace on
+ * their body and swallowed the round.
  *
- * Allocated once per shot, not per pellet or per segment.
+ * A spawn-protected ENEMY is deliberately NOT skipped: the round stops on them and reports
+ * `absorbed`, so the shooter learns the difference between "I missed" and "they are briefly
+ * invulnerable". Protection is judged in `_absorbedFor` from the tick the SHOOTER SAW, not
+ * from the present — see there.
+ *
+ * ONE reused closure over module state, rather than a fresh one per call. `fireHitscan` is
+ * invoked per PELLET (see `weaponSystem._fire`), so a shotgun allocated eight closures per
+ * trigger pull; the earlier comment claiming "once per shot" was simply wrong. Safe because
+ * nothing here survives a synchronous call — the same reasoning as the module-scope vector
+ * scratch above it.
  */
-function _skipUndamageable(game, shooter) {
-  return (e) => {
-    if (damageScale(game, shooter, e) > 0) return false;
-    return !(game.match?.isProtected?.(e) && e.team !== shooter?.team);
-  };
+let _skipGame = null;
+let _skipShooter = null;
+const _skipUndamageable = (e) => {
+  const shooter = _skipShooter;
+  if (!shooter || e === shooter) return false;
+  const match = _skipGame?.match;
+  // Nobody can be hurt at all right now (pre-round freeze, dead shooter, match over).
+  if (match?.canFire?.(shooter) === false) return true;
+  const teamBased = match?.mode?.teamBased ?? match?.teamBased ?? true;
+  return !!(teamBased && shooter.team != null && shooter.team === e.team);
+};
+
+/**
+ * Did this round stop on someone who was invulnerable when the shooter saw them?
+ *
+ * Asked at the SHOOTER'S view tick, not the present. Lag compensation rewinds the geometry
+ * but `Match._protect` is live state, so judging protection in the present got it wrong in
+ * both directions: a hit that lag comp says landed on an unprotected body was reported
+ * absorbed because protection had since begun, and a target who WAS invulnerable in the
+ * world the shooter saw took full damage because it had since lapsed. `wasProtected` was
+ * written for exactly this and had no callers.
+ */
+function _absorbedFor(game, shooter, target) {
+  if (!target || target === shooter) return false;
+  if (target.team === shooter?.team) return false;
+  const lag = game.lagcomp;
+  const viewTick = shooter?._lagViewTick;
+  if (lag && viewTick != null) return lag.wasProtected(target, viewTick);
+  return !!game.match?.isProtected?.(target);
 }
 
 export function raycastEntities(game, origin, dir, maxDist, exclude, skip) {
@@ -465,8 +497,8 @@ export function fireHitscan(game, o) {
 
   _origin.copy(o.origin);
   _dir.copy(o.dir).normalize();
-  // Once per shot, not once per segment: the segment loop runs several times per pellet.
-  const skipThrough = _skipUndamageable(game, shooter);
+  _skipGame = game;
+  _skipShooter = shooter;
 
   const res = _shotResult;
   res.hitEntity = null;
@@ -478,6 +510,9 @@ export function fireHitscan(game, o) {
   res.penetrated = false;
   res.damageDealt = 0;
   res.killed = false;
+  // Pooled: without this an absorbed round left the flag set on every LATER shot, so a
+  // clean miss, an 82-damage explosion and a 55-damage knife all reported `absorbed: true`.
+  res.absorbed = false;
 
   if (o.emitShot !== false) {
     _evShot.shooter = shooter;
@@ -522,7 +557,7 @@ export function fireHitscan(game, o) {
     //
     // Spawn-protected ENEMIES are deliberately not skipped: the round should stop on them
     // and report itself absorbed, so the shooter learns their aim was good. See below.
-    let ent = raycastEntities(game, _origin, _dir, Math.min(remaining, wallDist), shooter, skipThrough);
+    let ent = raycastEntities(game, _origin, _dir, Math.min(remaining, wallDist), shooter, _skipUndamageable);
 
     // Why the damage is zero decides what the shooter is shown, and the two cases are not
     // the same.
@@ -540,9 +575,9 @@ export function fireHitscan(game, o) {
     //
     // It now stops on the body and reports itself as absorbed: the shooter learns their aim
     // was good and the target was invulnerable, which is information, not a mystery.
-    // Anything the ray still returns is damageable, except a spawn-protected enemy, which
-    // `skipThrough` deliberately lets through so the round can stop and say so.
-    const absorbed = !!ent && damageScale(game, shooter, ent.entity) <= 0;
+    // Anything the ray still returns is an enemy. It may nonetheless be invulnerable, and
+    // that is judged from the tick the shooter saw.
+    const absorbed = !!ent && _absorbedFor(game, shooter, ent.entity);
 
     if (ent && ent.distance <= wallDist) {
       // ---------------------------------------------------------- entity hit
@@ -760,6 +795,9 @@ export function applyExplosionDamage(game, o) {
     _evDamage.normal.copy(_expDirWorld);
     _evDamage.weaponId = weaponId;
     _evDamage.headshot = false;
+    // Pooled with the hitscan path — see the note there. An 82-damage explosion was
+    // reporting itself as absorbed.
+    _evDamage.absorbed = false;
     game.bus?.emit('damage', _evDamage);
 
     e.applyDamage?.(amount, _evDamage);
@@ -820,6 +858,9 @@ export function applyMeleeDamage(game, attacker, hit, amount, weaponId) {
   _evHit.normal.copy(hit.normal);
   _evHit.headshot = false;
   _evHit.surface = 'flesh';
+  // Pooled with the hitscan path, which is the only place this is ever set. Left over, it
+  // labelled a real 55-damage knife as having done nothing.
+  _evHit.absorbed = false;
   game.bus?.emit('hit', _evHit);
 
   _evDamage.target = target;
@@ -830,6 +871,7 @@ export function applyMeleeDamage(game, attacker, hit, amount, weaponId) {
   _evDamage.normal.copy(hit.normal);
   _evDamage.weaponId = weaponId;
   _evDamage.headshot = false;
+  _evDamage.absorbed = false;
   game.bus?.emit('damage', _evDamage);
 
   target.applyDamage?.(amount, _evDamage);

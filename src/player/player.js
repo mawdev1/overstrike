@@ -1057,6 +1057,39 @@ export class Player {
 
     this._localToggleAdsMode = s.get('toggleAds');
 
+    // ── the HELD half of the command ──────────────────────────────────────────────
+    //
+    // These eight were missing entirely, and the consequence was total: online, the server
+    // never pulled the trigger for a human player, ever. `cmd.fireHeld` was read in three
+    // places and written in none. The wire format has always reserved the bits; only the
+    // producer was absent.
+    //
+    // Everything the player saw when they shot — muzzle flash, tracer, decal, the ammo
+    // counter going down, recoil climbing, crosshair bloom — is client-side prediction,
+    // with nothing authoritative behind it. Measured on a real browser client against a
+    // real server, trigger held five seconds: client 30 rounds, magazine emptied; server
+    // 0 rounds, ammo still 30. Melee and grenades worked throughout because they ride edge
+    // bits, which is exactly the shape of the report — "the bots kill me and each other,
+    // my shots do nothing".
+    //
+    // It also silently disabled aiming down sights (so every shot used hip spread),
+    // crouch, sprint, breath hold and lean — lean moves the eye, which is the fire origin.
+    //
+    // Every test missed it because every harness hand-builds its commands with
+    // `fireHeld: true`, constructing the one field the real client never sent.
+    //
+    // Copied from `_held`, which `_refreshHeldState` has already filled this step —
+    // `MultiplayerSession.step` calls it immediately before this.
+    const h = this._held;
+    cmd.fireHeld = h.fireHeld;
+    cmd.aimButtonHeld = h.aimButtonHeld;
+    cmd.crouchHeld = h.crouchHeld;
+    cmd.toggleAdsMode = h.toggleAdsMode;
+    cmd.sprintKeyHeld = h.sprintKeyHeld;
+    cmd.breathHold = h.breathHold;
+    cmd.leanKeyHeld = h.leanKeyHeld;
+    cmd.leanRightKeyHeld = h.leanRightKeyHeld;
+
     cmd.deltaYaw = 0;
     cmd.deltaPitch = 0;
     this._lookDeltaToRadians(cmd);
@@ -1183,7 +1216,17 @@ export class Player {
 
   fixedUpdate(dt) {
     this._pumpLocalCommand();
-    this._refreshHeldState();
+    // In multiplayer the held state comes from the COMMAND being applied, and re-deriving
+    // it here from the live input device is wrong in the one case that matters: replaying
+    // unacked commands during reconciliation would re-simulate those past ticks with the
+    // buttons held NOW rather than the ones held then. `MultiplayerSession.step` refreshes
+    // this itself, once, immediately before building the command it sends, which is the
+    // only place the live device should be consulted. Same reasoning as
+    // `_pumpLocalCommand` directly above.
+    //
+    // Invisible in Node, which has no `game.input` and so returns early anyway — which is
+    // why no test caught it.
+    if (!this.game.net) this._refreshHeldState();
     this._snapshotAim();
     if (!this.game.world) return;
 

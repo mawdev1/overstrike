@@ -19,7 +19,7 @@ import { RecordingPresenter, NullPresenter } from '../src/core/presenter.js';
 import { GameServer, SNAPSHOT_INTERVAL } from '../src/net/server.js';
 import { NetClient } from '../src/net/client.js';
 import { createLoopbackPair } from '../src/net/transport.js';
-import { encodeSnapshot, decodeSnapshot, EV_KINDS } from '../src/net/protocol.js';
+import { encodeSnapshot, decodeSnapshot, EV_KINDS, HELD_BITS, EDGE_BITS } from '../src/net/protocol.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
 
 let failures = 0;
@@ -78,6 +78,15 @@ console.log('\ncombat feedback reaches the client');
   }, null), null).events[0];
   if (wd.weaponIdx === 9 && wd.headshot === true) ok('the weapon index shares the flag byte with the headshot bit');
   else bad('the weapon index survives', JSON.stringify(wd));
+
+  // `absorbed` rides another spare bit. Without it a networked shooter saw a NORMAL
+  // hitmarker for a round that did nothing to a spawn-protected enemy — a lie, and worse
+  // than showing nothing at all.
+  const ab = decodeSnapshot(encodeSnapshot({
+    ...snap, events: [{ kind: 'hitmarker', absorbed: true, headshot: false }],
+  }, null), null).events[0];
+  if (ab.absorbed === true && ab.headshot === false) ok('an absorbed hit is marked as such on the wire');
+  else bad('absorbed survives the wire', JSON.stringify(ab));
 
   // The entity block must still decode when the sender emitted no events at all.
   const bare = decodeSnapshot(encodeSnapshot({ ...snap, events: [] }, null), null);
@@ -257,6 +266,67 @@ console.log('\ncombat feedback reaches the client');
   else bad('bots are still split across both sides', `all bots on team ${[...botTeams][0]}`);
 }
 
+// ── the command a REAL client builds actually contains the trigger ───────────────────
+//
+// This is the one that mattered. `_buildLocalCommand` filled every edge and the look
+// deltas and never wrote a single HELD field — `cmd.fireHeld` was read in three places and
+// written in none. So online the server never pulled the trigger for a human player, ever:
+// measured on a real browser client, trigger held five seconds, client fired 30 rounds and
+// emptied the magazine while the server fired 0 and its ammo stayed at 30. Everything the
+// player saw was client-side prediction with nothing authoritative behind it. Melee and
+// grenades worked because they ride EDGE bits — exactly the reported shape.
+//
+// It was invisible to the whole suite because every harness in this repo (this file
+// included) hand-builds commands with `fireHeld: true`, constructing the very field the
+// real client never sent. So this asserts on `_buildLocalCommand`'s OUTPUT and enumerates
+// the wire's own field list rather than a list written out by hand — a ninth held bit
+// added tomorrow is covered automatically.
+{
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 21 });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  game.state = 'playing';
+  game.paused = false;
+
+  // A stand-in for the browser's input device, with everything pressed at once. Headless
+  // has none, and `_refreshHeldState` returns early without one.
+  const down = new Set(['forward', 'crouch', 'sprint', 'lean', 'right']);
+  game.input = {
+    fire: true, aim: true, firePressed: true, aimPressed: true,
+    isDown: (k) => down.has(k),
+    wasPressed: () => false,
+    wasReleased: () => false,
+    consumeWheel: () => 0,
+    consumeLook: (out) => { out.x = 0; out.y = 0; return out; },
+  };
+
+  const p = game.player;
+  p._refreshHeldState();
+  const cmd = p._buildLocalCommand();
+
+  const missing = HELD_BITS.filter((k) => cmd[k] === undefined);
+  if (missing.length === 0) ok(`the built command carries all ${HELD_BITS.length} held fields`);
+  else {
+    bad('the built command carries every held field',
+      `missing: ${missing.join(', ')} — the server can never act on these, and a missing ` +
+      '`fireHeld` means it never fires the player\'s gun at all');
+  }
+
+  if (cmd.fireHeld === true) ok('holding the trigger produces fireHeld=true');
+  else bad('holding the trigger produces fireHeld', `fireHeld=${cmd.fireHeld} while input.fire=true`);
+
+  if (cmd.aimButtonHeld === true) ok('holding aim produces aimButtonHeld=true (ADS reaches the server)');
+  else bad('holding aim reaches the server', `aimButtonHeld=${cmd.aimButtonHeld} — every shot would use hip spread`);
+
+  const missingEdge = EDGE_BITS.filter((k) => cmd[k] === undefined);
+  if (missingEdge.length === 0) ok(`and all ${EDGE_BITS.length} edge fields`);
+  else bad('the built command carries every edge field', `missing: ${missingEdge.join(', ')}`);
+
+  game.input = null;
+}
+
 // ── the client shoots with the server's dice ─────────────────────────────────────────
 //
 // Shot spread and recoil jitter are drawn BY ADDRESS —
@@ -297,6 +367,48 @@ console.log('\ncombat feedback reaches the client');
       'drawn from a different stream than the one the server fires');
   }
   session.dispose?.();
+}
+
+// ── the server shoots the gun the player actually picked ─────────────────────────────
+//
+// Nothing carried the loadout, so the server armed every client with the default
+// `ar_vector` whatever they chose in the armoury. While the trigger never reached the
+// server at all this was invisible; the moment it did, it became the visible bug — pick the
+// DMR and the client shows one aimed shot while the server empties 34 full-auto rounds,
+// with the wrong damage, fire rate, falloff and magazine, and a crosshair up to 4.2 degrees
+// off the authoritative gun (110 cm at 15 m).
+{
+  const { MultiplayerSession } = await import('../src/net/session.js');
+  const sg = new Game({ headless: true });
+  await sg.initHeadless({ presenter: new RecordingPresenter() });
+  sg.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 5 });
+  sg.match.phase = 'live'; sg.match.countdown = 0;
+
+  const cg = new Game({ headless: true });
+  await cg.initHeadless({ presenter: new NullPresenter() });
+  cg.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 5 });
+  cg.match.phase = 'live'; cg.match.countdown = 0;
+  cg.weapons.giveLoadout(cg.player, ['dmr_meridian', 'pistol_viper']);
+
+  const server = new GameServer(sg);
+  const [cT, sT] = createLoopbackPair({ latencyMs: 0, loss: 0 });
+  server.addClient(sT, sg.player);
+  const s2 = new MultiplayerSession(cg, cT);
+  s2.connected = true; cg.net = s2;
+  s2.sendLoadout();
+  let ms2 = 0;
+  for (let i = 0; i < 20; i++) { sT.pump(ms2); server.tick(); cT.pump(ms2); ms2 += FIXED_DT * 1000; }
+
+  const ids = (g2, p2) => g2.weapons.getLoadout(p2)?.weapons.map((w) => w.def.id).join(',');
+  const want = ids(cg, cg.player);
+  if (ids(sg, sg.player) === want) ok(`the server arms the client's own loadout (${want})`);
+  else bad("the server arms the client's loadout", `server has ${ids(sg, sg.player)}, client picked ${want}`);
+
+  // And it must survive a death: `respawn` re-gives the default.
+  sg.player.respawn?.();
+  for (let i = 0; i < 10; i++) { sT.pump(ms2); server.tick(); cT.pump(ms2); ms2 += FIXED_DT * 1000; }
+  if (ids(sg, sg.player) === want) ok('and it survives a respawn');
+  else bad('the loadout survives a respawn', `server rearmed to ${ids(sg, sg.player)} — the default`);
 }
 
 // ── a spawn-protected enemy is not a miss ────────────────────────────────────────────
@@ -356,6 +468,37 @@ console.log('\ncombat feedback reaches the client');
   else bad('the protected hit is absorbed', JSON.stringify({ absorbed: prot?.absorbed, dmg: prot?.damageDealt }));
   if (victim.health === 100) ok('the protected target really took no damage');
   else bad('the protected target takes no damage', `health ${victim.health}`);
+
+  // The `absorbed` flag lives on POOLED objects. Left set, it labelled the next clean
+  // miss — and a real explosion, and a real knife — as having done nothing.
+  stage();
+  game.match._protect.set(victim.id, game.match.elapsed + 5);
+  shoot();
+  stage();
+  game.match._protect.delete(victim.id);
+  shooter.setAngles(Math.PI / 2, 0);      // aim at nothing
+  const miss = (() => {
+    const origin = new THREE.Vector3();
+    shooter.getEyePosition(origin);
+    const dir = new THREE.Vector3(1, 0, 0);
+    return fireHitscan(game, {
+      shooter, origin, dir, damage: 30, range: 100,
+      falloffStart: 100, falloffEnd: 100, falloffMin: 1, penetration: 1, headshotMul: 2,
+      weaponId: 'ar_vector', emitShot: false, tracer: false,
+    });
+  })();
+  if (miss?.absorbed === false) ok('the absorbed flag is cleared for the next shot');
+  else bad('the absorbed flag is per-shot', `a shot that hit ${miss?.hitEntity ? 'an entity' : 'nothing'} reported absorbed=${miss?.absorbed}`);
+
+  // An absorbed round must not be credited as a hit, or accuracy reads 100% for 0 damage.
+  stage();
+  game.match._protect.set(victim.id, game.match.elapsed + 5);
+  const stBefore = game.match.statsFor?.(shooter)?.shotsHit ?? 0;
+  shoot();
+  const stAfter = game.match.statsFor?.(shooter)?.shotsHit ?? 0;
+  if (stAfter === stBefore) ok('an absorbed round is not credited as a hit');
+  else bad('an absorbed round is not credited', `shotsHit ${stBefore} -> ${stAfter} for zero damage`);
+  game.match._protect.delete(victim.id);
 
   // A TEAMMATE must still not register — a hitmarker for a friendly is a lie.
   stage();

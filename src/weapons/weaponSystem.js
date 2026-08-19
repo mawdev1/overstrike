@@ -482,7 +482,7 @@ export class WeaponInstance {
         // An absorbed round still gets a marker — the shooter's aim WAS good — but a
         // quieter, distinct one, so "they are spawn-protected" never reads as "I missed"
         // and never reads as a normal hit either.
-        game.present.hitmarker(r.headshot, owner);
+        game.present.hitmarker(r.headshot, owner, false, r.absorbed);
         if (r.absorbed) game.present.playUI('hitmarker', { volume: 0.3, rate: 0.7 });
         else game.present.playUI(r.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
       }

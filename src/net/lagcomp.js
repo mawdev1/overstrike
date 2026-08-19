@@ -159,7 +159,7 @@ export class LagCompensation {
 
       const saved = {
         x: e.position.x, y: e.position.y, z: e.position.z,
-        yaw: e.yaw, alive: e.alive,
+        yaw: e.yaw, alive: e.alive, team: e.team,
         boxes: e.hitboxes ? e.hitboxes.map((b) => ({
           ox: b.offset.x, oy: b.offset.y, oz: b.offset.z,
           sx: b.size.x, sy: b.size.y, sz: b.size.z,
@@ -170,6 +170,10 @@ export class LagCompensation {
       e.position.set(r[slot + OFF_X], r[slot + OFF_Y], r[slot + OFF_Z]);
       e.yaw = r[slot + OFF_YAW];
       e.alive = r[slot + OFF_ALIVE] > 0.5;
+      // Team is recorded and was never restored, so a friendly-fire test inside a rewind
+      // used the PRESENT team — wrong for anyone who changed sides (a rebalance, or a
+      // match restart) between the tick the shooter saw and now.
+      e.team = r[slot + OFF_TEAM];
       if (e.hitboxes) {
         for (let b = 0; b < MAX_BOXES && b < e.hitboxes.length; b++) {
           const o = OFF_BOXES + b * 6;
@@ -187,6 +191,7 @@ export class LagCompensation {
       e.position.set(s.x, s.y, s.z);
       e.yaw = s.yaw;
       e.alive = s.alive;
+      e.team = s.team;
       if (s.boxes && e.hitboxes) {
         for (let b = 0; b < s.boxes.length && b < e.hitboxes.length; b++) {
           const q = s.boxes[b];

@@ -660,6 +660,57 @@ if (engage.predictedShots > 0) {
   note('the client never fired, so the server-side chain is untested this run');
 }
 
+// ── C. the REAL input path pulls the trigger ────────────────────────────────────────
+//
+// Everything above synthesizes its own command objects, which is exactly how the whole
+// suite missed the bug that prompted this test: `_buildLocalCommand` never wrote ANY held
+// field, so `cmd.fireHeld` was read in four places and written in none, and online the
+// server never fired a human's weapon at all. Every harness hand-built the one field the
+// real client never sent.
+//
+// So this drives `game.input` — the actual mouse button — through `session.step()`, which
+// is the path a player uses, and asks the SERVER whether it fired.
+{
+  const beforeC = ((await health(true)).debug?.shots ?? []).find((x) => x.id === joined.entityId)?.n ?? 0;
+  const realFire = await page.evaluate(async () => {
+    const g = window.__GAME__;
+    const s = window.__SESSION__;
+    g.input.enabled = true;
+    g.input.buttons[0] = true;                 // hold the trigger, for real
+    let clientRounds = 0;
+    const off = g.bus.on('shot', (e) => { if (e.shooter === g.player) clientRounds++; });
+    let fireHeldInCommand = false;
+    for (let i = 0; i < 400; i++) {
+      s.step();
+      // Sampled WHILE the button is down. Checking after releasing it would assert on a
+      // command built with the trigger up, which is false for the right reason and proves
+      // nothing.
+      if (i === 200) fireHeldInCommand = g.player._buildLocalCommand().fireHeld === true;
+      await new Promise((r) => setTimeout(r, 6));
+    }
+    g.input.buttons[0] = false;
+    // Let the recoil spring settle before handing back. The aim test that follows measures
+    // client-vs-server agreement, and a burst still decaying on one side reads as a desync.
+    for (let i = 0; i < 120; i++) { s.step(); await new Promise((r) => setTimeout(r, 6)); }
+    off?.();
+    return { clientRounds, fireHeldInCommand };
+  });
+  await sleep(400);
+  const afterC = ((await health(true)).debug?.shots ?? []).find((x) => x.id === joined.entityId)?.n ?? 0;
+  const serverRounds = afterC - beforeC;
+
+  note(`real input: client fired ${realFire.clientRounds}, server fired ${serverRounds}, cmd.fireHeld=${realFire.fireHeldInCommand}`);
+  if (realFire.fireHeldInCommand) ok('the command a real client builds carries fireHeld');
+  else bad('the real client sends fireHeld', 'held state never reaches the command — the server can never fire this player\'s gun');
+
+  if (serverRounds > 0) ok(`holding the real mouse button made the SERVER fire ${serverRounds} rounds`);
+  else {
+    bad('the real input path fires on the server',
+      `the client predicted ${realFire.clientRounds} rounds and the server fired 0. Everything ` +
+      'the player sees when they shoot is prediction with nothing authoritative behind it.');
+  }
+}
+
 // What the SHOOTER experiences, as opposed to what the server records.
 //
 // Hitmarkers, blood and the flesh-hit sound are all produced by the CLIENT's own

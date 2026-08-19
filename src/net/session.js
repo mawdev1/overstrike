@@ -15,7 +15,10 @@
 import { NetClient, INTERP_DELAY_MS } from './client.js';
 import { WebSocketTransport } from './transport.js';
 import { Prediction } from './prediction.js';
-import { quantiseCommand, F_ALIVE, F_CROUCH, F_SPRINT, F_FIRING, F_ADS, F_RELOAD } from './protocol.js';
+import {
+  quantiseCommand, encodeLoadout, F_ALIVE, F_CROUCH, F_SPRINT, F_FIRING, F_ADS, F_RELOAD,
+} from './protocol.js';
+import { WEAPON_WIRE_IDX } from '../weapons/weaponDefs.js';
 import { FIXED_DT } from '../core/mathUtils.js';
 import { RemoteAvatars } from './avatars.js';
 import * as THREE from 'three';
@@ -94,6 +97,11 @@ export class MultiplayerSession {
           // owns a rule (respawning, above all), and a session opened by a test or a tool
           // must answer that question the same way one opened by the UI does.
           game.net = session;
+          session.sendLoadout();
+          // The armoury re-equips on every spawn (see `Menu`), so follow it.
+          session._offLoadout = game.bus?.on?.('spawn', (p) => {
+            if (p?.entity === game.player) session.sendLoadout();
+          });
           // The server told us which entity we drive. Bind the local player to that id so
           // snapshots about us are recognised as us.
           if (game.player) game.player.id = session.net.entityId;
@@ -159,6 +167,23 @@ export class MultiplayerSession {
     this.sendCommand({ ...cmd });
   }
 
+  /**
+   * Tell the server which guns we picked.
+   *
+   * Nothing carried this, so the server armed everyone with the default `ar_vector`
+   * whatever they chose. Called on join and again whenever the armoury re-equips, and the
+   * server remembers it — `Player.respawn` re-gives the default loadout, so without that
+   * the choice would survive exactly until the first death.
+   */
+  sendLoadout() {
+    const lo = this.game.weapons?.getLoadout?.(this.game.player);
+    const ids = lo?.weapons?.map((w) => w.def?.id).filter(Boolean) ?? [];
+    if (ids.length === 0) return;
+    const idx = ids.slice(0, 2).map((id) => WEAPON_WIRE_IDX.get(id) ?? 0);
+    while (idx.length < 2) idx.push(idx[0] ?? 0);
+    this.transport.send(encodeLoadout(idx[0], idx[1]));
+  }
+
   _onSnapshot(snap) {
     if (!this.synced) { this._syncToServer(snap); return; }
     this.prediction?.reconcile(snap);
@@ -186,8 +211,9 @@ export class MultiplayerSession {
     for (const ev of events) {
       switch (ev.kind) {
         case 'hitmarker':
-          present.hitmarker(ev.headshot);
-          present.playUI(ev.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
+          present.hitmarker(ev.headshot, null, false, ev.absorbed);
+          if (ev.absorbed) present.playUI('hitmarker', { volume: 0.3, rate: 0.7 });
+          else present.playUI(ev.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
           break;
 
         case 'fire': {

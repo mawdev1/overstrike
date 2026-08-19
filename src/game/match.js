@@ -386,6 +386,9 @@ export class Match {
   }
 
   _onHit(p) {
+    // An absorbed round stopped on a spawn-protected enemy and did nothing. Counting it
+    // as a hit credited 100% accuracy for zero damage.
+    if (p?.absorbed) return;
     const shooter = this._resolveAttacker(p?.shooter);
     const st = this.statsFor(shooter);
     if (!st || st._hitThisShot) return;

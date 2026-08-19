@@ -145,8 +145,24 @@ else bad('both pages receive snapshots', `${aRes.snapshots} / ${bRes.snapshots}`
 const aSeenByBEnd = bRes.remotes.find((r) => r.id === A.joined.entityId);
 if (aSeenByBStart && aSeenByBEnd) {
   const seen = Math.hypot(aSeenByBEnd.x - aSeenByBStart.x, aSeenByBEnd.z - aSeenByBStart.z);
-  if (seen > 1.5) ok(`page B watched page A move ${seen.toFixed(2)} m`);
-  else bad('each page sees the other move', `B saw A move only ${seen.toFixed(3)} m`);
+  // Measured against how far A ACTUALLY went, not against a fixed metre count.
+  //
+  // How much simulation fits in a fixed number of driver iterations swings with machine
+  // load — Chromium under SwiftShader is ~10 fps — and A also walks into geometry, so the
+  // absolute distance varied from 1.05 m to 6.07 m on a build that was working. The
+  // property under test is not "A travelled far", it is "B saw what A did", and that holds
+  // whatever the load. A tiny floor still catches a total failure to transmit movement.
+  const truth = Math.hypot(aRes.self.x - (before[0].self?.x ?? aRes.self.x),
+    aRes.self.z - (before[0].self?.z ?? aRes.self.z));
+  const ratio = truth > 0.05 ? seen / truth : 0;
+  if (truth < 0.3) {
+    bad('page A actually moved', `A only travelled ${truth.toFixed(3)} m — the driver never got going`);
+  } else if (ratio > 0.6 && ratio < 1.6) {
+    ok(`page B watched page A move ${seen.toFixed(2)} m of A's own ${truth.toFixed(2)} m`);
+  } else {
+    bad('each page sees the other move',
+      `A travelled ${truth.toFixed(2)} m and B saw ${seen.toFixed(2)} m of it (ratio ${ratio.toFixed(2)})`);
+  }
 } else {
   bad('page B can see page A', `start=${!!aSeenByBStart} end=${!!aSeenByBEnd}`);
 }

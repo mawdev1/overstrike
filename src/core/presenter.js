@@ -62,8 +62,12 @@ export class LivePresenter {
   flashDamage(amount) { this.game.engine?.flashDamage?.(amount); }
 
   // ── hud ────────────────────────────────────────────────────────────────────────
-  /** `kill` upgrades it to the kill variant — the one that tells you they went down. */
-  hitmarker(headshot, _owner, kill) { this.game.hud?.hitmarker?.(headshot, kill); }
+  /**
+   * `kill` upgrades it to the kill variant — the one that tells you they went down.
+   * `absorbed` means the round stopped on a spawn-protected enemy and did nothing; the
+   * caller plays a muted cue for it, so this must never read as a normal hit.
+   */
+  hitmarker(headshot, _owner, kill, absorbed) { this.game.hud?.hitmarker?.(headshot && !absorbed, kill); }
   setAmmo(ammo, reserve) { this.game.hud?.setAmmo?.(ammo, reserve); }
   setWeapon(def) { this.game.hud?.setWeapon?.(def); }
   setEquipment(lethal, tactical) { this.game.hud?.setEquipment?.(lethal, tactical); }
@@ -143,7 +147,12 @@ export class RecordingPresenter extends NullPresenter {
   _push(kind, to, extra) { this.events.push(Object.assign({ kind, to: to ?? null }, extra)); }
 
   // ── the shooter's own confirmation ─────────────────────────────────────────────
-  hitmarker(headshot, owner) { this._push('hitmarker', owner?.id, { headshot: !!headshot }); }
+  hitmarker(headshot, owner, kill, absorbed) {
+    // `absorbed` has to travel. Without it a networked shooter was shown a NORMAL hitmarker
+    // for a round that did zero damage to a spawn-protected enemy — which is worse than
+    // showing nothing, because it tells them they hurt someone they did not.
+    this._push('hitmarker', owner?.id, { headshot: !!headshot && !absorbed, absorbed: !!absorbed });
+  }
 
   // Kills and damage are deliberately NOT recorded here, because this is the wrong seam
   // for them. `Match._killfeed` returns early unless the HUD opts out of self-feeding, so
