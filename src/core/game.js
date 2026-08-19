@@ -90,6 +90,8 @@ export class Game {
     /** Single source of entity ids — see allocEntityId. */
     this._entityIdSeq = 0;
     this._rosterVersion = 0;
+    /** Remote players on a server — see addEntity. */
+    this._extraEntities = [];
     this._entIndexVersion = -1;
     this._entIndex = null;
 
@@ -603,7 +605,35 @@ export class Game {
     out.length = 0;
     if (this.player) out.push(this.player);
     if (this.bots) for (const b of this.bots.bots) out.push(b);
+    for (let i = 0; i < this._extraEntities.length; i++) out.push(this._extraEntities[i]);
     return out;
+  }
+
+  /**
+   * Register an entity that is neither the local player nor a bot.
+   *
+   * Remote players, server-side. They are ordinary `Player` instances — command-driven
+   * since Phase 2, so nothing about them needs to know where the commands came from —
+   * but they are not `game.player`, which means "the one this machine's input drives" and
+   * on a server means nobody.
+   *
+   * Ordering is append-only and stable, which matters: `entities` is iterated by
+   * ballistics and by the match, and a set that reordered itself would make results
+   * depend on join order.
+   */
+  addEntity(e) {
+    if (!e || this._extraEntities.includes(e)) return e;
+    this._extraEntities.push(e);
+    this.rosterChanged();
+    return e;
+  }
+
+  removeEntity(e) {
+    const i = this._extraEntities.indexOf(e);
+    if (i < 0) return false;
+    this._extraEntities.splice(i, 1);
+    this.rosterChanged();
+    return true;
   }
 
   /**

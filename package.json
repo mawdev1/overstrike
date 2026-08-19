@@ -15,7 +15,8 @@
     "simtest": "node scripts/simtest.mjs",
     "determinism": "node scripts/determinism.mjs",
     "presenttest": "node scripts/presenttest.mjs",
-    "headless": "node scripts/headless.mjs --ticks=7200"
+    "headless": "node scripts/headless.mjs --ticks=7200",
+    "nettest": "node scripts/nettest.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"
