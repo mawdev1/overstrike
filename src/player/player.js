@@ -779,8 +779,10 @@ export class Player {
       dirWorld.set(0, -1, 0);
     }
 
-    this.game.bus?.emit('playerDamaged', { amount: dmg, dirWorld });
-    this.game.present.flashDamage(clamp(dmg / 55, 0.12, 1), this);
+    // `entity` so a server can route this to the right client. Without it the event says
+    // only "somebody was hurt", which on a machine simulating twelve people is useless.
+    this.game.bus?.emit('playerDamaged', { entity: this, amount: dmg, dirWorld });
+    this.game.present.flashDamage(clamp(dmg / 55, 0.12, 1));
     // Aim-moving (sim) and presentation-only (punch/shake) — see damageKick(). Called
     // directly, not through game.present: the sim half must run without a presenter.
     this.damageKick(dirWorld, clamp(dmg / 40, 0.15, 1.4));
@@ -793,8 +795,16 @@ export class Player {
     return dmg;
   }
 
-  /** Kill the player. Ballistics owns the `kill` event — we never duplicate it. */
-  die(info) {
+  /**
+   * Kill the player. Ballistics owns the `kill` event — we never duplicate it.
+   *
+   * `opts.notifyMatch = false` performs the death without telling the local `Match`. That
+   * is for a networked client being told by the server that it died: the SERVER's match
+   * owns respawn timing and scoring, and letting the client's own match also queue a
+   * respawn had it calling `Spawner.spawnEntity` on a roster it does not own — which threw
+   * and, through `_safe`, isolated `match.fixed` for the rest of the session.
+   */
+  die(info, opts) {
     if (!this.alive) return;
     this.alive = false;
     this.health = 0;
@@ -822,7 +832,7 @@ export class Player {
     this.game.present.cameraStartDeathCam(this, killer && killer !== this ? killer.position : null);
 
     // The match owns respawn/score rules. Tell it both ways it may be listening.
-    callAny(this.game.match, M_DEATH, this, info);
+    if (opts?.notifyMatch !== false) callAny(this.game.match, M_DEATH, this, info);
     this.game.bus?.emit('playerDied', { entity: this, attacker: killer, info: info ?? null });
   }
 

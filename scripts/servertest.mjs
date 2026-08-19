@@ -30,6 +30,9 @@ const ok = (n) => console.log(`  ok   ${n}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const health = async () => (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+const debug = async () => (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
+/** Total rounds that have LANDED, across every attacker/target pair. */
+const totalHits = (d) => (d.debug?.damage ?? []).reduce((a, r) => a + (r.hits || 0), 0);
 
 console.log('\nthe dedicated server survives a round boundary');
 
@@ -39,8 +42,12 @@ const gs = spawn(
   { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
 );
 let log = '';
+let exited = null;
 gs.stdout.on('data', (d) => { log += d; });
 gs.stderr.on('data', (d) => { log += d; });
+// A server that dies mid-test must say so. Without this the only symptom is `fetch
+// failed`, which reads like a flaky harness and hides a real crash.
+gs.on('exit', (code, signal) => { exited = { code, signal }; });
 
 try {
   let up = false;
@@ -82,24 +89,42 @@ try {
     else bad('the server clock stays monotonic', `tick went BACKWARDS: ${first.tick} -> ${after.tick}`);
 
     // And the thing that actually matters: combat works again after the restart.
-    // 8 bots in a 22 m arena kill each other every few seconds; a window this size is
-    // several times the observed gap, so a zero here means combat is genuinely dead rather
-    // than merely slow. (An earlier version of this check used 4 bots and 8 seconds, which
-    // is BELOW the normal kill interval — it failed on a working server.)
-    const s0 = await health();
-    await sleep(20000);
-    const s1 = await health();
-    const before = (s0.scores ?? []).reduce((a, b) => a + b, 0);
-    const now = (s1.scores ?? []).reduce((a, b) => a + b, 0);
-    if (now > before) ok(`bots are fighting after the restart (+${now - before} kills in 20 s)`);
+    // Measured on HITS LANDED, not kills. A kill on an 8-bot server arrives roughly every
+    // 8-10 seconds, so a kill-counting window has to be long to be reliable and was flaky
+    // at 20 s — it failed twice on a server that was demonstrably fighting. Rounds landing
+    // is the same signal an order of magnitude more often, and it is the thing that
+    // actually goes to zero on a dead server: `Match.canFire` false makes ballistics zero
+    // ALL damage, so not one hit is recorded.
+    // POLLED, not a fixed window. Two things make a fixed window lie here: the round can
+    // end again mid-sample, and damage is correctly zero during the intermission; and on a
+    // loaded machine the whole cycle drifts. So watch until hits increase while the match
+    // is actually live, and only conclude "dead" if they never do.
+    const base = totalHits(await debug());
+    let landed = 0;
+    let liveSamples = 0;
+    const until = Date.now() + 45000;
+    while (Date.now() < until && landed <= 0) {
+      await sleep(2000);
+      const d = await debug();
+      if ((d.debug?.matchPhase ?? d.phase) === 'live') liveSamples++;
+      landed = totalHits(d) - base;
+    }
+    if (landed > 0) ok(`combat is live after the restart (${landed} rounds landed)`);
     else {
-      bad('bots fight after the restart',
-        `no kills in 20 s (scores ${JSON.stringify(s0.scores)} -> ${JSON.stringify(s1.scores)}).\n` +
-        '       A restarted match that scores nothing is the dead-server symptom again.');
+      bad('combat is live after the restart',
+        `ZERO rounds landed across every attacker/target pair over 45 s ` +
+        `(${liveSamples} samples with the match live).\n` +
+        '       That is the dead-server signature: damage is being zeroed, not merely scarce.');
     }
   }
 } catch (e) {
-  if (!failures) bad('the test ran', e.message);
+  if (exited) {
+    bad('the server stays up for a whole test',
+      `the server process exited (code ${exited.code}, signal ${exited.signal}) mid-run.\n` +
+      `       ${e.message}\n       server log tail: ${log.slice(-900)}`);
+  } else if (!failures) {
+    bad('the test ran', `${e.message}\n       server log tail: ${log.slice(-900)}`);
+  }
 } finally {
   gs.kill('SIGKILL');
 }

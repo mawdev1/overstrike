@@ -539,6 +539,12 @@ export class Game {
    * per frame, for no reason (§11 — no per-frame allocation).
    */
   _safe(system, phase, obj, method, arg) {
+    // A missing subsystem is absence, not a fault. A dedicated server has no local player
+    // (`game.player` is null there — nobody's input drives an entity on that machine), and
+    // treating that as a throw made `_safe` isolate `player.fixed` for the whole session
+    // on the first tick, which is the "a system silently stopped four minutes in" failure
+    // this method exists to make loud. Nothing else changes: a real throw still isolates.
+    if (!obj) return;
     try {
       obj[method](arg);
     } catch (err) {
@@ -565,6 +571,18 @@ export class Game {
     // rules. Each is isolated so a fault in the AI cannot stop the match clock.
     this._safe('nav', 'fixed', this.nav, 'fixedUpdate', dt);
     this._safe('player', 'fixed', this.player, 'fixedUpdate', dt);
+    // Networked players, on a server. They are ordinary command-driven `Player`s and they
+    // have to be STEPPED like one — this loop did not exist, so every client after the
+    // first was registered, snapshotted, lag-compensated and shootable, and never moved a
+    // centimetre no matter what it sent. Measured: client 1 moved 6.019 m over 300
+    // commands, client 2 moved 0.000 m over the same 300.
+    //
+    // `nettest` asserted that an idle second client "stayed put", which it did, for the
+    // wrong reason — the test passed on a statue.
+    for (let i = 0; i < this._extraEntities.length; i++) {
+      // Keyed per entity, so one client whose step throws cannot silence everybody else's.
+      this._safe(`entity${i}`, 'fixed', this._extraEntities[i], 'fixedUpdate', dt);
+    }
     this._safe('bots', 'fixed', this.bots, 'fixedUpdate', dt);
     this._safe('weapons', 'fixed', this.weapons, 'fixedUpdate', dt);
     this._safe('projectiles', 'fixed', this.projectiles, 'fixedUpdate', dt);

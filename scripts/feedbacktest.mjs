@@ -80,16 +80,11 @@ console.log('\ncombat feedback reaches the client');
 {
   const rec = new RecordingPresenter();
   rec.hitmarker(true, { id: 42 });
-  rec.flashDamage(30, { id: 99 });
   rec.muzzleFlash(new THREE.Vector3(1, 2, 3), new THREE.Vector3(0, 0, -1), 0.9, { id: 7 });
 
   const hm = rec.events.find((e) => e.kind === 'hitmarker');
   if (hm?.to === 42) ok('a hitmarker is addressed to the shooter');
   else bad('a hitmarker is addressed to the shooter', JSON.stringify(hm));
-
-  const dmg = rec.events.find((e) => e.kind === 'damaged');
-  if (dmg?.to === 99) ok('a damage flash is addressed to the victim');
-  else bad('a damage flash is addressed to the victim', JSON.stringify(dmg));
 
   const fire = rec.events.find((e) => e.kind === 'fire');
   if (fire && fire.to === null) ok('a gunshot is addressed to everyone');
@@ -170,6 +165,25 @@ console.log('\ncombat feedback reaches the client');
     const fires = received.filter((e) => e.kind === 'fire');
     if (fires.length > 0) ok(`gunshots are broadcast (${fires.length} seen)`);
     else bad('gunshots are broadcast', 'no fire events reached the client');
+
+    // The kill event is the one a review caught missing entirely: it used to be routed
+    // through `present.killfeed`, which `Match._killfeed` never calls on a headless
+    // server. Measured over 60 s of a real match: 9 kills, 0 kill events on the wire.
+    const kills = received.filter((e) => e.kind === 'kill');
+    if (kills.length > 0) {
+      ok(`kills reach the client (${kills.length}, killer ${kills[0].killerId} -> victim ${kills[0].victimId})`);
+    } else {
+      bad('kills reach the client',
+        `the target died on the server but NO kill event was sent — no killfeed, no kill ` +
+        `marker, no XP.\n       events seen: ${JSON.stringify([...new Set(received.map((e) => e.kind))])}`);
+    }
+
+    // And damage taken must be routed to the victim, with the real damage figure so the
+    // flash and the hurt sound scale the way they do in single player.
+    const dmgs = received.filter((e) => e.kind === 'damaged');
+    if (dmgs.length === 0) ok('the shooter took no damage in this scenario (nothing to route)');
+    else if (dmgs.every((d) => d.amount > 1)) ok(`damage events carry real damage (${dmgs.map((d) => d.amount).join(', ')})`);
+    else bad('damage events carry real damage', `amounts ${JSON.stringify(dmgs.map((d) => d.amount))} — a 0..1 intensity was sent instead of the damage`);
   }
 }
 
@@ -214,6 +228,88 @@ console.log('\ncombat feedback reaches the client');
   const botTeams = new Set(game.bots.bots.map((b) => b.team));
   if (botTeams.size > 1) ok('bots are still split across both sides');
   else bad('bots are still split across both sides', `all bots on team ${[...botTeams][0]}`);
+}
+
+// ── the client believes the server about being alive ─────────────────────────────────
+//
+// `Prediction._correct` set health, armour, height and lean and never touched `alive`, and
+// it only ran when the POSITION had also mispredicted. Two consequences, both severe:
+// a player standing still while being shot watched their HUD hold at 100, and a player the
+// server had killed went on believing they were alive indefinitely. The server discards a
+// dead player's commands, so from that moment every shot they fired silently did nothing.
+{
+  const { MultiplayerSession } = await import('../src/net/session.js');
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 3 });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+
+  const cgame = new Game({ headless: true });
+  await cgame.initHeadless({ presenter: new NullPresenter() });
+  cgame.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 3 });
+  cgame.match.phase = 'live';
+  cgame.match.countdown = 0;
+
+  const server = new GameServer(game);
+  const [cT, sT] = createLoopbackPair({ latencyMs: 0, loss: 0 });
+  server.addClient(sT, game.player);
+  const session = new MultiplayerSession(cgame, cT);
+
+  let ms = 0;
+  const step = (n) => {
+    for (let i = 0; i < n; i++) {
+      const cmd = emptyCommand();
+      cmd.tick = session.net.latestTick;
+      if (session.connected) session.sendCommand(cmd);
+      sT.pump(ms);
+      server.tick();
+      cT.pump(ms);
+      ms += FIXED_DT * 1000;
+    }
+  };
+  // Let the welcome land, then bind exactly as `MultiplayerSession.connect` does.
+  step(20);
+  if (session.net.entityId) {
+    cgame.player.id = session.net.entityId;
+    const { Prediction } = await import('../src/net/prediction.js');
+    session.prediction = new Prediction(cgame, cgame.player, session.net);
+    session.connected = true;
+  }
+  step(40);
+
+  // Hurt the server's copy while the client stands perfectly still, so position never
+  // mispredicts and the old code path would never have run at all.
+  game.player.health = 42;
+  step(30);
+  // Compared against the server's health NOW, not against 42: health regenerates, so the
+  // authoritative value has moved on by the time the snapshot lands. What matters is that
+  // the client tracks it rather than sitting at full.
+  const sh = game.player.health;
+  const ch = cgame.player.health;
+  if (Math.abs(ch - sh) < 2 && ch < 95) ok(`health syncs on a perfect position prediction (${ch.toFixed(0)} vs ${sh.toFixed(0)})`);
+  else bad('health syncs while standing still', `client ${ch.toFixed(1)}, server ${sh.toFixed(1)}`);
+
+  // The side we are on is the server's to decide. Forcing the server's copy onto team 1
+  // must reach the client, or its rigs are coloured against the wrong allegiance.
+  game.player.team = 1;
+  step(30);
+  if (cgame.player.team === 1) ok('the client adopts the team the server put it on');
+  else {
+    bad('the client adopts its team',
+      `server team 1, client team ${cgame.player.team} — every teammate would be drawn in ` +
+      'enemy colours and every enemy in friendly colours');
+  }
+
+  // Now kill it outright.
+  game.player.die?.(null);
+  step(40);
+  if (!cgame.player.alive) ok('the client learns it is dead');
+  else {
+    bad('the client learns it is dead',
+      'server says dead, client still alive — every shot this player fires from now on is ' +
+      'discarded by the server and they will never see a hit again');
+  }
 }
 
 console.log(failures ? `\n${failures} check(s) failed\n` : '\nfeedback survives the round trip\n');

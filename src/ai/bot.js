@@ -2222,13 +2222,14 @@ export class Bot {
     const nav = this.game.nav;
     this.moveMode = 'combat';
     _v6.set(this.lastKnown.x, this.lastKnown.y + EYE_STAND, this.lastKnown.z);
-    // 13 m, not 6. A bot only fires at a target it can SEE (`targetVisible`), so when the
-    // sightline breaks this is the entire mechanism for getting it back. At 6 m the search
-    // failed constantly in the market hall and around the warehouse — measured, a bot held
-    // the player as its target on 40% of thinks and had line of sight on 1.6% of those,
-    // and fired ZERO rounds in 25 seconds. Widening the ring to roughly one room means the
-    // query usually has a cell to offer.
-    const p = nav?.visiblePointNear?.(this.position, _v6, 13, _v4);
+    // The radius stays at 6. Widening it to 13 looked obviously right and measured inert:
+    // `visiblePointNear` keeps only the 64 nearest candidates in a fixed buffer and
+    // LOS-tests the 10 nearest of those, so at CELL = 0.75 the tested set is capped at a
+    // ~3.4 m ring and the radius stops mattering. Over 6000 real (searcher, target) pairs
+    // on this map: identical 26.0% success rate, ZERO cases where 13 m found a cell 6 m
+    // missed, and 4.12x the scan cost. If this needs to reach further, the lever is the
+    // candidate cap in `navGrid.visiblePointNear`, not this number.
+    const p = nav?.visiblePointNear?.(this.position, _v6, 6, _v4);
     if (p) { this.setDestination(p, 1.0); return; }
 
     // Nothing nearby can see it. Walk AT the last known position rather than doing

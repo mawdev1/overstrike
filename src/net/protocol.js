@@ -240,7 +240,8 @@ export const ENTITY_FIELDS = [
  */
 export const EV_KINDS = ['hitmarker', 'kill', 'fire', 'damaged', 'death', 'respawn'];
 const EV_CODE = new Map(EV_KINDS.map((k, i) => [k, i]));
-const EV_FIRE = EV_CODE.get('fire');
+/** Kinds that carry a vec3 payload: a muzzle position, or the direction damage came from. */
+const EV_VEC3 = new Set([EV_CODE.get('fire'), EV_CODE.get('damaged')]);
 
 export const F_ALIVE = 1 << 0;
 export const F_CROUCH = 1 << 1;
@@ -316,7 +317,7 @@ export function encodeSnapshot(snap, baseline) {
     v.setUint32(o, (ev.entityId ?? ev.killerId ?? 0) >>> 0, true); o += 4;
     v.setUint32(o, (ev.victimId ?? 0) >>> 0, true); o += 4;
     v.setUint16(o, Math.max(0, Math.min(65535, ev.amount ?? 0)), true); o += 2;
-    if (code === EV_FIRE) {
+    if (EV_VEC3.has(code)) {
       v.setFloat32(o, ev.x ?? 0, true); o += 4;
       v.setFloat32(o, ev.y ?? 0, true); o += 4;
       v.setFloat32(o, ev.z ?? 0, true); o += 4;
@@ -374,7 +375,7 @@ export function decodeSnapshot(buf, baseline) {
       const victimId = v.getUint32(o, true); o += 4;
       const amount = v.getUint16(o, true); o += 2;
       const ev = { kind: EV_KINDS[code] ?? 'unknown', headshot, victimId, amount };
-      if (code === EV_FIRE) {
+      if (EV_VEC3.has(code)) {
         ev.entityId = a;
         ev.x = v.getFloat32(o, true); o += 4;
         ev.y = v.getFloat32(o, true); o += 4;

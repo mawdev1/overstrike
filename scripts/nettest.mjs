@@ -224,6 +224,23 @@ console.log('\ntwo clients');
   if (movedB < 0.5) ok(`the idle client stayed put (${movedB.toFixed(3)} m)`);
   else bad('the idle client stayed put', `moved ${movedB.toFixed(2)} m — commands are reaching the wrong entity`);
 
+  // ...and now make B move, which is the half this was missing.
+  //
+  // "The idle client stayed put" passed for years on a client that COULD NOT MOVE:
+  // `Game._fixedUpdate` stepped `player` and `bots` and never `_extraEntities`, so every
+  // client after the first was snapshotted, lag-compensated and shootable, and completely
+  // inert. Asserting only that a thing does not happen cannot tell a working brake from a
+  // missing engine.
+  const startB2 = b.entity.position.clone();
+  run(s, 240, (cmd, t, c) => { if (c === b) cmd.wishForward = 1; });
+  const movedB2 = b.entity.position.distanceTo(startB2);
+  if (movedB2 > 1) ok(`the second client can move too (${movedB2.toFixed(2)} m)`);
+  else {
+    bad('the second client can move',
+      `${movedB2.toFixed(3)} m after 240 forward commands — it is registered and shootable ` +
+      'but never simulated, so every player after the first is a statue');
+  }
+
   // Each client must see BOTH entities, or there is no multiplayer.
   const seen = a.client.snapshots.at(-1)?.entities.length ?? 0;
   if (seen >= 2) ok(`a client's snapshot carries all ${seen} entities`);

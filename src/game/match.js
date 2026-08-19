@@ -669,7 +669,22 @@ export class Match {
     }
   }
 
+  /**
+   * Put the dead back in the world.
+   *
+   * Skipped entirely on a networked CLIENT. The server owns respawn timing, spawn choice
+   * and the roster; a client running this too was spawning entities from its own shadow
+   * copy — including bots it had already torn down at join — which threw inside
+   * `Spawner.spawnEntity` and, through `Game._safe`, isolated `match.fixed` for the whole
+   * session. From then on the match clock, scoring and spawn protection were all dead on
+   * that client.
+   */
   _updateRespawns(dt) {
+    if (this.game.net) return;
+    return this._updateRespawnsImpl(dt);
+  }
+
+  _updateRespawnsImpl(dt) {
     if (this._respawns.length === 0) return;
     const now = this.elapsed;
     // Scored spawning is the single most expensive thing this class does (a full

@@ -103,6 +103,33 @@ export class GameServer {
     this._nextClientId = 1;
     this._snapCounter = 0;
     this.lag = new LagCompensation(game);
+
+    // Kills and damage come off the BUS, not off the presenter.
+    //
+    // `Match._killfeed` only calls `present.killfeed` for a HUD that opts out of
+    // self-feeding, and a headless server has no HUD at all — so routing kills through the
+    // presenter produced exactly nothing on a real server, measured over 60 s: 9 kills,
+    // 0 kill events. The bus is where the data actually is, and it is also what every
+    // client-side consumer (killfeed, XP pops, streak chips, damage arrows) already
+    // listens to, so the client can simply re-emit and light all of them up at once.
+    game.bus?.on('kill', (p) => {
+      this._record({
+        kind: 'kill', to: null,
+        killerId: p?.attacker?.id ?? 0,
+        victimId: p?.victim?.id ?? 0,
+        headshot: !!p?.headshot,
+      });
+    });
+    game.bus?.on('playerDamaged', (p) => {
+      const id = p?.entity?.id;
+      if (!id) return;
+      const d = p.dirWorld;
+      this._record({
+        kind: 'damaged', to: id,
+        amount: Math.max(0, Math.min(65535, Math.round(p.amount ?? 0))),
+        x: d?.x ?? 0, y: d?.y ?? 0, z: d?.z ?? 0,
+      });
+    });
     // Ballistics reaches for this by name — see `raycastEntities`. Set here rather than
     // in Game, because only a server ever rewinds.
     game.lagcomp = this.lag;
@@ -158,6 +185,11 @@ export class GameServer {
     }
   }
 
+  /** Buffer one feedback event for the next snapshot, respecting the cap. */
+  _record(ev) {
+    if (this._pendingEvents.length < MAX_PENDING_EVENTS) this._pendingEvents.push(ev);
+  }
+
   /** Advance the simulation one fixed step, consuming at most one command per client. */
   tick() {
     for (const session of this.clients.values()) {
@@ -194,9 +226,7 @@ export class GameServer {
     // every burst's hitmarkers would be dropped on the floor.
     const rec = this.game.present;
     if (rec?.events?.length) {
-      for (const ev of rec.events) {
-        if (this._pendingEvents.length < MAX_PENDING_EVENTS) this._pendingEvents.push(ev);
-      }
+      for (const ev of rec.events) this._record(ev);
       rec.clear();
     }
 

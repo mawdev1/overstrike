@@ -46,6 +46,8 @@ export class MultiplayerSession {
     /** Rigs for everyone this client does not simulate. Built lazily, browser only. */
     this.avatars = null;
     this.stats = { commandsSent: 0, joinCorrectionM: 0 };
+    /** id -> stand-in object, so kill events can be identity-compared. See `_entityFor`. */
+    this._stubs = new Map();
 
     this.net.onSnapshot((snap) => this._onSnapshot(snap));
   }
@@ -66,6 +68,10 @@ export class MultiplayerSession {
         if (session.net.entityId) {
           clearInterval(poll);
           session.connected = true;
+          // Set here, not only by the menu: several things ask `game.net` to decide who
+          // owns a rule (respawning, above all), and a session opened by a test or a tool
+          // must answer that question the same way one opened by the UI does.
+          game.net = session;
           // The server told us which entity we drive. Bind the local player to that id so
           // snapshots about us are recognised as us.
           if (game.player) game.player.id = session.net.entityId;
@@ -174,27 +180,37 @@ export class MultiplayerSession {
           break;
         }
 
-        case 'damaged':
+        case 'damaged': {
+          // The same two calls `Player.applyDamage` makes locally, from the same raw
+          // damage figure — so a graze and a sniper round look and sound as different here
+          // as they do in single player. An earlier version sent a 0..1 intensity and
+          // divided it by 55 again on arrival, which pinned every hit to the minimum.
+          _fx.set(ev.x, ev.y, ev.z);
+          g.bus?.emit('playerDamaged', { entity: g.player, amount: ev.amount, dirWorld: _fx });
           present.flashDamage(Math.max(0.12, Math.min(1, ev.amount / 55)));
           present.play('hurt', { volume: Math.max(0.45, Math.min(1, 0.45 + ev.amount / 90)) });
           break;
+        }
 
-        case 'kill': {
-          const killer = this.remotes.get(ev.killerId);
-          const victim = this.remotes.get(ev.victimId);
-          present.killfeed({
-            attacker: null, victim: null,
+        case 'kill':
+          // Re-emitted onto the local bus rather than pushed at the HUD, because the HUD
+          // already subscribes to `kill` and does far more with it than draw a killfeed
+          // row: the kill hitmarker, XP pops, the streak chip, the death screen. Feeding
+          // the bus gets all of that for free and keeps one code path.
+          //
+          // The listeners compare entity IDENTITY (`p.attacker === me`), and the wire
+          // carries only ids, so both ends are resolved to stable objects first.
+          g.bus?.emit('kill', {
+            attacker: this._entityFor(ev.killerId),
+            victim: this._entityFor(ev.victimId),
+            headshot: ev.headshot,
             killer: this._nameFor(ev.killerId),
             victimName: this._nameFor(ev.victimId),
-            killerTeam: killer?.team ?? (ev.killerId === mineId ? g.player?.team ?? -1 : -1),
-            victimTeam: victim?.team ?? (ev.victimId === mineId ? g.player?.team ?? -1 : -1),
+            killerTeam: this._teamFor(ev.killerId),
+            victimTeam: this._teamFor(ev.victimId),
             mine: ev.killerId === mineId || ev.victimId === mineId,
-            headshot: ev.headshot,
           });
-          // The kill variant of the hitmarker, for the shooter only.
-          if (ev.killerId === mineId && ev.victimId !== mineId) present.hitmarker(ev.headshot, null, true);
           break;
-        }
 
         case 'death':
           if (ev.victimId !== mineId) break;
@@ -202,7 +218,7 @@ export class MultiplayerSession {
             killer: null,
             killerName: this._nameFor(ev.killerId),
             killerHealth: this.remotes.get(ev.killerId)?.health ?? 0,
-            respawnIn: 0,
+            respawnIn: (ev.amount || 0) / 100,
           });
           break;
 
@@ -220,6 +236,32 @@ export class MultiplayerSession {
     if (!id) return 'UNKNOWN';
     if (id === this.net.entityId) return this.game.player?.name || 'YOU';
     return `PLAYER ${id}`;
+  }
+
+  _teamFor(id) {
+    if (!id) return -1;
+    if (id === this.net.entityId) return this.game.player?.team ?? -1;
+    return this.remotes.get(id)?.team ?? -1;
+  }
+
+  /**
+   * A stable object for a networked id, so identity comparisons work.
+   *
+   * The HUD asks `p.attacker === game.player` to decide whether a kill was yours. That is
+   * an identity test, and the wire has only numbers — so our own id must resolve to the
+   * real local Player, and everyone else to one cached stand-in each. Caching matters: a
+   * fresh object per event would compare unequal to itself between two kills.
+   */
+  _entityFor(id) {
+    if (!id) return null;
+    if (id === this.net.entityId) return this.game.player;
+    let stub = this._stubs.get(id);
+    if (!stub) {
+      stub = { id, name: `PLAYER ${id}`, isPlayer: false, isRemote: true, team: -1 };
+      this._stubs.set(id, stub);
+    }
+    stub.team = this.remotes.get(id)?.team ?? stub.team;
+    return stub;
   }
 
   /**
@@ -245,6 +287,11 @@ export class MultiplayerSession {
       p.velocity.set(wire.vx, wire.vy, wire.vz);
       p.health = wire.health;
       p.armor = wire.armor;
+      // Adopted at join as well as on every later snapshot: the rigs for everyone already
+      // on the server are built the moment the first frame is drawn, and colouring them
+      // against a team we are about to be told is wrong shows the whole lobby in the
+      // wrong kit until the first correction.
+      if (typeof wire.team === 'number') p.team = wire.team;
       // Aim included, and ONLY here: this is the one moment the server legitimately
       // decides where we are looking. After this, aim is the client's alone.
       p.setAngles(wire.yaw, wire.pitch);

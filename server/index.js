@@ -37,6 +37,17 @@ game.match.phase = 'live';
 game.match.countdown = 0;
 if (TIME_LIMIT > 0) game.match.timeLimit = TIME_LIMIT;
 
+// There is no local player on a dedicated server, so stop carrying one.
+//
+// `Game` always builds a `Player`, and the server used to hand it to the FIRST client that
+// connected. When that client left it was never removed — `sock.on('close')` only removes
+// entities it created — so an idle, invulnerable, permanently team-0 body stood on a spawn
+// point for the life of the process: rendered by every client, counted when balancing
+// teams, and a free kill for whoever wandered past. Nulling it removes it from
+// `game.entities` outright (see the getter), which also lets `Match._assignTeams` deal
+// every human properly instead of pinning one of them to team 0 forever.
+game.player = null;
+
 const server = new GameServer(game);
 console.log(`[server] map built: ${game.world.boxes.length} colliders, ${game.world.spawnPoints.length} spawns, ${BOTS} bots`);
 
@@ -104,6 +115,11 @@ function restartMatch() {
     e.health = e.maxHealth ?? 100;
     e.alive = true;
     e.respawn?.();
+    // Clear the death screen of anyone who was dead when the round ended. `restartMatch`
+    // revives them directly, bypassing `Match._updateRespawns` — the only place that ever
+    // emits the clear — so without this a player comes back alive, moving and shootable
+    // while still staring at a full-screen death overlay until they die again.
+    game.present.deathScreen?.(null, e);
     // The bot roster is rebuilt with fresh ids, so every client's delta baseline now
     // describes entities that no longer exist. Force a keyframe rather than coding the
     // next snapshot against a roster that has been replaced.
@@ -274,13 +290,10 @@ wss.on('connection', (sock, req) => {
   }
   const transport = new WsServerTransport(sock);
 
-  // The first connection takes `game.player`, which a Game always builds; later ones get
-  // their own registered entity. See GameServer.addClient — the asymmetry is a wart, not
-  // a design.
-  let entity = game.player;
-  const taken = new Set([...server.clients.values()].map((c) => c.entity));
-  if (taken.has(entity)) {
-    entity = new Player(game);
+  // Every connection gets its OWN entity. There is no "first client takes game.player"
+  // asymmetry any more — see the note where `game.player` is nulled.
+  const entity = new Player(game);
+  {
     entity.init();
     game.addEntity(entity);
     game.weapons.giveLoadout(entity, ['ar_vector', 'pistol_sidewinder']);
@@ -299,7 +312,7 @@ wss.on('connection', (sock, req) => {
 
   sock.on('close', () => {
     server.removeClient(session);
-    if (entity !== game.player) game.removeEntity(entity);
+    game.removeEntity(entity);
     console.log(`[server] client ${session.id} left (${server.clients.size} online)`);
   });
 });

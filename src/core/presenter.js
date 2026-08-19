@@ -145,15 +145,14 @@ export class RecordingPresenter extends NullPresenter {
   // ── the shooter's own confirmation ─────────────────────────────────────────────
   hitmarker(headshot, owner) { this._push('hitmarker', owner?.id, { headshot: !!headshot }); }
 
-  // ── everyone's ─────────────────────────────────────────────────────────────────
-  killfeed(evt) {
-    this._push('kill', null, {
-      // `evt.killer` is a NAME string in this event — the entity ref is `attacker`.
-      killerId: evt?.attacker?.id ?? 0,
-      victimId: evt?.victim?.id ?? 0,
-      headshot: !!evt?.headshot,
-    });
-  }
+  // Kills and damage are deliberately NOT recorded here, because this is the wrong seam
+  // for them. `Match._killfeed` returns early unless the HUD opts out of self-feeding, so
+  // on a headless server `present.killfeed` is never called at all; and
+  // `present.flashDamage` takes a 0..1 intensity, which carries neither the damage nor the
+  // direction it came from. Both ride the `kill` and `playerDamaged` bus events instead —
+  // see `GameServer`. That also means the client can re-emit them onto its own bus and
+  // feed exactly the listeners single player feeds: killfeed, XP pops, streak chips,
+  // directional damage arrows.
 
   /**
    * A gunshot, as a discrete event.
@@ -175,7 +174,6 @@ export class RecordingPresenter extends NullPresenter {
   //
   // Routed by ENTITY, not by "the player": on a server every one of these is somebody's,
   // and the one thing that must never happen is showing a damage flash to the wrong client.
-  flashDamage(amount, owner) { this._push('damaged', owner?.id, { amount: Math.round(amount ?? 0) }); }
   /**
    * `deathScreen(null, owner)` is the CLEAR — the respawn, not a death. It must be routed
    * to the one client that respawned; letting a null event fall through to `to: null` would
@@ -184,6 +182,10 @@ export class RecordingPresenter extends NullPresenter {
   deathScreen(evt, owner) {
     if (!evt) { this._push('respawn', owner?.id, {}); return; }
     if (evt.victim?.id == null) return;
-    this._push('death', evt.victim.id, { killerId: evt.killer?.id ?? 0 });
+    // Centiseconds: the wire field is a u16, and the client shows this as a countdown.
+    this._push('death', evt.victim.id, {
+      killerId: evt.killer?.id ?? 0,
+      amount: Math.max(0, Math.min(65535, Math.round((evt.respawnIn ?? 0) * 100))),
+    });
   }
 }

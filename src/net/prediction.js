@@ -32,6 +32,13 @@ import { FIXED_DT } from '../core/mathUtils.js';
 import { PLAYER_SNAPSHOT } from '../player/player.js';
 import { saveLoadout, restoreLoadout } from '../weapons/weaponSystem.js';
 import { NullPresenter } from '../core/presenter.js';
+import { F_ALIVE } from './protocol.js';
+
+/**
+ * Snapshots to ignore after a death or respawn before trusting the living-error metrics.
+ * Half a second at 120 Hz — long enough for the correction and the replay behind it.
+ */
+const LIFE_SETTLE_TICKS = 60;
 
 /**
  * How far the prediction may be from the server before it is corrected, in metres.
@@ -60,6 +67,8 @@ export class Prediction {
     this.history = new Map();
     /** Shots predicted but not yet confirmed, so a rejected one can be unwound. */
     this.pendingShots = new Map();
+    /** Tick of the last death or respawn. See LIFE_SETTLE_TICKS. */
+    this._lifeChangeTick = 0;
 
     this.stats = {
       corrections: 0, replayedCommands: 0, worstError: 0,
@@ -173,7 +182,16 @@ export class Prediction {
       };
     }
 
-    const bothAlive = mine.player.alive && !!(wire.flags & 1);
+    // A death or a respawn moves the player by the width of the map, and no amount of
+    // prediction can or should track that — the client cannot know where the server will
+    // put it. Those frames are excluded from the LIVING error metrics, which exist to
+    // measure ordinary movement misprediction. This needs a settling window and not just
+    // `bothAlive`: on the frame after a respawn the client's own history says it was alive
+    // and the wire says it is alive, while the position it predicted belongs to where it
+    // died. Before the client synced `alive` at all it never died locally, so this case
+    // could not arise and the window was not needed.
+    const settling = this._lifeChangeTick > 0 && (snap.tick - this._lifeChangeTick) < LIFE_SETTLE_TICKS;
+    const bothAlive = mine.player.alive && !!(wire.flags & 1) && !settling;
     if (bothAlive) {
       const grounded = mine.player.grounded && mine.player.moveState !== 'air';
       if (grounded) {
@@ -198,6 +216,12 @@ export class Prediction {
       this.stats.respawnCorrections++;
     }
 
+    // Life state is authoritative on EVERY snapshot, and deliberately outside the
+    // tolerance check below. Health used to be applied only inside `_correct`, which runs
+    // only when the POSITION also mispredicted — so a player standing still and being shot
+    // watched their HUD sit at 100 while the server killed them.
+    this._syncLife(wire);
+
     if (posErr <= POSITION_TOLERANCE && velErr <= VELOCITY_TOLERANCE) {
       this._trim(snap.lastCommandSeq);
       return false;
@@ -205,6 +229,52 @@ export class Prediction {
 
     this._correct(wire, mine, snap.lastCommandSeq);
     return true;
+  }
+
+  /**
+   * Adopt the server's verdict on whether we are alive, and on how hurt we are.
+   *
+   * `_correct` set health, armour, height and lean and never touched `alive`. Nothing else
+   * in `src/net/` assigns it on the local player either, so a client that the server had
+   * killed went on believing it was alive — indefinitely. That is not a cosmetic desync:
+   * the server discards a dead player's commands, so from the player's side every shot
+   * after their first death silently did nothing, forever. It is the most complete version
+   * of "none of my shots are hitting" the codebase can produce.
+   *
+   * The transitions are driven through the entity's own `die`/`respawn` rather than by
+   * assigning the flag, because both do real work — stopping the trigger, dropping ADS,
+   * starting the death cam — that a bare assignment would skip.
+   */
+  _syncLife(wire) {
+    const e = this.entity;
+    const serverAlive = (wire.flags & F_ALIVE) !== 0;
+
+    if (e.alive && !serverAlive) {
+      this._lifeChangeTick = this.game.tick;
+      // Not `notifyMatch`: the server's match owns respawn timing and scoring, and this
+      // client's own match must not start queueing respawns for an entity it does not run.
+      e.die(null, { notifyMatch: false });
+      e.health = 0;
+      return;
+    }
+
+    if (!e.alive && serverAlive) {
+      this._lifeChangeTick = this.game.tick;
+      e.respawn?.();
+      // `respawn` picks a spawn point locally, which is not the one the server used. Take
+      // the server's, immediately, so the frame after coming back is not a teleport.
+      e.position.set(wire.x, wire.y, wire.z);
+      e.velocity.set(wire.vx, wire.vy, wire.vz);
+    }
+
+    e.health = wire.health;
+    e.armor = wire.armor;
+    // The side we are on is the server's to decide, and nothing else ever told us. The
+    // client's own `startMatch` pins the local player to team 0, so every client the
+    // server dealt onto team 1 kept believing it was on team 0 — and since remote rigs are
+    // coloured by ABSOLUTE team, half of all players saw their teammates in enemy kit and
+    // their enemies in friendly kit.
+    if (typeof wire.team === 'number') e.team = wire.team;
   }
 
   _correct(wire, mine, ackedSeq) {
