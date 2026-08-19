@@ -19,12 +19,19 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 8123;
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
+const note = (n) => console.log(`  --   ${n}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 console.log('\ndedicated server over a real WebSocket');
 
-const child = spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${PORT}`, '--bots=2'], {
+// No bots on this server. This block measures the SOCKET — that each command's aim delta
+// is integrated exactly once — and a bot killing the client mid-measurement respawns it,
+// which resets aim to the spawn angle and silently eats part of the turn. That is what
+// made this assertion bimodal (0.22 / 0.86 / 0.96 rad depending on whether and when the
+// client happened to die), and it read as load-related flakiness for several runs.
+// `npm run headless` is where bots fighting is asserted.
+const child = spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${PORT}`, '--bots=0'], {
   cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverLog = '';
@@ -51,44 +58,40 @@ if (health.tick > 0) ok(`the match is ticking without any client (tick ${health.
 else bad('the match ticks with no client', 'tick is still 0 — a lobby that never simulates');
 
 // ── play a client ────────────────────────────────────────────────────────────────────
-const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
-ws.binaryType = 'arraybuffer';
-let entityId = 0, welcomed = false, snapshots = 0, lastSnap = null;
-const held = [];
+//
+// Driven through the REAL `NetClient`, not a hand-rolled decoder.
+//
+// The first version reimplemented snapshot decoding here, and it drifted from the client
+// it was meant to be testing: it lost delta baselines, so omitted (unchanged) fields
+// decoded as 0 and the entity's yaw read back as a fraction of what the server actually
+// had. That produced 0.22 / 0.81 / 0.96 rad on identical runs and cost several rounds of
+// chasing load, packet drops and bot kills. A test of the wire should exercise the code
+// that reads the wire.
+const { NetClient } = await import('../src/net/client.js');
 
 /**
- * `ws` hands back a Buffer by default and an ArrayBuffer when `binaryType` is set; a
- * browser always gives an ArrayBuffer. A Buffer's underlying pool is also larger than its
- * view, so slicing by offset+length matters — copying the whole `.buffer` would hand the
- * decoder several unrelated messages' bytes.
+ * `ws` hands back a Buffer by default; a browser always gives an ArrayBuffer. A Buffer's
+ * underlying pool is larger than its view, so slicing by offset+length matters — copying
+ * the whole `.buffer` would hand the decoder several unrelated messages' bytes.
  */
 const toArrayBuffer = (d) => (d instanceof ArrayBuffer
   ? d
   : d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
 
-ws.on('message', (data) => {
-  const ab = toArrayBuffer(data);
-  const v = new DataView(ab);
-  const type = v.getUint8(0);
-  if (type === MSG_WELCOME) {
-    welcomed = true;
-    entityId = v.getUint32(5, true);
-    return;
-  }
-  if (type !== MSG_SNAPSHOT) return;
-  snapshots++;
-  const base = held.find((s) => s.tick === v.getUint32(6, true)) || null;
-  const snap = decodeSnapshot(ab, base);
-  held.push(snap);
-  while (held.length > 40) held.shift();
-  lastSnap = snap;
-});
+/** Adapts a `ws` socket to the transport interface `NetClient` expects. */
+function wsTransport(sock) {
+  let handler = null;
+  sock.on('message', (data) => handler?.(toArrayBuffer(data)));
+  return {
+    onMessage(fn) { handler = fn; },
+    send(buf) { if (sock.readyState === 1) sock.send(Buffer.from(buf), { binary: true }); },
+    close() { try { sock.close(); } catch { /* already gone */ } },
+    pump() {},
+  };
+}
 
-await new Promise((r, j) => { ws.on('open', r); ws.on('error', j); });
-await sleep(300);
-
-if (welcomed && entityId > 0) ok(`the server assigned entity ${entityId} on connect`);
-else bad('the server sends a welcome', `welcomed=${welcomed} entityId=${entityId}`);
+const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+const client = new NetClient(wsTransport(ws));
 
 const emptyCommand = () => ({
   wishForward: 0, wishRight: 0, jump: false, crouchPressed: false, reload: false,
@@ -100,20 +103,27 @@ const emptyCommand = () => ({
   baseYaw: 0, basePitch: 0, tick: 0,
 });
 
-const startWire = lastSnap?.entities.find((e) => e.id === entityId);
+await new Promise((r, j) => { ws.on('open', r); ws.on('error', j); });
+// Wait for the welcome AND for a snapshot that mentions us, so the baseline exists before
+// anything is measured against it.
+for (let i = 0; i < 100 && !client.entityId; i++) await sleep(20);
+const entityId = client.entityId;
+if (entityId > 0) ok(`the server assigned entity ${entityId} on connect`);
+else bad('the server sends a welcome', 'no welcome arrived');
+for (let i = 0; i < 100 && !client.latestEntity(entityId); i++) await sleep(20);
+
+const startWire = client.latestEntity(entityId);
 
 // Hold forward for two seconds of wall clock, at roughly the tick rate.
-let seq = 1;
 let baseYaw = 0;
 for (let i = 0; i < 240; i++) {
   const cmd = emptyCommand();
-  cmd.seq = seq++;
   cmd.wishForward = 1;
   cmd.deltaYaw = 0.004;
   baseYaw += Math.fround(0.004);
   cmd.baseYaw = baseYaw;
-  quantiseCommand(cmd);
-  ws.send(Buffer.from(encodeCommands([cmd])));
+  cmd.tick = client.latestTick;
+  client.sendCommand(cmd);
   // Slower than the 8.33 ms tick on purpose. A client that sends FASTER than the server
   // ticks builds a queue the server caps and then drops from, which is correct server
   // behaviour (it is how you stop someone acting ten times by sending ten times) but
@@ -122,14 +132,27 @@ for (let i = 0; i < 240; i++) {
 }
 await sleep(300);
 
-const endWire = lastSnap?.entities.find((e) => e.id === entityId);
+const getHealth = async () => {
+  try { return await (await fetch(`http://127.0.0.1:${PORT}/health`)).json(); } catch (e) {
+    bad('the server is still alive', `${e.message}\n       last server output:\n${serverLog.slice(-900)}`);
+    return null;
+  }
+};
+
+const endWire = client.latestEntity(entityId);
+// Fetched here rather than below, because the aim assertion needs the applied-command
+// count to derive its expectation.
+const health2 = await getHealth();
+if (!health2) { child.kill('SIGKILL'); process.exit(1); }
+const sess = health2.sessions?.[0];
 // The strongest single check here: every command sent over a real socket was consumed
 // exactly once. If commands are being dropped, the movement and aim assertions below
 // still "pass" at a lower threshold and say nothing about why.
-const sent = seq - 1;
-const consumed = lastSnap?.lastCommandSeq ?? 0;
+const sent = client.stats.sent;
+const consumed = client.lastAckedSeq;
 if (consumed === sent) ok(`the server acked all ${sent} commands sent over the socket`);
 else bad('every command sent is acked', `sent ${sent}, server acked ${consumed}`);
+const snapshots = client.stats.snapshots;
 if (snapshots > 20) ok(`received ${snapshots} snapshots over the socket`);
 else bad('snapshots arrive over a real socket', `only ${snapshots}`);
 
@@ -138,22 +161,56 @@ if (startWire && endWire) {
   if (moved > 1) ok(`commands sent over the socket moved the entity ${moved.toFixed(2)} m`);
   else bad('commands over a real socket move the entity', `moved ${moved.toFixed(3)} m`);
 
-  const turned = Math.abs(endWire.yaw - startWire.yaw);
-  if (turned > 0.5) ok(`aim deltas applied over the socket (${turned.toFixed(2)} rad)`);
-  else bad('aim deltas apply over a real socket', `turned ${turned.toFixed(3)} rad`);
+  // Compared against what the server ACTUALLY applied, not against a fixed total.
+  //
+  // Expecting 240 x 0.004 assumed every command was consumed within the measurement
+  // window, which is a statement about the machine's timing rather than about the socket:
+  // under load the same code turned 0.218 rad and failed, and idle it turns 0.96 and
+  // passes. Deriving the expectation from the applied count tests the thing that matters —
+  // that each command's delta was integrated exactly once — and is immune to how many of
+  // them the window happened to cover.
+  // Aim is measured in its own STATIONARY phase below, not here.
+  //
+  // Measuring it during the walk conflated two things: a client holding forward
+  // eventually walks off something, dies, and respawns — which resets position AND
+  // angles. The tell was that the turn and the distance shrank by the same factor on a
+  // failing run (0.218 rad with 2.81 m, against 0.96 rad with 11.2 m), which is a
+  // respawn, not a lost packet. I chased load, packet drops, bot kills and angle wrapping
+  // before reading those two numbers next to each other.
 } else {
   bad('the client sees its own entity', `start=${!!startWire} end=${!!endWire}`);
 }
 
-const getHealth = async () => {
-  try { return await (await fetch(`http://127.0.0.1:${PORT}/health`)).json(); } catch (e) {
-    bad('the server is still alive', `${e.message}\n       last server output:\n${serverLog.slice(-900)}`);
-    return null;
+// ── aim, measured standing still ─────────────────────────────────────────────────────
+{
+  const before = client.latestEntity(entityId);
+  const beforeCommands = sess?.commands ?? 0;
+  let yaw = before?.yaw ?? 0;
+  for (let i = 0; i < 120; i++) {
+    const cmd = emptyCommand();          // no movement at all: cannot fall, cannot die
+    cmd.deltaYaw = 0.004;
+    yaw += Math.fround(0.004);
+    cmd.baseYaw = yaw;
+    cmd.tick = client.latestTick;
+    client.sendCommand(cmd);
+    await sleep(11);
   }
-};
+  await sleep(400);
+  const after = client.latestEntity(entityId);
+  const h = await getHealth();
+  const applied = (h?.sessions?.[0]?.commands ?? 0) - beforeCommands;
+  const wrap = (d) => { let x = d; while (x > Math.PI) x -= Math.PI * 2; while (x < -Math.PI) x += Math.PI * 2; return x; };
+  const turned = Math.abs(wrap((after?.yaw ?? 0) - (before?.yaw ?? 0)));
+  const expected = applied * Math.fround(0.004);
+  if (applied > 100 && Math.abs(turned - expected) < 0.02) {
+    ok(`aim deltas applied exactly once each (${turned.toFixed(3)} rad over ${applied} commands)`);
+  } else {
+    bad('aim deltas apply over a real socket',
+      `turned ${turned.toFixed(3)} rad, expected ${expected.toFixed(3)} from ${applied} applied commands`);
+  }
+}
 
-const h2 = await getHealth();
-if (!h2) { child.kill('SIGKILL'); process.exit(1); }
+const h2 = health2;
 if (h2.clients === 1) ok('health reports the connected client');
 else bad('health reports connected clients', `clients=${h2.clients}`);
 if (h2.ticksBehind === 0) ok('the server kept up with real time (0 ticks dropped)');
@@ -162,7 +219,6 @@ else bad('the server keeps up with real time', `${h2.ticksBehind} ticks dropped`
 // The check `lastCommandSeq` cannot make. A client outrunning the tick rate has its
 // OLDEST commands dropped while the newest still ack, so the ack alone looks perfect
 // while a quarter of the player's input has vanished.
-const sess = h2.sessions?.[0];
 if (sess && sess.dropped === 0) ok(`no commands were dropped from the queue (${sess.commands} applied)`);
 else bad('no commands are dropped from the queue',
   `${sess?.dropped} dropped, ${sess?.commands} applied of ${sent} sent — the client is outrunning the tick rate`);
@@ -172,7 +228,8 @@ else bad('no commands are dropped from the queue',
 ws.close();
 await sleep(500);
 const h3 = await getHealth();
-if (h3 && h3.clients === 0) ok('the session is released on disconnect');
+if (h3 === null) note('server already gone at disconnect check');
+else if (h3.clients === 0) ok('the session is released on disconnect');
 else bad('sessions are released on disconnect', `clients=${h3.clients} after close`);
 
 // SIGTERM is what Fly sends. It must exit rather than be killed.

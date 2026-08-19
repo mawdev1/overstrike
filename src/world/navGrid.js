@@ -49,10 +49,21 @@ const NODE_BUDGET = 1800;      // hard cap on expansions; best partial path is r
 // best partial always stops directly under the goal and the bot livelocks
 // there, re-pathing to the same spot forever. Multi-level goals are rare, so
 // they get a larger one-off budget instead.
-// 5000 is the measured knee on an 86x86 m two-storey map: enough to find the
-// stairs in two hops, ~1.2 ms worst case, and it only ever runs for a
-// cross-layer goal.
-const NODE_BUDGET_MULTI = 5000;
+// 5000 was measured against a goal one storey up. It is not enough for two.
+// Re-measured, spawn -> every roof point of interest on the shipping map:
+//
+//   budget   5000 -> 59/252 goals actually reached, 0.75 ms/search
+//   budget  10000 -> 216/252,                       1.17 ms/search
+//   budget  20000 -> 216/252,                       1.19 ms/search
+//
+// So 5000 sat just under the knee for an 8 m goal and the search gave up in the
+// hall below the roof every time — which is why the roof stair, the mezzanine
+// stair and the rampart were unreachable in practice even though the bake says
+// they are connected. 10000 is the real knee: everything past it buys nothing
+// because the remaining failures are goals that genuinely have no route.
+// Cost is bounded by BotManager's one-search-per-two-ticks budget, and only a
+// cross-layer goal ever draws on it.
+const NODE_BUDGET_MULTI = 10000;
 const REV_CAP = 4096;
 
 const _v1 = new THREE.Vector3();
@@ -97,6 +108,7 @@ export class NavGrid {
     this.linkMask = null;      // Uint8Array, bit d = direction d is traversable
     this.dropMask = null;      // Uint8Array, bit d = that link is a one-way drop
     this.linkLayer = null;     // Uint8Array(node*8) — destination layer for direction d
+    this.reachable = null;     // Uint8Array — forward-reachable from a spawn point
 
     // --- A* scratch (allocated once)
     this._gScore = null;
@@ -227,6 +239,7 @@ export class NavGrid {
     this.linkMask = new Uint8Array(n);
     this.dropMask = new Uint8Array(n);
     this.linkLayer = new Uint8Array(n * 8);
+    this.reachable = new Uint8Array(n);
 
     this._gScore = new Float32Array(n);
     this._fScore = new Float32Array(n);
@@ -238,8 +251,10 @@ export class NavGrid {
     const { start, list } = this._rasterizeBoxes(boxes);
     this._bakeColumns(boxes, start, list);
     this._bakeLinks();
-
+    // Before _bakeReachability, which seeds itself through `nodeAt` — and `nodeAt`
+    // refuses to answer until the grid says it is ready.
     this.ready = true;
+    this._bakeReachability();
     this.stats.bakeMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
 
     let walkable = 0;
@@ -470,6 +485,63 @@ export class NavGrid {
     }
   }
 
+  /**
+   * Which nodes a bot that starts at a spawn point can actually walk to.
+   *
+   * The bake is generous — it calls any box top with headroom walkable — so the grid
+   * contains a lot of surface no one can get to: perimeter parapets, the tops of the
+   * skyline blocks, decorative ledges. Measured on the shipping map that is 4129 of
+   * 15997 walkable nodes, ALL of the 983 at y=15 and every node above y=8.
+   *
+   * That is harmless while the AI only ever samples the ground, and actively dangerous
+   * the moment it does not: `samplePoints` would hand the sweep board a point of
+   * interest on an unclimbable roof, `findPath` would return the best partial (which
+   * stops directly underneath it), and the bot would stand there re-pathing until the
+   * patrol timer expired. So the set is computed once, here, and anything that picks a
+   * DESTINATION filters by it.
+   *
+   * Forward BFS, because drops are one-way: reachability means "a bot can get there",
+   * not "the surfaces touch". If the world has no spawn points yet, everything is
+   * marked reachable, which is exactly the pre-existing behaviour.
+   */
+  _bakeReachability() {
+    const reach = this.reachable;
+    const spawns = this.world?.spawnPoints;
+    if (!spawns || spawns.length === 0) { reach.fill(1); return; }
+
+    // Each node is pushed at most once (it is marked as it is pushed), so this is
+    // an exact bound. One-off bake allocation; nothing here runs per frame.
+    const queue = new Int32Array(this.nodeCount);
+    let top = 0;
+    for (let i = 0; i < spawns.length; i++) {
+      const p = spawns[i]?.position;
+      if (!p) continue;
+      // +0.2: a spawn sits ON the floor, and nodeAt prefers a surface at or below.
+      const node = this.nodeAt(p.x, p.y + 0.2, p.z);
+      if (node >= 0 && !reach[node]) { reach[node] = 1; queue[top++] = node; }
+    }
+    if (top === 0) { reach.fill(1); return; }
+
+    const cols = this.cols, rows = this.rows;
+    const flags = this.flags, linkMask = this.linkMask, linkLayer = this.linkLayer;
+    while (top > 0) {
+      const cur = queue[--top];
+      const col = (cur / MAX_LAYERS) | 0;
+      const cx = col % cols, cz = (col / cols) | 0;
+      const mask = linkMask[cur];
+      if (mask === 0) continue;
+      for (let d = 0; d < 8; d++) {
+        if (!(mask & (1 << d))) continue;
+        const nx = cx + DX[d], nz = cz + DZ[d];
+        if (nx < 0 || nz < 0 || nx >= cols || nz >= rows) continue;
+        const nn = (nz * cols + nx) * MAX_LAYERS + linkLayer[cur * 8 + d];
+        if (!(flags[nn] & F_WALKABLE) || reach[nn]) continue;
+        reach[nn] = 1;
+        queue[top++] = nn;
+      }
+    }
+  }
+
   // ------------------------------------------------------------------- queries
 
   colOf(x, z) {
@@ -509,11 +581,20 @@ export class NavGrid {
     return out;
   }
 
-  /** Nearest walkable node centre to `pos`. Returns `out` or null. */
-  nearestWalkable(pos, out = _scratchPoint) {
+  /**
+   * Nearest walkable node centre to `pos`. Returns `out` or null.
+   *
+   * Prefers a node a bot can actually get to. The bake calls the top of every skyline
+   * block walkable, so an unfiltered nearest-hit near the map edge snapped destinations
+   * onto 15 m roofs with no route up — a retreat or a flank would aim at one, walk into
+   * the wall underneath it and burn the state timer. `reachableOnly = false` is the
+   * escape hatch for callers that are locating a BODY rather than choosing a
+   * destination, where the answer must exist even if it is an island.
+   */
+  nearestWalkable(pos, out = _scratchPoint, reachableOnly = false) {
     if (!this.ready) return null;
     let node = this.nodeAt(pos.x, pos.y, pos.z);
-    if (node >= 0) return this.nodeCenter(node, out);
+    if (node >= 0 && (!reachableOnly || this.reachable[node])) return this.nodeCenter(node, out);
 
     const cx0 = Math.floor((pos.x - this.originX) / CELL);
     const cz0 = Math.floor((pos.z - this.originZ) / CELL);
@@ -529,6 +610,7 @@ export class NavGrid {
           for (let l = 0; l < n; l++) {
             const node2 = col * MAX_LAYERS + l;
             if (!(this.flags[node2] & F_WALKABLE)) continue;
+            if (reachableOnly && !this.reachable[node2]) continue;
             const ddx = this.cellCenterX(col) - pos.x;
             const ddz = this.cellCenterZ(col) - pos.z;
             const ddy = (this.floorY[node2] - pos.y) * 2.2;
@@ -539,7 +621,8 @@ export class NavGrid {
       }
       if (best >= 0) return this.nodeCenter(best, out);
     }
-    return null;
+    // Nothing reachable within ten rings — better an island than no answer at all.
+    return reachableOnly ? this.nearestWalkable(pos, out, false) : null;
   }
 
   /**
@@ -576,6 +659,76 @@ export class NavGrid {
       return this.nodeCenter(best, out);
     }
     return null;
+  }
+
+  /**
+   * A walkable cell near `pos` that is at least `minRise` metres ABOVE it — a balcony,
+   * a mezzanine, a roof. Returns `out` or null.
+   *
+   * This exists because "go upstairs" and "walk somewhere" are not the same query, and
+   * treating them as one is why bots never used the vertical half of the map. Every
+   * other destination picker resolves a point to the layer nearest the bot's own
+   * height, so a bot standing in a hall asks for a spot 6 m away and is answered with
+   * the floor it is already on — the mezzanine directly overhead is never a candidate.
+   *
+   * Deliberately LOCAL. Sending a bot to a roof across the map does not work: measured,
+   * the walk takes ~20 s, and a patrol leg lasts 14-22 s before contact or the state
+   * timer takes the bot off it, so the leg is abandoned on the stairs every time. A
+   * rise found within a few metres is a leg the bot actually completes.
+   *
+   * Scored by travel cost, not by height: the nearest way up wins, so this reads as
+   * "take those stairs" rather than "teleport to the highest thing in range". No
+   * raycasts — it is called on a state transition and must stay cheap.
+   */
+  elevatedPointNear(pos, radius, minRise, out = _scratchPoint, rng = null) {
+    if (!this.ready) return null;
+    const cells = Math.max(1, Math.round(radius / CELL));
+    const cx0 = Math.floor((pos.x - this.originX) / CELL);
+    const cz0 = Math.floor((pos.z - this.originZ) / CELL);
+    const cand = this._coverCand, score = this._coverScore;
+    const capacity = cand.length;
+    let nc = 0;
+
+    for (let dz = -cells; dz <= cells; dz++) {
+      const cz = cz0 + dz;
+      if (cz < 0 || cz >= this.rows) continue;
+      for (let dx = -cells; dx <= cells; dx++) {
+        const cx = cx0 + dx;
+        if (cx < 0 || cx >= this.cols) continue;
+        if (dx * dx + dz * dz > cells * cells) continue;
+        const col = cz * this.cols + cx;
+        const n = this.layerCount[col];
+        for (let l = 0; l < n; l++) {
+          const node = col * MAX_LAYERS + l;
+          if (!(this.flags[node] & F_WALKABLE)) continue;
+          if (this.linkMask[node] === 0 || !this.reachable[node]) continue;
+          const rise = this.floorY[node] - pos.y;
+          if (rise < minRise) continue;
+          const wx = this.cellCenterX(col), wz = this.cellCenterZ(col);
+          const s = Math.hypot(wx - pos.x, wz - pos.z) + rise * 0.8 + this.danger[node] * 3;
+          if (nc < capacity) { cand[nc] = node; score[nc] = s; nc++; }
+          else {
+            let worst = 0;
+            for (let i = 1; i < capacity; i++) if (score[i] > score[worst]) worst = i;
+            if (s < score[worst]) { cand[worst] = node; score[worst] = s; }
+          }
+        }
+      }
+    }
+    if (nc === 0) return null;
+
+    let best = 0;
+    for (let i = 1; i < nc; i++) if (score[i] < score[best]) best = i;
+    if (rng && nc > 1) {
+      // Second-best occasionally, so a squad does not stack onto one balcony corner.
+      let second = -1;
+      for (let i = 0; i < nc; i++) {
+        if (i === best) continue;
+        if (second < 0 || score[i] < score[second]) second = i;
+      }
+      if (second >= 0 && rng() < 0.35) best = second;
+    }
+    return this.nodeCenter(cand[best], out);
   }
 
   /**
@@ -673,14 +826,28 @@ export class NavGrid {
   }
 
   /**
-   * A coarse lattice of walkable ground points spanning the whole map, used by
-   * the AI as its patrol/sweep graph. Built once per match (never per frame).
+   * A coarse lattice of walkable points spanning the whole map, used by the AI as its
+   * patrol/sweep graph. Built once per match (never per frame).
    *
-   * Every `spacing` metres we take the LOWEST walkable, linked layer in that
-   * column — the street rather than the roof — so the sweep set reads as "rooms
-   * and lanes a soldier would clear". If the exact column is solid (inside a
-   * building wall) we spiral out a little rather than punching a hole in the
-   * coverage, which is what keeps the sweep from ignoring whole buildings.
+   * Two passes, and the second one is the whole reason bots use the upper half of a
+   * map at all:
+   *
+   *   1. the ground lattice — every `spacing` metres, the LOWEST walkable, linked node
+   *      in that column: the street rather than the roof. If the exact column is solid
+   *      (inside a building wall) we spiral out a little rather than punching a hole in
+   *      the coverage, which is what keeps the sweep from ignoring whole buildings.
+   *   2. the layers ABOVE it, on a finer lattice.
+   *
+   * Pass 2 used not to exist, and the consequence was not subtle: on the shipping map
+   * exactly 8 of 66 points of interest sat above y=1, all of them stairs and plinths
+   * rather than floors, so the team board could not contain a rooftop and no bot ever
+   * chose to go to one. Every stair, mezzanine and rampart in the level was dead to the
+   * AI. A roof is a POSITION, not scenery, so it has to be on the board to be contested.
+   *
+   * The finer lattice for pass 2 is deliberate: upper floors and roofs cover a small
+   * fraction of the map's footprint, so sampling them at the street's spacing lands one
+   * point on a whole rooftop, or none. Filtering by `reachable` is what stops that
+   * generosity turning into bots staring up at parapets they cannot climb.
    *
    * Fills `out` with Vector3 (reusing existing entries) and returns the count.
    */
@@ -708,11 +875,32 @@ export class NavGrid {
         n++;
       }
     }
+
+    // -- pass 2: everything above the ground layer.
+    const ustep = Math.max(1, Math.round(step * 0.5));
+    const uhalf = ustep >> 1;
+    for (let cz = uhalf; cz < this.rows && n < maxOut; cz += ustep) {
+      for (let cx = uhalf; cx < this.cols && n < maxOut; cx += ustep) {
+        const col = cz * this.cols + cx;
+        const lc = this.layerCount[col];
+        let seenGround = false;
+        for (let l = 0; l < lc && n < maxOut; l++) {
+          const node = col * MAX_LAYERS + l;
+          if (!(this.flags[node] & F_WALKABLE) || this.linkMask[node] === 0) continue;
+          // The lowest linked layer is pass 1's business, and a column whose lowest
+          // surface is already a roof (solid building underneath) got it from there.
+          if (!seenGround) { seenGround = true; continue; }
+          if (!this.reachable[node]) continue;
+          this.nodeCenter(node, vecAt(out, n));
+          n++;
+        }
+      }
+    }
     if (out.length < n) out.length = n;
     return n;
   }
 
-  /** Lowest walkable + linked node in a column, or -1. */
+  /** Lowest walkable + linked + reachable node in a column, or -1. */
   _groundNodeAt(cx, cz) {
     const col = cz * this.cols + cx;
     const lc = this.layerCount[col];
@@ -720,6 +908,10 @@ export class NavGrid {
       const node = col * MAX_LAYERS + l;
       if (!(this.flags[node] & F_WALKABLE)) continue;
       if (this.linkMask[node] === 0) continue;
+      // A column filled solid by a skyline block has exactly one walkable layer — its
+      // 15 m roof — and nothing links it to the map. Emitting it as "the ground here"
+      // put a point of interest on top of a building with no way up.
+      if (!this.reachable[node]) continue;
       return node;
     }
     return -1;

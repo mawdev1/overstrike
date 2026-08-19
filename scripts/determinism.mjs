@@ -874,7 +874,19 @@ try {
     // earlier test block in this same page session (e.g. the frozen-frame test above,
     // which fires the weapon). Zero it explicitly rather than either
     // loosening the tolerance below or getting a false failure from a previous block.
+    //
+    // ALL of it, not just punch. Punch was the only term zeroed, and the omission was
+    // live: the worst disagreement this block ever reported landed on tick 0 or 1, and
+    // it was shake left over from the 8-bot replay above (shakeAmp 0.90 on a failing
+    // run, 0.25 on a passing one). That made the tolerance a measure of how close the
+    // last grenade of the previous block went off, so any change to bot behaviour could
+    // fail a test about the player's eye. Zeroing is the right answer rather than a
+    // looser bound: a genuine eye term leaking onto the camera still shows, because the
+    // probe runs 1500 more ticks after this.
     g.player.camera.punch = 0; g.player.camera.punchVel = 0;
+    g.player.camera.shakeAmp = 0; g.player.camera.shakeTime = 0;
+    g.player.camera.bobAmp = 0;
+    g.player.camera.lagYaw = 0; g.player.camera.lagPitch = 0;
     const THREE = g.player.position.constructor;
     const o = new THREE(); const e = new THREE();
     let worstOriginVsEye = 0, worstCamVsOrigin = 0, sawStep = 0, sawLand = 0, sawSlide = 0;

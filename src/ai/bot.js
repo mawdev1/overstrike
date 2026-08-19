@@ -41,6 +41,27 @@ const SPEED_COMBAT = 3.5;
 const SPEED_CROUCH = 2.0;
 
 const WAYPOINT_RADIUS = 0.85;
+// Vertical half-window on `arrived()`. Storeys on this map are ~4 m; the path follower
+// already tolerates 1.6 m of step per waypoint, so anything past that is another floor.
+const ARRIVE_VERTICAL = 1.8;
+// How often a short-range destination pick reaches for a floor ABOVE the bot instead of
+// the one it is standing on. Tuned by measurement, not taste: the target is bots using
+// upper floors and roofs for a meaningful slice of a match without abandoning the
+// ground, where most of the map and most of the fighting is. See scripts/vertprobe.mjs.
+const HIGH_GROUND_REPOSITION = 0.45;
+const HIGH_GROUND_FLANK = 0.40;      // scaled by persona.flank (0.40 .. 1.70)
+// How long a bot will keep walking toward a floor above it before the state machine is
+// allowed to send it somewhere else. Measured: without a lock, a vertical leg survived
+// 1.7 s on average — 142 of 145 legs were overwritten by the next `investigate` or
+// `engage` think tick, which is why bots that were CHOOSING roofs still never reached
+// one. Scaled by how far the stairs are, because a flight of stairs across the map is
+// not the same commitment as the one in this room.
+const CLIMB_COMMIT_MIN = 4.0;
+const CLIMB_COMMIT_MAX = 13.0;
+// A visible enemy beyond this cancels nothing: breaking off to take the high ground on
+// a distant contact is a manoeuvre, not a lapse. Inside it, the fight is here and now
+// and walking upstairs would just be a bot ignoring someone shooting at it.
+const CLIMB_BREAK_RANGE = 16;
 const REPATH_INTERVAL = 1.15;
 const STUCK_WINDOW = 1.2;
 const STUCK_DISTANCE = 0.32;
@@ -673,6 +694,8 @@ export class Bot {
     this.repathTimer = 0;
     this.pathPending = false;
     this._pathDest = new THREE.Vector3();
+    this.climbGoal = new THREE.Vector3();
+    this.climbLock = 0;
     this._separation = new THREE.Vector3();
     this.strafeDir = 0;
     this.strafeTimer = 0;
@@ -997,6 +1020,10 @@ export class Bot {
     this.destTolerance = WAYPOINT_RADIUS;
     this.repathTimer = 0;
     this._pathDest.set(0, 0, 0);
+    // Bots are pooled across matches, so a live climb commitment would otherwise
+    // survive into the next one and make the sim a function of match history.
+    this.climbGoal.set(0, 0, 0);
+    this.climbLock = 0;
     this._separation.set(0, 0, 0);
     this.strafeDir = 0;
     this.strafeTimer = 0;
@@ -1419,6 +1446,14 @@ export class Bot {
     if (this.strafeTimer > 0) this.strafeTimer -= dt;
     if (this._sidestepTimer > 0) this._sidestepTimer -= dt;
     if (this._lookTimer > 0) this._lookTimer -= dt;
+    if (this.climbLock > 0) {
+      this.climbLock -= dt;
+      const done = Math.abs(this.position.y - this.climbGoal.y) < 1.5;
+      const pressed = this.targetVisible && this.target
+        && this.position.distanceToSquared(this.target.position) < CLIMB_BREAK_RANGE * CLIMB_BREAK_RANGE;
+      const hurt = this.game.time - this.lastDamageTime < 1.5;
+      if (done || pressed || hurt) this.climbLock = 0;
+    }
 
     this._updateStance(dt);
     this._updateAim(dt);
@@ -1720,11 +1755,26 @@ export class Bot {
     return null;
   }
 
+  /**
+   * Arrival is a 3D question on a map with floors above floors.
+   *
+   * This used to test XZ only, which is fine on a street and quietly fatal anywhere
+   * else: a bot standing on the market hall's GROUND floor is within 1.8 m — measured
+   * flat — of a point of interest on its ROOF, so it declared itself arrived, the team
+   * board marked the roof as swept, and it walked off to the next leg without ever
+   * touching a stair. Every rooftop and mezzanine destination the AI was handed
+   * resolved that way, which is why they were never visited.
+   *
+   * The vertical gate is one storey minus a bit: loose enough that stairs, kerbs and
+   * the 1.6 m the path follower already tolerates never trip it, tight enough that a
+   * different floor is a different place.
+   */
   arrived() {
     if (!this.hasDestination) return true;
     const dx = this.destination.x - this.position.x;
     const dz = this.destination.z - this.position.z;
-    return dx * dx + dz * dz < this.destTolerance * this.destTolerance;
+    if (dx * dx + dz * dz >= this.destTolerance * this.destTolerance) return false;
+    return Math.abs(this.destination.y - this.position.y) < ARRIVE_VERTICAL;
   }
 
   distanceToDestination() {
@@ -1737,6 +1787,11 @@ export class Bot {
     // every think tick, and re-running A* for a destination that has not moved
     // is pure waste — especially for a cross-layer goal, which is the one
     // search expensive enough to show up in a frame.
+    // A climb in progress outranks whatever the state machine wants next. See
+    // CLIMB_COMMIT_MIN: every other destination pick resolves to the bot's current floor,
+    // so without this the first `investigate` think tick after the stairs came into
+    // view pulled the bot straight back off them.
+    if (this.climbLock > 0 && this.climbGoal.distanceToSquared(point) > 1) return;
     const moved = this.hasDestination ? this.destination.distanceToSquared(point) : Infinity;
     this.destination.copy(point);
     this.destTolerance = tolerance;
@@ -1766,7 +1821,7 @@ export class Bot {
     // path[0] is the cell we are already standing on — skip it.
     if (n > 1 && this.path[0].distanceToSquared(this.position) < 1.2) this.pathIdx = 1;
     // No route at all: drop the destination so the state machine picks another.
-    if (n === 0) this.hasDestination = false;
+    if (n === 0) { this.hasDestination = false; this.climbLock = 0; }
     return n > 0;
   }
 
@@ -1976,7 +2031,10 @@ export class Bot {
   pickPatrolDestination() {
     const mgr = this.game.bots;
     if (mgr?.pickSweepPoint && mgr.pickSweepPoint(this, _v4)) {
-      this.setDestination(_v4, 1.8);
+      // A sweep leg onto another floor is the one that needs protecting: it is long,
+      // and the walk to the stairs looks exactly like a walk to nowhere until the bot
+      // is on them. Committing to it is what makes the board's rooftop points real.
+      if (!this.commitClimb(_v4, 1.8)) this.setDestination(_v4, 1.8);
       return;
     }
     const nav = this.game.nav;
@@ -1987,9 +2045,32 @@ export class Bot {
     else this.hasDestination = false;
   }
 
+  /**
+   * Commit to a destination on another floor: set it, and refuse to be talked out of
+   * it for a few seconds (CLIMB_COMMIT_MIN..MAX, by distance) unless a target appears.
+   */
+  commitClimb(point, tolerance) {
+    if (point.y - this.position.y < 2) return false;
+    this.climbLock = 0;                 // so setDestination below is not self-blocked
+    this.setDestination(point, tolerance);
+    if (!this.hasDestination) return false;
+    this.climbGoal.copy(point);
+    const flat = Math.hypot(point.x - this.position.x, point.z - this.position.z);
+    this.climbLock = clamp(CLIMB_COMMIT_MIN + flat / 3.5, CLIMB_COMMIT_MIN, CLIMB_COMMIT_MAX);
+    return true;
+  }
+
   pickRepositionDestination() {
     const nav = this.game.nav;
     if (!nav?.ready) { this.hasDestination = false; return; }
+    // Repositioning is the cheapest chance the AI gets to change FLOOR: it is a short
+    // leg, so unlike a cross-map patrol it survives long enough to be walked. Without
+    // this every reposition resolved to the layer the bot was already standing on and
+    // the only way up was a patrol leg that combat always interrupted.
+    if (this.rng.chance(HIGH_GROUND_REPOSITION) && nav.elevatedPointNear) {
+      const up = nav.elevatedPointNear(this.position, 10, 2.2, _v4, this.rng);
+      if (up && this.commitClimb(up, 1.2)) return;
+    }
     const p = nav.randomPointNear(this.position, this.rng.range(4, 10), _v4, this.rng);
     if (p) this.setDestination(p, 1.2);
     else this.hasDestination = false;
@@ -2004,7 +2085,7 @@ export class Bot {
     if (_v5.lengthSq() < 0.01) _v5.set(this.rng.range(-1, 1), 0, this.rng.range(-1, 1));
     _v5.normalize().multiplyScalar(this.rng.range(12, 20));
     _v6.copy(this.position).add(_v5);
-    const p = nav.nearestWalkable(_v6, _v4) || nav.randomPointNear(this.position, 14, _v4, this.rng);
+    const p = nav.nearestWalkable(_v6, _v4, true) || nav.randomPointNear(this.position, 14, _v4, this.rng);
     if (p) this.setDestination(p, 1.8);
     else this.hasDestination = false;
   }
@@ -2036,7 +2117,14 @@ export class Bot {
       this.lastKnown.y,
       this.lastKnown.z - _v5.z * back + _v5.x * lateral,
     );
-    const p = nav.nearestWalkable(_v6, _v4);
+    // Take the high ground into the contact when there is one to take. A balcony over
+    // the flank point is the same manoeuvre as a wide angle on the floor, one storey
+    // up, and it is what puts bots on roofs during a fight rather than only on patrol.
+    if (this.rng.chance(HIGH_GROUND_FLANK * this.persona.flank) && nav.elevatedPointNear) {
+      const up = nav.elevatedPointNear(_v6, 9, 2.2, _v4, this.rng);
+      if (up && this.commitClimb(up, 1.6)) return;
+    }
+    const p = nav.nearestWalkable(_v6, _v4, true);
     if (p) this.setDestination(p, 1.6);
     else this.setDestination(this.lastKnown, 2.2);
   }
