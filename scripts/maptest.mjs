@@ -424,5 +424,48 @@ let reachable = new Set();
   else bad('wall segments meet cleanly', `${unique.length}:\n       ${unique.slice(0, 6).join('\n       ')}`);
 }
 
+// ── the collider set itself is well formed ───────────────────────────────────────────
+//
+// Cheap, and it fails loudly rather than silently: an inverted or zero-extent box is
+// invisible to the sweep, so a wall authored with its coordinates the wrong way round is
+// simply not there — and nothing else in this file would notice.
+{
+  const bad2 = [];
+  for (const b of w.boxes) {
+    const w = b.max.x - b.min.x, h = b.max.y - b.min.y, d = b.max.z - b.min.z;
+    if (![b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z].every(Number.isFinite)) {
+      bad2.push(`non-finite at [${b.min.x},${b.min.y},${b.min.z}]`);
+    } else if (w <= 0 || h <= 0 || d <= 0) {
+      bad2.push(`inverted ${w.toFixed(3)}x${h.toFixed(3)}x${d.toFixed(3)} at [${b.min.x.toFixed(1)},${b.min.y.toFixed(1)},${b.min.z.toFixed(1)}]`);
+    } else if (Math.min(w, h, d) < 0.01) {
+      bad2.push(`${(Math.min(w, h, d) * 100).toFixed(1)} cm thin at [${b.min.x.toFixed(1)},${b.min.y.toFixed(1)},${b.min.z.toFixed(1)}]`);
+    }
+  }
+  if (bad2.length === 0) ok(`all ${w.boxes.length} colliders are well formed`);
+  else bad('every collider is well formed', `${bad2.length}:\n       ${bad2.slice(0, 6).join('\n       ')}`);
+}
+
+// ── there is ground everywhere ───────────────────────────────────────────────────────
+//
+// A hole in the floor is the most complete version of "walked through a wall": the player
+// leaves the map downwards and never comes back. The nav bake once had 46% of its nodes
+// underground, so this is not hypothetical geometry paranoia.
+{
+  const STEP = 0.5;
+  let sampled = 0;
+  const holes = [];
+  for (let x = w.bounds.min.x + 0.25; x <= w.bounds.max.x; x += STEP) {
+    for (let z = w.bounds.min.z + 0.25; z <= w.bounds.max.z; z += STEP) {
+      sampled++;
+      const top = w.sampleGroundHeight(x, z, 20);
+      if (!(top > -Infinity) || top < w.bounds.min.y + 0.5) {
+        if (holes.length < 8) holes.push(`(${x.toFixed(1)}, ${z.toFixed(1)})`);
+      }
+    }
+  }
+  if (holes.length === 0) ok(`solid ground under all ${sampled} sampled columns`);
+  else bad('there is ground everywhere', `${holes.length}+ columns with no floor: ${holes.join(' ')}`);
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nthe map holds up');
 process.exit(failures ? 1 : 0);
