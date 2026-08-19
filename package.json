@@ -16,10 +16,12 @@
     "determinism": "node scripts/determinism.mjs",
     "presenttest": "node scripts/presenttest.mjs",
     "headless": "node scripts/headless.mjs --ticks=7200",
-    "nettest": "node scripts/nettest.mjs"
+    "nettest": "node scripts/nettest.mjs",
+    "wstest": "node scripts/wstest.mjs"
   },
   "dependencies": {
-    "three": "^0.185.1"
+    "three": "^0.185.1",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "playwright": "^1.57.0",

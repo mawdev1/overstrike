@@ -1,0 +1,48 @@
+# OVERSTRIKE dedicated game server.
+#
+#   fly deploy --config fly.gameserver.toml --dockerfile Dockerfile.gameserver
+#
+# A SECOND app, separate from the static site (fly.toml), so the two scale and stop
+# independently. The site is stateless and idles to zero; this holds a live match in
+# memory and must not.
+app = "overstrike-gs"
+primary_region = "iad"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # The critical difference from the static site, which sets these the other way round.
+  #
+  # A game server is STATEFUL: stopping an idle machine discards the match, every
+  # connected player's entity, and the whole lag-compensation history. Worse, "idle" is
+  # measured by request traffic, which a long-lived WebSocket does not generate — so a
+  # busy match can look idle and be stopped out from under its players.
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    # Connections, not requests: a player holds one WebSocket for the whole match, so
+    # request-based limits measure nothing here.
+    type = "connections"
+    soft_limit = 12
+    hard_limit = 16
+
+  [[http_service.checks]]
+    # /health reports the tick counter, so this checks the match is actually SIMULATING
+    # rather than merely that the process is alive and accepting sockets.
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  # The simulation measured ~148x faster than real time on one core, so a shared CPU is
+  # ample for a single match. Memory is dominated by the world and the nav grid (~130 MB
+  # observed), so 512 MB leaves real headroom.
+  size = "shared-cpu-1x"
+  memory = "512mb"

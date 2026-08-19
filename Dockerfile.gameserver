@@ -1,0 +1,30 @@
+# The OVERSTRIKE dedicated game server.
+#
+# Built from the REPOSITORY ROOT, not from server/ — it copies both `src/` (the actual
+# simulation, shared with the browser client) and `server/`, so the build context has to
+# contain both:
+#
+#   fly deploy --config fly.gameserver.toml --dockerfile Dockerfile.gameserver
+#
+# Separate image and separate Fly app from the static site: the site is stateless and
+# should stop when idle, this holds a live match and must not.
+FROM node:22-slim
+
+WORKDIR /app
+
+# Manifest first, so editing a source file does not invalidate the dependency layer.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# The server imports the game's own source directly. That is the whole point of the
+# conversion — one simulation, not a server reimplementation that drifts from the client.
+COPY src ./src
+COPY server ./server
+
+ENV NODE_ENV=production
+ENV PORT=8080
+EXPOSE 8080
+
+# No init shim: index.js installs SIGTERM/SIGINT handlers and exits cleanly on its own,
+# which scripts/wstest.mjs asserts.
+CMD ["node", "server/index.js"]
