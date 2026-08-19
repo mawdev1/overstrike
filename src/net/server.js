@@ -20,7 +20,7 @@
  */
 import { FIXED_DT, PITCH_LIMIT } from '../core/mathUtils.js';
 import {
-  MSG_COMMANDS, MSG_WELCOME, decodeCommands, encodeSnapshot, entityToWire,
+  MSG_COMMANDS, MSG_WELCOME, decodeCommands, encodeSnapshot, entityToWire, EV_SPATIAL,
 } from './protocol.js';
 import { LagCompensation } from './lagcomp.js';
 import { INTERP_DELAY_MS } from './client.js';
@@ -30,6 +30,21 @@ export const SNAPSHOT_INTERVAL = 4;
 
 /** Feedback events buffered between snapshots. A grenade in a crowd is the worst case. */
 const MAX_PENDING_EVENTS = 256;
+
+/**
+ * Beyond this, a spatial event is not sent to a client at all.
+ *
+ * Gunshots are broadcast, one per shot per shooter, at 24 bytes. Uncapped that is a real
+ * cost: measured, twenty shooters firing full-auto adds 5.86 KiB/s per client against a
+ * ~10 KiB/s baseline — a 59% increase — and 70 KiB/s aggregate upstream, for effects that
+ * are mostly on the far side of the map. The server knows both positions, so the cheapest
+ * possible fix is also the right one.
+ *
+ * Set above the client's own VFX range so audio, which culls itself and matters most for
+ * shots you CANNOT see, still arrives.
+ */
+const EVENT_RANGE_M = 90;
+const EVENT_RANGE_SQ = EVENT_RANGE_M * EVENT_RANGE_M;
 
 /**
  * How far a client's own aim may drift from the server's before it is snapped.
@@ -50,6 +65,29 @@ const AIM_RESYNC_RAD = 0.05;
  * laggy, since its most recent intent is the one that matters.
  */
 const MAX_QUEUED_COMMANDS = 32;
+
+/**
+ * How much command backlog a client is allowed to keep.
+ *
+ * The server consumes exactly one command per tick and never catches up, so a backlog is
+ * permanent input latency: measured, a single 250 ms hitch on a 60 ms link left 28 commands
+ * queued and they were still queued 25 seconds later — +233 ms of lag on every input, for
+ * the rest of the session, from one transient stall.
+ *
+ * Worse, `_updateRtt` derives the round trip from how old the consumed command is, so a
+ * backlogged client's estimate pinned at MAX_RTT_MS. Lag compensation then rewound the full
+ * 225 ms for someone whose real latency was 60 ms — they were killing people who had been
+ * behind cover for a fifth of a second.
+ *
+ * So a backlog past this is trimmed from the OLDEST end. That discards a few ticks of input
+ * the player has already moved on from, once, instead of carrying the delay forever.
+ * Deliberately not a catch-up (running two commands in one tick would let a stalled client
+ * move at double speed, which is the exploit this queue exists to prevent).
+ *
+ * 8 commands is 66 ms — comfortably above the 2-4 a 60 fps client banks between packets, so
+ * ordinary burstiness never trips it.
+ */
+const COMMAND_BACKLOG_TARGET = 8;
 
 /**
  * Ceiling on the round trip a client may claim, in ms.
@@ -87,7 +125,9 @@ class ClientSession {
     this.baseline = null;
     this.baseTick = 0;
     this.pendingBaselines = new Map();
-    this.stats = { commands: 0, duplicates: 0, dropped: 0, snapshots: 0, resyncs: 0 };
+    this.stats = {
+      commands: 0, duplicates: 0, dropped: 0, snapshots: 0, resyncs: 0, backlogTrimmed: 0,
+    };
   }
 }
 
@@ -182,6 +222,11 @@ export class GameServer {
     while (session.queue.length > MAX_QUEUED_COMMANDS) {
       session.queue.shift();
       session.stats.dropped++;
+    }
+    // Recover from a stall rather than living with it. See COMMAND_BACKLOG_TARGET.
+    while (session.queue.length > COMMAND_BACKLOG_TARGET) {
+      session.queue.shift();
+      session.stats.backlogTrimmed = (session.stats.backlogTrimmed ?? 0) + 1;
     }
   }
 
@@ -344,7 +389,15 @@ export class GameServer {
       // belongs to exactly one client. Showing somebody else's hitmarker is worse than
       // showing none, so this filter is the whole point of recording `to` at all.
       const mine = session.entity?.id;
-      const events = this._pendingEvents.filter((ev) => ev.to == null || ev.to === mine);
+      const at = session.entity?.position;
+      const events = this._pendingEvents.filter((ev) => {
+        if (ev.to != null) return ev.to === mine;        // private: routing decides it
+        if (!at || !EV_SPATIAL.has(ev.kind)) return true;
+        const dx = ev.x - at.x;
+        const dy = ev.y - at.y;
+        const dz = ev.z - at.z;
+        return dx * dx + dy * dy + dz * dz <= EVENT_RANGE_SQ;
+      });
 
       const snap = {
         tick: g.tick,

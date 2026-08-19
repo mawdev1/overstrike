@@ -238,16 +238,38 @@ export const ENTITY_FIELDS = [
  * reliable and ordered; an event put on the wire arrives exactly once, and redundancy
  * would only buy duplicate hitmarkers.
  */
-export const EV_KINDS = ['hitmarker', 'kill', 'fire', 'damaged', 'death', 'respawn'];
+export const EV_KINDS = [
+  'hitmarker', 'kill', 'fire', 'damaged', 'death', 'respawn',
+  // Appended, never reordered — the wire code IS the index.
+  'explosion', 'blood', 'flash',
+];
 const EV_CODE = new Map(EV_KINDS.map((k, i) => [k, i]));
-/** Kinds that carry a vec3 payload: a muzzle position, or the direction damage came from. */
-const EV_VEC3 = new Set([EV_CODE.get('fire'), EV_CODE.get('damaged')]);
+/**
+ * Kinds carrying a vec3: a muzzle, a blast centre, a splash of blood, or the direction a
+ * hit came from. Everything spatial, which is also exactly the set the server can cull by
+ * distance before sending.
+ */
+const EV_VEC3 = new Set(
+  ['fire', 'damaged', 'explosion', 'blood', 'flash'].map((k) => EV_CODE.get(k)),
+);
+/** Spatial kinds worth culling: nobody needs a muzzle flash from across the map. */
+export const EV_SPATIAL = new Set(['fire', 'explosion', 'blood']);
 
 export const F_ALIVE = 1 << 0;
 export const F_CROUCH = 1 << 1;
 export const F_SPRINT = 1 << 2;
 export const F_SLIDE = 1 << 3;
 export const F_FIRING = 1 << 4;
+/**
+ * Aiming down sights, and reloading.
+ *
+ * Free: the flags byte had three spare bits. Remote rigs read `anim.aim` and `anim.reload`
+ * to shoulder the weapon and play the reload, and `avatars.js` built that object once and
+ * never wrote to it again — so every remote player stood with their gun at rest, firing
+ * from the hip, all match, and never visibly reloaded. Two bits fix both.
+ */
+export const F_ADS = 1 << 5;
+export const F_RELOAD = 1 << 6;
 
 const FIELD_SIZE = { f32: 4, u16: 2, u8: 1 };
 
@@ -313,7 +335,9 @@ export function encodeSnapshot(snap, baseline) {
     const code = EV_CODE.get(ev.kind);
     if (code === undefined) continue;
     v.setUint8(o, code); o += 1;
-    v.setUint8(o, ev.headshot ? 1 : 0); o += 1;
+    // bit 0 is the headshot flag; bits 1-5 carry a weapon index on a gunshot, so a remote
+    // rifle, shotgun and sniper do not all play the same sound. Free — the byte was there.
+    v.setUint8(o, (ev.headshot ? 1 : 0) | (((ev.weaponIdx ?? 0) & 0x1f) << 1)); o += 1;
     v.setUint32(o, (ev.entityId ?? ev.killerId ?? 0) >>> 0, true); o += 4;
     v.setUint32(o, (ev.victimId ?? 0) >>> 0, true); o += 4;
     v.setUint16(o, Math.max(0, Math.min(65535, ev.amount ?? 0)), true); o += 2;
@@ -370,11 +394,13 @@ export function decodeSnapshot(buf, baseline) {
     const m = v.getUint16(o, true); o += 2;
     for (let i = 0; i < m && o < buf.byteLength; i++) {
       const code = v.getUint8(o); o += 1;
-      const headshot = v.getUint8(o) === 1; o += 1;
+      const fl = v.getUint8(o); o += 1;
+      const headshot = (fl & 1) === 1;
+      const weaponIdx = (fl >> 1) & 0x1f;
       const a = v.getUint32(o, true); o += 4;
       const victimId = v.getUint32(o, true); o += 4;
       const amount = v.getUint16(o, true); o += 2;
-      const ev = { kind: EV_KINDS[code] ?? 'unknown', headshot, victimId, amount };
+      const ev = { kind: EV_KINDS[code] ?? 'unknown', headshot, weaponIdx, victimId, amount };
       if (EV_VEC3.has(code)) {
         ev.entityId = a;
         ev.x = v.getFloat32(o, true); o += 4;
@@ -397,6 +423,8 @@ export function entityToWire(e, weaponIdx = 0) {
   if (e.sprinting) flags |= F_SPRINT;
   if (e.moveState === 'slide') flags |= F_SLIDE;
   if (e.weapon?.triggerDown) flags |= F_FIRING;
+  if ((e.weapon?.adsAmount ?? 0) > 0.5) flags |= F_ADS;
+  if (e.weapon?.reloadTimer > 0 || e.weapon?.isReloading) flags |= F_RELOAD;
   return {
     id: e.id,
     x: e.position.x, y: e.position.y, z: e.position.z,

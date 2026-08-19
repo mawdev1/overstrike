@@ -18,6 +18,7 @@ import {
   MAX_COMMANDS_PER_BATCH,
 } from '../src/net/protocol.js';
 import { createLoopbackPair } from '../src/net/transport.js';
+import { WEAPON_LIST } from '../src/weapons/weaponDefs.js';
 
 let passed = 0;
 const failures = [];
@@ -747,6 +748,40 @@ test('a closed transport delivers nothing further', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════ report ══
+
+// ── weapon balance invariants ────────────────────────────────────────────────────────
+
+test('only a sniper one-shots to the head', () => {
+  // Five weapons sat on ballistics' default head multiplier of 4.2 and quietly one-shot:
+  // VECTOR 113, HAVOC 151, FALCON 109, BULWARK 130, VIPER 118 against 100 HP. With ADS
+  // spread under 0.2 degrees the chance of hitting a head you are aiming at is 1.000 to
+  // 15 m, so a sidearm one-tapped across the map — and bots head-aim on up to 20% of
+  // engagements, which is what "I died instantly for no reason" actually was.
+  const ONE_SHOT_OK = new Set(['sniper', 'melee', 'grenade']);
+  const offenders = WEAPON_LIST
+    .filter((d) => d.damage != null && d.headshotMul != null && !ONE_SHOT_OK.has(d.class))
+    .map((d) => ({ id: d.id, head: d.damage * d.headshotMul }))
+    .filter((w) => w.head >= 100);
+  if (offenders.length) {
+    throw new Error(
+      `these one-shot to the head: ${offenders.map((w) => `${w.id} ${w.head.toFixed(0)}`).join(', ')}`,
+    );
+  }
+});
+
+test('a headshot is still decisive', () => {
+  // The other half of the invariant: capping the multiplier must not make headshots
+  // pointless. Every automatic weapon should still turn its body-shot kill into a
+  // strictly shorter one.
+  const weak = WEAPON_LIST
+    .filter((d) => ['ar', 'smg', 'lmg', 'pistol'].includes(d.class))
+    .filter((d) => {
+      const body = Math.ceil(100 / d.damage);
+      const withHead = Math.ceil((100 - d.damage * d.headshotMul) / d.damage) + 1;
+      return withHead >= body;
+    });
+  if (weak.length) throw new Error(`a headshot buys nothing on: ${weak.map((d) => d.id).join(', ')}`);
+});
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) {

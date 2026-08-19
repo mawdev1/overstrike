@@ -166,7 +166,7 @@ export const WEAPONS = {
     fireMode: 'auto', burstCount: 0, burstDelay: 0,
     pellets: 1,
     spreadHip: 2.4, spreadAds: 0.20,
-    spreadMoveMul: 1.9, spreadAirMul: 2.8, spreadCrouchMul: 0.72,
+    spreadMoveMul: 1.4, spreadAirMul: 2.8, spreadCrouchMul: 0.72,
     bloomPerShot: 0.16, bloomMax: 1.9, bloomRecovery: 3.2, bloomAdsMul: 0.55,
     recoil: {
       up: 0.52, side: 0.30, kick: 0.055, recovery: 7.5,
@@ -176,7 +176,7 @@ export const WEAPONS = {
     reloadTime: 2.05, reloadEmptyTime: 2.62, switchTime: 0.55, raiseTime: 0.42,
     range: 140, falloffStart: 34, falloffEnd: 68, falloffMin: 0.70,
     penetration: 0.45,
-    headshotMul: 4.2,
+    headshotMul: 3.3,
     moveSpeedMul: 0.95,
     tracerEvery: 2, tracerColor: 0xffd08a,
     audio: { fire: 'rifle', reload: 'magIn', tail: 'indoor' },
@@ -209,7 +209,7 @@ export const WEAPONS = {
     fireMode: 'auto', burstCount: 0, burstDelay: 0,
     pellets: 1,
     spreadHip: 3.1, spreadAds: 0.18,
-    spreadMoveMul: 2.2, spreadAirMul: 3.2, spreadCrouchMul: 0.68,
+    spreadMoveMul: 1.35, spreadAirMul: 3.2, spreadCrouchMul: 0.68,
     bloomPerShot: 0.30, bloomMax: 2.6, bloomRecovery: 2.6, bloomAdsMul: 0.6,
     recoil: {
       up: 0.86, side: 0.44, kick: 0.086, recovery: 6.2,
@@ -219,7 +219,7 @@ export const WEAPONS = {
     reloadTime: 2.45, reloadEmptyTime: 3.05, switchTime: 0.62, raiseTime: 0.50,
     range: 175, falloffStart: 40, falloffEnd: 85, falloffMin: 0.72,
     penetration: 0.62,
-    headshotMul: 4.2,
+    headshotMul: 2.6,
     moveSpeedMul: 0.90,
     tracerEvery: 1, tracerColor: 0xffc070,
     audio: { fire: 'rifle', reload: 'magIn', tail: 'outdoor' },
@@ -252,7 +252,7 @@ export const WEAPONS = {
     fireMode: 'auto', burstCount: 0, burstDelay: 0,
     pellets: 1,
     spreadHip: 2.7, spreadAds: 0.26,
-    spreadMoveMul: 1.7, spreadAirMul: 2.6, spreadCrouchMul: 0.75,
+    spreadMoveMul: 1.35, spreadAirMul: 2.6, spreadCrouchMul: 0.75,
     bloomPerShot: 0.20, bloomMax: 2.3, bloomRecovery: 3.6, bloomAdsMul: 0.6,
     recoil: {
       up: 0.66, side: 0.46, kick: 0.062, recovery: 8.4,
@@ -262,7 +262,7 @@ export const WEAPONS = {
     reloadTime: 2.20, reloadEmptyTime: 2.85, switchTime: 0.52, raiseTime: 0.40,
     range: 130, falloffStart: 22, falloffEnd: 54, falloffMin: 0.62,
     penetration: 0.35,
-    headshotMul: 4.2,
+    headshotMul: 3.4,
     moveSpeedMul: 0.96,
     tracerEvery: 3, tracerColor: 0x9fe0ff,
     audio: { fire: 'rifle', reload: 'magIn', tail: 'indoor' },
@@ -395,7 +395,7 @@ export const WEAPONS = {
     reloadTime: 5.40, reloadEmptyTime: 6.60, switchTime: 0.85, raiseTime: 0.70,
     range: 190, falloffStart: 42, falloffEnd: 95, falloffMin: 0.70,
     penetration: 0.75,
-    headshotMul: 4.2,
+    headshotMul: 3.0,
     moveSpeedMul: 0.82,
     tracerEvery: 4, tracerColor: 0xff8844,
     audio: { fire: 'lmg', reload: 'magIn', tail: 'outdoor' },
@@ -579,7 +579,7 @@ export const WEAPONS = {
     reloadTime: 1.55, reloadEmptyTime: 2.05, switchTime: 0.30, raiseTime: 0.24,
     range: 90, falloffStart: 18, falloffEnd: 42, falloffMin: 0.62,
     penetration: 0.15,
-    headshotMul: 4.2,
+    headshotMul: 3.3,
     moveSpeedMul: 1.06,
     tracerEvery: 0, tracerColor: 0xffd08a,
     audio: { fire: 'pistol', reload: 'magIn', tail: 'indoor' },
@@ -763,6 +763,16 @@ export const WEAPONS = {
 
 /** Every id in the table (guns + melee + throwables). */
 export const ALL_WEAPON_IDS = Object.keys(WEAPONS);
+
+/**
+ * Weapon id -> small integer, for the wire.
+ *
+ * Derived from declaration order, which is stable for a given build — both ends of a
+ * connection run the same bundle, so this never needs to be authored by hand. Used to tell
+ * a client WHICH gun a remote player just fired, so a sniper does not sound like a rifle.
+ */
+export const WEAPON_WIRE_IDX = new Map(ALL_WEAPON_IDS.map((id, i) => [id, i]));
+export const WEAPON_BY_WIRE_IDX = ALL_WEAPON_IDS.map((id) => WEAPONS[id]);
 
 /** The ten selectable firearms, in armoury display order (primaries then the sidearm). */
 export const WEAPON_LIST = [

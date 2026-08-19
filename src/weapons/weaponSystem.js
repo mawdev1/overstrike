@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { clamp, damp, DEG, spreadDir } from '../core/mathUtils.js';
-import { WEAPONS, getWeapon, DEFAULT_LOADOUT, MELEE, fireInterval } from './weaponDefs.js';
+import { WEAPONS, getWeapon, DEFAULT_LOADOUT, MELEE, fireInterval, WEAPON_WIRE_IDX } from './weaponDefs.js';
 import { addressedRNG, hashRandom } from '../core/rng.js';
 import { fireHitscan, meleeSweep, applyMeleeDamage } from './ballistics.js';
 import { Viewmodel } from './viewmodel.js';
@@ -552,7 +552,7 @@ export class WeaponInstance {
     const d = this.def;
 
     if (hasMuzzle) {
-      game.present.muzzleFlash(_muzzle, _dir, d.class === 'sniper' || d.class === 'lmg' ? 1.35 : 1.0, owner);
+      game.present.muzzleFlash(_muzzle, _dir, d.class === 'sniper' || d.class === 'lmg' ? 1.35 : 1.0, owner, WEAPON_WIRE_IDX.get(d.id) ?? 0);
     }
 
     // Audio pitch variance only — presentation, drawn from fxRng, not the gameplay stream.

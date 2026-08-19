@@ -70,6 +70,15 @@ console.log('\ncombat feedback reaches the client');
   if (k.kind === 'kill' && k.killerId === 1 && k.victimId === 7) ok('a kill carries both ids');
   else bad('a kill carries both ids', JSON.stringify(k));
 
+  // The weapon index rides in the spare bits of the flag byte, so a remote sniper does not
+  // sound like a rifle. It must survive alongside the headshot bit, not instead of it.
+  const wd = decodeSnapshot(encodeSnapshot({
+    ...snap,
+    events: [{ kind: 'fire', entityId: 3, weaponIdx: 9, headshot: true, amount: 40000, x: 0, y: 0, z: 0 }],
+  }, null), null).events[0];
+  if (wd.weaponIdx === 9 && wd.headshot === true) ok('the weapon index shares the flag byte with the headshot bit');
+  else bad('the weapon index survives', JSON.stringify(wd));
+
   // The entity block must still decode when the sender emitted no events at all.
   const bare = decodeSnapshot(encodeSnapshot({ ...snap, events: [] }, null), null);
   if (bare.entities.length === 1 && bare.events.length === 0) ok('a snapshot with no events still decodes');
@@ -89,6 +98,24 @@ console.log('\ncombat feedback reaches the client');
   const fire = rec.events.find((e) => e.kind === 'fire');
   if (fire && fire.to === null) ok('a gunshot is addressed to everyone');
   else bad('a gunshot is addressed to everyone', JSON.stringify(fire));
+
+  // The effects a headless server used to drop on the floor entirely.
+  rec.clear();
+  rec.explosion(new THREE.Vector3(4, 1, 5), 6.5);
+  rec.bloodSpray(new THREE.Vector3(1, 1, 1), new THREE.Vector3(0, 1, 0), 1.4);
+  rec.flashbang(0.8, 2.5, { id: 77 });
+
+  const ex = rec.events.find((e) => e.kind === 'explosion');
+  if (ex && ex.to === null && Math.abs(ex.amount / 100 - 6.5) < 0.02) ok('explosions are broadcast with their radius');
+  else bad('explosions are broadcast with their radius', JSON.stringify(ex));
+
+  const bl = rec.events.find((e) => e.kind === 'blood');
+  if (bl && bl.to === null) ok('blood is broadcast at the point of the hit');
+  else bad('blood is broadcast', JSON.stringify(bl));
+
+  const fb = rec.events.find((e) => e.kind === 'flash');
+  if (fb?.to === 77 && Math.abs(fb.amount / 100 - 0.8) < 0.02) ok('a flashbang is routed to who it blinded');
+  else bad('a flashbang is routed to who it blinded', JSON.stringify(fb));
 
   // The respawn clear must never broadcast "you died" to the whole server.
   rec.clear();

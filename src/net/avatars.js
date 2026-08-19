@@ -34,6 +34,7 @@ class Avatar {
     };
     this._lastPos = new THREE.Vector3();
     this._havePos = false;
+    this._wasAlive = true;
   }
 
   dispose() { this.model?.dispose(); this.model = null; }
@@ -76,6 +77,17 @@ export class RemoteAvatars {
       st.yaw = r.yaw;
       st.pitch = r.pitch;
       st.height = r.crouching ? 1.15 : 1.8;
+
+      // The rig reads these three and nothing wrote them. `BotModel` blends `aim` into a
+      // shouldered stance, `reload` into the reload, and `deathYaw` decides which way a
+      // body falls — so every remote player stood with their weapon at rest whatever they
+      // were doing, never visibly reloaded, and every corpse fell the same way. All three
+      // now come off flag bits that were already free in the snapshot.
+      st.anim.aim = (r.ads || r.firing) ? 1 : 0;
+      st.anim.reload = r.reloading ? 1 : 0;
+      // Captured on the transition, from the yaw they were facing when they went down.
+      if (av._wasAlive && !r.alive) st.anim.deathYaw = r.yaw;
+      av._wasAlive = r.alive;
       st.alive = r.alive;
 
       av.model.setVisible(true);

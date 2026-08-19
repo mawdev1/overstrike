@@ -163,10 +163,45 @@ export class RecordingPresenter extends NullPresenter {
    * instead of firing. An event per shot is the only thing that reproduces the cadence the
    * shooter actually pulled.
    */
-  muzzleFlash(position, dir, scale, owner) {
+  muzzleFlash(position, dir, scale, owner, weaponIdx) {
     this._push('fire', null, {
       entityId: owner?.id ?? 0,
+      weaponIdx: weaponIdx ?? 0,
+      // Quantised heading, so a remote flash points where the gun points instead of due
+      // north. A muzzle flash is a 60 ms sprite; a sixteenth of a degree is plenty.
+      amount: dir ? Math.round(((Math.atan2(dir.x, dir.z) + Math.PI) / (Math.PI * 2)) * 65535) : 0,
       x: position?.x ?? 0, y: position?.y ?? 0, z: position?.z ?? 0,
+    });
+  }
+
+  /**
+   * The rest of the world's feedback, which a headless server used to drop on the floor.
+   *
+   * Online there was no blood, no impact, no decals and no flesh-hit sound; grenades and
+   * airstrikes were silent and invisible; and an enemy flashbang did NOTHING to you, which
+   * is a gameplay hole rather than a missing effect. All are spatial, so the server culls
+   * them by distance before they go on the wire.
+   */
+  explosion(point, radius) {
+    this._push('explosion', null, {
+      amount: Math.max(0, Math.min(65535, Math.round((radius ?? 0) * 100))),
+      x: point?.x ?? 0, y: point?.y ?? 0, z: point?.z ?? 0,
+    });
+  }
+
+  bloodSpray(point, normal, amount) {
+    this._push('blood', null, {
+      amount: Math.max(0, Math.min(65535, Math.round((amount ?? 0) * 100))),
+      x: point?.x ?? 0, y: point?.y ?? 0, z: point?.z ?? 0,
+    });
+  }
+
+  /** Routed: being blinded is something that happens to ONE player. */
+  flashbang(amount, duration, owner) {
+    this._push('flash', owner?.id, {
+      amount: Math.max(0, Math.min(65535, Math.round((amount ?? 0) * 100))),
+      victimId: Math.max(0, Math.round((duration ?? 0) * 100)),
+      x: 0, y: 0, z: 0,
     });
   }
 

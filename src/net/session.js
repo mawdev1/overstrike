@@ -15,14 +15,28 @@
 import { NetClient, INTERP_DELAY_MS } from './client.js';
 import { WebSocketTransport } from './transport.js';
 import { Prediction } from './prediction.js';
-import { quantiseCommand, F_ALIVE, F_CROUCH, F_SPRINT } from './protocol.js';
+import { quantiseCommand, F_ALIVE, F_CROUCH, F_SPRINT, F_FIRING, F_ADS, F_RELOAD } from './protocol.js';
 import { FIXED_DT } from '../core/mathUtils.js';
 import { RemoteAvatars } from './avatars.js';
 import * as THREE from 'three';
+import { WEAPON_BY_WIRE_IDX } from '../weapons/weaponDefs.js';
 
 /** Scratch for replayed effects. Module scope: nothing survives a synchronous call. */
 const _fx = new THREE.Vector3();
 const _fdir = new THREE.Vector3(0, 0, -1);
+const _fup = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Beyond this, a remote effect is not drawn.
+ *
+ * `fx.muzzleFlash` never rejects on distance — it only chooses view-space vs world-space
+ * under 1.2 m — so replaying every shot on the map meant hundreds of flash sprites and
+ * lights a second, nearly all of them behind walls or past the far side of the level.
+ * Audio already culls itself (`audio.js` drops past MAX_DISTANCE and has a voice budget),
+ * so this is about VFX churn. 70 m comfortably covers the longest sightline here.
+ */
+const EFFECT_RANGE_M = 70;
+const EFFECT_RANGE_SQ = EFFECT_RANGE_M * EFFECT_RANGE_M;
 
 export class MultiplayerSession {
   constructor(game, transport) {
@@ -170,13 +184,42 @@ export class MultiplayerSession {
 
         case 'fire': {
           if (ev.entityId === mineId) break;            // already presented locally
-          const r = this.remotes.get(ev.entityId);
           // Fire from where the SERVER said the muzzle was, not from the interpolated
           // avatar: the avatar is ~100 ms behind, and a flash offset from the gun that
           // made it is more distracting than no flash at all.
           _fx.set(ev.x, ev.y, ev.z);
-          present.muzzleFlash(_fx, _fdir, 0.9);
-          present.play('rifle', { position: _fx, volume: r ? 0.9 : 0.6 });
+          const def = WEAPON_BY_WIRE_IDX[ev.weaponIdx] || null;
+          // The heading came quantised in `amount`. Without it every remote flash pointed
+          // due north regardless of where the shooter was actually looking.
+          const yaw = (ev.amount / 65535) * Math.PI * 2 - Math.PI;
+          _fdir.set(Math.sin(yaw), 0, Math.cos(yaw));
+          if (this._near(_fx)) present.muzzleFlash(_fx, _fdir, def?.class === 'sniper' || def?.class === 'lmg' ? 1.35 : 0.9);
+          // Audio is NOT distance-culled here — it culls itself, and a shot you cannot see
+          // is exactly the one you most need to hear.
+          present.play(def?.audio?.fire ?? 'rifle', { position: _fx, volume: 0.9 });
+          break;
+        }
+
+        case 'explosion':
+          _fx.set(ev.x, ev.y, ev.z);
+          if (this._near(_fx)) present.explosion(_fx, ev.amount / 100);
+          break;
+
+        case 'blood':
+          _fx.set(ev.x, ev.y, ev.z);
+          // The surface normal is not on the wire; straight up reads correctly for a spray
+          // and costs nothing.
+          if (this._near(_fx)) present.bloodSpray(_fx, _fup, ev.amount / 100);
+          break;
+
+        case 'flash': {
+          // Routed to us specifically. Without this an enemy flashbang did nothing at all
+          // online — not a missing effect, a missing game mechanic.
+          const amt = ev.amount / 100;
+          const dur = ev.victimId / 100;
+          present.flashbang(amt, dur);
+          present.play('explosion', { volume: 0.5, rate: 0.35 });
+          g.bus?.emit('flashbang', { amount: amt, duration: dur, position: g.player?.position });
           break;
         }
 
@@ -236,6 +279,16 @@ export class MultiplayerSession {
     if (!id) return 'UNKNOWN';
     if (id === this.net.entityId) return this.game.player?.name || 'YOU';
     return `PLAYER ${id}`;
+  }
+
+  /** Is this world point close enough to be worth drawing an effect for? */
+  _near(point) {
+    const p = this.game.player?.position;
+    if (!p) return true;
+    const dx = point.x - p.x;
+    const dy = point.y - p.y;
+    const dz = point.z - p.z;
+    return dx * dx + dy * dy + dz * dz <= EFFECT_RANGE_SQ;
   }
 
   _teamFor(id) {
@@ -341,7 +394,11 @@ export class MultiplayerSession {
       seen.add(ea.id);
       let r = this.remotes.get(ea.id);
       if (!r) {
-        r = { id: ea.id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, health: 0, team: 0, alive: false, crouching: false, sprinting: false };
+        r = {
+          id: ea.id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, health: 0, team: 0,
+          alive: false, crouching: false, sprinting: false,
+          firing: false, ads: false, reloading: false,
+        };
         this.remotes.set(ea.id, r);
       }
       r.x = ea.x + (eb.x - ea.x) * t;
@@ -356,6 +413,9 @@ export class MultiplayerSession {
       r.alive = !!(eb.flags & F_ALIVE);
       r.crouching = !!(eb.flags & F_CROUCH);
       r.sprinting = !!(eb.flags & F_SPRINT);
+      r.firing = !!(eb.flags & F_FIRING);
+      r.ads = !!(eb.flags & F_ADS);
+      r.reloading = !!(eb.flags & F_RELOAD);
     }
     // Anyone who has left the snapshot has left the match.
     for (const id of [...this.remotes.keys()]) if (!seen.has(id)) this.remotes.delete(id);

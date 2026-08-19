@@ -412,7 +412,7 @@ export class ProjectileSystem {
     // fx.explosion() already lays the scorch decal on the real ground it probes for
     // (fx.js), so no second decal here — that one landed at the burst's mid-air origin
     // and cost a second slot of the 256-slot ring per detonation.
-    game.present.explosion(p.pos, pr.radius);
+    game.present.explosion(p.pos, pr.radius);   // broadcast — everyone nearby sees it
     // No `audio.play('explosion')` here either. `applyExplosionDamage()` above emits the
     // canonical `explosion` bus event unconditionally, and the audio engine's handler
     // plays the boom off it at priority 100 — louder and better defended than this call
@@ -480,7 +480,7 @@ export class ProjectileSystem {
         _flashEvt.duration = blind;
         _flashEvt.position.copy(p.pos);
         game.bus?.emit('flashbang', _flashEvt);
-        game.present.flashbang(clamp(t, 0, 1), blind);
+        game.present.flashbang(clamp(t, 0, 1), blind, e);
         game.present.play('explosion', { position: _eye, volume: 0.5, rate: 0.35 });
       }
     }
