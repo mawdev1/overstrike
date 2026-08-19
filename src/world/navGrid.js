@@ -331,7 +331,17 @@ export class NavGrid {
 
         // -- candidate floor heights: world floor + the top of every covering box
         let nc = 0;
-        cand[nc++] = this.minY;
+        // `minY` is the world's lower BOUND, not a surface. Seeding it unconditionally
+        // gave every column a walkable node in the void under the terrain slab (which is
+        // only 1 m thick), i.e. a complete wall-free copy of the map 3 m down — and it
+        // burned one of the MAX_LAYERS slots everywhere. Only use it where the column
+        // holds no geometry at all; otherwise the ground is the top of the lowest box,
+        // which the loop below already contributes.
+        let roofed = false;
+        for (let i = 0; i < ns; i++) {
+          if (spanClass[i] === 2 && spanMin[i] > this.minY) { roofed = true; break; }
+        }
+        if (!roofed) cand[nc++] = this.minY;
         for (let i = 0; i < ns; i++) {
           if (spanClass[i] !== 2) continue;
           const y = spanMax[i];
@@ -358,7 +368,15 @@ export class NavGrid {
           for (let i = 0; i < ns; i++) {
             if (spanClass[i] === 0) continue;
             const smin = spanMin[i], smax = spanMax[i];
-            if (smax > y + FOOT_EPS && smin < y + FOOT_EPS) { blocked = true; break; }
+            if (smax > y + FOOT_EPS && smin < y + FOOT_EPS) {
+              // A kerb or plinth the body simply steps onto is not an obstruction:
+              // World lets a mover step up STEP_HEIGHT. This only applies to class-1
+              // spans — the INFLATE skirt, where the cell centre is NEXT to the box,
+              // not on it. A class-2 span underfoot already contributes its own top as
+              // a floor candidate, so leaving it blocking is correct.
+              if (spanClass[i] === 1 && smax <= y + STEP_HEIGHT) continue;
+              blocked = true; break;
+            }
             if (smin >= y + FOOT_EPS) {
               const c = smin - y;
               if (c < clear) clear = c;

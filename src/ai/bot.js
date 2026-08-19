@@ -932,6 +932,17 @@ export class Bot {
    * and only authority that places entities: BotManager builds the roster,
    * Match decides where everyone stands. Placing in both is what made the same
    * seed produce a different number of spawn scorings each match.
+   *
+   * It is also the ONLY place a bot is wound back to its constructor state, and bots
+   * are pooled — `_resizeRoster` reuses the same instances match after match. So this
+   * must clear EVERY volatile field, not just the ones a reader thinks matter. It used
+   * to clear a dozen, and the rest (`lastKnown`, `investigatePoint`, the aim-error
+   * triple, `_coverOut`, the stuck/strafe timers …) survived into the next match. None
+   * of them are read on tick 1, which is why it looked harmless — but each is read
+   * later on a path that runs before anything overwrites it (`lastKnown` the moment
+   * memory outlives sight, `_coverOut[0]` whenever `coverPointsNear` returns none),
+   * so the same seed produced different bot behaviour depending on what the previous
+   * match happened to leave behind. Anything added to the constructor belongs here.
    */
   deactivate() {
     this.alive = false;
@@ -941,25 +952,97 @@ export class Bot {
     this.armor = 0;
     this.velocity.set(0, 0, 0);
     this.deathTime = -999;
+    this.respawnAt = 0;
+
+    // ---- pose
+    this.pitch = 0;
+    this.height = STAND_HEIGHT;
+    this.eyeHeight = EYE_STAND;
+    this.crouching = false;
+    this.grounded = false;
+    this._syncHitboxes();
+
+    // ---- perception
     this.target = null;
     this.targetVisible = false;
+    this.lastKnown.set(0, 0, 0);
+    this.lastKnownVel.set(0, 0, 0);
     this.timeSinceSeen = 999;
     this.suspicion = 0;
     this.suppression = 0;
+    this.investigatePoint.set(0, 0, 0);
     this.investigateConfidence = 0;
     this.lastDamageTime = -999;
-    this.wantFire = false;
+
+    // ---- state machine
+    this.state = 'idle';
+    this.stateTimer = 0;
+    this.searchHold = 0;
+    this.peekTimer = 0;
+    this.peeking = false;
+    this.peekOffset = 0;
+    this.inCover = false;
+    this.coverFailed = false;
+    this.coverBudget = 0;
+    this.coverCooldown = 0;
+    this.patrolHold = 0;
+    this.patrolPause = 1;
+    this._lastReport = -999;
+
+    // ---- movement
+    this.moveMode = 'walk';
     this.wantCrouch = false;
+    this.wantJump = false;
+    this.destination.set(0, 0, 0);
+    this.destTolerance = WAYPOINT_RADIUS;
+    this.repathTimer = 0;
+    this._pathDest.set(0, 0, 0);
+    this._separation.set(0, 0, 0);
+    this.strafeDir = 0;
+    this.strafeTimer = 0;
+    this._lookYaw = 0;
+    this._lookTimer = 0;
     this.weapon?.stopFire?.();
     this.clearPath();
     this.game.bots?.releaseSweepClaim?.(this);
-    this.state = 'idle';
-    this.stateTimer = 0;
-    this.inCover = false;
-    this.peeking = false;
-    this.peekOffset = 0;
-    this.coverCooldown = 0;
-    this.strafeDir = 0;
+
+    // ---- stuck detection
+    this._stuckSample.set(0, 0, 0);
+    this._stuckTimer = 0;
+    this._stuckLevel = 0;
+    this._sidestepTimer = 0;
+    this._sidestepSign = 1;
+    this._wedgeTimer = 0;
+    this._wedged = false;
+
+    // ---- combat
+    this.wantFire = false;
+    this._reactTimer = 0;
+    this._errMag = 0;
+    this._errYaw = 0;
+    this._errPitch = 0;
+    this._errSpin = 0;
+    this._sprayIn = 0;
+    this._jitPhase = 0;
+    this._burstLeft = 0;
+    this._restTimer = 0;
+    this._triggerHeld = false;
+    this._extShotSeen = false;
+    this._grenades = 2;
+    this._grenadeCd = 6;
+    this._aimYawTarget = 0;
+    this._aimPitchTarget = 0;
+    this._aimHeightFrac = 0.66;
+    this._hitWall = false;
+    // Scratch that outlives the match it was filled in. `_selectCover` falls back to
+    // `_coverOut[0]` when the nav query returns nothing, which would otherwise hand a
+    // bot a cover point from the previous match.
+    if (this._coverOut) this._coverOut.length = 0;
+
+    this._lastThinkTime = 0;
+    this.anim.aim = 0;
+    this.anim.reload = 0;
+    this.anim.deathYaw = 0;
     this.model?.setVisible(false);
   }
 
