@@ -275,7 +275,9 @@ function buildMarketHall(B) {
   B.wall(3.3, 5, 3.7, Z1, PLINTH, L1_UNDER, 'plaster', 'concrete', {
     openings: [{ a0: 7.2, a1: 9.6, y0: PLINTH, y1: 2.4, frame: 'door' }],
   });
-  B.wall(3.5, 4.8, X1, 5.2, PLINTH, L1_UNDER, 'plaster', 'concrete', {
+  // 3.3, mirroring the -3.3 partition opposite. At 3.5 it left a 0.2 x 0.2 m notch in the
+  // inside corner — a copy-paste-and-nudge, not a design.
+  B.wall(3.3, 4.8, X1, 5.2, PLINTH, L1_UNDER, 'plaster', 'concrete', {
     openings: [{ a0: 6.9, a1: 9.3, y0: PLINTH, y1: 2.4, frame: 'door' }],
   });
 
@@ -681,12 +683,18 @@ function buildOldTown(B) {
   // the courtyard and the plaza merge into one 75 m diagonal.
   B.wall(-14.2, -16, -13.8, 10, 0, 4.6, 'brick', 'concrete', {
     openings: [
+      // The third gateway used to sit at z 5.0-8.5, which is 85% filled by the market hall's
+      // west balcony stair — that run climbs z 11.2 -> 4.4 half a metre behind this wall, so
+      // at 5.0-8.5 it is 2.5-4 m of solid tread. Measured clear rectangle 1.23 x 0.80 m: an
+      // arch you could see through and not walk through, with a beaten-track wear decal
+      // painted across it advertising a route that did not exist. Moved into the clear span
+      // between the other two, the only part of this wall the stair does not stand behind.
       { a0: -12.5, a1: -8.5, y0: 0, y1: 3.2 },
+      { a0: -7.5, a1: -4.0, y0: 0, y1: 3.2 },
       { a0: -2.5, a1: 1.5, y0: 0, y1: 3.2 },
-      { a0: 5.0, a1: 8.5, y0: 0, y1: 3.2 },
     ],
   });
-  for (const [a0, a1] of [[-12.5, -8.5], [-2.5, 1.5], [5.0, 8.5]]) {
+  for (const [a0, a1] of [[-12.5, -8.5], [-7.5, -4.0], [-2.5, 1.5]]) {
     B.deco(-14.45, 3.2, a0 - 0.3, -13.55, 3.62, a1 + 0.3, 'concreteDark');
     B.deco(-14.45, 0, a0 - 0.3, -13.55, 3.2, a0, 'concreteDark');
     B.deco(-14.45, 0, a1, -13.55, 3.2, a1 + 0.3, 'concreteDark');
@@ -748,7 +756,7 @@ function dressOldTownCourt(B) {
   board(B, -13.6, 3.75, -0.5, Math.PI / 2, 3.6, 0.78, OT_PAINT);
 
   // Beaten tracks through the three archways and across to the well.
-  for (const [a0, a1] of [[-12.5, -8.5], [-2.5, 1.5], [5.0, 8.5]]) {
+  for (const [a0, a1] of [[-12.5, -8.5], [-7.5, -4.0], [-2.5, 1.5]]) {
     B.wear(-17.2, a0 - 0.4, -11.6, a1 + 0.4);
   }
   B.wear(-29.5, -5.5, -16.0, -0.6);
@@ -808,7 +816,12 @@ function oldTownBlock(B, z0, z1, tag) {
       { a0: mid - 4.4, a1: mid - 1.8, y0: PLINTH, y1: 2.45, frame: 'door' },
       { a0: mid + 2.6, a1: mid + 5.4, y0: 1.15, y1: 2.45, glass: true, frame: 'window', stain: 1.2, shutter: 1, ...{ shutterColors: OT_SHUTTERS } },
       // No shutters on this one: it sits shoulder-to-shoulder with the door reveal.
-      { a0: z0 + 1.6, a1: z0 + 4.2, y0: 1.15, y1: 2.45, frame: 'window', stain: 1 },
+      //
+      // z0 + 0.6, not z0 + 1.6. The door opposite is `mid`-relative and this is `z0`-relative,
+      // so the two only clear each other when the block is long enough — block B is 18 m and
+      // clears by 0.4 m, block A is 16 m and OVERLAPPED by 0.60 m, putting the window's sill
+      // course inside the doorway and narrowing it to 2.00 m of an authored 2.60.
+      { a0: z0 + 0.6, a1: z0 + 3.2, y0: 1.15, y1: 2.45, frame: 'window', stain: 1 },
     ],
   });
 
@@ -1091,7 +1104,10 @@ function buildWarehouse(B) {
   for (const x of [19, 31]) B.deco(x - 0.2, PLINTH, -24.8, x + 0.2, 6.4, -24.4, 'metal');
   B.deco(18.6, 6.4, -24.9, 31.4, 6.9, -24.3, 'metal');
   B.prop('container', 22.5, PLINTH, -21.5, 0, { color: CONTAINER_COLORS[1] });
-  B.prop('container', 30, PLINTH, -18.2, Math.PI / 2, { color: CONTAINER_COLORS[3] });
+  // Pulled deeper into the shed. At z -18.2 its 6.2 m flank stood across the whole of the
+  // eastern roller door (x 27-32), leaving 1.63 m of clear height in a 4.25 m opening — the
+  // building's main vehicle entrance, half filled by its own dressing.
+  B.prop('container', 30, PLINTH, -22.6, Math.PI / 2, { color: CONTAINER_COLORS[3] });
   B.prop('crate', 26.5, PLINTH, -22.5, 0.2);
   B.prop('crate', 27.4, PLINTH, -21.6, -0.6);
   B.prop('crate', 26.9, PLINTH + 0.94, -22.1, 0.4);
