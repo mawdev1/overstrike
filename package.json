@@ -17,7 +17,8 @@
     "presenttest": "node scripts/presenttest.mjs",
     "headless": "node scripts/headless.mjs --ticks=7200",
     "nettest": "node scripts/nettest.mjs",
-    "wstest": "node scripts/wstest.mjs"
+    "wstest": "node scripts/wstest.mjs",
+    "mptest": "node scripts/mptest.mjs"
   },
   "dependencies": {
     "three": "^0.185.1",

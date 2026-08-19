@@ -28,6 +28,9 @@ export const INTERP_DELAY_MS = 100;
 /** How many already-sent commands to repeat in each packet. */
 const REDUNDANT_COMMANDS = 3;
 
+/** Monotonic-ish wall clock, in a form both Node and a browser have. */
+const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
 export class NetClient {
   constructor(transport) {
     this.transport = transport;
@@ -42,6 +45,8 @@ export class NetClient {
     /** Snapshots newest-last, trimmed to what interpolation can still need. */
     this.snapshots = [];
     this.latestTick = 0;
+    /** Wall clock when `latestTick` arrived, so render time can advance between snapshots. */
+    this.latestAtMs = 0;
 
     this.stats = { sent: 0, snapshots: 0, acked: 0, discarded: 0 };
     this._onSnapshot = null;
@@ -73,6 +78,7 @@ export class NetClient {
     // rewind every remote entity for a frame.
     if (snap.tick < this.latestTick) { this.stats.discarded++; return; }
     this.latestTick = snap.tick;
+    this.latestAtMs = now();
 
     this.snapshots.push(snap);
     // Keep a couple of seconds; interpolation only ever reaches back INTERP_DELAY_MS, and
@@ -120,7 +126,18 @@ export class NetClient {
    */
   interpolationAt(nowTick, tickRateHz = 120) {
     const delayTicks = (INTERP_DELAY_MS / 1000) * tickRateHz;
-    const target = nowTick - delayTicks;
+    // Render time is derived from the SERVER's clock, not the local simulation's.
+    //
+    // The local tick drifts: a client steps its own simulation on its own frame timing,
+    // so over a match it runs slightly ahead or behind the server's tick numbering. Using
+    // it here silently breaks interpolation once the drift exceeds the buffer — the
+    // target falls outside every snapshot held and remote players simply stop appearing,
+    // with no error anywhere. Anchoring to the newest snapshot removes the drift, and
+    // adding the wall-clock time since it arrived keeps motion smooth BETWEEN snapshots
+    // instead of stepping at the 30 Hz snapshot rate.
+    const sinceMs = this.latestAtMs ? Math.max(0, now() - this.latestAtMs) : 0;
+    const serverNow = this.latestTick + (sinceMs / 1000) * tickRateHz;
+    const target = (nowTick === undefined ? serverNow : Math.min(nowTick, serverNow)) - delayTicks;
 
     let a = null, b = null;
     for (let i = this.snapshots.length - 1; i >= 0; i--) {

@@ -1,0 +1,196 @@
+/**
+ * The client's multiplayer session.
+ *
+ * Ties the transport, the protocol, prediction and the local simulation together into the
+ * one object a page needs. Opt-in by construction: nothing here runs unless a server URL
+ * is configured, so single player stays exactly what it was — its own simulation in its
+ * own tab, with no dependency on any of this being reachable.
+ *
+ * Remote players are held as plain state rather than as `Player` instances. A remote
+ * player is not simulated locally — the server owns them — so giving them a full Player
+ * would mean a movement integrator running on data it does not own, fighting the
+ * snapshots that are the actual truth. What a client needs from them is where to draw
+ * them and where they were, and that is what this keeps.
+ */
+import { NetClient, INTERP_DELAY_MS } from './client.js';
+import { WebSocketTransport } from './transport.js';
+import { Prediction } from './prediction.js';
+import { quantiseCommand, F_ALIVE, F_CROUCH, F_SPRINT } from './protocol.js';
+
+export class MultiplayerSession {
+  constructor(game, transport) {
+    this.game = game;
+    this.transport = transport;
+    this.net = new NetClient(transport);
+    this.prediction = null;
+    /** id -> latest interpolated remote state */
+    this.remotes = new Map();
+    this.connected = false;
+    /**
+     * Whether we have adopted the server's clock and position yet.
+     *
+     * A joining client's simulation starts at tick 0 with the player wherever a local
+     * `startMatch` put them, while the server is thousands of ticks in with that entity
+     * somewhere else entirely. Until the two are reconciled ONCE, deliberately and at
+     * join time, every snapshot looks like a catastrophic misprediction and no snapshot
+     * can be found to interpolate against — the tick numbers do not even overlap.
+     */
+    this.synced = false;
+    this.stats = { commandsSent: 0, joinCorrectionM: 0 };
+
+    this.net.onSnapshot((snap) => this._onSnapshot(snap));
+  }
+
+  /**
+   * Open a session. Resolves once the server has said who we are — until then the client
+   * does not know which entity in the snapshots is itself, so sending commands would be
+   * predicting on behalf of nobody.
+   */
+  static connect(game, url, { timeoutMs = 10000 } = {}) {
+    return new Promise((resolve, reject) => {
+      let transport;
+      try { transport = new WebSocketTransport(url); } catch (e) { reject(e); return; }
+      const session = new MultiplayerSession(game, transport);
+
+      const started = Date.now();
+      const poll = setInterval(() => {
+        if (session.net.entityId) {
+          clearInterval(poll);
+          session.connected = true;
+          // The server told us which entity we drive. Bind the local player to that id so
+          // snapshots about us are recognised as us.
+          if (game.player) game.player.id = session.net.entityId;
+          session.prediction = new Prediction(game, game.player, session.net);
+          resolve(session);
+          return;
+        }
+        if (transport.closed) { clearInterval(poll); reject(new Error('socket closed before welcome')); return; }
+        if (Date.now() - started > timeoutMs) {
+          clearInterval(poll);
+          transport.close();
+          reject(new Error(`no welcome from ${url} within ${timeoutMs} ms`));
+        }
+      }, 20);
+    });
+  }
+
+  /**
+   * Send one command and predict it locally.
+   *
+   * Called once per fixed step. The command is quantised inside `sendCommand`, and
+   * prediction runs on the SAME object afterwards, so the client predicts from exactly
+   * the values the server will decode.
+   */
+  sendCommand(cmd) {
+    if (!this.connected) return null;
+    // The absolute-aim checksum has to be the client's real aim; a constant here makes
+    // the server think we have desynced and snap our aim on every command.
+    const p = this.game.player;
+    if (p) { cmd.baseYaw = p.baseYaw; cmd.basePitch = p.basePitch; }
+    const sent = this.net.sendCommand(cmd);
+    this.stats.commandsSent++;
+    this.prediction?.predict(sent);
+    return sent;
+  }
+
+  _onSnapshot(snap) {
+    if (!this.synced) { this._syncToServer(snap); return; }
+    this.prediction?.reconcile(snap);
+  }
+
+  /**
+   * Adopt the server's clock and our entity's authoritative state, once, on join.
+   *
+   * The clock matters as much as the position. Every snapshot is stamped with the
+   * SERVER's tick, and interpolation looks for snapshots at or before `now - delay`; run
+   * that against a local clock that started at zero and nothing ever matches, so remote
+   * players never appear at all. The client's simulation has to be numbered in the
+   * server's ticks, not its own.
+   */
+  _syncToServer(snap) {
+    const g = this.game;
+    const p = g.player;
+    const wire = snap.entities.find((e) => e.id === this.net.entityId);
+    if (!wire) return;                       // wait for a snapshot that mentions us
+
+    if (p) {
+      this.stats.joinCorrectionM = Math.hypot(
+        wire.x - p.position.x, wire.y - p.position.y, wire.z - p.position.z,
+      );
+      p.position.set(wire.x, wire.y, wire.z);
+      p.velocity.set(wire.vx, wire.vy, wire.vz);
+      p.health = wire.health;
+      p.armor = wire.armor;
+      // Aim included, and ONLY here: this is the one moment the server legitimately
+      // decides where we are looking. After this, aim is the client's alone.
+      p.setAngles(wire.yaw, wire.pitch);
+      p._updateHitboxes?.();
+    }
+    g.tick = snap.tick;
+    this.synced = true;
+    // Discard the join snap so it is not reported as a prediction failure — it is not
+    // one, and leaving it in makes the worst-error metric meaningless forever after.
+    if (this.prediction) {
+      this.prediction.history.clear();
+      this.prediction.stats.worstError = 0;
+      this.prediction.stats.worstErrorLiving = 0;
+    }
+  }
+
+  /**
+   * Interpolated state of everyone else, for drawing.
+   *
+   * Deliberately at `INTERP_DELAY_MS` behind the newest snapshot: with a buffer in hand
+   * the client interpolates between two states it actually received, instead of
+   * extrapolating from one and being wrong every time somebody changes direction.
+   */
+  updateRemotes() {
+    // No local tick: interpolation is anchored to the server's clock (see
+    // `NetClient.interpolationAt`). Passing the local one re-introduces exactly the drift
+    // that makes remote players vanish after a few minutes.
+    const frame = this.net.interpolationAt();
+    if (!frame) return this.remotes;
+    const { a, b, t } = frame;
+
+    const seen = new Set();
+    for (const ea of a.entities) {
+      if (ea.id === this.net.entityId) continue;      // ourselves: prediction owns us
+      const eb = b.entities.find((x) => x.id === ea.id) || ea;
+      seen.add(ea.id);
+      let r = this.remotes.get(ea.id);
+      if (!r) {
+        r = { id: ea.id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, health: 0, team: 0, alive: false, crouching: false, sprinting: false };
+        this.remotes.set(ea.id, r);
+      }
+      r.x = ea.x + (eb.x - ea.x) * t;
+      r.y = ea.y + (eb.y - ea.y) * t;
+      r.z = ea.z + (eb.z - ea.z) * t;
+      // Angles interpolate the short way round, or a player crossing the +/-pi seam spins
+      // the long way through a whole turn in one frame.
+      r.yaw = ea.yaw + shortestAngle(eb.yaw - ea.yaw) * t;
+      r.pitch = ea.pitch + (eb.pitch - ea.pitch) * t;
+      r.health = eb.health;
+      r.team = eb.team;
+      r.alive = !!(eb.flags & F_ALIVE);
+      r.crouching = !!(eb.flags & F_CROUCH);
+      r.sprinting = !!(eb.flags & F_SPRINT);
+    }
+    // Anyone who has left the snapshot has left the match.
+    for (const id of [...this.remotes.keys()]) if (!seen.has(id)) this.remotes.delete(id);
+    return this.remotes;
+  }
+
+  close() {
+    this.connected = false;
+    this.transport.close();
+  }
+}
+
+function shortestAngle(d) {
+  let x = d;
+  while (x > Math.PI) x -= Math.PI * 2;
+  while (x < -Math.PI) x += Math.PI * 2;
+  return x;
+}
+
+export { INTERP_DELAY_MS, quantiseCommand };
