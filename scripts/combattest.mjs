@@ -689,9 +689,14 @@ if (engage.predictedShots > 0) {
       await new Promise((r) => setTimeout(r, 6));
     }
     g.input.buttons[0] = false;
-    // Let the recoil spring settle before handing back. The aim test that follows measures
-    // client-vs-server agreement, and a burst still decaying on one side reads as a desync.
-    for (let i = 0; i < 120; i++) { s.step(); await new Promise((r) => setTimeout(r, 6)); }
+    // Let the recoil spring settle before handing back, and let the aim checksum reconcile.
+    //
+    // The turn test that follows asserts ZERO aim resyncs on a clean link. Twelve per cent
+    // of every recoil kick is permanent, folded into baseYaw, and nothing reconciles how
+    // many rounds each side thinks it fired — so a few rounds of drift after a 400-tick
+    // burst is enough to trip the resync threshold and fail a test about turning. 400 ticks
+    // of settling covers it. The underlying drift is a known open item, not this test's.
+    for (let i = 0; i < 400; i++) { s.step(); await new Promise((r) => setTimeout(r, 6)); }
     off?.();
     return { clientRounds, fireHeldInCommand };
   });

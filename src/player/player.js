@@ -247,8 +247,21 @@ const _UP = new THREE.Vector3(0, 1, 0);
 const _lookOut = { x: 0, y: 0 };
 
 // Probe offsets (unit circle) used for the stand-up ceiling check.
-const _PROBE_X = [0, 0.72, -0.72, 0, 0];
-const _PROBE_Z = [0, 0, 0, 0.72, -0.72];
+/**
+ * Stand-up probe ring, as a fraction of the body radius.
+ *
+ * These were 0.72, which reads like "one body width" and is not: they are multiplied by
+ * `this.radius` (0.36), so the ring sat at +/-0.259 m while the body is +/-0.36 m. Every
+ * probe fired from INSIDE the silhouette, and an obstruction in the 0.10 m annulus between
+ * them was invisible — measured, 35 places on the map where the standing capsule genuinely
+ * does not fit and `_canStand` said it did. 1.0 puts the probes on the body's own edge.
+ */
+/** Most a mantle may be pushed out of geometry in one tick. ~1 tick of sprint travel. */
+const MANTLE_DEPEN_MAX = 0.09;
+const _mantleFix = new THREE.Vector3();
+
+const _PROBE_X = [0, 1, -1, 0, 0];
+const _PROBE_Z = [0, 0, 0, 1, -1];
 
 /**
  * What `_buildLocalCommand` returns while not playing (menu, paused): every edge and
@@ -1379,7 +1392,12 @@ export class Player {
     // 1.25 m. This runs BEFORE `_mantleStep` every tick and used to grow the capsule back
     // at 5 m/s, so all 509 measured vaults finished at full standing height and 506 of them
     // spent part of the flight inside the ledge. Hold the crouch until the vault is over.
-    if (this.moveState === 'mantle') return;
+    //
+    // `alive` matters: `_mantleStep` does not run for a dead player, so `_mantleT` never
+    // advances and `moveState` never leaves 'mantle'. Without this the capsule of anyone
+    // who died mid-vault stayed at 1.10 m indefinitely — through the whole corpse and
+    // killcam window, with the server hitbox to match.
+    if (this.moveState === 'mantle' && this.alive) return;
     const sliding = this.moveState === 'slide';
     // A slide that ends early (wall, speed loss) must still let the camera dip
     // recover smoothly instead of leaving `slideAmount` stuck mid-value.
@@ -1627,12 +1645,29 @@ export class Player {
     this.position.x = lerp(this._mantleFrom.x, this._mantleTo.x, hz);
     this.position.z = lerp(this._mantleFrom.z, this._mantleTo.z, hz);
     this.position.y = lerp(this._mantleFrom.y, this._mantleTo.y, vy);
-    // The vault lerps the body along an authored arc with no collision of its own, so it
-    // routinely passed THROUGH the lip it is climbing — measured, 506 of 509 vaults put the
-    // body inside the ledge collider mid-flight, worst 0.360 m, once for 0.81 s. Online
-    // that means the hitboxes are inside a wall for those ticks: you can be shot through it,
-    // or be unshootable. Pushing back out each tick keeps the arc but not the clipping.
-    this.game.world?._depenetrate?.(this.position, this.radius, this.height);
+    // Push out of anything the arc has clipped into — but by a BOUNDED amount per tick.
+    //
+    // The vault lerps along an authored path with no collision of its own, so it routinely
+    // passes through the lip it is climbing: 506 of 509 measured vaults put the body inside
+    // the ledge, worst 0.360 m. Online those ticks have the hitboxes inside a wall, so you
+    // can be shot through it or be unshootable.
+    //
+    // Calling `_depenetrate` raw here made that worse, not better: the lerp overwrites the
+    // correction every tick and the two fight, producing a 1.68 m jump in a single 1/120 s
+    // step (201 m/s) and 1.5 m of drift from the authored landing. Clamping the correction
+    // keeps the arc, unwinds the clipping over a few ticks, and cannot teleport — the cap is
+    // roughly the distance a sprinting player covers in one tick.
+    const wld = this.game.world;
+    if (wld?._depenetrate) {
+      _mantleFix.copy(this.position);
+      wld._depenetrate(_mantleFix, this.radius, this.height);
+      _mantleFix.sub(this.position);
+      const push = _mantleFix.length();
+      if (push > 1e-6) {
+        if (push > MANTLE_DEPEN_MAX) _mantleFix.multiplyScalar(MANTLE_DEPEN_MAX / push);
+        this.position.add(_mantleFix);
+      }
+    }
     this.velocity.set(0, 0, 0);
     this.moveSpeed = 0;
 

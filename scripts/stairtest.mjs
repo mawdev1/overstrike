@@ -416,7 +416,11 @@ function walk(R, up, laneFrac = 0.5) {
       }
     }
   }
-  return { reached, best, stuckAt, maxDrop, endY: p.position.y, trace, blockers, dir: Math.sign(goalA - startA), lane: cMid, span: Math.abs(goalA - startA) };
+  // `maxDrop` was computed and never asserted, so a descent that FELL down the stairwell
+  // counted as "walked down". A tread is 0.22 m; anything past half a metre in one step is
+  // a fall, not a step.
+  const fell = maxDrop > 0.5;
+  return { reached, best, stuckAt, maxDrop, fell, endY: p.position.y, trace, blockers, dir: Math.sign(goalA - startA), lane: cMid, span: Math.abs(goalA - startA) };
 }
 
 // Three lanes, not one. A stair with an AC unit or a market stall dumped on half of it
@@ -432,8 +436,12 @@ for (const R of analyses) {
     R.upAll = ups; R.downAll = dns;
     R.up = pick(ups).w; R.upLane = pick(ups).f;
     R.down = pick(dns).w; R.downLane = pick(dns).f;
-    R.upLanesOK = ups.filter((e) => e.w.reached).length;
-    R.downLanesOK = dns.filter((e) => e.w.reached).length;
+    // A lane only counts if it walked the run — not if it FELL down it. `maxDrop` was
+    // recorded and never used, so a descent that dropped off the side scored as a success.
+    R.upLanesOK = ups.filter((e) => e.w.reached && !e.w.fell).length;
+    R.downLanesOK = dns.filter((e) => e.w.reached && !e.w.fell).length;
+    R.fellUp = ups.filter((e) => e.w.fell).length;
+    R.fellDown = dns.filter((e) => e.w.fell).length;
   } catch (e) {
     R.walkError = e.message;
   }

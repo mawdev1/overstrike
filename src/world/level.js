@@ -1132,7 +1132,10 @@ function buildWarehouse(B) {
   B.prop('crate', 26.5, PLINTH, -22.5, 0.2);
   B.prop('crate', 27.4, PLINTH, -21.6, -0.6);
   B.prop('crate', 26.9, PLINTH + 0.94, -22.1, 0.4);
-  B.prop('pallets', 17.5, PLINTH, -16.8, 0, { variant: 'tall' });   // clear of the mezzanine stair foot
+  // Out of the west doorway's throat as well as off the stair foot. Moving these clear of
+  // the stair put them 1.3 m behind the door that was relocated to z -18..-15.6 in the same
+  // pass, narrowing it to 0.80 m against a 0.72 m body — two fixes colliding with each other.
+  B.prop('pallets', 22.0, PLINTH, -17.0, 0, { variant: 'tall' });
   B.prop('barrel', 33.5, PLINTH, -21, 0, { color: BARREL_COLORS[0] });
   B.prop('tyres', 16.6, PLINTH, -29.5, 0);
   // Moved clear of the north door (x 23.5-26.5). Parked at x=25.5 it plus its nav skirt

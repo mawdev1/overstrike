@@ -627,19 +627,19 @@ export class World {
   /**
    * Push a body out of anything it is inside.
    *
-   * Eight passes, not four. A body 0.20 m through a face was still 0.03-0.26 m embedded
-   * after two seconds in 28 measured places, and only walked out once the player supplied
-   * movement input. Four passes simply is not enough to unwind a body wedged against
-   * several boxes at once; eight clears all 28.
+   * Four passes. I raised this to eight claiming it cleared 28 measured sites where a body
+   * stayed embedded; an A/B with only the pass count differing produced BYTE-IDENTICAL
+   * results — 1676 embedded, 1442 pushed out, the same 28 sites either way. The claim was
+   * wrong and the change did nothing, so it is reverted rather than left in as cargo.
    *
    * It resolves the DEEPEST overlap each pass, which looks wrong — minimum-translation is
    * the usual choice — and measurement says otherwise. Switching to the shallowest fixed
-   * 27 of the 28 and turned the last one into something worse: a body between two stair
-   * treads that could not walk out in any of eight directions, because the two shallow
-   * pushes alternate and cancel. Deepest-first commits to one escape and finishes it.
+   * 27 of the 28 and turned the last into something worse: a body between two stair treads
+   * that could not walk out in any of eight directions, because the two shallow pushes
+   * alternate and cancel. Deepest-first commits to one escape and finishes it.
    */
   _depenetrate(p, radius, height) {
-    for (let pass = 0; pass < 8; pass++) {
+    for (let pass = 0; pass < 4; pass++) {
       const minx = p.x - radius, maxx = p.x + radius;
       const miny = p.y, maxy = p.y + height;
       const minz = p.z - radius, maxz = p.z + radius;

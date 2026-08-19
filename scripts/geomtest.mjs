@@ -614,3 +614,8 @@ if (R.sym.length) {
   }
   console.log('');
 }
+
+// A headless `Game` keeps a live handle, so this never exited on its own — two runs were
+// found still alive after 75 minutes with their output complete. Every other harness here
+// ends with an explicit exit; this one now does too, and reports a status while it is at it.
+process.exit(typeof failures === 'number' && failures > 0 ? 1 : 0);

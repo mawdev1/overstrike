@@ -430,7 +430,11 @@ function cornerTest() {
     // place a body can be, so walking off it is not a defect the player can produce.
     // (`reachTop` is single-hop, so also cap at the map's real playable ceiling — the
     // 15 m perimeter walls are not somewhere a body can be.)
-    if (y > reachTop(b) || y > 8.5) { seamsSkipped++; continue; }
+    // 12.0, not 8.5. The old cap skipped every corner and seam above 8.5 m — 92 of 997
+    // colliders top out higher, including the market hall lantern deck at 11.67, which this
+    // project's own commit messages call the most contested position on the map. A coverage
+    // gate set below the interesting geometry makes a PASS mean less than it looks.
+    if (y > reachTop(b) || y > 12.0) { seamsSkipped++; continue; }
     for (const [vx, vz] of [[1, 0], [-1, 0], [0, 1], [0, 1e-9], [0, -1]]) {
       const px = (b.min.x + b.max.x) / 2, pz = (b.min.z + b.max.z) / 2;
       if (world._overlapAny(px, y, pz, RADIUS, STAND)) continue;
