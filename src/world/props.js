@@ -654,8 +654,14 @@ export class Builder {
     // including all four on the market hall roof deck — see-through and shoot-through at
     // ankle-to-chest height on a roof edge, with the coping cap above making it look closed.
     // Extending one axis is enough to cover the square, and avoids double-overhang.
+    // ...but only where the end actually meets something. `extendStart`/`extendEnd: false`
+    // opts out per end: extending an end that is a deliberate OPENING closes 0.13 m of it,
+    // and the warehouse roof's east parapet was split precisely to leave a stair mouth
+    // there — the extension took 16% off the width the split existed to create.
     const ext = alongX ? 0 : t / 2;
-    const ax0 = (alongX ? x0 : z0) - ext, ax1 = (alongX ? x1 : z1) + ext;
+    const ext0 = opts.extendStart === false ? 0 : ext;
+    const ext1 = opts.extendEnd === false ? 0 : ext;
+    const ax0 = (alongX ? x0 : z0) - ext0, ax1 = (alongX ? x1 : z1) + ext1;
     const gaps = (opts.gaps || []).slice().sort((p, q) => p[0] - q[0]);
     // A crenellation must be a firing slit, not a doorway.
     //

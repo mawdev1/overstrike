@@ -1393,10 +1393,12 @@ export class Player {
     // at 5 m/s, so all 509 measured vaults finished at full standing height and 506 of them
     // spent part of the flight inside the ledge. Hold the crouch until the vault is over.
     //
-    // `alive` matters: `_mantleStep` does not run for a dead player, so `_mantleT` never
-    // advances and `moveState` never leaves 'mantle'. Without this the capsule of anyone
-    // who died mid-vault stayed at 1.10 m indefinitely — through the whole corpse and
-    // killcam window, with the server hitbox to match.
+    // The `alive` term is DEFENSIVE, not a fix. I added it believing a player who died
+    // mid-vault was left stuck at crouch height; verification showed otherwise —
+    // `fixedUpdate` returns into `_deadFixedUpdate` before this is ever reached when dead,
+    // and that path damps to CROUCH_HEIGHT unconditionally, so every corpse sits at 1.10 m
+    // by design and `respawn()` resets it. The guard costs nothing and states the intent,
+    // but it is unreachable for a corpse and fixes no observed bug.
     if (this.moveState === 'mantle' && this.alive) return;
     const sliding = this.moveState === 'slide';
     // A slide that ends early (wall, speed loss) must still let the camera dip

@@ -1077,7 +1077,9 @@ function buildWarehouse(B) {
   // player climbed both flights, stood on the landing at 7.90, and stopped dead at x 35.49.
   // Measured, walk-only: 0 of 30,900 standing states on the warehouse roof. It was
   // mantle-only, and the comment above claims it is reached by the stair.
-  B.parapet(X1, -31.4, X1, Z1, ROOF, 1.0, 'metal', 'metal', { gaps: [[-22, -18]], capMat: 'metal' });
+  // `extendStart: false`: this run starts AT the stair mouth, so squaring that end would
+  // close 0.13 m of the only walk-on route to this roof.
+  B.parapet(X1, -31.4, X1, Z1, ROOF, 1.0, 'metal', 'metal', { gaps: [[-22, -18]], capMat: 'metal', extendStart: false });
   B.prop('acUnit', 22.5, ROOF, -19.5, 0);
   B.prop('acUnit', 24.2, ROOF, -19.5, 0);
   B.prop('acUnit', 30.5, ROOF, -28.5, 1.2);
@@ -1578,7 +1580,10 @@ function buildHarbour(B, rng) {
   // Loose barrels and tyres along the quay.
   for (let i = 0; i < 7; i++) {
     const x = rng.range(36.6, 40.2), z = rng.range(-36, 36);
-    if (Math.abs(z + 1) < 4 || Math.abs(z + 26) < 4 || Math.abs(z - 16) < 6 || Math.abs(z - 32) < 5) continue;
+    // The quay container stack moved from z -26 to z -36; this exclusion band followed it,
+    // or a scatter barrel ends up 0.33 m inside the stack while the old band is kept
+    // pointlessly clear.
+    if (Math.abs(z + 1) < 4 || Math.abs(z + 36) < 5 || Math.abs(z - 16) < 6 || Math.abs(z - 32) < 5) continue;
     B.prop('barrel', x, 0, z, rng.range(0, 6.28), { color: BARREL_COLORS[rng.int(BARREL_COLORS.length)] });
   }
   B.prop('tyres', 36.9, 0, 6.5, 0);
@@ -1743,7 +1748,11 @@ function buildSpawnYards(B, rng) {
   // straddled the wall and reached 1.82 m INTO the ground floor, and it stood across the
   // door relocated there — 1.07 m of a 2.60 m opening. Moving that door out from behind its
   // own staircase had put it behind a container instead.
-  B.prop('container', 15, 0, 29, Math.PI / 2, { color: CONTAINER_COLORS[0] });
+  // North of the customs west door (z 24.8-27.4), not across it. Moving this out of the
+  // wall it was clipping through parked it 0.78 m off the door face covering 1.53 m of the
+  // 2.60 m opening — 6 cm of straight-through latitude. Two fixes in a row put the same
+  // doorway behind something.
+  B.prop('container', 15, 0, 33, Math.PI / 2, { color: CONTAINER_COLORS[0] });
   B.prop('jersey', 25.5, 0, 30.5, 0);
   B.prop('tyres', 16.5, 0, 36, 0);
   B.prop('tyres', 17.4, 0, 36.8, 0.4);
