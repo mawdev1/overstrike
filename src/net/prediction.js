@@ -72,7 +72,21 @@ export class Prediction {
        * client look catastrophically wrong, so they are counted separately.
        */
       worstErrorLiving: 0,
-      lastError: 0, shotsRejected: 0, worstAt: null, respawnCorrections: 0,
+      /**
+       * Worst error while alive AND on the ground — the number that reflects controlled
+       * play, and the one to hold to a tight bound.
+       *
+       * Airborne divergence is a different animal and is tracked separately. A fall is
+       * dominated by gravity, not by input: if a lost command means the client leaves a
+       * ledge one tick before the server does, the two are already moving apart at
+       * several metres a second and nothing either simulation does will bring them back
+       * until they land. Holding that to the same bound as walking would mean either a
+       * meaningless threshold or a permanently failing test.
+       */
+      worstErrorGrounded: 0,
+      worstErrorAir: 0,
+      lastError: 0, shotsRejected: 0, worstAt: null, worstLivingAt: null,
+      respawnCorrections: 0,
     };
   }
 
@@ -161,7 +175,25 @@ export class Prediction {
 
     const bothAlive = mine.player.alive && !!(wire.flags & 1);
     if (bothAlive) {
-      if (posErr > this.stats.worstErrorLiving) this.stats.worstErrorLiving = posErr;
+      const grounded = mine.player.grounded && mine.player.moveState !== 'air';
+      if (grounded) {
+        if (posErr > this.stats.worstErrorGrounded) this.stats.worstErrorGrounded = posErr;
+      } else if (posErr > this.stats.worstErrorAir) {
+        this.stats.worstErrorAir = posErr;
+      }
+      if (posErr > this.stats.worstErrorLiving) {
+        this.stats.worstErrorLiving = posErr;
+        // Its OWN context. Sharing `worstAt` with the all-inclusive figure meant the
+        // reported detail described a different sample than the reported number — which
+        // sent me looking at a respawn while the actual worst live error was elsewhere.
+        this.stats.worstLivingAt = {
+          seq: snap.lastCommandSeq, tick: snap.tick,
+          health: [mine.player.health, wire.health],
+          posErr: +posErr.toFixed(3), velErr: +velErr.toFixed(3),
+          grounded: mine.player.grounded,
+          moveState: mine.player.moveState,
+        };
+      }
     } else {
       this.stats.respawnCorrections++;
     }

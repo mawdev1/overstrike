@@ -18,7 +18,9 @@
     "headless": "node scripts/headless.mjs --ticks=7200",
     "nettest": "node scripts/nettest.mjs",
     "wstest": "node scripts/wstest.mjs",
-    "mptest": "node scripts/mptest.mjs"
+    "mptest": "node scripts/mptest.mjs",
+    "ci": "npm run check && npm run simtest && npm run headless && npm run nettest && npm run wstest",
+    "ci:browser": "npm run determinism && npm run presenttest && npm run smoke && npm run mptest"
   },
   "dependencies": {
     "three": "^0.185.1",

@@ -239,9 +239,17 @@ console.log('\nprediction and reconciliation');
 async function makePredictedSession({ latencyMs = 0, loss = 0, bots = 0, seed = 4242 } = {}) {
   const server = await makeSession({ clients: 1, bots, latencyMs, loss, seed });
 
+  // The client runs NO bots, whatever the server has.
+  //
+  // This is the architecture, not a test shortcut: a client does not simulate anyone it
+  // does not control. Remote entities — bots included — arrive as snapshots and are
+  // interpolated. Running local twins would mean two independent AI simulations drifting
+  // apart from the first tick, and the client's player colliding with bots that are not
+  // where the server says they are, which reconciliation would then spend the whole match
+  // correcting.
   const clientGame = new Game({ headless: true });
   await clientGame.initHeadless({ presenter: new NullPresenter() });
-  clientGame.startMatch({ mode: 'tdm', botCount: bots, difficulty: 'regular', seed });
+  clientGame.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed });
   clientGame.match.phase = 'live';
   clientGame.match.countdown = 0;
 
@@ -403,6 +411,50 @@ function runPredicted(s, n, shape = () => {}) {
     bad('replay happened at all', 'no commands were replayed, so this test proves nothing about silencing');
   }
   ok(`presentation fired ${plays} times across ${s.pred.stats.corrections} corrections`);
+}
+
+console.log('\nlatency soak (80 ms RTT, 3% loss)');
+
+{
+  // The plan asks for this specifically, and the reason is worth stating: reconciliation
+  // only runs when prediction is WRONG, so at 0 ms it never executes. Without a soak, the
+  // single most intricate part of the netcode would be exercised by nothing until the
+  // first real match — and single player, the mode played most, would be the mode that
+  // tests it least.
+  const s = await makePredictedSession({ latencyMs: 40, loss: 0.03, bots: 4, seed: 5150 });
+  runPredicted(s, 2400, (cmd, t) => {
+    cmd.wishForward = t % 180 < 110 ? 1 : -1;
+    cmd.wishRight = t % 300 < 90 ? 1 : 0;
+    cmd.deltaYaw = Math.sin(t / 40) * 0.015;
+    cmd.fireHeld = t % 100 < 30;
+    if (t % 260 === 0) cmd.jump = true;
+    if (t % 400 === 0) cmd.crouchPressed = true;
+  });
+
+  const st = s.pred.stats;
+  const drift = s.conns[0].entity.position.distanceTo(s.clientGame.player.position);
+
+  // Grounded is the number that reflects controlled play. Airborne is reported, not
+  // asserted tightly: a lost command near a ledge means the two simulations leave the
+  // ground a tick apart, and from then on gravity — not input — decides how far apart
+  // they get. Holding both to one bound would mean a meaningless threshold.
+  if (st.worstErrorGrounded < 0.75) ok(`20 s soak: worst grounded error ${st.worstErrorGrounded.toFixed(3)} m`);
+  else bad('the soak keeps grounded prediction tight',
+    `worst grounded error ${st.worstErrorGrounded.toFixed(2)} m at ${JSON.stringify(st.worstLivingAt)}`);
+  if (st.worstErrorAir < 6) ok(`worst airborne error ${st.worstErrorAir.toFixed(2)} m (gravity, not input)`);
+  else bad('airborne divergence stays bounded', `${st.worstErrorAir.toFixed(2)} m`);
+
+  if (st.corrections > 0) ok(`reconciliation actually ran (${st.corrections} corrections, ${st.replayedCommands} commands replayed)`);
+  else bad('reconciliation is exercised by the soak',
+    'zero corrections in 20 s at 40 ms one-way with 3% loss — the soak is not stressing anything');
+
+  if (drift < 3) ok(`client and server finish ${drift.toFixed(2)} m apart after 2400 ticks`);
+  else bad('client and server stay together over a soak', `${drift.toFixed(2)} m apart`);
+
+  const upBytes = s.conns[0].sT.stats.bytesSent;
+  const downBytes = s.conns[0].cT.stats.bytesSent;
+  const secs = 2400 * FIXED_DT;
+  ok(`bandwidth over the soak: up ${(upBytes / secs / 1024).toFixed(1)} KiB/s, down ${(downBytes / secs / 1024).toFixed(1)} KiB/s`);
 }
 
 console.log('\nlag compensation');
