@@ -338,7 +338,28 @@ function buildMarketHall(B) {
   B.parapet(X0, Z0, X1, Z0, L2, 1.05, 'plaster', 'concrete', { gaps: [[-6.5, -3.5], [3.5, 6.5]] });
   B.parapet(X1, Z0, X1, Z1, L2, 1.05, 'plaster', 'concrete', { gaps: [[-7, -4], [4, 7]] });
   B.parapet(X0, Z0, X0, Z1, L2, 1.05, 'plaster', 'concrete', { gaps: [[-7, -4], [4, 7]] });
-  B.prop('acUnit', 4.6, L2, -6.2, 0.3);
+  // Firing step (banquette) inside the parapet.
+  //
+  // The roof is the map's centrepiece and, measured, it saw almost nothing: from the deck
+  // centre 0.9% of the ground, because the 1.05 m parapet occludes everything nearby
+  // unless you walk right up to it and skyline yourself in a crenellation gap. So the
+  // reward for taking the high ground was smaller than for standing on a first floor —
+  // the warehouse mezzanine at 4.15 m sees 18%.
+  //
+  // 0.35 m of step puts a standing eye at 10.02, comfortably over the 9.10 parapet top,
+  // while leaving 0.70 m of parapet as chest cover from up there. Crouching drops you
+  // fully behind it. That is the whole point of a banquette: height when you choose to
+  // take it, cover when you do not — rather than a parapet that only offers both at the
+  // two gaps somebody remembered to cut.
+  const STEP_H = 0.35, STEP_W = 1.1;
+  for (const [sx0, sz0, sx1, sz1] of [
+    [X0 + 0.13, Z0 + 0.13, X1 - 0.13, Z0 + 0.13 + STEP_W],
+    [X0 + 0.13, Z1 - 0.13 - STEP_W, X1 - 0.13, Z1 - 0.13],
+    [X0 + 0.13, Z0 + 0.13 + STEP_W, X0 + 0.13 + STEP_W, Z1 - 0.13 - STEP_W],
+    [X1 - 0.13 - STEP_W, Z0 + 0.13 + STEP_W, X1 - 0.13, Z1 - 0.13 - STEP_W],
+  ]) B.box(sx0, L2, sz0, sx1, L2 + STEP_H, sz1, 'concreteDark', 'concrete');
+
+  B.prop('acUnit', 4.6, L2 + STEP_H, -6.2, 0.3);
   B.prop('acUnit', 6.4, L2, -4.4, -0.2);
   B.prop('acUnit', -4.2, L2, -7.4, 1.4);
   B.prop('crate', 2.2, L2, 6.4, 0.5);

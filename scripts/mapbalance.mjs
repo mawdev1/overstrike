@@ -37,14 +37,22 @@ console.log(`\nmap balance (${w.boxes.length} colliders, ${w.spawnPoints.length}
 
 // Key positions a match is fought over. Named so a regression reads as "team 1 lost their
 // route to the warehouse" rather than as a number moving.
+// Probe points are chosen to be FAIR, which matters more than it sounds. An earlier
+// version put "market hall L1" at z = -8 — the north half of a hall that spans z ±11 —
+// and then reported the north team 3.4 s closer, which is a fact about the probe, not
+// about the map. Central objectives sit on the centreline; anything lane-specific is
+// measured against its mirror so the comparison is like for like.
 const OBJECTIVES = [
-  { name: 'market hall roof', at: new THREE.Vector3(0, 8.05, 0) },
-  { name: 'market hall L1', at: new THREE.Vector3(0, 4.15, -8) },
-  { name: 'warehouse mezzanine', at: new THREE.Vector3(25, 4.0, -30) },
-  { name: 'warehouse floor', at: new THREE.Vector3(25, 0.15, -24) },
-  { name: 'customs L1', at: new THREE.Vector3(25, 4.15, 20) },
-  { name: 'old town rampart', at: new THREE.Vector3(-27, 3.95, -8) },
+  { name: 'market hall roof', at: new THREE.Vector3(0, 8.05, 0), central: true },
+  { name: 'market hall L1', at: new THREE.Vector3(0, 4.15, 0), central: true },
+  { name: 'market hall ground', at: new THREE.Vector3(0, 0.15, 0), central: true },
   { name: 'plaza centre', at: new THREE.Vector3(0, 0, 22) },
+  // Forward buildings — each team's own. Compared against each other, not to zero.
+  { name: 'warehouse floor', at: new THREE.Vector3(25, 0.15, -24), forwardFor: 1 },
+  { name: 'customs floor', at: new THREE.Vector3(25, 0.15, 20), forwardFor: 0 },
+  { name: 'warehouse mezzanine', at: new THREE.Vector3(25, 4.0, -30), forwardFor: 1 },
+  { name: 'customs L1', at: new THREE.Vector3(25, 4.15, 20), forwardFor: 0 },
+  { name: 'old town rampart', at: new THREE.Vector3(-27, 3.95, -8) },
 ];
 
 // `findPath` fills an ARRAY of Vector3-like waypoints and grows it as needed — not a
@@ -102,6 +110,7 @@ function pathLen(from, to) {
   const SPRINT = 7.2;                                   // m/s, from TUNE
   console.log('\n  travel from each team\'s nearest spawn:');
   let worstName = null, worstDelta = 0;
+  const forward = { 0: null, 1: null };
   for (const obj of OBJECTIVES) {
     const best = [Infinity, Infinity];
     for (const t of [0, 1]) {
@@ -120,7 +129,22 @@ function pathLen(from, to) {
     console.log(`     ${obj.name.padEnd(22)} t0 ${best[0].toFixed(1).padStart(6)} m   t1 ${best[1].toFixed(1).padStart(6)} m   ${who} by ${delta.toFixed(1)} m (${secs.toFixed(1)} s)`);
     // The CENTRE is the one that has to be even; a forward building being closer to the
     // team it is forward of is the point of a forward building.
-    if (obj.name.startsWith('market hall') && delta > worstDelta) { worstDelta = delta; worstName = obj.name; }
+    if (obj.central && delta > worstDelta) { worstDelta = delta; worstName = obj.name; }
+    // A forward building being closer to the team it is forward OF is the point of a
+    // forward building. What matters is whether the two teams' forward buildings are
+    // worth the same to them.
+    if (obj.forwardFor !== undefined && obj.name.endsWith('floor')) {
+      forward[obj.forwardFor] = { own: best[obj.forwardFor], theirs: best[1 - obj.forwardFor] };
+    }
+  }
+
+  if (forward[0] && forward[1]) {
+    const adv0 = forward[0].theirs - forward[0].own;
+    const adv1 = forward[1].theirs - forward[1].own;
+    const gap = Math.abs(adv0 - adv1) / SPRINT;
+    console.log(`     forward-building advantage: team 0 ${(adv0 / SPRINT).toFixed(1)} s, team 1 ${(adv1 / SPRINT).toFixed(1)} s`);
+    if (gap <= 1.5) ok(`both teams' forward buildings are worth the same within ${gap.toFixed(1)} s`);
+    else note(`one team's forward building is worth ${gap.toFixed(1)} s more than the other's`);
   }
   const centreSecs = worstDelta / SPRINT;
   if (centreSecs <= 0.45) ok(`the contested centre is even within ${centreSecs.toFixed(2)} s`);
@@ -168,20 +192,37 @@ function pathLen(from, to) {
   const from = new THREE.Vector3(), dir = new THREE.Vector3();
   let best = 0, bestAt = null;
   const scores = [];
+  // The BEST stance within each objective, not its geometric centre.
+  //
+  // A rooftop's centre is the one place on it nobody fights from — the parapet occludes
+  // everything from there. Measuring it reported the market hall roof at 0.9% and made a
+  // firing step look like it had changed nothing. What a player actually holds is the
+  // strongest position the objective offers, so that is what gets measured.
   for (const obj of OBJECTIVES) {
-    from.copy(obj.at); from.y += EYE;
-    if (w.pointInSolid(from.x, from.y, from.z)) continue;
-    let seen = 0;
-    for (const g of ground) {
-      dir.subVectors(g, from);
-      const dist = dir.length();
-      if (dist < 0.5 || dist > 90) continue;
-      dir.normalize();
-      if (!w.raycast(from, dir, dist - 0.3)) seen++;
+    let objBest = 0;
+    for (let ox = -8; ox <= 8; ox += 2) {
+      for (let oz = -8; oz <= 8; oz += 2) {
+        from.set(obj.at.x + ox, obj.at.y, obj.at.z + oz);
+        // Stand on whatever surface is there, if any, rather than floating at the
+        // objective's nominal height.
+        const surf = w.sampleGroundHeight(from.x, from.z, obj.at.y + 1.2);
+        if (surf === null || surf < obj.at.y - 0.6) continue;
+        from.y = surf + EYE;
+        if (w.pointInSolid(from.x, from.y, from.z)) continue;
+        let seen = 0;
+        for (const g of ground) {
+          dir.subVectors(g, from);
+          const dist = dir.length();
+          if (dist < 0.5 || dist > 90) continue;
+          dir.normalize();
+          if (!w.raycast(from, dir, dist - 0.3)) seen++;
+        }
+        const f = seen / ground.length;
+        if (f > objBest) objBest = f;
+      }
     }
-    const frac = seen / ground.length;
-    scores.push(`${obj.name} ${(frac * 100).toFixed(1)}%`);
-    if (frac > best) { best = frac; bestAt = obj.name; }
+    scores.push(`${obj.name} ${(objBest * 100).toFixed(1)}%`);
+    if (objBest > best) { best = objBest; bestAt = obj.name; }
   }
   console.log(`\n  ground visible from each objective (${ground.length} sample points):`);
   console.log(`     ${scores.join(' · ')}`);
