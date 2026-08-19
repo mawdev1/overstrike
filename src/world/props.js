@@ -85,6 +85,21 @@ export function scaleCylUV(geo, radius, h, uv = UV) {
  * Tiny local-space geometry accumulator used to author prop templates.
  * Everything it emits is indexed with (position, normal, uv) so it merges cleanly.
  */
+/**
+ * Build colliders without geometry (the headless server).
+ *
+ * The one rule, and it is not optional: the skip must happen at `addGeo` and NEVER any
+ * higher up the call chain. Decoration code — `_stain`, `_shutters`, `debris` — draws
+ * from the shared `game.rng` while producing nothing but appearance. Those functions
+ * must still RUN, and still consume exactly the draws they always did; only the geometry
+ * they hand to `addGeo` is discarded. Short-circuiting a caller instead would leave the
+ * server's stream a different number of draws along than every client's, and the whole
+ * map would then be built from different randomness — with no error and no test to catch
+ * it beyond the collider hash in scripts/headless.mjs.
+ */
+let COLLIDERS_ONLY = false;
+export function setCollidersOnly(v) { COLLIDERS_ONLY = !!v; }
+
 function templateBuilder() {
   const parts = new Map();     // matName -> { mat, tint, cast, receive, geos: [] }
   const colliders = [];
@@ -133,6 +148,13 @@ function templateBuilder() {
     },
     finish() {
       const out = [];
+      // Colliders are pure numbers from `col()` and owe nothing to the geometry, so the
+      // merge is skipped wholesale. The geometries themselves were still built — see the
+      // note on COLLIDERS_ONLY: the factories that make them also draw RNG.
+      if (COLLIDERS_ONLY) {
+        for (const b of parts.values()) for (const g of b.geos) g.dispose();
+        return { parts: out, colliders };
+      }
       for (const b of parts.values()) {
         const geo = b.geos.length === 1 ? b.geos[0] : mergeGeometries(b.geos, false);
         if (!geo) continue;
@@ -231,6 +253,8 @@ export class Builder {
    *   requires a matching attribute set across the whole bucket.
    */
   addGeo(geo, matName, cast = true, receive = true, colored = false) {
+    // THE skip point. See COLLIDERS_ONLY above before moving this anywhere else.
+    if (COLLIDERS_ONLY) { geo?.dispose?.(); return; }
     const key = `${matName}|${cast ? 1 : 0}${receive ? 1 : 0}`;
     let b = this._static.get(key);
     if (!b) { b = { mat: matName, cast, receive, colored: false, geos: [] }; this._static.set(key, b); }
@@ -309,6 +333,13 @@ export class Builder {
    */
   groundPlane(x0, z0, x1, z1, y, matName, surface, opts = {}) {
     const w = x1 - x0, d = z1 - z0;
+    // The only primitive that builds a mesh without going through addGeo, and the one
+    // that actually throws headlessly: `assets.tiled` clones a material that was never
+    // generated. It draws no RNG, so short-circuiting to the collider is safe here.
+    if (COLLIDERS_ONLY) {
+      if (opts.collide !== false) this.collider(x0, y - 1, z0, x1, y, z1, surface);
+      return;
+    }
     const g = new THREE.PlaneGeometry(w, d, 1, 1);
     g.rotateX(-Math.PI / 2);
     g.translate((x0 + x1) / 2, y, (z0 + z1) / 2);
@@ -782,6 +813,14 @@ export class Builder {
 
   /** Merge every static bucket, build every InstancedMesh, attach to the world group. */
   finish() {
+    // `stats` is still returned: level.js reads drawCalls/triangles off it, and
+    // `colliders` was counted as they were added, independently of any geometry.
+    if (COLLIDERS_ONLY) {
+      for (const b of this._static.values()) for (const g of b.geos) g.dispose();
+      this._static.clear();
+      this._inst.clear();
+      return this.stats;
+    }
     this._foldSingletons();
 
     for (const b of this._static.values()) {

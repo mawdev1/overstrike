@@ -38,6 +38,24 @@ const stubMat = () => new THREE.MeshBasicMaterial();
 assets.mat = stubMat;
 assets.tiled = stubMat;
 
+/**
+ * Digest of everything the SIMULATION takes from a built level.
+ *
+ * Colliders and spawns are the entire simulation-visible output of world building; the
+ * meshes are not consulted by anything that decides an outcome. Full precision, no
+ * rounding — this is checking for bit-identity, and a tolerance would hide exactly the
+ * drift it exists to catch.
+ */
+const levelDigest = (w) => {
+  const parts = [];
+  for (const b of w.boxes) {
+    parts.push(`${b.min.x},${b.min.y},${b.min.z},${b.max.x},${b.max.y},${b.max.z},${b.surface}`);
+  }
+  parts.push('|');
+  for (const sp of w.spawnPoints) parts.push(`${sp.position.x},${sp.position.y},${sp.position.z},${sp.yaw},${sp.team ?? '-'}`);
+  return parts.join(';');
+};
+
 let game;
 const t0 = performance.now();
 try {
@@ -62,6 +80,37 @@ if (!game.engine && !game.renderer && !game.hud && !game.audio && !game.fx) {
 const boxes = game.world?.boxes?.length ?? 0;
 if (boxes > 100) ok(`world built with ${boxes} colliders and ${game.world.spawnPoints.length} spawns`);
 else bad('world built', `only ${boxes} colliders`);
+
+// ── the collider hash ────────────────────────────────────────────────────────────────
+//
+// The load-bearing check of colliders-only mode, and the only defence against its one
+// real hazard. The level builder draws from the shared `game.rng` inside code that
+// produces nothing but decoration (stains, shutters, debris). Those draws must still
+// happen headlessly, or the server's stream ends up a different number of draws along
+// than every client's and the entire map is built from different randomness — silently,
+// with no error anywhere.
+//
+// So: build the same seed twice in this process, once with geometry and once without,
+// and demand the simulation-visible output be identical.
+const headlessDigest = levelDigest(game.world);
+{
+  const full = new Game({ headless: true });
+  await full.initHeadless({ presenter: new NullPresenter(), colliders: false });
+  const fullDigest = levelDigest(full.world);
+  if (fullDigest === headlessDigest) {
+    ok(`colliders-only build is bit-identical to a full build (${boxes} boxes, ${game.world.spawnPoints.length} spawns)`);
+  } else {
+    // Report where, not just that: the first differing entry localises an RNG desync to
+    // the prop that caused it.
+    const a = headlessDigest.split(';'), c = fullDigest.split(';');
+    let at = 'length only';
+    for (let i = 0; i < Math.max(a.length, c.length); i++) {
+      if (a[i] !== c[i]) { at = `entry ${i}:\n         colliders-only: ${a[i]}\n         full:           ${c[i]}`; break; }
+    }
+    bad('colliders-only build is bit-identical to a full build',
+      `${a.length} vs ${c.length} entries — the RNG streams diverged during world build.\n       ${at}`);
+  }
+}
 
 // Bots must exist and must NOT have rigs: the rig is a rendering resource, so a no-op
 // presenter cannot make it free — it has to not be built.

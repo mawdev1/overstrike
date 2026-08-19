@@ -9,6 +9,7 @@ import { LivePresenter, NullPresenter } from './presenter.js';
 import { clamp, FIXED_DT } from './mathUtils.js';
 
 import { World } from '../world/world.js';
+import { setCollidersOnly } from '../world/props.js';
 import { NavGrid } from '../world/navGrid.js';
 import { Player } from '../player/player.js';
 import { BotManager } from '../ai/botManager.js';
@@ -169,6 +170,7 @@ export class Game {
     });
     await step('generating materials', (tick) => assets.init(tick));
     await step('building world', async () => {
+      setCollidersOnly(false);
       this.world = new World(this);
       await this.world.init();
       this.engine.fitShadowCamera(this.world.bounds);
@@ -238,10 +240,14 @@ export class Game {
    * There is no render loop: the caller drives `_fixedUpdate(FIXED_DT)` at whatever rate
    * it likes. `start()` is deliberately not called — it wants requestAnimationFrame.
    */
-  async initHeadless({ presenter } = {}) {
+  async initHeadless({ presenter, colliders = true } = {}) {
     const tBoot = performance.now();
     this.present = presenter || new NullPresenter();
 
+    // Build colliders without geometry. The collider set and spawn table come out
+    // bit-identical either way — asserted by scripts/headless.mjs, which is the only
+    // thing standing between this and a silent server/client map divergence.
+    setCollidersOnly(colliders);
     this.world = new World(this);
     await this.world.init();
 
