@@ -135,6 +135,33 @@ try {
 const faults = [];
 game.bus.on('systemFault', (f) => faults.push(`${f.system}.${f.phase}: ${f.error?.message}`));
 
+// ── entity ids and the registry ──────────────────────────────────────────────────────
+//
+// Ids used to come from three module-level counters kept apart by hard-coded gaps
+// (player from 1, bots from 1000, streak hardware from 100000). killstreaks.js still
+// carries the scar of that going wrong: sentry #1 and the player both being id 1, so
+// anything keyed on shooter.id confused them. Networking makes an id the name one machine
+// uses to tell another which entity it means, so they now come from one allocator.
+{
+  const ents = game.entities;
+  const ids = ents.map((e) => e.id);
+  const unique = new Set(ids);
+  if (unique.size === ids.length) ok(`all ${ids.length} entity ids are distinct`);
+  else bad('entity ids are distinct', `${ids.length} entities, ${unique.size} distinct ids: ${ids.join(',')}`);
+
+  // Hardware draws from the same allocator, so it cannot collide with an entity either.
+  const hw = [game.allocEntityId(), game.allocEntityId()];
+  if (!hw.some((id) => unique.has(id))) ok('freshly allocated ids do not collide with live entities');
+  else bad('freshly allocated ids do not collide', `${hw.join(',')} overlaps the roster`);
+
+  const byId = ents.every((e) => game.entityById(e.id) === e);
+  if (byId) ok('entityById resolves every live entity to the same object');
+  else bad('entityById resolves every live entity', 'a lookup returned a different object or null');
+
+  if (game.entityById(-1) === null) ok('entityById returns null for an unknown id');
+  else bad('entityById returns null for an unknown id', 'got a value');
+}
+
 const DT = 1 / 120;
 const t1 = performance.now();
 try {
@@ -159,6 +186,18 @@ const moved = game.bots.bots.filter((b) => b.position.lengthSq() > 0).length;
 const scored = game.match.scores.reduce((a, b) => a + b, 0);
 if (moved > 0) ok(`bots are live (${moved} placed, scores ${game.match.scores.join(':')}, ${scored} total)`);
 else bad('bots are live', 'no bot has a position — the loop ran but nothing simulated');
+
+// Kills prove the whole chain end to end — bots seeing, pathing, shooting, ballistics
+// resolving, and Match booking the result. That last step runs through `_isLiveEntity`,
+// which now resolves via `entityById` rather than scanning; if the registry were wrong,
+// scoring would silently stop and everything above would still pass. Long runs only:
+// a few seconds of simulation is not enough for anyone to die.
+const LONG_ENOUGH = 3600;
+if (TICKS >= LONG_ENOUGH) {
+  if (scored > 0) ok(`combat resolves end to end (${scored} kills booked in ${(TICKS / 120).toFixed(0)}s)`);
+  else bad('combat resolves end to end',
+    `no kills in ${(TICKS / 120).toFixed(0)}s of simulation — bots may be inert, or Match may not be booking (check _isLiveEntity / the entity registry)`);
+}
 
 if (game.tick === TICKS) ok(`the clock advanced to tick ${game.tick} (time ${game.time.toFixed(3)}s)`);
 else bad('the clock advanced', `tick ${game.tick}, expected ${TICKS}`);

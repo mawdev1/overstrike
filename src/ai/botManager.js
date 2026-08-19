@@ -417,6 +417,7 @@ export class BotManager {
   }
 
   _resizeRoster(count) {
+    if (this.bots.length === count) return;
     while (this.bots.length > count) {
       const b = this.bots.pop();
       b.dispose();
@@ -424,6 +425,8 @@ export class BotManager {
     while (this.bots.length < count) {
       this.bots.push(new Bot(this.game, 1, 'BOT'));
     }
+    // The only place the roster changes size; `game.entityById` reindexes off this.
+    this.game.rosterChanged();
   }
 
   _buildNamePool() {

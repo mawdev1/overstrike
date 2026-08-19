@@ -311,9 +311,9 @@ export class Match {
   }
 
   _isLiveEntity(entity) {
-    const ents = this.game.entities;
-    for (let i = 0; i < ents.length; i++) if (ents[i] === entity) return true;
-    return false;
+    // Identity, not id: an id that resolves to a DIFFERENT object means this entity is a
+    // stale reference, which is exactly the case worth rejecting.
+    return !!entity && this.game.entityById(entity.id) === entity;
   }
 
   /** Stat row for an entity, or null for non-combatants (sentries, gunships, world). */

@@ -185,8 +185,6 @@ const _v4 = new THREE.Vector3();
 const _v5 = new THREE.Vector3();
 const _v6 = new THREE.Vector3();
 
-let _nextEntityId = 1000;
-
 /**
  * Minimal stand-in used only if `game.weapons` exposes no instance factory we
  * recognise. Implements the documented WeaponInstance surface (§7) so nothing
@@ -591,7 +589,7 @@ export class Bot {
     this.game = game;
 
     // ---- §4 entity contract
-    this.id = _nextEntityId++;
+    this.id = game.allocEntityId();
     this.isPlayer = false;
     // Its own stream from the outset. Aliasing `game.rng` here meant a bot that somehow
     // missed `_configureRoster` would silently share the global stream — the exact

@@ -104,13 +104,12 @@ export class Killstreaks {
     this._group = null;
     this._ballistics = null;
     /**
-     * Streak hardware is NOT in `game.entities` and never goes through the player/bot id
-     * allocator, so its ids must not collide with theirs. Starting at 1 put sentry #1 on
-     * exactly the same id as the player (`player.js` also starts at 1), and anything that
-     * keys off `shooter.id` — spawn protection above all — then confused the two. Base
-     * the hardware space far above any plausible roster.
+     * Streak hardware is not in `game.entities`, but its ids must still not collide with
+     * entities': anything keyed off `shooter.id` — spawn protection above all — confuses
+     * the two if they overlap, which is how sentry #1 once became the player. It used to
+     * be avoided by basing the hardware space at 100000 and hoping. It now draws from
+     * `game.allocEntityId()`, the single allocator, so the gaps are not load-bearing.
      */
-    this._nextId = 100000;
     this._availTmp = [];
 
     this._onKillstreak = this._onKillstreak.bind(this);
@@ -445,7 +444,7 @@ export class Killstreaks {
     this._group?.add(g);
 
     return {
-      id: this._nextId++,
+      id: this.game.allocEntityId(),
       kind: 'sentry',
       active: false,
       alive: false,
@@ -603,7 +602,7 @@ export class Killstreaks {
     this._group?.add(g);
 
     return {
-      id: this._nextId++,
+      id: this.game.allocEntityId(),
       kind: 'chopper',
       active: false,
       team: 0,

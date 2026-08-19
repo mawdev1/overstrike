@@ -87,6 +87,12 @@ export class Game {
     this._systems = null;
     this._loop = this._loop.bind(this);
 
+    /** Single source of entity ids — see allocEntityId. */
+    this._entityIdSeq = 0;
+    this._rosterVersion = 0;
+    this._entIndexVersion = -1;
+    this._entIndex = null;
+
     /** Per-phase boot timings in ms. Read by the perf harnesses via `__GAME__`. */
     this.bootProfile = { phases: [], totalMs: 0 };
   }
@@ -380,6 +386,15 @@ export class Game {
     if (opts.difficulty !== undefined) this.settings.set('difficulty', opts.difficulty);
     if (opts.mode !== undefined) this.settings.set('mode', String(opts.mode));
 
+    // Deliberately NOT resetting `_entityIdSeq` here. The Player is constructed once at
+    // boot and keeps its id for the process; restarting the sequence per match would hand
+    // the first bot the id the player is still using, and everything keyed on `shooter.id`
+    // — spawn protection above all — would then confuse them. Ids climbing across matches
+    // costs nothing: nothing derives simulation state from an id (bot RNG streams are
+    // seeded from the roster index, not the id), and the server tells clients which ids it
+    // chose rather than expecting them to agree independently.
+    this.rosterChanged();
+
     for (const s of this.systems) s.reset?.(opts);
     this.match.begin(opts);
     this.state = 'playing';
@@ -578,6 +593,51 @@ export class Game {
     if (this.player) out.push(this.player);
     if (this.bots) for (const b of this.bots.bots) out.push(b);
     return out;
+  }
+
+  /**
+   * Allocate an entity id.
+   *
+   * One counter, so ids cannot collide. They used to come from three module-level
+   * counters — Player from 1, Bot from 1000, killstreak hardware from 100000 — kept apart
+   * by nothing but the size of the gaps, and killstreaks.js still carries comments about
+   * the time a sentry and the player both ended up as id 1. Networking makes that worse,
+   * not better: ids become the name by which one machine tells another which entity it
+   * means.
+   *
+   * Reset per match by `startMatch`, so a long-lived server process replays the same ids
+   * for the same match rather than drifting upward across restarts.
+   */
+  allocEntityId() {
+    return ++this._entityIdSeq;
+  }
+
+  /**
+   * Entity for an id, or null.
+   *
+   * `entities` stays exactly what it was — a reused array, rebuilt per access, player
+   * first — because 25-odd call sites index it in hot loops and at least one (botManager)
+   * documents its dependence on that reuse. This is an index BESIDE it, not a
+   * replacement, and it is what a network message will resolve against: the wire carries
+   * an id, never an object.
+   *
+   * Rebuilt only when the roster actually changes, which BotManager reports; a per-access
+   * rebuild would put a Map allocation inside the ballistics loop.
+   */
+  entityById(id) {
+    if (this._entIndexVersion !== this._rosterVersion || !this._entIndex) {
+      const map = this._entIndex || (this._entIndex = new Map());
+      map.clear();
+      const ents = this.entities;
+      for (let i = 0; i < ents.length; i++) map.set(ents[i].id, ents[i]);
+      this._entIndexVersion = this._rosterVersion;
+    }
+    return this._entIndex.get(id) || null;
+  }
+
+  /** Called when an entity joins or leaves, so `entityById` knows to reindex. */
+  rosterChanged() {
+    this._rosterVersion++;
   }
 
   dispose() {

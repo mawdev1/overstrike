@@ -282,8 +282,6 @@ const M_LOADOUT = ['createLoadout', 'giveLoadout', 'spawnLoadout', 'equipDefault
 const M_STREAK = ['useKillstreak', 'activateKillstreak', 'triggerKillstreak'];
 const M_DEATH = ['onPlayerDeath', 'onEntityDeath', 'reportDeath'];
 
-let _nextId = 1;
-
 /** Call the first method in `names` that actually exists. Never throws. */
 function callAny(obj, names, a, b, c, d) {
   if (!obj) return undefined;
@@ -340,7 +338,7 @@ export class Player {
     this.game = game;
 
     // ── entity contract ──
-    this.id = _nextId++;
+    this.id = game.allocEntityId();
     this.isPlayer = true;
     this.team = 0;
     this.alive = true;
