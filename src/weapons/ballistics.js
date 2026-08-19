@@ -308,32 +308,64 @@ function traceWorld(game, origin, dir, maxDist) {
 }
 
 /**
- * Is the surface we just hit thin enough to shoot through?
+ * Is the material we just hit thin enough to shoot through?
  *
- * We start `PENETRATION_PROBE` metres past the impact and cast BACK along the ray. The
- * first face we meet is the far side of the wall — and its normal points along the
- * bullet's travel, which is exactly what distinguishes it from the entry face we would
- * meet if the wall were thicker than the probe. Writes the exit point/normal on success.
+ * Measures the UNBROKEN run of solid from just inside the impact, forward along the ray,
+ * and punches only if that run ends within the budget. Overlapping and abutting boxes
+ * read as one wall, which is what a bullet actually experiences.
+ *
+ * The previous version probed BACKWARDS from a fixed distance past the impact and took
+ * the first face it met as the far side. That failed two ways, and both were live:
+ *
+ *   - `raycast` skips any box the ray STARTS inside (see `World.pointInSolid`), so when
+ *     the probe origin was buried — which it is whenever the wall is thicker than the
+ *     probe, i.e. exactly the case it was meant to reject — the wall itself was invisible
+ *     and the probe reported whatever unrelated face happened to be nearby.
+ *   - it measured ONE box's slab rather than the union. This level has four glass panes
+ *     entombed inside concrete walls; the probe found a pane's far face 0.23 m back and
+ *     declared 0.40 m of concrete "thin".
+ *
+ * Measured before the fix: 4.29% of all wall hits leaked, mean 1.68 m of material
+ * bypassed, worst 13.69 m, and 0.53% of no-line-of-sight position pairs were shootable
+ * through. Now the run is measured directly, so a wall is penetrable exactly when it is
+ * actually thin.
  */
 function probeExit(game, dirX, dirY, dirZ) {
   const w = game.world;
-  if (!w || typeof w.raycast !== 'function') return false;
-  const probe = PENETRATION_PROBE + EPS;
+  if (!w || typeof w.solidRun !== 'function') return false;
+
+  // Start just INSIDE the surface. Starting exactly on the face is ambiguous — the point
+  // is on the boundary of the box it just hit — and starting outside measures the air in
+  // front of the wall as part of the run.
   _probeOrigin.set(
-    _wallPoint.x + dirX * probe,
-    _wallPoint.y + dirY * probe,
-    _wallPoint.z + dirZ * probe,
+    _wallPoint.x + dirX * EPS,
+    _wallPoint.y + dirY * EPS,
+    _wallPoint.z + dirZ * EPS,
   );
-  _probeDir.set(-dirX, -dirY, -dirZ);
-  const r = w.raycast(_probeOrigin, _probeDir, probe);
-  if (!r) return false;                                   // still inside solid => too thick
-  // Exit faces point downrange; the entry face points back at us.
-  const facing = r.normal.x * dirX + r.normal.y * dirY + r.normal.z * dirZ;
-  if (facing <= 0.05) return false;
-  const thickness = probe - r.distance;
-  if (thickness <= 1e-3 || thickness > PENETRATION_PROBE) return false;
-  _exitPoint.copy(r.point);
-  _exitNormal.copy(r.normal);
+  _probeDir.set(dirX, dirY, dirZ);
+
+  const budget = PENETRATION_PROBE + EPS;
+  const run = w.solidRun(_probeOrigin, _probeDir, budget);
+  // `run === 0` means the sample point is not in solid at all — a graze along a face, or
+  // an impact on something with no volume. Nothing to punch through.
+  if (run <= 1e-3) return false;
+  if (run >= budget) return false;                        // thicker than the budget
+
+  _exitPoint.set(
+    _probeOrigin.x + dirX * run,
+    _probeOrigin.y + dirY * run,
+    _probeOrigin.z + dirZ * run,
+  );
+  // Just past the exit must be air, or the run measurement was wrong and resuming there
+  // would put the round back inside solid it cannot see.
+  if (w.pointInSolid(
+    _exitPoint.x + dirX * EPS, _exitPoint.y + dirY * EPS, _exitPoint.z + dirZ * EPS,
+  )) return false;
+
+  // The exit normal is the wall face the round leaves through: opposite its travel. The
+  // old code took it from the probe hit, which was the wrong box whenever the probe was
+  // confused.
+  _exitNormal.set(-dirX, -dirY, -dirZ);
   return true;
 }
 

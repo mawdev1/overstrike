@@ -1339,7 +1339,10 @@ function buildPlaza(B, rng) {
   B.box(-13, 0, 17.6, -10.2, 3.1, 20.2, 'plaster', 'concrete');
   B.deco(-13.2, 3.1, 17.4, -10, 3.4, 20.4, 'concreteDark');
   B.prop('windowFrame', -11.6, 1.35, -17.52, 0, { variant: '1.4x1.1' });
-  B.prop('windowFrame', -11.6, 1.35, 17.68, Math.PI, { variant: '1.4x1.1' });
+  // 17.52, mirroring the -17.52 above: the hut's face is at z=17.6, so the frame sits
+  // just OUTSIDE it. At 17.68 the frame — and the glass pane it carries — was 8 cm inside
+  // a solid block, an invisible pane entombed in plaster.
+  B.prop('windowFrame', -11.6, 1.35, 17.52, Math.PI, { variant: '1.4x1.1' });
   B.prop('barrel', -14.2, 0, -18.4, 0, { color: BARREL_COLORS[rng.int(BARREL_COLORS.length)] });
   B.prop('barrel', -14.2, 0, -19.4, 0.4, { color: BARREL_COLORS[rng.int(BARREL_COLORS.length)] });
 

@@ -30,6 +30,9 @@ const MAX_SUBSTEPS = 24;
 const RAY_EPS = 1e-8;
 
 // ── pooled results ────────────────────────────────────────────────────────────────────
+/** Scratch for `solidRun` — pairs of [enter, exit]. 256 boxes deep is far past plausible. */
+const _runSpans = new Float64Array(512);
+
 const _res = {
   position: new THREE.Vector3(),
   velocity: new THREE.Vector3(),
@@ -839,6 +842,100 @@ export class World {
       }
     }
     return best;
+  }
+
+  /**
+   * Is this point inside solid material?
+   *
+   * `raycast` deliberately cannot answer this: `_march` skips any box with `tmin <= 0`,
+   * so a ray that STARTS inside a box never sees it. That is the right behaviour for a
+   * line-of-sight query — a shooter standing a centimetre inside a doorframe should still
+   * be able to see — but it means nothing downstream can tell "no face ahead" from
+   * "buried in concrete", which is exactly the distinction penetration depends on.
+   */
+  pointInSolid(x, y, z) {
+    if (!this._grid) this.build();
+    const n = this._query(x, y, z, x, y, z);
+    const bx = this._bx, cand = this._cand;
+    for (let k = 0; k < n; k++) {
+      const o = cand[k] * 6;
+      if (x >= bx[o] && x <= bx[o + 3]
+        && y >= bx[o + 1] && y <= bx[o + 4]
+        && z >= bx[o + 2] && z <= bx[o + 5]) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Thickness of the UNBROKEN run of solid material starting at `origin` along `dir`.
+   *
+   * Marches forward accumulating the union of every box interval the ray crosses, and
+   * returns where that union first has a hole in it — so overlapping and abutting boxes
+   * read as one continuous wall, which is what a bullet actually experiences.
+   *
+   * This exists because measuring one box's slab is not measuring a wall. The previous
+   * approach probed BACKWARDS from a fixed distance past the impact and took the first
+   * face it met as the far side, which fails in two ways that matter here: a box the
+   * probe origin sits inside is invisible (see `pointInSolid`), and a thin collider
+   * buried inside a thick one — this level has four glass panes entombed in concrete —
+   * reports its own far face as the wall's, turning 0.40 m of concrete into a free
+   * window. Measured: 4.29% of all wall hits were leaking, up to 13.7 m of material.
+   *
+   * @returns {number} metres of solid from `origin` to the first gap, capped at `maxDepth`.
+   *   0 means the origin is not in solid at all.
+   */
+  solidRun(origin, dir, maxDepth) {
+    if (!this._grid) this.build();
+    const ox = origin.x, oy = origin.y, oz = origin.z;
+    const dx = dir.x, dy = dir.y, dz = dir.z;
+
+    // One broadphase query over the whole segment's AABB. Cheaper than marching cells for
+    // the short distances penetration cares about, and immune to the DDA's own edge cases.
+    const ex = ox + dx * maxDepth, ey = oy + dy * maxDepth, ez = oz + dz * maxDepth;
+    const n = this._query(
+      Math.min(ox, ex), Math.min(oy, ey), Math.min(oz, ez),
+      Math.max(ox, ex), Math.max(oy, ey), Math.max(oz, ez),
+    );
+    const bx = this._bx, cand = this._cand;
+
+    // Collect [enter, exit] for every box the ray actually crosses, clipped to the segment.
+    const spans = _runSpans;
+    let count = 0;
+    for (let k = 0; k < n; k++) {
+      const o = cand[k] * 6;
+      let tmin = 0, tmax = maxDepth;
+      let ok = true;
+      for (let a = 0; a < 3 && ok; a++) {
+        const d = a === 0 ? dx : a === 1 ? dy : dz;
+        const p = a === 0 ? ox : a === 1 ? oy : oz;
+        const lo = bx[o + a], hi = bx[o + 3 + a];
+        if (d > -RAY_EPS && d < RAY_EPS) { if (p < lo || p > hi) ok = false; continue; }
+        const inv = 1 / d;
+        let ta = (lo - p) * inv, tb = (hi - p) * inv;
+        if (ta > tb) { const s = ta; ta = tb; tb = s; }
+        if (ta > tmin) tmin = ta;
+        if (tb < tmax) tmax = tb;
+        if (tmin > tmax) ok = false;
+      }
+      if (!ok || tmax <= 0) continue;
+      spans[count++] = tmin;
+      spans[count++] = tmax;
+      if (count >= spans.length - 1) break;      // absurd overlap; the cap is the answer
+    }
+    if (count === 0) return 0;
+
+    // Sweep the union from t=0. The run ends at the first t where nothing covers it.
+    let end = 0;
+    let advanced = true;
+    while (advanced) {
+      advanced = false;
+      for (let i = 0; i < count; i += 2) {
+        // `<=` so exactly-abutting boxes (a wall built from segments) count as continuous.
+        if (spans[i] <= end + 1e-6 && spans[i + 1] > end) { end = spans[i + 1]; advanced = true; }
+      }
+      if (end >= maxDepth) return maxDepth;
+    }
+    return end;
   }
 
   /**

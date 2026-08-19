@@ -378,6 +378,19 @@ export class Builder {
       const oa0 = Math.max(a0, op.a0), oa1 = Math.min(a1, op.a1);
       if (oa1 <= oa0) continue;
       const oy0 = Math.max(y0, op.y0 ?? y0), oy1 = Math.min(y1, op.y1 ?? y1);
+      // The opening's height range may not intersect this band at all — walls are built
+      // in courses, and a window at 4.6-6.3 m simply does not cut the 0.15-1.3 m base
+      // course. Skipping without advancing `cursor` leaves the span to be emitted as
+      // solid wall by the next `emit`, which is what a course below a window should be.
+      //
+      // Unhandled, this was a shoot-through generator. `oy0`/`oy1` are clamped
+      // independently, so a non-intersecting opening inverts them (oy0 = 4.6 > oy1 = 1.3)
+      // and then: the sill `emit(oa0, oa1, y0, oy0)` builds a box 3.3 m TALLER than its
+      // own band, and `_glassPane` receives an inverted range that `addBoxRaw` silently
+      // normalises into a real pane — entombed inside the oversized sill. Four such panes
+      // existed, three in the warehouse, and each turned its patch of 0.40 m concrete
+      // into a free window for every rifle on the map.
+      if (oy1 <= oy0) continue;
       if (oa0 > cursor) emit(cursor, oa0, y0, y1);
       if (oy0 > y0) emit(oa0, oa1, y0, oy0);          // sill
       if (oy1 < y1) emit(oa0, oa1, oy1, y1);          // lintel
