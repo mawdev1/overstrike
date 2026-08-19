@@ -61,6 +61,48 @@ export function createRNG(seed = 0x9e3779b9) {
 }
 
 /**
+/**
+ * A draw addressed by INDEX rather than by stream position.
+ *
+ * Prediction cannot use a shared stream. The client re-simulates its own shots
+ * immediately, but it has no idea how many draws the server's other entities made in
+ * between — bots thinking, other players firing — so a streamed `rng()` puts the two
+ * machines at different positions and the same shot spreads differently on each. That is
+ * not a bug that shows up as a warning; it shows up as bullets landing somewhere else.
+ *
+ * Addressing a draw as `hash(matchSeed, shooterId, shotSeq, pelletIndex)` removes the
+ * ordering dependence entirely: the Nth pellet of a shooter's Mth shot is the same number
+ * on every machine, whenever it is computed, in whatever order.
+ *
+ * Returns [0, 1). Same avalanche as `mixSeed`, one more round.
+ */
+export function hashRandom(seed, a, b = 0, c = 0) {
+  let h = (seed >>> 0) ^ 0x9e3779b9;
+  h = Math.imul(h ^ ((a | 0) + 0x85ebca6b), 0xcc9e2d51) >>> 0;
+  h = Math.imul(h ^ ((b | 0) + 0x165667b1), 0x1b873593) >>> 0;
+  h = Math.imul(h ^ ((c | 0) + 0xd3a2646c), 0x85ebca6b) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/**
+ * An index-addressable RNG shaped like `createRNG`'s callable, for APIs that take one.
+ *
+ * Each call advances a local counter, so N calls inside one shot are N distinct draws —
+ * but the sequence is a pure function of the address, not of anything that happened
+ * earlier on this machine.
+ */
+export function addressedRNG(seed, a, b = 0) {
+  let n = 0;
+  const fn = () => hashRandom(seed, a, b, n++);
+  fn.range = (min, max) => min + fn() * (max - min);
+  fn.int = (k) => Math.floor(fn() * k);
+  fn.sign = () => (fn() < 0.5 ? -1 : 1);
+  fn.chance = (p) => fn() < p;
+  return fn;
+}
+
+/**
  * Derive an independent stream seed from a base seed and an index.
  *
  * Used to give each actor its own RNG rather than sharing one. A shared stream makes

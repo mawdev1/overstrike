@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { clamp, damp, DEG, spreadDir } from '../core/mathUtils.js';
 import { WEAPONS, getWeapon, DEFAULT_LOADOUT, MELEE, fireInterval } from './weaponDefs.js';
+import { addressedRNG, hashRandom } from '../core/rng.js';
 import { fireHitscan, meleeSweep, applyMeleeDamage } from './ballistics.js';
 import { Viewmodel } from './viewmodel.js';
 import { defineSnapshot } from '../core/snapshot.js';
@@ -447,8 +448,14 @@ export class WeaponInstance {
     const tracerEvery = d.tracerEvery || 0;
     const wantTracer = tracerEvery > 0 && (this.shotsFired % tracerEvery) === 0;
 
+    // Index-addressed, not drawn from the shared stream. A predicting client cannot know
+    // how many times `game.rng` was called on the server between its own shots — bots
+    // thinking, other players firing — so a streamed draw gives the same shot a different
+    // spread on each machine. Addressing it by (shooter, shot, pellet) makes it the same
+    // number everywhere, computed in any order. See rng.js `hashRandom`.
+    const shotRng = addressedRNG(game.matchSeed, (owner?.id ?? 0) * 65537 + this.shotsFired, 1);
     for (let p = 0; p < pellets; p++) {
-      if (spreadRad > 0) spreadDir(_dir, spreadRad, game.rng, _spread);
+      if (spreadRad > 0) spreadDir(_dir, spreadRad, shotRng, _spread);
       else _spread.copy(_dir);
 
       const r = fireHitscan(game, {
@@ -503,7 +510,12 @@ export class WeaponInstance {
     }
 
     // A few percent of noise keeps a memorised pattern from being a laser.
-    const jitter = 1 + (rng() - 0.5) * 0.14;
+    // Same reasoning as the spread above: addressed by (shooter, shot), so the client's
+    // predicted recoil and the server's authoritative recoil are the same number. This
+    // one matters even more — recoil moves the aim the NEXT shot fires along, so a
+    // divergence here compounds across a whole spray.
+    const jitter = 1 + (hashRandom(this.game.matchSeed,
+      (this.owner?.id ?? 0) * 65537 + this.shotsFired, 2) - 0.5) * 0.14;
     const adsMul = 1 - this.adsAmount * 0.28;
     const crouchMul = (this.owner?.crouching ?? false) ? 0.86 : 1;
     const scale = jitter * adsMul * crouchMul;

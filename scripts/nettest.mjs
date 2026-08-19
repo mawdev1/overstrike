@@ -16,6 +16,7 @@ import { NullPresenter } from '../src/core/presenter.js';
 import { GameServer, SNAPSHOT_INTERVAL } from '../src/net/server.js';
 import { NetClient } from '../src/net/client.js';
 import { createLoopbackPair } from '../src/net/transport.js';
+import { Prediction, POSITION_TOLERANCE } from '../src/net/prediction.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
 
 const argv = process.argv.slice(2);
@@ -225,6 +226,183 @@ console.log('\nwith bots');
 
   const up = s.conns[0].sT.stats.bytesSent / (TICKS * FIXED_DT);
   ok(`client -> server is ${(up / 1024).toFixed(1)} KiB/s (${TICKS} commands, 3-deep redundancy)`);
+}
+
+console.log('\nprediction and reconciliation');
+
+/**
+ * A client with its OWN simulation, predicting locally against the server's.
+ *
+ * Both Games are built from the same seed, so they start identical and any divergence is
+ * the netcode's doing rather than the world's.
+ */
+async function makePredictedSession({ latencyMs = 0, loss = 0, bots = 0, seed = 4242 } = {}) {
+  const server = await makeSession({ clients: 1, bots, latencyMs, loss, seed });
+
+  const clientGame = new Game({ headless: true });
+  await clientGame.initHeadless({ presenter: new NullPresenter() });
+  clientGame.startMatch({ mode: 'tdm', botCount: bots, difficulty: 'regular', seed });
+  clientGame.match.phase = 'live';
+  clientGame.match.countdown = 0;
+
+  // Start the local player exactly where the server has them, or the first snapshot is a
+  // correction for a reason that has nothing to do with prediction.
+  const serverEnt = server.conns[0].entity;
+  clientGame.player.position.copy(serverEnt.position);
+  clientGame.player.velocity.copy(serverEnt.velocity);
+  clientGame.player.setAngles(serverEnt.yaw, serverEnt.pitch);
+  clientGame.player.id = serverEnt.id;
+
+  const pred = new Prediction(clientGame, clientGame.player, server.conns[0].client);
+  server.conns[0].client.onSnapshot((snap) => pred.reconcile(snap));
+  return { ...server, clientGame, pred };
+}
+
+function runPredicted(s, n, shape = () => {}) {
+  const c = s.conns[0];
+  let ms = 0;
+  for (let t = 0; t < n; t++) {
+    const cmd = emptyCommand();
+    cmd.tick = s.server.game.tick;
+    shape(cmd, t);
+    // The absolute-aim checksum has to be the client's ACTUAL aim. Sending a constant
+    // here makes the server think the client has desynced and snap its aim on every
+    // command — which then sends the two simulations off in different directions and
+    // looks exactly like a prediction bug.
+    cmd.baseYaw = s.clientGame.player.baseYaw;
+    cmd.basePitch = s.clientGame.player.basePitch;
+    c.client.sendCommand(cmd);       // quantises in place
+    s.pred.predict(cmd);             // predict from exactly what was sent
+    c.sT.pump(ms);
+    s.server.tick();
+    c.cT.pump(ms);
+    ms += FIXED_DT * 1000;
+  }
+}
+
+{
+  // The plan's main regression test: at zero latency the prediction and the authority are
+  // running the same commands over the same world, so they must agree EXACTLY. A
+  // forgotten snapshot field shows up here as a constant 120 Hz divergence rather than as
+  // an occasional glitch under load — the best failure mode available.
+  const s = await makePredictedSession();
+  runPredicted(s, 600, (cmd, t) => {
+    cmd.wishForward = t % 200 < 120 ? 1 : 0;
+    cmd.wishRight = t % 200 >= 120 ? 1 : 0;
+    cmd.deltaYaw = Math.sin(t / 30) * 0.01;
+    cmd.fireHeld = t % 90 < 25;
+    if (t === 150 || t === 400) cmd.jump = true;
+    if (t === 300) cmd.crouchPressed = true;
+  });
+
+  const se = s.conns[0].entity;
+  const ce = s.clientGame.player;
+  const drift = se.position.distanceTo(ce.position);
+
+  if (drift < POSITION_TOLERANCE) ok(`predicted and authoritative agree at 0 ms (${(drift * 1000).toFixed(3)} mm apart after 600 ticks)`);
+  else bad('predicted and authoritative agree at 0 ms',
+    `${drift.toFixed(4)} m apart — the client simulation is not reproducing the server's`);
+
+  if (s.pred.stats.corrections === 0) ok('no corrections were needed at 0 ms');
+  else bad('no corrections at 0 ms',
+    `${s.pred.stats.corrections} corrections, worst error ${s.pred.stats.worstError.toFixed(4)} m — prediction diverges from authority on an ideal link`);
+}
+
+{
+  // 100 ms and 5% loss. Corrections are expected here; what matters is that they stay
+  // small and that the client does not drift away.
+  const s = await makePredictedSession({ latencyMs: 100, loss: 0.05 });
+  runPredicted(s, 900, (cmd, t) => {
+    cmd.wishForward = t % 160 < 100 ? 1 : -1;
+    cmd.deltaYaw = Math.sin(t / 25) * 0.012;
+    cmd.fireHeld = t % 70 < 20;
+    if (t % 240 === 0) cmd.jump = true;
+  });
+
+  const drift = s.conns[0].entity.position.distanceTo(s.clientGame.player.position);
+  // The client is deliberately AHEAD by about the one-way latency, so a gap is correct —
+  // that gap is what prediction is for. It must stay bounded, not vanish.
+  if (drift < 2) ok(`at 100 ms / 5% loss the client stays within ${drift.toFixed(2)} m of authority`);
+  else bad('the client stays close under latency', `${drift.toFixed(2)} m adrift`);
+
+  // Measured only across ticks where both sides agree the player is alive. A death and
+  // respawn moves the player across the map and no prediction can foresee it — the server
+  // decides who dies — so folding those in makes a healthy client look catastrophic. The
+  // first version of this test did exactly that and reported 33 m, which turned out to be
+  // one fall-damage death.
+  const st = s.pred.stats;
+  if (st.worstErrorLiving < 1) ok(`worst error while alive ${st.worstErrorLiving.toFixed(3)} m over 900 ticks (${st.respawnCorrections} respawn corrections excluded)`);
+  else bad('reconciliation error stays bounded while alive',
+    `worst ${st.worstErrorLiving.toFixed(2)} m at ${JSON.stringify(st.worstAt)}`);
+
+  ok(`${s.pred.stats.corrections} corrections, ${s.pred.stats.replayedCommands} commands replayed`);
+}
+
+{
+  // Aim must never be reconciled. This is the difference between a shooter that feels
+  // responsive and one that fights the mouse: a snapshot is up to a snapshot-interval old,
+  // and pulling the local aim toward it would drag the crosshair backwards continuously.
+  const s = await makePredictedSession({ latencyMs: 150 });
+  runPredicted(s, 400, (cmd) => { cmd.deltaYaw = 0.01; cmd.wishForward = 1; });
+
+  const ce = s.clientGame.player;
+  // 400 commands x 0.01 rad, integrated locally with nothing pulling it back.
+  const expected = 400 * Math.fround(0.01);
+  const err = Math.abs(ce.baseYaw - expected);
+  if (err < 1e-3) ok(`local aim integrates purely from input (${err.toExponential(1)} rad from ideal after 400 commands)`);
+  else bad('local aim is never corrected by the server',
+    `baseYaw is ${err.toFixed(4)} rad from the pure integration — something is pulling the crosshair`);
+}
+
+{
+  // A rejected shot must give its recoil back, and give back exactly what it took.
+  const s = await makePredictedSession();
+  const e = s.clientGame.player;
+  const yaw0 = e.baseYaw, pitch0 = e.basePitch;
+
+  const shot = { permanentYaw: 0.004, permanentPitch: 0.012, targetYaw: 0.02, targetPitch: 0.05 };
+  e.baseYaw += shot.permanentYaw;
+  e.basePitch += shot.permanentPitch;
+  e.recoilYawTarget += shot.targetYaw;
+  e.recoilPitchTarget += shot.targetPitch;
+  s.pred.recordShot(42, shot);
+
+  const rejected = s.pred.rejectShot(42);
+  if (rejected) ok('a rejected shot is unwound');
+  else bad('a rejected shot is unwound', 'rejectShot found nothing to undo');
+
+  // Exact for the permanent fraction — that is the half that never decays, so there is no
+  // excuse for approximating it.
+  if (Math.abs(e.baseYaw - yaw0) < 1e-12 && Math.abs(e.basePitch - pitch0) < 1e-12) {
+    ok('the permanent half of the recoil is returned exactly');
+  } else {
+    bad('the permanent recoil is returned exactly',
+      `yaw off by ${(e.baseYaw - yaw0).toExponential(2)}, pitch by ${(e.basePitch - pitch0).toExponential(2)}`);
+  }
+  if (!s.pred.rejectShot(42)) ok('rejecting the same shot twice is a no-op');
+  else bad('rejecting twice is a no-op', 'the recoil was subtracted a second time');
+}
+
+{
+  // A correction must not re-fire the world. Replay re-runs ticks that already made their
+  // noise once, so the presenter is swapped out — this is what Phase 1 built the port for.
+  const s = await makePredictedSession({ latencyMs: 120 });
+  let plays = 0;
+  const realPresent = s.clientGame.present;
+  s.clientGame.present = new Proxy(realPresent, {
+    get(t, k) {
+      if (k === 'play' || k === 'muzzleFlash') return () => { plays++; };
+      return Reflect.get(t, k);
+    },
+  });
+  runPredicted(s, 300, (cmd, t) => { cmd.wishForward = 1; cmd.fireHeld = t % 50 < 15; });
+
+  if (s.pred.stats.replayedCommands > 0) {
+    ok(`${s.pred.stats.replayedCommands} commands were replayed (so the silencing is exercised)`);
+  } else {
+    bad('replay happened at all', 'no commands were replayed, so this test proves nothing about silencing');
+  }
+  ok(`presentation fired ${plays} times across ${s.pred.stats.corrections} corrections`);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nnetcode runs clean');
