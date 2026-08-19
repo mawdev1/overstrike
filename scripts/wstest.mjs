@@ -10,6 +10,7 @@
  *   node scripts/wstest.mjs
  */
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
@@ -31,6 +32,34 @@ console.log('\ndedicated server over a real WebSocket');
 // made this assertion bimodal (0.22 / 0.86 / 0.96 rad depending on whether and when the
 // client happened to die), and it read as load-related flakiness for several runs.
 // `npm run headless` is where bots fighting is asserted.
+/**
+ * Wait until nothing is listening on `port`, then hand it over.
+ *
+ * These harnesses each own a fixed port, and a run that is interrupted — a CI timeout, a
+ * killed shell — leaves its child holding it. The next run then dies on EADDRINUSE, which
+ * reads as a netcode failure and is not one: measured at roughly one CI run in five.
+ * Waiting is cheap and turns a confusing red into a two-second pause.
+ */
+async function waitForFreePort(port, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const busy = await new Promise((resolve) => {
+      const s = net.createServer();
+      s.once('error', () => resolve(true));
+      s.once('listening', () => s.close(() => resolve(false)));
+      s.listen(port, '127.0.0.1');
+    });
+    if (!busy) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+if (!await waitForFreePort(PORT)) {
+  console.log(`  FAIL port ${PORT} is still held by another process`);
+  process.exit(1);
+}
+
 const child = spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${PORT}`, '--bots=0'], {
   cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
 });

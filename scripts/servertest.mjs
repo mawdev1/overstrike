@@ -18,6 +18,7 @@
  *   node scripts/servertest.mjs
  */
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,6 +36,34 @@ const debug = async () => (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`
 const totalHits = (d) => (d.debug?.damage ?? []).reduce((a, r) => a + (r.hits || 0), 0);
 
 console.log('\nthe dedicated server survives a round boundary');
+
+/**
+ * Wait until nothing is listening on `port`, then hand it over.
+ *
+ * These harnesses each own a fixed port, and a run that is interrupted — a CI timeout, a
+ * killed shell — leaves its child holding it. The next run then dies on EADDRINUSE, which
+ * reads as a netcode failure and is not one: measured at roughly one CI run in five.
+ * Waiting is cheap and turns a confusing red into a two-second pause.
+ */
+async function waitForFreePort(port, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const busy = await new Promise((resolve) => {
+      const s = net.createServer();
+      s.once('error', () => resolve(true));
+      s.once('listening', () => s.close(() => resolve(false)));
+      s.listen(port, '127.0.0.1');
+    });
+    if (!busy) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+if (!await waitForFreePort(PORT)) {
+  console.log(`  FAIL port ${PORT} is still held by another process`);
+  process.exit(1);
+}
 
 const gs = spawn(
   process.execPath,
