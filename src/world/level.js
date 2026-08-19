@@ -972,6 +972,13 @@ function buildWarehouse(B) {
     { a0: 27, a1: 32, y0: PLINTH, y1: 4.4 },
   ]);
   shell(X0, Z0, X1, Z0 + T, [
+    // Ground entrance on the NORTH face. Without it this elevation — the one pointed
+    // straight at the north spawns, 2 m away — was two high windows and nothing else, so
+    // reaching the building from the side of the map that looks onto it meant walking
+    // round to the south roller doors: a 15 m sightline became a 54 m path, against 26 m
+    // for the other team to their own forward building. It sits in the clear span between
+    // the two windows.
+    { a0: 23.5, a1: 26.5, y0: PLINTH, y1: 3.0, frame: 'door' },
     { a0: 19, a1: 23, y0: 4.6, y1: 6.3, glass: true, frame: 'window' },
     { a0: 27, a1: 31, y0: 4.6, y1: 6.3, glass: true, frame: 'window' },
   ]);
@@ -1580,7 +1587,10 @@ function buildSpawnYards(B, rng) {
   B.prop('container', 20, 0, -37, 0, { color: CONTAINER_COLORS[2] });
   B.prop('container', 20, 2.6, -37, 0, { color: CONTAINER_COLORS[0] });
   B.prop('container', 30, 0, -37, 0, { color: CONTAINER_COLORS[4] });
-  B.prop('jersey', 25.5, 0, -34.5, 0);
+  // Shifted clear of the warehouse's north door (x 23.5-26.5). A 0.92 m barrier parked
+  // squarely in a doorway's mouth does not read as cover, it reads as the door being
+  // decorative — and the nav bake agreed, routing 68.7 m around a door 8 m away.
+  B.prop('jersey', 21.0, 0, -34.5, 0);
   B.prop('pallets', 16.5, 0, -34.5, 0.2, { variant: 'tall' });
 
   // ── south (team 0)
