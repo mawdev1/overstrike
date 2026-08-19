@@ -29,6 +29,26 @@ const COVER_LOW = 0.15;        // vertical band that counts as "cover" beside a 
 const COVER_HIGH = 1.35;
 const MAX_SPANS = 48;          // per-column solid spans considered
 
+// -- staircase probe (see _stairLink)
+//
+// A cell is 0.75 m; a tread is ~0.36 m deep and rises ~0.22 m. So consecutive
+// cell CENTRES on a stair sit two or three treads apart, and the sampled rise
+// between neighbouring cells is 0.44 m most of the time but 0.66 m wherever the
+// aliasing lands on three treads. 0.66 > STEP_HEIGHT, so the plain height test
+// in _bakeLinks read a perfectly climbable staircase as a cliff and dropped the
+// link — one missing rung is enough to make the AI route around the whole run.
+// When the plain test fails, walk the segment between the two cell centres in
+// sub-steps shorter than a tread and ask the geometry the same question the
+// player's mover asks: is every individual step at most STEP_HEIGHT?
+const SUBSTEP = 0.18;          // < the shallowest tread going on the map (0.29 m)
+const STAIR_MAX_RISE = 1.50;   // per cell; past this we do not even probe
+const STAIR_HEADROOM = 1.00;   // clearance required over an intermediate sample
+// How far ABOVE a path endpoint a surface may sit and still be taken to be where
+// that endpoint is. Past this, _endpoint prefers the ring search: a position with
+// no floor of its own (inside a wall, under a mezzanine) used to resolve to the
+// ROOF several metres up, and the path then started on the roof.
+const MAX_SNAP_ABOVE = 1.20;
+
 const F_WALKABLE = 1;
 const F_NEARCOVER = 2;
 
@@ -250,7 +270,7 @@ export class NavGrid {
     const boxes = world.boxes || [];
     const { start, list } = this._rasterizeBoxes(boxes);
     this._bakeColumns(boxes, start, list);
-    this._bakeLinks();
+    this._bakeLinks(boxes, start, list);
     // Before _bakeReachability, which seeds itself through `nodeAt` — and `nodeAt`
     // refuses to answer until the grid says it is ready.
     this.ready = true;
@@ -431,7 +451,57 @@ export class NavGrid {
     }
   }
 
-  _bakeLinks() {
+  /**
+   * Highest solid top under (x, z) that a mover standing at `fromY` could step onto,
+   * or -Infinity if the point has no support or is inside something solid.
+   *
+   * Deliberately a point test, not the INFLATE footprint used for cells: this probes
+   * the middle of a stair run, where the stringers and the wall beside the treads are
+   * within the skirt of every sample and would veto the whole staircase.
+   */
+  _supportAt(boxes, start, list, x, z, fromY) {
+    const col = this.colOf(x, z);
+    if (col < 0) return -Infinity;
+    const s0 = start[col], s1 = start[col + 1];
+    const ceilY = fromY + STEP_HEIGHT + 1e-4;
+    let best = -Infinity;
+    for (let k = s0; k < s1; k++) {
+      const bx = boxes[list[k]];
+      if (x < bx.min.x || x > bx.max.x || z < bx.min.z || z > bx.max.z) continue;
+      const t = bx.max.y;
+      if (t <= ceilY && t > best) best = t;
+    }
+    if (best === -Infinity) return -Infinity;
+    for (let k = s0; k < s1; k++) {
+      const bx = boxes[list[k]];
+      if (x < bx.min.x || x > bx.max.x || z < bx.min.z || z > bx.max.z) continue;
+      // Something standing ON that surface — a wall, a crate — is not a step.
+      if (bx.max.y > best + FOOT_EPS && bx.min.y < best + STAIR_HEADROOM) return -Infinity;
+    }
+    return best;
+  }
+
+  /**
+   * Is the height difference between two cell centres a staircase rather than a cliff?
+   * True only when every sub-step of the segment between them is within STEP_HEIGHT,
+   * which is exactly the rule World's mover applies.
+   */
+  _stairLink(boxes, start, list, x0, z0, y0, x1, z1, y1) {
+    const dx = x1 - x0, dz = z1 - z0;
+    const steps = Math.max(2, Math.ceil(Math.hypot(dx, dz) / SUBSTEP));
+    let prev = y0;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const y = i === steps
+        ? y1
+        : this._supportAt(boxes, start, list, x0 + dx * t, z0 + dz * t, prev);
+      if (!(Math.abs(y - prev) <= STEP_HEIGHT)) return false;   // also catches -Infinity
+      prev = y;
+    }
+    return true;
+  }
+
+  _bakeLinks(boxes, start, list) {
     const cols = this.cols, rows = this.rows;
     const lc = this.layerCount, floorY = this.floorY, flags = this.flags;
 
@@ -445,11 +515,16 @@ export class NavGrid {
           const y = floorY[node];
           let mask = 0, drops = 0;
 
+          const wx = this.originX + (cx + 0.5) * CELL;
+          const wz = this.originZ + (cz + 0.5) * CELL;
+
           for (let d = 0; d < 8; d++) {
             const nx = cx + DX[d], nz = cz + DZ[d];
             if (nx < 0 || nz < 0 || nx >= cols || nz >= rows) continue;
             const ncol = nz * cols + nx;
             const count = lc[ncol];
+            const wnx = this.originX + (nx + 0.5) * CELL;
+            const wnz = this.originZ + (nz + 0.5) * CELL;
             let best = -1, bestDiff = Infinity, bestDrop = 0;
             for (let k = 0; k < count; k++) {
               const nn = ncol * MAX_LAYERS + k;
@@ -458,9 +533,16 @@ export class NavGrid {
               const ady = Math.abs(dy);
               let isDrop = 0;
               if (ady > STEP_HEIGHT) {
-                // Falling is allowed (one-way); climbing is not.
-                if (dy < 0 && ady <= DROP_HEIGHT) isDrop = 1;
-                else continue;
+                // A staircase samples as a run of small cliffs (see SUBSTEP): if the
+                // geometry in between really is treads, this is an ordinary two-way
+                // link, up or down. Otherwise: falling is allowed (one-way), climbing
+                // is not.
+                const stair = ady <= STAIR_MAX_RISE
+                  && this._stairLink(boxes, start, list, wx, wz, y, wnx, wnz, floorY[nn]);
+                if (!stair) {
+                  if (dy < 0 && ady <= DROP_HEIGHT) isDrop = 1;
+                  else continue;
+                }
               }
               const score = ady + isDrop * 0.9;
               if (score < bestDiff) { bestDiff = score; best = k; bestDrop = isDrop; }
@@ -590,11 +672,15 @@ export class NavGrid {
    * the wall underneath it and burn the state timer. `reachableOnly = false` is the
    * escape hatch for callers that are locating a BODY rather than choosing a
    * destination, where the answer must exist even if it is an island.
+   *
+   * `maxAbove` refuses a surface that sits more than that far OVER `pos` — see
+   * _endpoint, whose whole problem is columns whose only layer is the roof.
    */
-  nearestWalkable(pos, out = _scratchPoint, reachableOnly = false) {
+  nearestWalkable(pos, out = _scratchPoint, reachableOnly = false, maxAbove = Infinity) {
     if (!this.ready) return null;
     let node = this.nodeAt(pos.x, pos.y, pos.z);
-    if (node >= 0 && (!reachableOnly || this.reachable[node])) return this.nodeCenter(node, out);
+    if (node >= 0 && (!reachableOnly || this.reachable[node])
+      && this.floorY[node] - pos.y <= maxAbove) return this.nodeCenter(node, out);
 
     const cx0 = Math.floor((pos.x - this.originX) / CELL);
     const cz0 = Math.floor((pos.z - this.originZ) / CELL);
@@ -611,6 +697,7 @@ export class NavGrid {
             const node2 = col * MAX_LAYERS + l;
             if (!(this.flags[node2] & F_WALKABLE)) continue;
             if (reachableOnly && !this.reachable[node2]) continue;
+            if (this.floorY[node2] - pos.y > maxAbove) continue;
             const ddx = this.cellCenterX(col) - pos.x;
             const ddz = this.cellCenterZ(col) - pos.z;
             const ddy = (this.floorY[node2] - pos.y) * 2.2;
@@ -622,7 +709,7 @@ export class NavGrid {
       if (best >= 0) return this.nodeCenter(best, out);
     }
     // Nothing reachable within ten rings — better an island than no answer at all.
-    return reachableOnly ? this.nearestWalkable(pos, out, false) : null;
+    return reachableOnly ? this.nearestWalkable(pos, out, false, maxAbove) : null;
   }
 
   /**
@@ -1024,6 +1111,29 @@ export class NavGrid {
   // ---------------------------------------------------------------------- A*
 
   /**
+   * Resolve one end of a search to a node.
+   *
+   * `nodeAt` answers with the best layer in the column, however far above the query
+   * that layer is — which for a position with no floor of its own (inside a wall, in
+   * a doorway recess, under a mezzanine) is the CEILING. Pathing from there put the
+   * whole route on the roof: the foot of the market hall stair resolved to the roof
+   * node 7.9 m up and the "bottom -> top" path went round the building at y = 8.05
+   * instead of up 18 perfectly good treads. A cell one step sideways is a far better
+   * answer than a surface a storey overhead, so past MAX_SNAP_ABOVE we hand over to
+   * the ring search. Confined to path endpoints on purpose: `nodeAt`/`nearestWalkable`
+   * are also how the AI picks DESTINATIONS, and tightening those changes which places
+   * bots decide to go, which is not this function's business.
+   */
+  _endpoint(vec) {
+    const node = this.nodeAt(vec.x, vec.y, vec.z);
+    if (node >= 0 && this.floorY[node] - vec.y <= MAX_SNAP_ABOVE) return node;
+    const p = this.nearestWalkable(vec, _v3, false, MAX_SNAP_ABOVE);
+    if (!p) return node;
+    const alt = this.nodeAt(p.x, p.y, p.z);
+    return alt >= 0 ? alt : node;
+  }
+
+  /**
    * A* with an octile heuristic and a binary heap.
    * Fills `out` with waypoints (reusing existing Vector3s) and returns the
    * waypoint count. If the expansion budget is exhausted the best-so-far
@@ -1033,20 +1143,9 @@ export class NavGrid {
   findPath(fromVec3, toVec3, out) {
     if (!this.ready || !out) return 0;
 
-    let startNode = this.nodeAt(fromVec3.x, fromVec3.y, fromVec3.z);
-    if (startNode < 0) {
-      const p = this.nearestWalkable(fromVec3, _v3);
-      if (!p) return 0;
-      startNode = this.nodeAt(p.x, p.y, p.z);
-      if (startNode < 0) return 0;
-    }
-    let goalNode = this.nodeAt(toVec3.x, toVec3.y, toVec3.z);
-    if (goalNode < 0) {
-      const p = this.nearestWalkable(toVec3, _v3);
-      if (!p) return 0;
-      goalNode = this.nodeAt(p.x, p.y, p.z);
-      if (goalNode < 0) return 0;
-    }
+    const startNode = this._endpoint(fromVec3);
+    const goalNode = this._endpoint(toVec3);
+    if (startNode < 0 || goalNode < 0) return 0;
     if (startNode === goalNode) {
       const v = vecAt(out, 0);
       this.nodeCenter(goalNode, v);

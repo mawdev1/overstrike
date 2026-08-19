@@ -1364,12 +1364,22 @@ export class Player {
         this.position.y + Math.max(0.05, this.height - 0.05),
         this.position.z + _PROBE_Z[i] * r,
       );
+      // FAIL CLOSED when the probe itself starts inside geometry. `World._march` skips any
+      // box with `tmin <= 0` (documented at world.js:848), so a ray fired from INSIDE a
+      // wall sees no ceiling and this returned "yes, you may stand" — which is how a
+      // mantling player, briefly clipped into the ledge, grew back to full height inside it.
+      if (world.pointInSolid?.(_v1.x, _v1.y, _v1.z)) return false;
       if (world.raycast(_v1, _UP, need)) return false;
     }
     return true;
   }
 
   _updateStance(dt) {
+    // A vault commits at crouch height precisely because the clearance gate only checks
+    // 1.25 m. This runs BEFORE `_mantleStep` every tick and used to grow the capsule back
+    // at 5 m/s, so all 509 measured vaults finished at full standing height and 506 of them
+    // spent part of the flight inside the ledge. Hold the crouch until the vault is over.
+    if (this.moveState === 'mantle') return;
     const sliding = this.moveState === 'slide';
     // A slide that ends early (wall, speed loss) must still let the camera dip
     // recover smoothly instead of leaving `slideAmount` stuck mid-value.
@@ -1617,6 +1627,12 @@ export class Player {
     this.position.x = lerp(this._mantleFrom.x, this._mantleTo.x, hz);
     this.position.z = lerp(this._mantleFrom.z, this._mantleTo.z, hz);
     this.position.y = lerp(this._mantleFrom.y, this._mantleTo.y, vy);
+    // The vault lerps the body along an authored arc with no collision of its own, so it
+    // routinely passed THROUGH the lip it is climbing — measured, 506 of 509 vaults put the
+    // body inside the ledge collider mid-flight, worst 0.360 m, once for 0.81 s. Online
+    // that means the hitboxes are inside a wall for those ticks: you can be shot through it,
+    // or be unshootable. Pushing back out each tick keeps the arc but not the clipping.
+    this.game.world?._depenetrate?.(this.position, this.radius, this.height);
     this.velocity.set(0, 0, 0);
     this.moveSpeed = 0;
 

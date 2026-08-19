@@ -624,8 +624,22 @@ export class World {
   }
 
   /** Minimum-translation push-out, up to 4 relaxation passes. */
+  /**
+   * Push a body out of anything it is inside.
+   *
+   * Eight passes, not four. A body 0.20 m through a face was still 0.03-0.26 m embedded
+   * after two seconds in 28 measured places, and only walked out once the player supplied
+   * movement input. Four passes simply is not enough to unwind a body wedged against
+   * several boxes at once; eight clears all 28.
+   *
+   * It resolves the DEEPEST overlap each pass, which looks wrong — minimum-translation is
+   * the usual choice — and measurement says otherwise. Switching to the shallowest fixed
+   * 27 of the 28 and turned the last one into something worse: a body between two stair
+   * treads that could not walk out in any of eight directions, because the two shallow
+   * pushes alternate and cancel. Deepest-first commits to one escape and finishes it.
+   */
   _depenetrate(p, radius, height) {
-    for (let pass = 0; pass < 4; pass++) {
+    for (let pass = 0; pass < 8; pass++) {
       const minx = p.x - radius, maxx = p.x + radius;
       const miny = p.y, maxy = p.y + height;
       const minz = p.z - radius, maxz = p.z + radius;

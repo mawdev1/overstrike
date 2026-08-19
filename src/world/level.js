@@ -409,15 +409,24 @@ function marketLantern(B) {
 
   // Clerestory: piers on the corners, glazing between, so it reads as a lantern and not
   // as a shed. The glass is a collider (surface 'glass') like every other pane on the map.
+  // The clerestory is SEALED from the base top (y+1.05) to the cap (y+3.3).
+  //
+  // It was not. The piers started at y+1.18 while the base topped out at y+1.05, so they
+  // floated 0.13 m; the glass ran y+1.35 to y+3.1, leaving a 0.30 m open ring at 9.10-9.40
+  // and a second 0.20 m ring at 11.15-11.35, on all four faces — 4 x 4.83 m of aperture.
+  // The lower ring sits 1.05-1.35 m above the roof deck, which is exactly chest height on
+  // the most contested position on the map: you could see, shoot and be shot straight
+  // through the middle of the lantern. Only the non-colliding coping and mullions were in
+  // those bands, so nothing was stopping anything.
   for (const sx of [-2.72, 2.72]) for (const sz of [-2.72, 2.72]) {
-    B.box(sx - 0.28, y + 1.18, sz - 0.28, sx + 0.28, y + 3.3, sz + 0.28, 'plaster', 'concrete');
+    B.box(sx - 0.28, y + 1.05, sz - 0.28, sx + 0.28, y + 3.3, sz + 0.28, 'plaster', 'concrete');
   }
   for (const s of [-2.85, 2.85]) {
-    B.box(-2.44, y + 1.35, s - 0.05, 2.44, y + 3.1, s + 0.05, 'glass', 'glass', { cast: false, receive: false });
-    B.box(s - 0.05, y + 1.35, -2.44, s + 0.05, y + 3.1, 2.44, 'glass', 'glass', { cast: false, receive: false });
+    B.box(-2.44, y + 1.05, s - 0.05, 2.44, y + 3.3, s + 0.05, 'glass', 'glass', { cast: false, receive: false });
+    B.box(s - 0.05, y + 1.05, -2.44, s + 0.05, y + 3.3, 2.44, 'glass', 'glass', { cast: false, receive: false });
     for (const m of [-1.22, 0, 1.22]) {
-      B.deco(m - 0.06, y + 1.3, s - 0.1, m + 0.06, y + 3.15, s + 0.1, 'metal', { cast: false });
-      B.deco(s - 0.1, y + 1.3, m - 0.06, s + 0.1, y + 3.15, m + 0.06, 'metal', { cast: false });
+      B.deco(m - 0.06, y + 1.05, s - 0.1, m + 0.06, y + 3.3, s + 0.1, 'metal', { cast: false });
+      B.deco(s - 0.1, y + 1.05, m - 0.06, s + 0.1, y + 3.3, m + 0.06, 'metal', { cast: false });
     }
   }
   // Stepped cap.
@@ -1017,7 +1026,10 @@ function buildWarehouse(B) {
     { a0: 27, a1: 31, y0: 4.6, y1: 6.3, glass: true, frame: 'window' },
   ]);
   shell(X0, Z0, X0 + T, Z1, [
-    { a0: -25, a1: -22.6, y0: PLINTH, y1: 2.5, frame: 'door' },
+    // At the south end, not z -25..-22.6. The internal stair runs z -25.5..-18.7 half a
+    // metre behind this wall, and at -25..-22.6 it is near its top — so the door opened
+    // onto a solid wall of concrete treads. Measured clear rectangle: 0.00 x 0.00 m.
+    { a0: -18, a1: -15.6, y0: PLINTH, y1: 2.5, frame: 'door' },
     { a0: -31, a1: -28, y0: 4.6, y1: 6.3, glass: true, frame: 'window' },
     { a0: -21, a1: -18, y0: 1.2, y1: 2.6, glass: true, frame: 'window' },
   ]);
@@ -1047,8 +1059,19 @@ function buildWarehouse(B) {
   // Mezzanine + internal stair.
   B.stairs({ x0: 15.6, z0: -25.5, x1: 18, z1: -18.7, y0: PLINTH, y1: MEZZ, dir: '-z', matName: 'metal', surface: 'metal', rail: true });
   B.slab(X0, Z0, X1, -25.5, MEZZ_UNDER, MEZZ, 'metal', 'metal');
-  B.railing(18, -25.5, X1, -25.5, MEZZ, { height: 1.05 });
-  for (const x of [20, 26, 32]) B.deco(x - 0.22, PLINTH, -26.2, x + 0.22, MEZZ_UNDER, -25.8, 'metal');
+  // East return, so the mezzanine door in the east wall has a floor behind it.
+  //
+  // That door (x 34.6-35, z -25..-23, y 4.00-6.30) is fed by the external switchback's half
+  // landing, and the mezzanine stopped at z -25.5 — so stepping through it dropped you
+  // 3.85 m to the ground floor. The documented route existed in the walls and not in the
+  // geometry. Kept east of x 20 so it does not bury the top of the internal stair, which
+  // arrives at z -25.5.
+  B.slab(20, -25.5, X1, -22.8, MEZZ_UNDER, MEZZ, 'metal', 'metal');
+  B.railing(18, -25.5, 20, -25.5, MEZZ, { height: 1.05 });
+  B.railing(20, -25.5, 20, -22.8, MEZZ, { height: 1.05 });
+  B.railing(20, -22.8, X1, -22.8, MEZZ, { height: 1.05 });
+  for (const x of [26, 32]) B.deco(x - 0.22, PLINTH, -23.5, x + 0.22, MEZZ_UNDER, -23.1, 'metal');
+  B.deco(19.78, PLINTH, -26.2, 20.22, MEZZ_UNDER, -25.8, 'metal');
   B.prop('crate', 21, MEZZ, -28.5, 0.3);
   B.prop('crate', 22, MEZZ, -29.3, -0.5);
   B.prop('crate', 21.6, MEZZ + 0.94, -28.9, 0.9, { variant: 'small' });
@@ -1200,7 +1223,10 @@ function buildCustoms(B) {
   });
   B.wall(X0, Z0, X0 + T, Z1, PLINTH, L1_UNDER, 'concrete', 'concrete', {
     openings: [
-      { a0: 15, a1: 17.6, y0: PLINTH, y1: 2.5, frame: 'door' },
+      // South of the stairwell, not at z 15-17.6. STAIR occupies z 14.2-19.8 just 0.2 m
+      // behind this wall, so the door was 84% filled by its own staircase — 1.02 x 0.56 m
+      // of a 2.60 x 2.35 opening.
+      { a0: 24.8, a1: 27.4, y0: PLINTH, y1: 2.5, frame: 'door' },
       { a0: 21, a1: 24, y0: 1.15, y1: 2.5, glass: true, frame: 'window' },
     ],
   });

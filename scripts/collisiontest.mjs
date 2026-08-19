@@ -32,7 +32,6 @@
  *
  *   node scripts/collisiontest.mjs [--quick] [--only=tunnel,mantle,…] [--verbose]
  */
-import * as THREE from 'three';
 import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
 
@@ -51,7 +50,6 @@ const FIXED_DT = 1 / 120;
 const RADIUS = 0.36;
 const STAND = 1.8;
 const CROUCH = 1.1;
-const SKIN = 0.005;
 /** Overlap deeper than this is a real interpenetration, not solver skin. */
 const PEN_TOL = 0.02;
 
@@ -83,10 +81,10 @@ console.log(`\nplayer collision integrity — ${boxes.length} colliders, `
 // collider thinner than one substep's travel. Top speeds are 11 u/s horizontal
 // (AIR_MAX_SPEED) and 60 u/s vertical (TERMINAL) → 0.092 m and 0.500 m per 1/120 s tick.
 {
-  let thinnest = Infinity, thinnestBox = null, underTravel = 0;
+  let thinnest = Infinity, underTravel = 0;
   for (const b of boxes) {
     const t = Math.min(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
-    if (t < thinnest) { thinnest = t; thinnestBox = b; }
+    if (t < thinnest) thinnest = t;
     if (t < 0.4) underTravel++;
   }
   console.log(`  thinnest collider ${thinnest.toFixed(3)} m; ${underTravel} of ${boxes.length} `
@@ -462,7 +460,7 @@ function cornerTest() {
 // destination beyond one zero-radius up-ray. Every ledge on the map is tried.
 
 function mantleTest() {
-  let ledges = 0, attempts = 0, mantled = 0, transient = 0, worstTransient = 0, heightRegrown = 0;
+  let ledges = 0, attempts = 0, mantled = 0, transient = 0, worstTransient = 0, heightRegrown = 0, standingClip = 0;
   const embedded = [];
   const step = QUICK ? 5 : 1;
 
@@ -527,6 +525,7 @@ function mantleTest() {
           } else if (worst > 0.06 && worstBox) {
             transient++;
             if (worst > worstTransient) worstTransient = worst;
+            if (worstH > CROUCH + 0.15) standingClip++;
             report('MANTLE-TRANSIENT', `box${bi}-${f.axis}${f.sign}`,
               `mantling ${fmtB(b)} put the body ${worst.toFixed(3)} m inside `
               + `${fmtB(worstBox)} mid-vault (capsule height ${worstH.toFixed(2)} m); `
@@ -543,7 +542,7 @@ function mantleTest() {
   console.log(`\n  mantle: ${ledges} reachable ledge approaches, ${attempts} vault attempts, `
     + `${mantled} vaults actually triggered`);
   console.log(`          ${transient} vaults clipped through geometry mid-flight `
-    + `(worst ${worstTransient.toFixed(3)} m); ${heightRegrown}/${mantled} finished the vault at `
+    + `(worst ${worstTransient.toFixed(3)} m, ${standingClip} of them at STANDING height inside the ledge); ${heightRegrown}/${mantled} finished the vault at `
     + `more than crouch height despite _tryMantle committing at CROUCH_HEIGHT`);
   if (embedded.length === 0) ok('no vault leaves the body inside geometry');
   else bad('no vault leaves the body inside geometry', `${embedded.length} vaults did`);
