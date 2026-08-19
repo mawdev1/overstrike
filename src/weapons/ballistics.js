@@ -208,6 +208,26 @@ export function raycastEntity(entity, origin, dir, maxDist) {
  * @returns {null | {entity, distance, part, point, normal}} POOLED
  */
 export function raycastEntities(game, origin, dir, maxDist, exclude) {
+  // Lag compensation hooks in exactly here, and nowhere else.
+  //
+  // A shot has to be tested against the world the SHOOTER saw, which is RTT/2 plus their
+  // interpolation delay in the past. This is the only place entity geometry is consulted
+  // for a shot, so rewinding around this loop rewinds precisely what needs rewinding and
+  // nothing else — the shooter's own movement, everyone else's movement, and the world
+  // all stay in the present. `exclude` is already the shooter, so the seam costs nothing.
+  //
+  // `_lagViewTick` is set by the server for the one tick in which a client's firing
+  // command is applied, and cleared immediately after; on a client, or on a server tick
+  // with no shot, this branch never runs.
+  const lag = game.lagcomp;
+  const viewTick = exclude?._lagViewTick;
+  if (lag && viewTick != null && !lag._rewound) {
+    return lag.rewind(viewTick, exclude, () => _raycastEntitiesNow(game, origin, dir, maxDist, exclude));
+  }
+  return _raycastEntitiesNow(game, origin, dir, maxDist, exclude);
+}
+
+function _raycastEntitiesNow(game, origin, dir, maxDist, exclude) {
   const ents = game.entities;
   let best = Infinity;
   let found = false;

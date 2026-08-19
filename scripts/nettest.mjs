@@ -405,5 +405,191 @@ function runPredicted(s, n, shape = () => {}) {
   ok(`presentation fired ${plays} times across ${s.pred.stats.corrections} corrections`);
 }
 
+console.log('\nlag compensation');
+
+{
+  // The whole point, measured directly: a shooter fires at where a moving target APPEARS
+  // to be on their screen — which is where it was RTT/2 + interpolation delay ago. Tested
+  // against the present, that shot misses through no fault of the shooter's.
+  //
+  // Set up deliberately: a target strafing across the shooter's view, the shooter aiming
+  // at the target's PAST position (what they can see), and the same shot judged with and
+  // without the rewind.
+  const { Game: G } = await import('../src/core/game.js');
+  const { LagCompensation } = await import('../src/net/lagcomp.js');
+  const { raycastEntities } = await import('../src/weapons/ballistics.js');
+  const { Player } = await import('../src/player/player.js');
+
+  const g = new G({ headless: true });
+  await g.initHeadless({ presenter: new NullPresenter() });
+  g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 31337 });
+  g.match.phase = 'live'; g.match.countdown = 0;
+
+  const shooter = g.player;
+  const target = new Player(g);
+  await target.init();
+  g.addEntity(target);
+  target.team = shooter.team === 0 ? 1 : 0;
+  target.alive = true;
+
+  const lag = new LagCompensation(g);
+  g.lagcomp = lag;
+
+  // Put the shooter at the origin looking down -Z; walk the target across their view.
+  shooter.position.set(0, 0, 0);
+  shooter.setAngles(0, 0);
+  shooter.alive = true;
+
+  const TRACK = 40;                 // ticks of history to build
+  const positions = [];
+  for (let t = 0; t < TRACK; t++) {
+    target.position.set(-2 + t * 0.1, 0, -10);   // 12 m/s across, left to right
+    target._updateHitboxes();
+    positions.push(target.position.clone());
+    g.tick = t;
+    lag.record();
+  }
+
+  // The shooter saw the target 20 ticks ago (~167 ms: 100 ms interpolation + 67 ms of
+  // round trip) and aimed exactly there.
+  const sawAtTick = TRACK - 1 - 20;
+  const sawAt = positions[sawAtTick];
+  const eye = shooter.position.clone(); eye.y += 1.6;
+  const dir = sawAt.clone(); dir.y += 1.1; dir.sub(eye).normalize();
+
+  // Present: the target has moved on, so the shot misses.
+  const nowHit = raycastEntities(g, eye, dir, 100, shooter);
+  // Rewound to what the shooter saw: it lands.
+  let rewoundHit = null;
+  lag.rewind(sawAtTick, shooter, () => { rewoundHit = raycastEntities(g, eye, dir, 100, shooter); });
+
+  if (!nowHit) ok('without rewinding, a shot at where the target APPEARED to be misses');
+  else bad('the scenario actually needs lag compensation',
+    `the shot hit ${nowHit.part} even against the present — the target is not moving enough for this test to mean anything`);
+
+  if (rewoundHit) ok(`rewinding to the shooter's view lands the shot (${rewoundHit.part})`);
+  else bad('rewinding lands the shot', 'the shot missed even against the rewound world — the rewind is not restoring the right state');
+
+  // And the world must be exactly as it was afterwards.
+  const after = target.position.clone();
+  if (after.distanceTo(positions[TRACK - 1]) < 1e-9) ok('the target is restored to the present after the rewind');
+  else bad('the world is restored after a rewind', `target left at ${after.toArray().map((v) => v.toFixed(3))}`);
+}
+
+{
+  // A rewind must restore even when the code inside it throws — otherwise one error
+  // leaves every entity 100 ms in the past for the rest of the match, which is far worse
+  // than the original fault.
+  const { Game: G } = await import('../src/core/game.js');
+  const { LagCompensation } = await import('../src/net/lagcomp.js');
+  const g = new G({ headless: true });
+  await g.initHeadless({ presenter: new NullPresenter() });
+  g.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 5 });
+  g.match.phase = 'live'; g.match.countdown = 0;
+  const lag = new LagCompensation(g);
+  for (let t = 0; t < 20; t++) { g._fixedUpdate(FIXED_DT); lag.record(); }
+
+  const before = g.bots.bots.map((b) => b.position.clone());
+  let threw = false;
+  try {
+    lag.rewind(g.tick - 10, g.player, () => { throw new Error('boom'); });
+  } catch { threw = true; }
+  const restored = g.bots.bots.every((b, i) => b.position.distanceTo(before[i]) < 1e-9);
+
+  if (threw) ok('a throw inside a rewind propagates');
+  else bad('a throw inside a rewind propagates', 'the error was swallowed');
+  if (restored) ok('the world is still restored when the rewind body throws');
+  else bad('the world is restored when the body throws', 'entities were left in the past');
+}
+
+{
+  // Hitboxes are stored, not recomputed. `_updateHitboxes` runs only at the end of a LIVE
+  // tick, so a rewind that restored a transform and recomputed would test the CURRENT
+  // tick's box sizes against a rewound position — the trap flagged during Phase 3.
+  const { Game: G } = await import('../src/core/game.js');
+  const { LagCompensation } = await import('../src/net/lagcomp.js');
+  const g = new G({ headless: true });
+  await g.initHeadless({ presenter: new NullPresenter() });
+  g.startMatch({ mode: 'tdm', botCount: 1, difficulty: 'regular', seed: 7 });
+  g.match.phase = 'live'; g.match.countdown = 0;
+  const lag = new LagCompensation(g);
+
+  const bot = g.bots.bots[0];
+  const sync = () => (bot._syncHitboxes ? bot._syncHitboxes() : bot._updateHitboxes());
+  bot.height = 1.8; sync();
+  g.tick = 100; lag.record();
+  const tallTorso = bot.hitboxes[1].size.y;
+
+  bot.height = 1.1; sync();      // crouched
+  g.tick = 110; lag.record();
+  const shortTorso = bot.hitboxes[1].size.y;
+
+  if (Math.abs(tallTorso - shortTorso) > 1e-6) ok('standing and crouched hitboxes genuinely differ');
+  else bad('the hitbox sizes differ with height', 'this test cannot detect anything');
+
+  let rewoundSize = 0;
+  lag.rewind(100, g.player, () => { rewoundSize = bot.hitboxes[1].size.y; });
+  if (Math.abs(rewoundSize - tallTorso) < 1e-6) ok('a rewind restores the hitbox SIZES from that tick, not just the position');
+  else bad('a rewind restores historical hitbox sizes', `got ${rewoundSize}, expected the standing ${tallTorso}`);
+  if (Math.abs(bot.hitboxes[1].size.y - shortTorso) < 1e-6) ok('and puts the current sizes back afterwards');
+  else bad('hitbox sizes are restored after a rewind', `left at ${bot.hitboxes[1].size.y}`);
+
+  // EVERY box, not just the ones a Player happens to have. Bots carry a fourth (arms),
+  // the widest part of the silhouette, and storing only three would leave it un-rewound:
+  // shots at a moving bot's edge would behave differently from shots at its middle.
+  // Checked by comparing each rewound box against the geometry the historical height
+  // actually produces.
+  bot.height = 1.8; sync();
+  const wantBoxes = bot.hitboxes.map((x) => ({ oy: x.offset.y, sy: x.size.y }));
+  bot.height = 1.1; sync();
+  let mismatched = [];
+  lag.rewind(100, g.player, () => {
+    for (let i = 0; i < bot.hitboxes.length; i++) {
+      const got = bot.hitboxes[i];
+      if (Math.abs(got.offset.y - wantBoxes[i].oy) > 1e-5
+        || Math.abs(got.size.y - wantBoxes[i].sy) > 1e-5) mismatched.push(i);
+    }
+  });
+  if (mismatched.length === 0) ok(`all ${bot.hitboxes.length} hitboxes are rewound, not just the first three`);
+  else bad('every hitbox is rewound', `boxes [${mismatched.join(',')}] kept their present geometry`);
+
+  if (bot.hitboxes.length >= 4) ok(`the entity really has ${bot.hitboxes.length} hitboxes (so covering only 3 would be a live gap)`);
+  else bad('the entity has more than 3 hitboxes', `only ${bot.hitboxes.length} — this check proves nothing`);
+}
+
+{
+  // Rewinding further back than the ring holds must clamp, not read a wrapped slot: the
+  // ring is only HISTORY_TICKS deep and a modulo on an older tick silently returns a
+  // FUTURE sample, which would be worse than not rewinding at all.
+  const { Game: G } = await import('../src/core/game.js');
+  const { LagCompensation, HISTORY_TICKS } = await import('../src/net/lagcomp.js');
+  const g = new G({ headless: true });
+  await g.initHeadless({ presenter: new NullPresenter() });
+  g.startMatch({ mode: 'tdm', botCount: 1, difficulty: 'regular', seed: 11 });
+  g.match.phase = 'live'; g.match.countdown = 0;
+  const lag = new LagCompensation(g);
+  for (let t = 0; t < HISTORY_TICKS * 3; t++) { g._fixedUpdate(FIXED_DT); lag.record(); }
+
+  const oldest = g.tick - (HISTORY_TICKS - 1);
+  const clamped = lag._clampTick(g.tick - HISTORY_TICKS * 2);
+  if (clamped === oldest) ok(`a rewind beyond the ring clamps to the oldest sample (tick ${clamped})`);
+  else bad('a too-old rewind clamps', `got ${clamped}, expected ${oldest}`);
+  if (lag._clampTick(g.tick + 50) === g.tick) ok('a rewind into the future clamps to now');
+  else bad('a future rewind clamps to now', 'got a tick ahead of the simulation');
+}
+
+{
+  // The view tick must account for BOTH halves of the delay. Leaving out the client's
+  // interpolation delay under-rewinds by ~100 ms, which is most of the error.
+  const { LagCompensation } = await import('../src/net/lagcomp.js');
+  const lag = new LagCompensation({ tick: 1000, entities: [], match: null });
+  const withInterp = lag.viewTickFor(1000, 60, 100);      // 30 ms + 100 ms = 130 ms = 15.6 ticks
+  const withoutInterp = lag.viewTickFor(1000, 60, 0);
+  if (withInterp === 1000 - 16) ok(`view tick accounts for RTT/2 and interpolation delay (${1000 - withInterp} ticks back)`);
+  else bad('view tick accounts for both delays', `got ${1000 - withInterp} ticks back, expected 16`);
+  if (withoutInterp - withInterp === 12) ok('the interpolation delay is the larger half at 60 ms RTT');
+  else bad('the interpolation delay is accounted for', `only ${withoutInterp - withInterp} ticks of difference`);
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nnetcode runs clean');
 process.exit(failures ? 1 : 0);

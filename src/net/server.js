@@ -22,6 +22,8 @@ import { FIXED_DT } from '../core/mathUtils.js';
 import {
   MSG_COMMANDS, MSG_WELCOME, decodeCommands, encodeSnapshot, entityToWire,
 } from './protocol.js';
+import { LagCompensation } from './lagcomp.js';
+import { INTERP_DELAY_MS } from './client.js';
 
 /** Snapshots at 30 Hz against a 120 Hz simulation. */
 export const SNAPSHOT_INTERVAL = 4;
@@ -52,6 +54,8 @@ class ClientSession {
     this.transport = transport;
     this.entity = entity;
     this.queue = [];
+    /** Smoothed round trip, used to work out which tick this client was looking at. */
+    this.rttMs = 0;
     /** Highest command seq consumed. Sent back so the client knows what to stop resending. */
     this.lastCommandSeq = 0;
     /** The snapshot this client has acknowledged, and which deltas are coded against. */
@@ -71,6 +75,10 @@ export class GameServer {
     this.clients = new Map();
     this._nextClientId = 1;
     this._snapCounter = 0;
+    this.lag = new LagCompensation(game);
+    // Ballistics reaches for this by name — see `raycastEntities`. Set here rather than
+    // in Game, because only a server ever rewinds.
+    game.lagcomp = this.lag;
   }
 
   /**
@@ -99,6 +107,7 @@ export class GameServer {
 
   removeClient(session) {
     this.clients.delete(session.id);
+    if (session.entity) this.lag.forget(session.entity.id);
     session.transport.close();
   }
 
@@ -137,9 +146,29 @@ export class GameServer {
       session.stats.commands++;
       session.lastCommandSeq = cmd.seq;
       this._applyCommand(session, cmd);
+      // Mark the shooter for lag compensation. The shot does NOT resolve here — the
+      // weapon fires inside `_fixedUpdate` when its timer allows — so the rewind cannot
+      // wrap this call. It has to happen around the entity test itself, which is why
+      // ballistics reads `_lagViewTick` and rewinds there. Wrapping the wrong call was
+      // the first version of this, and it rewound nothing at all.
+      const e = session.entity;
+      if (e) {
+        e._lagViewTick = (cmd.fireHeld || cmd.firePressed)
+          ? this.lag.viewTickFor(this.game.tick, session.rttMs, INTERP_DELAY_MS)
+          : null;
+      }
     }
 
     this.game._fixedUpdate(FIXED_DT);
+
+    // The mark lives for exactly the tick that consumed the command. Leaving it set would
+    // rewind every later shot to a stale view.
+    for (const session of this.clients.values()) {
+      if (session.entity) session.entity._lagViewTick = null;
+    }
+
+    // After the step, so the sample is the state a client will be told about.
+    this.lag.record();
 
     if (++this._snapCounter >= SNAPSHOT_INTERVAL) {
       this._snapCounter = 0;
