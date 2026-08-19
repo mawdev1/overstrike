@@ -127,6 +127,8 @@ function restartMatch() {
     session.baseTick = 0;
     session.pendingBaselines?.clear?.();
   }
+  // The seed changed, and shot spread is addressed by it — see `GameServer._sendWelcome`.
+  server.broadcastWelcome();
   matchesPlayed++;
   console.log(`[server] match ${matchesPlayed} started — ${server.clients.size} clients, ${BOTS} bots`);
 }

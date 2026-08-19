@@ -257,6 +257,146 @@ console.log('\ncombat feedback reaches the client');
   else bad('bots are still split across both sides', `all bots on team ${[...botTeams][0]}`);
 }
 
+// ── the client shoots with the server's dice ─────────────────────────────────────────
+//
+// Shot spread and recoil jitter are drawn BY ADDRESS —
+// `addressedRNG(game.matchSeed, shooterId * 65537 + shotsFired, ...)` — precisely so the
+// same shot produces the same number on every machine. The seed was never sent. `Menu`
+// starts a match with no seed, so the client rolls `Math.random()` and only then connects,
+// and every predicted bullet came out of a different stream than the one the server fired.
+// Measured over 200 rounds of `ar_vector`: mean 2.08 degrees of divergence hip-fire, worst
+// 4.60 — 54 cm at 15 m, against a torso about 50 cm wide. The player's own tracers and
+// impact decals pointed somewhere the bullet did not go.
+{
+  const { MultiplayerSession } = await import('../src/net/session.js');
+  const sg = new Game({ headless: true });
+  await sg.initHeadless({ presenter: new RecordingPresenter() });
+  sg.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 0xABCDEF });
+  sg.match.phase = 'live'; sg.match.countdown = 0;
+
+  const cg = new Game({ headless: true });
+  await cg.initHeadless({ presenter: new NullPresenter() });
+  cg.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular' });   // no seed, exactly as the menu does
+  cg.match.phase = 'live'; cg.match.countdown = 0;
+  const rolledItsOwn = cg.matchSeed;
+
+  const server = new GameServer(sg);
+  const [cT, sT] = createLoopbackPair({ latencyMs: 0, loss: 0 });
+  server.addClient(sT, sg.player);
+  const session = new MultiplayerSession(cg, cT);
+  let ms = 0;
+  for (let i = 0; i < 30; i++) { sT.pump(ms); server.tick(); cT.pump(ms); ms += FIXED_DT * 1000; }
+
+  if (rolledItsOwn === sg.matchSeed) {
+    bad('the seed test is meaningful', 'the client happened to roll the server seed — rerun');
+  } else if (cg.matchSeed === sg.matchSeed) {
+    ok(`the client adopts the server's match seed (${rolledItsOwn} -> ${cg.matchSeed})`);
+  } else {
+    bad("the client adopts the server's match seed",
+      `client ${cg.matchSeed} vs server ${sg.matchSeed} — every predicted shot's spread is ` +
+      'drawn from a different stream than the one the server fires');
+  }
+  session.dispose?.();
+}
+
+// ── a spawn-protected enemy is not a miss ────────────────────────────────────────────
+//
+// `damageScale` returns 0 for a protected target and `fireHitscan` used to null the entity
+// hit entirely, so the round carried on and painted a concrete impact on the wall behind.
+// From behind the screen a perfectly aimed shot was indistinguishable from a miss — and
+// measured, 7-24% of a player's on-target shots land on a protected bot, because fights
+// cluster on spawns and a freshly spawned enemy is the obvious target.
+{
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 11 });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+
+  const shooter = game.player;
+  const victim = game.bots.bots.find((b) => b.team !== shooter.team);
+  const { fireHitscan } = await import('../src/weapons/ballistics.js');
+
+  const stage = () => {
+    shooter.position.set(0, 1.0, 0);
+    shooter.setAngles(0, 0);
+    victim.position.set(0, 1.0, -4);
+    victim.health = 100;
+    victim.alive = true;
+    shooter._updateHitboxes?.();
+    victim._updateHitboxes?.();
+  };
+  const shoot = () => {
+    const origin = new THREE.Vector3();
+    shooter.getEyePosition(origin);
+    const dir = new THREE.Vector3(victim.position.x - origin.x, (victim.position.y + 1.0) - origin.y, victim.position.z - origin.z).normalize();
+    return fireHitscan(game, {
+      shooter, origin, dir, damage: 30, range: 100,
+      falloffStart: 100, falloffEnd: 100, falloffMin: 1, penetration: 1, headshotMul: 2,
+      weaponId: 'ar_vector', emitShot: false, tracer: false,
+    });
+  };
+
+  stage();
+  game.match.clearProtection?.(victim);
+  const normal = shoot();
+  if (normal?.hitEntity === victim && normal.damageDealt > 0) ok(`an unprotected enemy takes the shot (${normal.damageDealt.toFixed(0)} damage)`);
+  else bad('an unprotected enemy takes the shot', JSON.stringify({ hit: !!normal?.hitEntity, dmg: normal?.damageDealt }));
+
+  stage();
+  game.match._protect.set(victim.id, game.match.elapsed + 5);
+  const prot = shoot();
+  if (prot?.hitEntity === victim) ok('a spawn-protected enemy still registers as a hit ON THEM');
+  else {
+    bad('a spawn-protected enemy registers as a hit',
+      `the round passed through and reported surface "${prot?.surface}" — from behind the ` +
+      'screen that is a miss, and the shooter never learns their aim was good');
+  }
+  if (prot?.absorbed === true && prot.damageDealt === 0) ok('and it is reported as absorbed, dealing no damage');
+  else bad('the protected hit is absorbed', JSON.stringify({ absorbed: prot?.absorbed, dmg: prot?.damageDealt }));
+  if (victim.health === 100) ok('the protected target really took no damage');
+  else bad('the protected target takes no damage', `health ${victim.health}`);
+
+  // A TEAMMATE must still not register — a hitmarker for a friendly is a lie.
+  stage();
+  game.match.clearProtection?.(victim);
+  const savedTeam = victim.team;
+  victim.team = shooter.team;
+  const friendly = shoot();
+  victim.team = savedTeam;
+  if (!friendly?.hitEntity) ok('a teammate still does not register as a hit at all');
+  else bad('a teammate does not register', `hitEntity set, absorbed=${friendly.absorbed} — friendly fire should pass through`);
+
+  // ...and, the part that was actually broken: the round must CONTINUE past them.
+  //
+  // The old code ran the raycast normally and nulled the result afterwards, with a comment
+  // claiming "the round passes through instead". It did not — after `ent = null` the
+  // segment loop had only the wall branch left, so nothing beyond the discarded body was
+  // ever tested. A friendly anywhere in the line swallowed the whole burst in silence.
+  // Measured: 60 rounds at a clearly visible enemy 8 m away, perfect aim, ZERO damage.
+  // It falls hardest on a human, who pushes with friendly bots around them while bots
+  // engage spread out — which is exactly "my shots do not land but the bots are fine".
+  const mate = game.bots.bots.find((b) => b.team === shooter.team && b !== victim);
+  if (!mate) { bad('there is a teammate bot to stand in the way', 'none found'); }
+  else {
+    stage();
+    game.match.clearProtection?.(victim);
+    game.match._protect.delete(victim.id);
+    game.match._protect.delete(mate.id);
+    mate.position.set(0, 1.0, -2);          // directly between shooter (z=0) and victim (z=-4)
+    mate.alive = true; mate.health = 100;
+    mate._updateHitboxes?.();
+    const through = shoot();
+    if (through?.hitEntity === victim && through.damageDealt > 0) {
+      ok(`a round passes THROUGH a teammate and hits the enemy behind (${through.damageDealt.toFixed(0)} damage)`);
+    } else {
+      bad('a round passes through a teammate',
+        `hitEntity ${through?.hitEntity?.id ?? 'null'}, damage ${through?.damageDealt ?? 0}, ` +
+        `enemy health ${victim.health} — a friendly in the line is eating the whole burst`);
+    }
+  }
+}
+
 // ── the client believes the server about being alive ─────────────────────────────────
 //
 // `Prediction._correct` set health, armour, height and lean and never touched `alive`, and

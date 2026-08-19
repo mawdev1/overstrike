@@ -50,12 +50,16 @@ export class NetClient {
 
     this.stats = { sent: 0, snapshots: 0, acked: 0, discarded: 0 };
     this._onSnapshot = null;
+    this._onWelcome = null;
+    /** The server's match seed. Shot spread is addressed by it — see GameServer._sendWelcome. */
+    this.matchSeed = null;
 
     transport.onMessage((data) => this._onMessage(data));
   }
 
   /** Called with each decoded snapshot, for prediction to reconcile against. */
   onSnapshot(fn) { this._onSnapshot = fn; }
+  onWelcome(fn) { this._onWelcome = fn; }
 
   _onMessage(data) {
     const v = new DataView(data);
@@ -64,6 +68,10 @@ export class NetClient {
     if (type === MSG_WELCOME) {
       this.clientId = v.getUint32(1, true);
       this.entityId = v.getUint32(5, true);
+      // Sent again on every match restart, so this is an assignment and not a one-time
+      // handshake. `null` only if talking to a server that predates the field.
+      this.matchSeed = data.byteLength >= 13 ? v.getUint32(9, true) : null;
+      if (this._onWelcome) this._onWelcome(this);
       return;
     }
     if (type !== MSG_SNAPSHOT) return;

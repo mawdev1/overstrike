@@ -52,6 +52,26 @@ const BOTS = arg('bots', 4);
 const HEADLESS_ONLY = argv.includes('--headless-only');
 const GS_PORT = 8179;
 
+/**
+ * Point the whole test at an already-running server instead of a local one.
+ *
+ *   node scripts/combattest.mjs --against=https://overstrike.fly.dev \
+ *                               --server=wss://overstrike-gs.fly.dev \
+ *                               --health=https://overstrike-gs.fly.dev
+ *
+ * Exists because "it works locally" is not the claim under test when a user reports that
+ * their shots do not land in PRODUCTION. Real latency, a server that has been up for hours
+ * with a tick count in the millions, a full bot roster and a match that has restarted
+ * several times are all things a freshly spawned local server does not reproduce.
+ */
+const argOf = (k) => {
+  const hit = process.argv.slice(2).find((a) => a.startsWith(`--${k}=`));
+  return hit ? hit.slice(k.length + 3) : null;
+};
+const AGAINST = argOf('against');          // page URL, or null for a local vite dev server
+const REMOTE_WS = argOf('server');         // wss:// URL, or null for the local game server
+const REMOTE_HEALTH = argOf('health');     // https:// origin serving /health
+
 let failures = 0;
 const ok = (n) => { console.log(`  ok   ${n}`); };
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
@@ -211,29 +231,30 @@ console.log('\nB. browser client vs a server bot');
 const { createServer } = await import('vite');
 const { chromium } = await import('playwright');
 
-const gs = spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${GS_PORT}`, `--bots=${BOTS}`], {
+const gs = REMOTE_WS ? null : spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${GS_PORT}`, `--bots=${BOTS}`], {
   cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let gsLog = '';
-gs.stdout.on('data', (d) => { gsLog += d; });
-gs.stderr.on('data', (d) => { gsLog += d; });
+gs?.stdout.on('data', (d) => { gsLog += d; });
+gs?.stderr.on('data', (d) => { gsLog += d; });
 
-const health = async (debug = false) => (await fetch(`http://127.0.0.1:${GS_PORT}/health${debug ? '?debug=1' : ''}`)).json();
+const HEALTH_ORIGIN = REMOTE_HEALTH || `http://127.0.0.1:${GS_PORT}`;
+const health = async (debug = false) => (await fetch(`${HEALTH_ORIGIN}/health${debug ? '?debug=1' : ''}`)).json();
 
 let up = false;
 for (let i = 0; i < 120 && !up; i++) {
   await sleep(200);
-  try { up = (await fetch(`http://127.0.0.1:${GS_PORT}/health`)).ok; } catch { /* not yet */ }
+  try { up = (await fetch(`${HEALTH_ORIGIN}/health`)).ok; } catch { /* not yet */ }
 }
-if (!up) { bad('the game server starts', gsLog.slice(-800)); gs.kill('SIGKILL'); process.exit(1); }
+if (!up) { bad('the game server starts', gsLog.slice(-800)); gs?.kill('SIGKILL'); process.exit(1); }
 ok(`the dedicated server is up with ${BOTS} bots`);
 
-const vite = await createServer({
+const vite = AGAINST ? null : await createServer({
   root: ROOT, configFile: path.join(ROOT, 'vite.config.js'),
   server: { port: 5225, strictPort: false, hmr: false, watch: null }, logLevel: 'error',
 });
-await vite.listen();
-const url = vite.resolvedUrls.local[0];
+if (vite) await vite.listen();
+const url = AGAINST || vite.resolvedUrls.local[0];
 
 const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--mute-audio'],
@@ -248,12 +269,30 @@ await page.waitForFunction(() => window.__GAME__ && window.__BOOTPROF__?.menu > 
 // The render loop is deliberately not used: SwiftShader runs at ~10 fps and this test
 // would end up measuring the software rasteriser. The session is stepped by hand, exactly
 // as mptest.mjs does.
-const joined = await page.evaluate(async (gsUrl) => {
+/**
+ * Where `MultiplayerSession` lives in the page's module graph.
+ *
+ * A dev server serves the source path; a production build serves a hashed chunk, and the
+ * hash changes every deploy. Discovered from the shipped entry chunk rather than
+ * hardcoded, so this keeps working across deploys.
+ */
+let SESSION_MODULE = '/src/net/session.js';
+if (AGAINST) {
+  const html = await (await fetch(AGAINST)).text();
+  const entry = html.match(/\/assets\/index-[A-Za-z0-9_.-]+\.js/)?.[0];
+  const js = entry ? await (await fetch(new URL(entry, AGAINST))).text() : '';
+  const chunk = js.match(/\.\/(session-[A-Za-z0-9_.-]+\.js)/)?.[1];
+  if (!chunk) { bad('the shipped bundle contains the netcode', `no session chunk referenced from ${entry}`); }
+  else SESSION_MODULE = `/assets/${chunk}`;
+  note(`page ${AGAINST} -> ${SESSION_MODULE}`);
+}
+
+const joined = await page.evaluate(async ([gsUrl, sessionModule]) => {
   const g = window.__GAME__;
   g.stop();
   g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 1234 });
   g.match.phase = 'live'; g.match.countdown = 0;
-  const { MultiplayerSession } = await import('/src/net/session.js');
+  const { MultiplayerSession } = await import(sessionModule);
   try {
     const session = await MultiplayerSession.connect(g, gsUrl);
     window.__SESSION__ = session;
@@ -273,7 +312,7 @@ const joined = await page.evaluate(async (gsUrl) => {
   } catch (e) {
     return { ok: false, error: e.message };
   }
-}, `ws://127.0.0.1:${GS_PORT}`);
+}, [REMOTE_WS || `ws://127.0.0.1:${GS_PORT}`, SESSION_MODULE]);
 
 if (!joined.ok) {
   bad('the browser joins the server', joined.error);
@@ -683,10 +722,10 @@ if (realErrors.length === 0) ok('the page logged no errors');
 else bad('the page logs no errors', realErrors.slice(0, 4).join('\n       '));
 
 await browser.close();
-await vite.close();
-gs.kill('SIGTERM');
+if (vite) await vite.close();
+gs?.kill('SIGTERM');
 await sleep(400);
-gs.kill('SIGKILL');
+gs?.kill('SIGKILL');
 
 console.log(failures ? `\n${failures} FAILED` : '\nshots fired from a browser hit bots on the server');
 process.exit(failures ? 1 : 0);

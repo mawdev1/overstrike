@@ -207,7 +207,24 @@ export function raycastEntity(entity, origin, dir, maxDist) {
  * Ray vs every live entity except `exclude`.  (ARCHITECTURE.md §6)
  * @returns {null | {entity, distance, part, point, normal}} POOLED
  */
-export function raycastEntities(game, origin, dir, maxDist, exclude) {
+/**
+ * Entities this shooter's round should pass straight through, as a predicate.
+ *
+ * Teammates (and anyone else who cannot be hurt at all) are invisible to the ray, which is
+ * what "friendly fire is off" has to mean geometrically. A spawn-protected ENEMY is NOT in
+ * this set — the round stops on them and reports `absorbed`, because the shooter needs to
+ * learn the difference between "I missed" and "they are briefly invulnerable".
+ *
+ * Allocated once per shot, not per pellet or per segment.
+ */
+function _skipUndamageable(game, shooter) {
+  return (e) => {
+    if (damageScale(game, shooter, e) > 0) return false;
+    return !(game.match?.isProtected?.(e) && e.team !== shooter?.team);
+  };
+}
+
+export function raycastEntities(game, origin, dir, maxDist, exclude, skip) {
   // Lag compensation hooks in exactly here, and nowhere else.
   //
   // A shot has to be tested against the world the SHOOTER saw, which is RTT/2 plus their
@@ -222,18 +239,21 @@ export function raycastEntities(game, origin, dir, maxDist, exclude) {
   const lag = game.lagcomp;
   const viewTick = exclude?._lagViewTick;
   if (lag && viewTick != null && !lag._rewound) {
-    return lag.rewind(viewTick, exclude, () => _raycastEntitiesNow(game, origin, dir, maxDist, exclude));
+    return lag.rewind(viewTick, exclude, () => _raycastEntitiesNow(game, origin, dir, maxDist, exclude, skip));
   }
-  return _raycastEntitiesNow(game, origin, dir, maxDist, exclude);
+  return _raycastEntitiesNow(game, origin, dir, maxDist, exclude, skip);
 }
 
-function _raycastEntitiesNow(game, origin, dir, maxDist, exclude) {
+function _raycastEntitiesNow(game, origin, dir, maxDist, exclude, skip) {
   const ents = game.entities;
   let best = Infinity;
   let found = false;
   for (let i = 0; i < ents.length; i++) {
     const e = ents[i];
-    if (e === exclude || !e.alive) continue;
+    // `skip` is how a teammate stops blocking the shot. See the note at the call site:
+    // discarding the hit AFTER the raycast ended the trace on their body, so a friendly
+    // standing in the line swallowed the whole burst in silence.
+    if (e === exclude || !e.alive || (skip && skip(e))) continue;
     const h = raycastEntity(e, origin, dir, best < maxDist ? best : maxDist);
     if (!h || h.distance >= best) continue;
     best = h.distance;
@@ -445,6 +465,8 @@ export function fireHitscan(game, o) {
 
   _origin.copy(o.origin);
   _dir.copy(o.dir).normalize();
+  // Once per shot, not once per segment: the segment loop runs several times per pellet.
+  const skipThrough = _skipUndamageable(game, shooter);
 
   const res = _shotResult;
   res.hitEntity = null;
@@ -485,12 +507,42 @@ export function fireHitscan(game, o) {
     const wallSurface = wall ? _wallSurface : 'concrete';
     if (wall) { _point.copy(_wallPoint); _normal.copy(_wallNormal); }
 
-    let ent = raycastEntities(game, _origin, _dir, Math.min(remaining, wallDist), shooter);
+    // Teammates are skipped INSIDE the raycast rather than discarded after it.
+    //
+    // This used to run the raycast normally and then null the result if the target could
+    // not be hurt, with a comment saying "the round passes through instead". It did not:
+    // after `ent = null` the loop only has the wall branch left, so nothing beyond the
+    // discarded body was ever tested. A friendly bot anywhere in the line silently ate the
+    // entire burst — measured, 60 rounds at a clearly visible enemy 8 m away with perfect
+    // aim produced ZERO damage and no feedback of any kind.
+    //
+    // It falls hardest on a human: bots engage spread out and from cover, while a player
+    // pushes with friendly bots around and in front of them. That is the reported symptom
+    // exactly — "my shots do not land, but the bots kill each other fine".
+    //
+    // Spawn-protected ENEMIES are deliberately not skipped: the round should stop on them
+    // and report itself absorbed, so the shooter learns their aim was good. See below.
+    let ent = raycastEntities(game, _origin, _dir, Math.min(remaining, wallDist), shooter, skipThrough);
 
-    // A target we are not allowed to hurt (teammate, spawn-protected, already dead)
-    // must not register as a hit at all — otherwise the shooter gets a hitmarker and
-    // a blood spray for a bullet that did nothing. The round passes through instead.
-    if (ent && damageScale(game, shooter, ent.entity) <= 0) ent = null;
+    // Why the damage is zero decides what the shooter is shown, and the two cases are not
+    // the same.
+    //
+    // A TEAMMATE must not register at all — a hitmarker and a blood spray for a bullet
+    // that did nothing would be a lie. The round passes through, as before.
+    //
+    // A SPAWN-PROTECTED enemy is different, and treating it the same way was a real fault.
+    // The round used to carry on to the wall behind and paint a concrete impact there, so
+    // from behind the screen a perfectly aimed shot on a protected body was literally
+    // indistinguishable from a miss — no hitmarker, no impact on them, nothing. Measured,
+    // 7-24% of a player's on-target shots land on a protected bot, because engagements
+    // cluster around spawns and a freshly spawned enemy is the stationary, visible, obvious
+    // shot. Bots do not care, so the entire visible cost of this fell on the human.
+    //
+    // It now stops on the body and reports itself as absorbed: the shooter learns their aim
+    // was good and the target was invulnerable, which is information, not a mystery.
+    // Anything the ray still returns is damageable, except a spawn-protected enemy, which
+    // `skipThrough` deliberately lets through so the round can stop and say so.
+    const absorbed = !!ent && damageScale(game, shooter, ent.entity) <= 0;
 
     if (ent && ent.distance <= wallDist) {
       // ---------------------------------------------------------- entity hit
@@ -498,30 +550,39 @@ export function fireHitscan(game, o) {
       const dist = travelled + ent.distance;
       const mul = falloffMultiplier(dist, o.falloffStart ?? range, o.falloffEnd ?? range, o.falloffMin ?? 1);
       const partMul = ent.part === 'head' ? headMul : (HIT_MUL[ent.part] ?? 1);
-      const amount = damage * mul * partMul;
-      const headshot = ent.part === 'head';
+      const amount = absorbed ? 0 : damage * mul * partMul;
+      const headshot = !absorbed && ent.part === 'head';
 
       res.hitEntity = target;
       res.point.copy(ent.point);
       res.distance = dist;
       res.headshot = headshot;
       res.part = ent.part;
-      res.surface = 'flesh';
+      res.surface = absorbed ? 'shield' : 'flesh';
+      res.absorbed = absorbed;
       res.damageDealt = amount;
       if (target === game.player) hitPlayer = true;
 
       _tracerTo.copy(ent.point);
       endSet = true;
 
-      game.present.bloodSpray(ent.point, ent.normal, clamp(amount / 45, 0.3, 2.2));
-      game.present.play(headshot ? 'headshot' : 'fleshHit', { position: ent.point, volume: 0.95 });
+      // No blood for an absorbed round — nothing was hurt — but it must still be visibly
+      // and audibly a hit ON THEM rather than a hole in the wall behind.
+      if (absorbed) {
+        game.present.impact(ent.point, ent.normal, 'shield');
+        game.present.play('hitmarker', { position: ent.point, volume: 0.5, rate: 0.7 });
+      } else {
+        game.present.bloodSpray(ent.point, ent.normal, clamp(amount / 45, 0.3, 2.2));
+        game.present.play(headshot ? 'headshot' : 'fleshHit', { position: ent.point, volume: 0.95 });
+      }
 
       _evHit.shooter = shooter;
       _evHit.target = target;
       _evHit.point.copy(ent.point);
       _evHit.normal.copy(ent.normal);
       _evHit.headshot = headshot;
-      _evHit.surface = 'flesh';
+      _evHit.surface = absorbed ? 'shield' : 'flesh';
+      _evHit.absorbed = absorbed;
       game.bus?.emit('hit', _evHit);
 
       _evDamage.target = target;
@@ -532,10 +593,13 @@ export function fireHitscan(game, o) {
       _evDamage.normal.copy(ent.normal);
       _evDamage.weaponId = weaponId;
       _evDamage.headshot = headshot;
-      game.bus?.emit('damage', _evDamage);
+      _evDamage.absorbed = absorbed;
+      // No `damage` event for an absorbed round: nothing took damage, and every listener
+      // (scoring, the AI's threat model, damage numbers) would be reporting a fiction.
+      if (!absorbed) game.bus?.emit('damage', _evDamage);
 
       const wasAlive = target.alive;
-      target.applyDamage?.(amount, _evDamage);
+      if (!absorbed) target.applyDamage?.(amount, _evDamage);
       res.killed = wasAlive && !target.alive;
       break;
     }

@@ -770,7 +770,15 @@ export class Match {
   /** Multiplier ballistics can fold straight into the damage it is about to apply. */
   damageMultiplierFor(entity) { return this.isProtected(entity) ? 0 : 1; }
 
-  /** Explicitly drop protection (fired a weapon, threw a grenade, took an objective). */
+  /**
+   * Explicitly drop protection (fired a weapon, threw a grenade, took an objective).
+   *
+   * The firing case is NOT handled here — `_onShot` already deletes the entry inline, and
+   * has to, because it resolves streak hardware back to its operator first. This method is
+   * the public entry point for the other cases and for tests. It has no callers in `src/`
+   * today, which reads like dead code and is not: the behaviour its name describes is
+   * implemented, just not through it.
+   */
   clearProtection(entity) { if (entity) this._protect.delete(entity.id); }
 
   /** Pre-round freeze + death + post-match lockout, in one question. */

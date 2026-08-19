@@ -64,6 +64,14 @@ export class MultiplayerSession {
     this._stubs = new Map();
 
     this.net.onSnapshot((snap) => this._onSnapshot(snap));
+    // Adopting the seed is not bookkeeping: every shot's spread is addressed by it, so
+    // until this runs the client predicts a different bullet than the server fires.
+    this.net.onWelcome((net) => {
+      if (net.matchSeed == null) return;
+      if (this.game.matchSeed === net.matchSeed) return;
+      this.game.matchSeed = net.matchSeed;
+      this.game.rng?.reseed?.(net.matchSeed);
+    });
   }
 
   /**

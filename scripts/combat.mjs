@@ -165,7 +165,12 @@ const out = await page.evaluate(async () => {
   R.enemyAlive = enemy.alive;
   R.hits = hits; R.damages = damages; R.kills = kills; R.killfeedRows = killfeedRows;
 
-  ok('shotsFired', fired > 3, `${fired} shots`);
+  // The loop stops the moment the enemy dies, so "how many rounds left the barrel" is a
+  // measure of how QUICKLY the target went down, not of whether the gun works. With
+  // headshots landing (~89 damage) a kill can take two rounds, and demanding more than
+  // three reported the best possible outcome as a failure. What matters is that the weapon
+  // fired at all and the target actually died.
+  ok('shotsFired', fired >= 1, `${fired} shots`);
   ok('damageLanded', R.enemyDamage > 0 || !enemy.alive, `dealt ${R.enemyDamage}`);
   ok('hitEventsFired', hits > 0, `${hits} hit events`);
   ok('enemyKilled', !enemy.alive, `alive=${enemy.alive} hp=${enemy.health}`);
