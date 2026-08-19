@@ -63,7 +63,13 @@ const OBJECTIVES = [
   // The rampart runs x -41..-36; -27 is 9 m east of it, out in the courtyard, so this
   // measured the floor and attributed its numbers to the rampart.
   { name: 'old town rampart', at: new THREE.Vector3(-38, 3.95, -8) },
-  { name: 'old town terrace A', at: new THREE.Vector3(-23, 5.0, -16) },
+  // z -26, not -16. Block A spans z -32..-16, so -16 is its EDGE: the probe landed on the
+  // terrace parapet at 5.00 m rather than the deck at 3.95, on an isolated node with no
+  // links, and this zone has been reporting "no route within the A* budget for team 0" ever
+  // since. Both teams can in fact reach the terrace — measured 26.8 m for team 0 and 15.3 m
+  // for team 1. Same class of mistake as the rampart probe fixed directly above; -26 mirrors
+  // terrace B's probe, which sits 6 m inside its own block.
+  { name: 'old town terrace A', at: new THREE.Vector3(-23, 3.95, -26) },
   { name: 'old town terrace B', at: new THREE.Vector3(-23, 5.0, 16) },
 ];
 
