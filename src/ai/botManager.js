@@ -425,7 +425,7 @@ export class BotManager {
     while (this.bots.length < count) {
       this.bots.push(new Bot(this.game, 1, 'BOT'));
     }
-    // The only place the roster changes size; `game.entityById` reindexes off this.
+    // `game.entityById` reindexes off this. `dispose()` reports separately.
     this.game.rosterChanged();
   }
 
@@ -692,6 +692,9 @@ export class BotManager {
     this._unsub.length = 0;
     for (const b of this.bots) b.dispose();
     this.bots.length = 0;
+    // Teardown changes the roster like any other path. Without this the registry keeps
+    // handing back disposed bots — and strongly retaining them.
+    this.game.rosterChanged();
     disposeBotRigs();
   }
 }

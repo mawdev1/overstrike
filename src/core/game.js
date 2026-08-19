@@ -207,6 +207,7 @@ export class Game {
       await this.player.init();
       this.bots = new BotManager(this);
       await this.bots.init();
+      this.rosterChanged();
     });
     await step('assembling hud', async () => {
       this.hud = new HUD(this);
@@ -253,6 +254,12 @@ export class Game {
     // Build colliders without geometry. The collider set and spawn table come out
     // bit-identical either way — asserted by scripts/headless.mjs, which is the only
     // thing standing between this and a silent server/client map divergence.
+    // No `assets.init()` headlessly: nothing on the simulation path reads a texture or a
+    // material property. Tell assets so, and its misses become a counter rather than
+    // sixty warnings — see `Assets.mat`.
+    assets.headless = true;
+    assets.headlessMatRequests = 0;
+
     setCollidersOnly(colliders);
     this.world = new World(this);
     await this.world.init();
@@ -269,6 +276,7 @@ export class Game {
     await this.player.init();
     this.bots = new BotManager(this);
     await this.bots.init();
+    this.rosterChanged();
 
     this.match = new Match(this);
     await this.match.init();
@@ -448,7 +456,10 @@ export class Game {
 
   stop() {
     this._running = false;
-    cancelAnimationFrame(this._raf);
+    // `dispose()` calls this unconditionally, and a server has no rAF to cancel. Throwing
+    // here aborted teardown BEFORE any system was disposed, so every match a server ran
+    // leaked its systems and their bus subscriptions.
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this._raf);
   }
 
   _loop(now) {
@@ -605,8 +616,10 @@ export class Game {
    * not better: ids become the name by which one machine tells another which entity it
    * means.
    *
-   * Reset per match by `startMatch`, so a long-lived server process replays the same ids
-   * for the same match rather than drifting upward across restarts.
+   * Deliberately NOT reset per match — see the note in `startMatch`. Resetting hands the
+   * first bot of the next match the id the Player is still using, which is the original
+   * collision. Ids therefore climb for the life of the process, and nothing depends on
+   * them being reproducible across matches.
    */
   allocEntityId() {
     return ++this._entityIdSeq;

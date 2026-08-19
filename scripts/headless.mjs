@@ -30,13 +30,11 @@ const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 
 console.log(`\nheadless boot (${TICKS} ticks, ${BOTS} bots, seed ${SEED})`);
 
-// The world builder asks `assets` for materials. Nothing on the simulation path reads a
-// material — only the merged meshes do, and a headless build makes none — so a plain
-// object satisfies every call site without pulling in a texture loader or a GL context.
+// Deliberately NOT stubbing `assets`. An earlier version replaced `mat`/`tiled` here,
+// which made the boot quiet and hid the thing this harness exists to notice: how much
+// rendering the simulation path still asks for. `Game.initHeadless` puts assets into
+// headless mode instead, where a miss increments a counter — asserted below.
 const { assets } = await import('../src/core/assets.js');
-const stubMat = () => new THREE.MeshBasicMaterial();
-assets.mat = stubMat;
-assets.tiled = stubMat;
 
 /**
  * Digest of everything the SIMULATION takes from a built level.
@@ -77,6 +75,15 @@ if (!game.engine && !game.renderer && !game.hud && !game.audio && !game.fx) {
     `engine=${!!game.engine} renderer=${!!game.renderer} hud=${!!game.hud} audio=${!!game.audio} fx=${!!game.fx}`);
 }
 
+// The registry must be usable the moment the roster exists, not merely after the first
+// startMatch. `entityById` caches its index against a version counter, and nothing bumped
+// that when the player and bots were constructed — so a single lookup during boot froze an
+// empty map and `Match._isLiveEntity(player)` then answered false, silently refusing to
+// book the player's own stats. Phase 5 resolves wire ids through this, and a lobby-phase
+// lookup is the natural first caller.
+if (game.entityById(game.player.id) === game.player) ok('entityById resolves the player straight after boot, before any match');
+else bad('entityById resolves the player straight after boot', 'the index was stale before the first startMatch');
+
 const boxes = game.world?.boxes?.length ?? 0;
 if (boxes > 100) ok(`world built with ${boxes} colliders and ${game.world.spawnPoints.length} spawns`);
 else bad('world built', `only ${boxes} colliders`);
@@ -93,10 +100,41 @@ else bad('world built', `only ${boxes} colliders`);
 // So: build the same seed twice in this process, once with geometry and once without,
 // and demand the simulation-visible output be identical.
 const headlessDigest = levelDigest(game.world);
+const headlessRng = JSON.stringify(game.rng.getState());
+
+// Publish for the cross-process check in determinism.mjs, which digests the real browser
+// build. In-process comparison cannot see what differs BETWEEN processes — module state,
+// the THREE instance, the JIT — and that is exactly where a server/client map split would
+// come from.
+{
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const pathMod = await import('node:path');
+  const file = pathMod.join(os.tmpdir(), 'overstrike-collider-digest.json');
+  let peer = null;
+  try { peer = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* first to run */ }
+  fs.writeFileSync(file, JSON.stringify({
+    from: 'headless', digest: headlessDigest,
+    boxes: game.world.boxes.length, spawns: game.world.spawnPoints.length,
+  }));
+  if (peer && peer.from === 'browser') {
+    if (peer.digest === headlessDigest) ok(`matches the browser build recorded by determinism.mjs (${boxes} boxes)`);
+    else bad('matches the browser build', 'the browser and this server disagree on the map — see determinism.mjs for the first differing entry');
+  }
+}
 {
   const full = new Game({ headless: true });
   await full.initHeadless({ presenter: new NullPresenter(), colliders: false });
   const fullDigest = levelDigest(full.world);
+
+  // Stronger than comparing output: compare the STREAM POSITION. Two builds can produce
+  // the same colliders while having drawn a different number of times — decoration draws
+  // that happen to land on the same geometry — and the difference would then only surface
+  // later, on the next thing to draw. Identical positions means identical draw counts.
+  const fullRng = JSON.stringify(full.rng.getState());
+  if (fullRng === headlessRng) ok(`both builds leave the rng at the same position (${headlessRng})`);
+  else bad('both builds leave the rng at the same position',
+    `colliders-only ${headlessRng} vs full ${fullRng} — an unequal number of draws, even though the colliders may match`);
   if (fullDigest === headlessDigest) {
     ok(`colliders-only build is bit-identical to a full build (${boxes} boxes, ${game.world.spawnPoints.length} spawns)`);
   } else {
@@ -127,6 +165,15 @@ try {
   bad('startMatch', `${e.message}\n${(e.stack || '').split('\n').slice(1, 4).join('\n')}`);
   process.exit(1);
 }
+
+// How much rendering the simulation path still asks for. Not zero: WeaponSystem builds a
+// Viewmodel, Killstreaks builds sentry and chopper meshes, ProjectileSystem builds its
+// pool — all rendering resources a server has no use for, and all still constructed. This
+// is waste rather than a fault, so the check is a ceiling that makes it visible and stops
+// it growing quietly.
+if (assets.headlessMatRequests < 200) ok(`the sim path asked for ${assets.headlessMatRequests} materials (still-built rendering resources)`);
+else bad('the sim path asks for few materials',
+  `${assets.headlessMatRequests} material lookups — something large is building rendering resources headlessly`);
 
 // `Game._safe` catches a throwing system and isolates it for the rest of the session
 // rather than crashing. That is right for a shipped game and disastrous for this test:
@@ -201,6 +248,20 @@ if (TICKS >= LONG_ENOUGH) {
 
 if (game.tick === TICKS) ok(`the clock advanced to tick ${game.tick} (time ${game.time.toFixed(3)}s)`);
 else bad('the clock advanced', `tick ${game.tick}, expected ${TICKS}`);
+
+// Teardown has to work on a server: it runs between matches, for the life of the process.
+// `stop()` called `cancelAnimationFrame` unconditionally, so `dispose()` threw BEFORE
+// disposing a single system — every match leaked its systems and their bus subscriptions.
+try {
+  const throwaway = new Game({ headless: true });
+  await throwaway.initHeadless({ presenter: new NullPresenter() });
+  throwaway.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 5 });
+  for (let i = 0; i < 120; i++) throwaway._fixedUpdate(1 / 120);
+  throwaway.dispose();
+  ok('a match instance disposes cleanly (no rAF, systems actually torn down)');
+} catch (e) {
+  bad('a match instance disposes cleanly', `${e.message} — a server leaks every system it ever built`);
+}
 
 console.log(failures ? `\n${failures} FAILED` : '\nheadless simulation runs clean');
 process.exit(failures ? 1 : 0);

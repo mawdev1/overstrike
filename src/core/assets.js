@@ -861,6 +861,15 @@ export class Assets {
     this.materials = new Map();
     this.geometries = new Map();
     this.ready = false;
+    /**
+     * Set by `Game.initHeadless`. A server never runs `init()`, so every material lookup
+     * misses; warning about each is noise on a CORRECT boot. See `mat` — the misses are
+     * counted instead, which turns "how much rendering does the sim path still ask for"
+     * from invisible into a number a test can assert on.
+     */
+    this.headless = false;
+    this.headlessMatRequests = 0;
+    this._nullMatCache = null;
   }
 
   /**
@@ -1084,10 +1093,21 @@ export class Assets {
   mat(name) {
     const m = this.materials.get(name);
     if (!m) {
+      // A headless server never runs `init()`, so EVERY material is missing and warning
+      // about each one is just noise on a correct boot. Count instead: a non-zero count
+      // is a live measure of how much rendering the sim path still asks for, which is
+      // otherwise invisible — it is how the viewmodel, sentry and projectile meshes stay
+      // quietly constructed on a server that has no screen.
+      if (this.headless) { this.headlessMatRequests++; return this._nullMat(); }
       console.warn(`[assets] missing material "${name}"`);
       return this.materials.get('concrete');
     }
     return m;
+  }
+
+  /** One shared stand-in, so a headless boot allocates a material rather than N. */
+  _nullMat() {
+    return this._nullMatCache || (this._nullMatCache = new THREE.MeshBasicMaterial({ name: 'headless' }));
   }
 
   /**
@@ -1147,4 +1167,8 @@ export class Assets {
   }
 }
 
+/**
+ * `headless` swaps the missing-material warning for a counter — see `mat`. Set by
+ * `Game.initHeadless`; a browser never touches it.
+ */
 export const assets = new Assets();

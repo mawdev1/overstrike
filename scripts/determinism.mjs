@@ -802,6 +802,56 @@ try {
   if (rewind.firstBad === -1) ok('every tick of the replay is identical, field for field');
   else bad('every tick of the replay is identical', `first divergence at tick ${rewind.firstBad}: ${rewind.badFields.join(', ')}`);
 
+  // ── the browser and the server build the same map ────────────────────────────────
+  //
+  // The check Phase 4 actually needs, and the only one that can make it: everything else
+  // compares two builds inside ONE process, where module-level state, the THREE instance
+  // and the JIT are all shared. A server whose colliders differ from its clients' by a
+  // millimetre produces shots that hit on one machine and miss on the other, with nothing
+  // in any log.
+  //
+  // This side digests the real browser build; scripts/headless.mjs writes the Node
+  // colliders-only digest to the same file, and whichever runs second compares.
+  console.log('\nbrowser and headless builds agree on the map');
+  const browserDigest = await page.evaluate(() => {
+    const g = window.__GAME__;
+    const parts = [];
+    for (const b of g.world.boxes) {
+      parts.push(`${b.min.x},${b.min.y},${b.min.z},${b.max.x},${b.max.y},${b.max.z},${b.surface}`);
+    }
+    parts.push('|');
+    for (const sp of g.world.spawnPoints) {
+      parts.push(`${sp.position.x},${sp.position.y},${sp.position.z},${sp.yaw},${sp.team ?? '-'}`);
+    }
+    return { digest: parts.join(';'), boxes: g.world.boxes.length, spawns: g.world.spawnPoints.length };
+  });
+  {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const pathMod = await import('node:path');
+    const file = pathMod.join(os.tmpdir(), 'overstrike-collider-digest.json');
+    let peer = null;
+    try { peer = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* first to run */ }
+    fs.writeFileSync(file, JSON.stringify({ from: 'browser', ...browserDigest }));
+
+    if (!peer || peer.from === 'browser') {
+      // Not a failure: run `npm run headless` and this suite in either order and the
+      // second one compares. Say so rather than passing silently.
+      console.log(`  --   no headless digest to compare against yet (${browserDigest.boxes} boxes here);`);
+      console.log('       run `npm run headless` then re-run this suite to close the loop');
+    } else if (peer.digest === browserDigest.digest) {
+      ok(`browser and headless builds are byte-identical (${browserDigest.boxes} boxes, ${browserDigest.spawns} spawns)`);
+    } else {
+      const a = browserDigest.digest.split(';'), c = peer.digest.split(';');
+      let at = 'length only';
+      for (let i = 0; i < Math.max(a.length, c.length); i++) {
+        if (a[i] !== c[i]) { at = `entry ${i}:\n         browser:  ${a[i]}\n         headless: ${c[i]}`; break; }
+      }
+      bad('browser and headless builds are byte-identical',
+        `${a.length} vs ${c.length} entries — a shot would hit on one machine and miss on the other.\n       ${at}`);
+    }
+  }
+
   // ── the eye invariant ──────────────────────────────────────────────────────────
   //
   // Bullets leave from `getEyePosition()`, and the camera renders from that same point

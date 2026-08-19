@@ -44,7 +44,7 @@ const _warnEvt = { id: 0, kind: 'frag', position: new THREE.Vector3(), distance:
 const _flashEvt = { amount: 0, duration: 0, position: new THREE.Vector3() };
 const _smokeEvt = { id: 0, position: new THREE.Vector3(), radius: 0, duration: 0 };
 
-let _nextId = 1;
+
 
 // ==================================================================== system
 
@@ -151,7 +151,7 @@ export class ProjectileSystem {
     const p = this._acquire();
 
     const speed = pr.throwSpeedMin + (pr.throwSpeed - pr.throwSpeedMin) * clamp(power, 0, 1);
-    p.id = _nextId++;
+    p.id = this.game.allocEntityId();
     p.active = true;
     p.kind = pr.kind;
     p.def = d;
@@ -196,7 +196,7 @@ export class ProjectileSystem {
     const p = this._acquire();
     const speed = speedOverride || pr.speed || pr.throwSpeed || 45;
 
-    p.id = _nextId++;
+    p.id = this.game.allocEntityId();
     p.active = true;
     p.kind = pr.kind || 'rocket';
     p.def = def;
