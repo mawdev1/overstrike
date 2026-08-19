@@ -231,12 +231,33 @@ export class Match {
       // BotManager has already dealt the roster into two sides and baked a model
       // colourway per bot. Only intervene if that split is actually wrong — a team
       // flip here would leave a bot wearing the other side's kit.
+      // Only the LOCAL player is pinned. `isPlayer` is true of every networked client's
+      // entity too, and pinning all of them put every human on team 0 — on a server that
+      // meant humans could never damage each other, and with the bot roster dealt evenly
+      // it meant half the enemies on screen were teammates who took zero damage. The
+      // symptom is not "friendly fire is off", it is `damageScale` returning 0 and
+      // `fireHitscan` then nulling the hit outright: no hitmarker, no blood, no sound.
+      // Indistinguishable from the bullet missing.
+      const local = this.game.player;
       let a = 0;
       let b = 0;
       let dirty = false;
       for (let i = 0; i < ents.length; i++) {
         const e = ents[i];
-        if (e.isPlayer) { if (e.team !== 0) { e.team = 0; dirty = true; } a++; continue; }
+        if (e === local) { if (e.team !== 0) { e.team = 0; dirty = true; } a++; continue; }
+
+        // Networked humans are DEALT, not merely counted. Leaving them on their default
+        // team 0 and trusting `_rebalance` to sort it out does not work: rebalance moves
+        // whichever team-0 entity it meets first, and `game.entities` lists bots before
+        // joined players, so it emptied team 0 of BOTS and left every human standing on
+        // one side. Dealing them to the smaller side as we go puts humans on both.
+        if (e.isPlayer) {
+          const want = a <= b ? 0 : 1;
+          if (e.team !== want) { e.team = want; dirty = true; }
+          (want === 1 ? b++ : a++);
+          continue;
+        }
+
         if (e.team !== 0 && e.team !== 1) { e.team = i % 2 === 0 ? 0 : 1; dirty = true; }
         (e.team === 1 ? b++ : a++);
       }
@@ -248,7 +269,7 @@ export class Match {
       let t = 2;
       for (let i = 0; i < ents.length; i++) {
         const e = ents[i];
-        e.team = e.isPlayer ? 0 : t++;
+        e.team = e === this.game.player ? 0 : t++;
       }
     }
   }
@@ -256,6 +277,7 @@ export class Match {
   _rebalance() {
     if (!this.mode.teamBased) return;
     const ents = this.game.entities;
+    const local = this.game.player;
     let a = 0;
     let b = 0;
     for (let i = 0; i < ents.length; i++) (ents[i].team === 1 ? b++ : a++);
@@ -265,7 +287,7 @@ export class Match {
       let moved = false;
       for (let i = 0; i < ents.length; i++) {
         const e = ents[i];
-        if (e.isPlayer || e.team !== from) continue;
+        if (e === local || e.team !== from) continue;
         e.team = to;
         // The bot's model colourway is baked per team; rebuild it to match.
         e.ensureTeamModel?.();
@@ -638,6 +660,7 @@ export class Match {
     });
     if (isPlayer) {
       this.game.present.deathScreen({
+        victim: entity,
         killer: killer && killer !== entity ? killer : null,
         killerName: killer ? (this._book.get(killer.id)?.name || killer.name || '') : '',
         killerHealth: killer?.health ?? 0,
@@ -676,7 +699,7 @@ export class Match {
       if (!e.isPlayer) this._rebalanceOnRespawn(e);
       this.spawner.spawnEntity(e);
       spawned++;
-      if (e.isPlayer) this.game.present.deathScreen(null);
+      if (e.isPlayer) this.game.present.deathScreen(null, e);
     }
   }
 

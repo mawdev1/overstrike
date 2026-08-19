@@ -18,6 +18,11 @@ import { Prediction } from './prediction.js';
 import { quantiseCommand, F_ALIVE, F_CROUCH, F_SPRINT } from './protocol.js';
 import { FIXED_DT } from '../core/mathUtils.js';
 import { RemoteAvatars } from './avatars.js';
+import * as THREE from 'three';
+
+/** Scratch for replayed effects. Module scope: nothing survives a synchronous call. */
+const _fx = new THREE.Vector3();
+const _fdir = new THREE.Vector3(0, 0, -1);
 
 export class MultiplayerSession {
   constructor(game, transport) {
@@ -129,6 +134,92 @@ export class MultiplayerSession {
   _onSnapshot(snap) {
     if (!this.synced) { this._syncToServer(snap); return; }
     this.prediction?.reconcile(snap);
+    if (snap.events?.length) this._replayEvents(snap.events);
+  }
+
+  /**
+   * Turn the server's recorded feedback back into things the player can see and hear.
+   *
+   * The mirror of `RecordingPresenter`: the server resolved these shots and knew exactly
+   * what should have been presented, but it has no screen. This is the screen. Everything
+   * goes through `game.present` rather than touching the HUD directly, so multiplayer
+   * feedback and single-player feedback are the same code and cannot drift apart.
+   *
+   * Note what is deliberately NOT here: the local player's own gunshot and muzzle flash.
+   * Those are predicted client-side the instant the trigger is pulled, and replaying the
+   * server's copy a round trip later would double every shot.
+   */
+  _replayEvents(events) {
+    const g = this.game;
+    const present = g.present;
+    if (!present) return;
+    const mineId = this.net.entityId;
+
+    for (const ev of events) {
+      switch (ev.kind) {
+        case 'hitmarker':
+          present.hitmarker(ev.headshot);
+          present.playUI(ev.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
+          break;
+
+        case 'fire': {
+          if (ev.entityId === mineId) break;            // already presented locally
+          const r = this.remotes.get(ev.entityId);
+          // Fire from where the SERVER said the muzzle was, not from the interpolated
+          // avatar: the avatar is ~100 ms behind, and a flash offset from the gun that
+          // made it is more distracting than no flash at all.
+          _fx.set(ev.x, ev.y, ev.z);
+          present.muzzleFlash(_fx, _fdir, 0.9);
+          present.play('rifle', { position: _fx, volume: r ? 0.9 : 0.6 });
+          break;
+        }
+
+        case 'damaged':
+          present.flashDamage(Math.max(0.12, Math.min(1, ev.amount / 55)));
+          present.play('hurt', { volume: Math.max(0.45, Math.min(1, 0.45 + ev.amount / 90)) });
+          break;
+
+        case 'kill': {
+          const killer = this.remotes.get(ev.killerId);
+          const victim = this.remotes.get(ev.victimId);
+          present.killfeed({
+            attacker: null, victim: null,
+            killer: this._nameFor(ev.killerId),
+            victimName: this._nameFor(ev.victimId),
+            killerTeam: killer?.team ?? (ev.killerId === mineId ? g.player?.team ?? -1 : -1),
+            victimTeam: victim?.team ?? (ev.victimId === mineId ? g.player?.team ?? -1 : -1),
+            mine: ev.killerId === mineId || ev.victimId === mineId,
+            headshot: ev.headshot,
+          });
+          // The kill variant of the hitmarker, for the shooter only.
+          if (ev.killerId === mineId && ev.victimId !== mineId) present.hitmarker(ev.headshot, null, true);
+          break;
+        }
+
+        case 'death':
+          if (ev.victimId !== mineId) break;
+          present.deathScreen({
+            killer: null,
+            killerName: this._nameFor(ev.killerId),
+            killerHealth: this.remotes.get(ev.killerId)?.health ?? 0,
+            respawnIn: 0,
+          });
+          break;
+
+        case 'respawn':
+          present.deathScreen(null);
+          break;
+
+        default: break;                                  // a kind this build does not know
+      }
+    }
+  }
+
+  /** Best available display name for a networked id. Ids are all the wire carries. */
+  _nameFor(id) {
+    if (!id) return 'UNKNOWN';
+    if (id === this.net.entityId) return this.game.player?.name || 'YOU';
+    return `PLAYER ${id}`;
   }
 
   /**

@@ -28,6 +28,9 @@ import { INTERP_DELAY_MS } from './client.js';
 /** Snapshots at 30 Hz against a 120 Hz simulation. */
 export const SNAPSHOT_INTERVAL = 4;
 
+/** Feedback events buffered between snapshots. A grenade in a crowd is the worst case. */
+const MAX_PENDING_EVENTS = 256;
+
 /**
  * How far a client's own aim may drift from the server's before it is snapped.
  *
@@ -95,6 +98,8 @@ export class GameServer {
   constructor(game) {
     this.game = game;
     this.clients = new Map();
+    /** Feedback recorded by `RecordingPresenter`, drained into each snapshot. */
+    this._pendingEvents = [];
     this._nextClientId = 1;
     this._snapCounter = 0;
     this.lag = new LagCompensation(game);
@@ -184,6 +189,17 @@ export class GameServer {
 
     this.game._fixedUpdate(FIXED_DT);
 
+    // Collect the feedback this tick generated. Snapshots go out every SNAPSHOT_INTERVAL
+    // ticks, so events have to accumulate across the ticks in between or three quarters of
+    // every burst's hitmarkers would be dropped on the floor.
+    const rec = this.game.present;
+    if (rec?.events?.length) {
+      for (const ev of rec.events) {
+        if (this._pendingEvents.length < MAX_PENDING_EVENTS) this._pendingEvents.push(ev);
+      }
+      rec.clear();
+    }
+
     // The mark lives for exactly the tick that consumed the command. Leaving it set would
     // rewind every later shot to a stale view.
     for (const session of this.clients.values()) {
@@ -237,21 +253,37 @@ export class GameServer {
     h.leanKeyHeld = cmd.leanKeyHeld;
     h.leanRightKeyHeld = cmd.leanRightKeyHeld;
 
+    // The aim checksum has to be compared against the aim the CLIENT was describing, which
+    // is its aim BEFORE this command's delta — `MultiplayerSession.sendCommand` stamps
+    // `cmd.baseYaw` from the player and only then predicts the delta onto it. Comparing it
+    // against the post-delta aim instead made the difference exactly `cmd.deltaYaw`, so any
+    // single command turning faster than AIM_RESYNC_RAD (about 4 degrees in 8 ms — a flick,
+    // not a desync) tripped the "we have parted company" branch, which then wrote the STALE
+    // pre-delta angle back and left the server aiming one command behind the client for the
+    // whole turn. Measured 2 resyncs on a clean link with 0 dropped commands, and it shows
+    // up in play as flick shots landing behind a moving target.
+    const preYaw = e.baseYaw;
+    const prePitch = e.basePitch;
+
     e.applyCommand(cmd);
     e._firePressedThisFrame = !!cmd.firePressed;
 
-    // The aim checksum. Deltas alone are lossy: lose one command and the server's aim sits
-    // permanently offset from the client's, with nothing to notice. Compare against what
-    // the client says its absolute aim is and snap if they have genuinely parted company.
-    const dy = Math.abs(wrapAngle(e.baseYaw - cmd.baseYaw));
-    const dp = Math.abs(e.basePitch - cmd.basePitch);
+    // Deltas alone are lossy: lose one command and the server's aim sits permanently offset
+    // from the client's, with nothing to notice. Compare against what the client says its
+    // absolute aim is and snap if they have genuinely parted company.
+    const dy = Math.abs(wrapAngle(preYaw - cmd.baseYaw));
+    const dp = Math.abs(prePitch - cmd.basePitch);
     if (dy > AIM_RESYNC_RAD || dp > AIM_RESYNC_RAD) {
-      e.baseYaw = cmd.baseYaw;
+      // Snap to the client's stated aim and then RE-APPLY this command's delta. The
+      // checksum describes where the client was before it turned; adopting it raw would
+      // throw away the turn the same command was carrying, which is how a resync used to
+      // leave the server a command behind instead of catching it up.
+      e.baseYaw = cmd.baseYaw + (cmd.deltaYaw || 0);
       // Clamped exactly as `applyCommand` clamps the normal path. Taking the client's
       // value raw here let a client deliberately trip the threshold to push its pitch
       // past the game's own limit — aim is client-authoritative by design, but the limit
       // is not the client's to opt out of.
-      e.basePitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, cmd.basePitch));
+      e.basePitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, cmd.basePitch + (cmd.deltaPitch || 0)));
       e._writeAngles();
       session.stats.resyncs++;
     }
@@ -278,11 +310,18 @@ export class GameServer {
     }
 
     for (const session of this.clients.values()) {
+      // Route: an event with no `to` is everyone's (a gunshot, a kill); an event with one
+      // belongs to exactly one client. Showing somebody else's hitmarker is worse than
+      // showing none, so this filter is the whole point of recording `to` at all.
+      const mine = session.entity?.id;
+      const events = this._pendingEvents.filter((ev) => ev.to == null || ev.to === mine);
+
       const snap = {
         tick: g.tick,
         baseTick: session.baseTick,
         lastCommandSeq: session.lastCommandSeq,
         entities: wire,
+        events,
       };
       const buf = encodeSnapshot(snap, session.baseline);
       session.transport.send(buf);
@@ -303,6 +342,8 @@ export class GameServer {
       session.baseline = snap;
       session.baseTick = g.tick;
     }
+
+    this._pendingEvents.length = 0;
   }
 }
 

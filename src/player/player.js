@@ -780,7 +780,7 @@ export class Player {
     }
 
     this.game.bus?.emit('playerDamaged', { amount: dmg, dirWorld });
-    this.game.present.flashDamage(clamp(dmg / 55, 0.12, 1));
+    this.game.present.flashDamage(clamp(dmg / 55, 0.12, 1), this);
     // Aim-moving (sim) and presentation-only (punch/shake) — see damageKick(). Called
     // directly, not through game.present: the sim half must run without a presenter.
     this.damageKick(dirWorld, clamp(dmg / 40, 0.15, 1.4));

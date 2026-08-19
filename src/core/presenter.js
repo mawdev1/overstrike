@@ -62,13 +62,14 @@ export class LivePresenter {
   flashDamage(amount) { this.game.engine?.flashDamage?.(amount); }
 
   // ── hud ────────────────────────────────────────────────────────────────────────
-  hitmarker(headshot) { this.game.hud?.hitmarker?.(headshot); }
+  /** `kill` upgrades it to the kill variant — the one that tells you they went down. */
+  hitmarker(headshot, _owner, kill) { this.game.hud?.hitmarker?.(headshot, kill); }
   setAmmo(ammo, reserve) { this.game.hud?.setAmmo?.(ammo, reserve); }
   setWeapon(def) { this.game.hud?.setWeapon?.(def); }
   setEquipment(lethal, tactical) { this.game.hud?.setEquipment?.(lethal, tactical); }
   setCrosshairSpread(px) { this.game.hud?.setCrosshairSpread?.(px); }
   killfeed(evt) { this.game.hud?.killfeed?.(evt); }
-  deathScreen(evt) { this.game.hud?.deathScreen?.(evt); }
+  deathScreen(evt, _owner) { this.game.hud?.deathScreen?.(evt); }
 
   // ── camera feel (player only — bots have no PlayerCamera) ────────────────────
   //
@@ -103,4 +104,86 @@ export class NullPresenter {
   cameraStartDeathCam() {} cameraEndDeathCam() {}
   cameraStartSlide() {} cameraStartMantle() {} cameraMeleeKick() {}
   cameraRecoilPunch() {} cameraDamageFlinch() {}
+}
+
+/**
+ * A presenter that WRITES DOWN what it was asked to present, instead of doing it.
+ *
+ * This is the server's presenter, and it exists because of the sharpest bug in the whole
+ * multiplayer conversion: a shot fired by a networked client resolves on the SERVER, where
+ * `game.present` was a `NullPresenter`. The hit landed, the damage applied, the score
+ * moved — and then `present.hitmarker()` did nothing, because there is no HUD in a Node
+ * process. Nothing was ever sent to the client that fired. The player saw no hitmarker, no
+ * hit sound, no blood, and reported, entirely reasonably, that "none of the shots are
+ * hitting the enemies". They were all hitting.
+ *
+ * The presentation port already draws the line in exactly the right place — everything
+ * reached through `game.present` is feedback, by construction — so the fix is not to
+ * special-case combat, it is to make the server's presenter a RECORDER and let the wire
+ * carry what it recorded to the machine that owns the screen.
+ *
+ * Events are plain objects with string kinds, deliberately: `core/` must not know the wire
+ * format, and `net/protocol.js` is where kinds become bytes. Two audiences:
+ *
+ *   `to` set    — for one entity's client only (your hitmarker, your damage flash)
+ *   `to` null   — for everyone (a gunshot, a death, the killfeed)
+ */
+export class RecordingPresenter extends NullPresenter {
+  visual = false;
+
+  constructor() {
+    super();
+    /** @type {Array<{kind: string, to: number|null, [k: string]: any}>} */
+    this.events = [];
+  }
+
+  /** Drop everything recorded. The server calls this once per tick, after draining. */
+  clear() { this.events.length = 0; }
+
+  _push(kind, to, extra) { this.events.push(Object.assign({ kind, to: to ?? null }, extra)); }
+
+  // ── the shooter's own confirmation ─────────────────────────────────────────────
+  hitmarker(headshot, owner) { this._push('hitmarker', owner?.id, { headshot: !!headshot }); }
+
+  // ── everyone's ─────────────────────────────────────────────────────────────────
+  killfeed(evt) {
+    this._push('kill', null, {
+      // `evt.killer` is a NAME string in this event — the entity ref is `attacker`.
+      killerId: evt?.attacker?.id ?? 0,
+      victimId: evt?.victim?.id ?? 0,
+      headshot: !!evt?.headshot,
+    });
+  }
+
+  /**
+   * A gunshot, as a discrete event.
+   *
+   * The snapshot already carries an `F_FIRING` flag, and it is not enough: snapshots go out
+   * at 30 Hz while a rifle fires at 12.5 rounds/second and a semi-auto tap lasts one tick.
+   * Sampling a boolean at 30 Hz drops shots and merges bursts, so remote guns flickered
+   * instead of firing. An event per shot is the only thing that reproduces the cadence the
+   * shooter actually pulled.
+   */
+  muzzleFlash(position, dir, scale, owner) {
+    this._push('fire', null, {
+      entityId: owner?.id ?? 0,
+      x: position?.x ?? 0, y: position?.y ?? 0, z: position?.z ?? 0,
+    });
+  }
+
+  // ── the victim's ───────────────────────────────────────────────────────────────
+  //
+  // Routed by ENTITY, not by "the player": on a server every one of these is somebody's,
+  // and the one thing that must never happen is showing a damage flash to the wrong client.
+  flashDamage(amount, owner) { this._push('damaged', owner?.id, { amount: Math.round(amount ?? 0) }); }
+  /**
+   * `deathScreen(null, owner)` is the CLEAR — the respawn, not a death. It must be routed
+   * to the one client that respawned; letting a null event fall through to `to: null` would
+   * broadcast "you died" to the entire server every time anybody came back.
+   */
+  deathScreen(evt, owner) {
+    if (!evt) { this._push('respawn', owner?.id, {}); return; }
+    if (evt.victim?.id == null) return;
+    this._push('death', evt.victim.id, { killerId: evt.killer?.id ?? 0 });
+  }
 }

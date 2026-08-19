@@ -226,6 +226,22 @@ export const ENTITY_FIELDS = [
   ['ammo', 'u16'],
 ];
 
+/**
+ * Combat feedback, as discrete events riding along with the snapshot.
+ *
+ * Entity state alone cannot express feedback. A hitmarker is not a property of anybody's
+ * position — it is a thing that happened once, to one player, at one instant — and the
+ * first version of this protocol carried no events at all, which is why a networked shot
+ * landed on the server and the shooter saw nothing whatsoever. See `RecordingPresenter`.
+ *
+ * These are NOT delta-coded and NOT resent. The transport is a WebSocket, so delivery is
+ * reliable and ordered; an event put on the wire arrives exactly once, and redundancy
+ * would only buy duplicate hitmarkers.
+ */
+export const EV_KINDS = ['hitmarker', 'kill', 'fire', 'damaged', 'death', 'respawn'];
+const EV_CODE = new Map(EV_KINDS.map((k, i) => [k, i]));
+const EV_FIRE = EV_CODE.get('fire');
+
 export const F_ALIVE = 1 << 0;
 export const F_CROUCH = 1 << 1;
 export const F_SPRINT = 1 << 2;
@@ -249,7 +265,8 @@ export function encodeSnapshot(snap, baseline) {
   const ents = snap.entities;
   // Worst case: every field of every entity, plus masks and ids.
   const perEnt = 4 + 4 + ENTITY_FIELDS.reduce((a, [, t]) => a + FIELD_SIZE[t], 0);
-  const buf = new ArrayBuffer(20 + ents.length * perEnt);
+  const events = snap.events || [];
+  const buf = new ArrayBuffer(20 + ents.length * perEnt + 2 + events.length * 24);
   const v = new DataView(buf);
 
   v.setUint8(0, MSG_SNAPSHOT);
@@ -281,6 +298,30 @@ export function encodeSnapshot(snap, baseline) {
     }
     v.setUint32(maskAt, mask, true);
   }
+
+  // Events last, so a decoder stops cleanly at the end of the entity block rather than
+  // reading event bytes as entity fields.
+  //
+  // The count is omitted entirely when there is nothing to say. Most snapshots carry no
+  // events, and a delta for an entity that did not move is 26 bytes — spending 2 of them
+  // every time on a zero would be a 8% tax on the most common packet in the protocol.
+  // `decodeSnapshot` treats "no bytes left" and "a count of zero" identically.
+  if (events.length === 0) return buf.slice(0, o);
+  v.setUint16(o, Math.min(65535, events.length), true); o += 2;
+  for (const ev of events) {
+    const code = EV_CODE.get(ev.kind);
+    if (code === undefined) continue;
+    v.setUint8(o, code); o += 1;
+    v.setUint8(o, ev.headshot ? 1 : 0); o += 1;
+    v.setUint32(o, (ev.entityId ?? ev.killerId ?? 0) >>> 0, true); o += 4;
+    v.setUint32(o, (ev.victimId ?? 0) >>> 0, true); o += 4;
+    v.setUint16(o, Math.max(0, Math.min(65535, ev.amount ?? 0)), true); o += 2;
+    if (code === EV_FIRE) {
+      v.setFloat32(o, ev.x ?? 0, true); o += 4;
+      v.setFloat32(o, ev.y ?? 0, true); o += 4;
+      v.setFloat32(o, ev.z ?? 0, true); o += 4;
+    }
+  }
   return buf.slice(0, o);
 }
 
@@ -294,6 +335,7 @@ export function decodeSnapshot(buf, baseline) {
     lastCommandSeq: v.getUint32(10, true),
     keyframe,
     entities: [],
+    events: [],
   };
   const n = v.getUint32(14, true);
   let o = 18;
@@ -320,6 +362,28 @@ export function decodeSnapshot(buf, baseline) {
       }
     }
     snap.entities.push(e);
+  }
+
+  // A snapshot from a server that predates the event block simply ends here.
+  if (o + 2 <= buf.byteLength) {
+    const m = v.getUint16(o, true); o += 2;
+    for (let i = 0; i < m && o < buf.byteLength; i++) {
+      const code = v.getUint8(o); o += 1;
+      const headshot = v.getUint8(o) === 1; o += 1;
+      const a = v.getUint32(o, true); o += 4;
+      const victimId = v.getUint32(o, true); o += 4;
+      const amount = v.getUint16(o, true); o += 2;
+      const ev = { kind: EV_KINDS[code] ?? 'unknown', headshot, victimId, amount };
+      if (code === EV_FIRE) {
+        ev.entityId = a;
+        ev.x = v.getFloat32(o, true); o += 4;
+        ev.y = v.getFloat32(o, true); o += 4;
+        ev.z = v.getFloat32(o, true); o += 4;
+      } else {
+        ev.killerId = a;
+      }
+      snap.events.push(ev);
+    }
   }
   return snap;
 }

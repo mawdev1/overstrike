@@ -1730,7 +1730,7 @@ export class Bot {
     game.bus?.emit('shot', pl);
 
     // Only when WE ran the shot — otherwise the weapon system owns presentation.
-    game.present.muzzleFlash(origin, dir, 0.9);
+    game.present.muzzleFlash(origin, dir, 0.9, this);
     game.present.play(def.audio?.fire ?? 'rifle', { position: origin, volume: 0.9 });
     game.nav?.addDanger?.(this.position, 0.5, 5);
   }
@@ -2222,8 +2222,21 @@ export class Bot {
     const nav = this.game.nav;
     this.moveMode = 'combat';
     _v6.set(this.lastKnown.x, this.lastKnown.y + EYE_STAND, this.lastKnown.z);
-    const p = nav?.visiblePointNear?.(this.position, _v6, 6, _v4);
-    if (p) this.setDestination(p, 1.0);
+    // 13 m, not 6. A bot only fires at a target it can SEE (`targetVisible`), so when the
+    // sightline breaks this is the entire mechanism for getting it back. At 6 m the search
+    // failed constantly in the market hall and around the warehouse — measured, a bot held
+    // the player as its target on 40% of thinks and had line of sight on 1.6% of those,
+    // and fired ZERO rounds in 25 seconds. Widening the ring to roughly one room means the
+    // query usually has a cell to offer.
+    const p = nav?.visiblePointNear?.(this.position, _v6, 13, _v4);
+    if (p) { this.setDestination(p, 1.0); return; }
+
+    // Nothing nearby can see it. Walk AT the last known position rather than doing
+    // nothing: the old code simply returned, so the bot stood still until its 7 s memory
+    // expired and it dropped to `investigate` — which reads, from the other end of the
+    // room, exactly like an enemy that has stopped playing. Pushing is also the right
+    // instinct; the sightline is usually restored a couple of metres later.
+    this.setDestination(this.lastKnown, 1.0);
   }
 
   pickStrafe() {

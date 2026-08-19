@@ -479,13 +479,13 @@ export class WeaponInstance {
       });
 
       if (r.hitEntity && owner?.isPlayer) {
-        game.present.hitmarker(r.headshot);
+        game.present.hitmarker(r.headshot, owner);
         game.present.playUI(r.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
       }
     }
 
     this._applyRecoil();
-    this._feedback(hasMuzzle);
+    this._feedback(hasMuzzle, owner);
 
     if (owner?.isPlayer) {
       game.present.setAmmo(this.ammo, this.reserve);
@@ -547,12 +547,12 @@ export class WeaponInstance {
   }
 
   /** Flash, light, sound, shell, viewmodel kick. */
-  _feedback(hasMuzzle) {
+  _feedback(hasMuzzle, owner) {
     const game = this.game;
     const d = this.def;
 
     if (hasMuzzle) {
-      game.present.muzzleFlash(_muzzle, _dir, d.class === 'sniper' || d.class === 'lmg' ? 1.35 : 1.0);
+      game.present.muzzleFlash(_muzzle, _dir, d.class === 'sniper' || d.class === 'lmg' ? 1.35 : 1.0, owner);
     }
 
     // Audio pitch variance only — presentation, drawn from fxRng, not the gameplay stream.
@@ -870,7 +870,7 @@ export class WeaponSystem {
     if (!hit) return;
     applyMeleeDamage(this.game, entity, hit, d.damage, d.id);
     if (entity.isPlayer) {
-      this.game.present.hitmarker(false);
+      this.game.present.hitmarker(false, entity);
       this.game.present.playUI('hitmarker', { volume: 0.7 });
     }
   }
