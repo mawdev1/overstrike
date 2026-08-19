@@ -151,6 +151,9 @@ try {
     const g = window.__GAME__;
     g.__probe = {
       startPos: g.player.position.clone(),
+      lastPos: g.player.position.clone(),
+      startTime: g.time,
+      pathLen: 0,
       maxSpeed: 0,
       shots: 0,
       hits: 0,
@@ -209,6 +212,13 @@ try {
 
       const sp = Math.hypot(g.player.velocity.x, g.player.velocity.z);
       if (sp > p.maxSpeed) p.maxSpeed = sp;
+      // DISTANCE TRAVELLED, accumulated. The assertion used straight-line displacement
+      // from the spawn, which is not the same thing at all: the driver steers with a sine
+      // wave, so a run that happens to curve back scores near zero having moved the whole
+      // time. That made this fail about one run in three (4.8, 9.1, 2.8 m against a 3 m
+      // gate) with nothing wrong.
+      p.pathLen += g.player.position.distanceTo(p.lastPos);
+      p.lastPos.copy(g.player.position);
       p.fpsSamples.push(g.engine.stats.fps);
       p.drawCalls = Math.max(p.drawCalls, g.engine.stats.drawCalls);
       p.triangles = Math.max(p.triangles, g.engine.stats.triangles);
@@ -237,7 +247,15 @@ try {
     const fps = p.fpsSamples.filter((v) => v > 0);
     fps.sort((a, b) => a - b);
     return {
-      moved: g.player.position.distanceTo(p.startPos),
+      moved: p.pathLen,
+      displaced: g.player.position.distanceTo(p.startPos),
+      // Per SIMULATED second, not per wall-clock second. Under SwiftShader this page runs
+      // at roughly 10 fps, and how much simulation fits in the fixed play window swings
+      // with machine load — so raw distance swung 6.6-15.6 m on a build that was working
+      // perfectly. Average speed is the property actually being asserted: that the player
+      // moves when told to.
+      simSeconds: Math.max(0.001, g.time - p.startTime),
+      avgSpeed: p.pathLen / Math.max(0.001, g.time - p.startTime),
       maxSpeed: p.maxSpeed,
       shots: p.shots,
       hits: p.hits,
@@ -267,7 +285,10 @@ try {
   };
 
   // ---------------------------------------------------------------- assertions
-  if (probe.moved < 3) fail(`player barely moved (${probe.moved.toFixed(2)} m) — movement or collision is broken`);
+  if (probe.avgSpeed < 0.6) {
+    fail(`player barely moved (${probe.moved.toFixed(2)} m over ${probe.simSeconds.toFixed(1)} s of simulation, ` +
+      `${probe.avgSpeed.toFixed(2)} m/s average) — movement or collision is broken`);
+  }
   if (probe.maxSpeed < 2) fail(`player never reached walking speed (max ${probe.maxSpeed.toFixed(2)} u/s)`);
   if (probe.shots < 5) fail(`only ${probe.shots} shots fired in ${PLAY_SECONDS}s — weapons are not firing`);
   if (probe.botCount === 0) fail('no bots spawned');
@@ -310,7 +331,7 @@ if (report.perf) {
 }
 if (report.gameplay) {
   const g = report.gameplay;
-  console.log(`play: moved ${g.moved?.toFixed(1)} m, maxSpeed ${g.maxSpeed?.toFixed(1)}, shots ${g.shots}, hits ${g.hits}, ` +
+  console.log(`play: moved ${g.moved?.toFixed(1)} m (${g.avgSpeed?.toFixed(2)} m/s avg), maxSpeed ${g.maxSpeed?.toFixed(1)}, shots ${g.shots}, hits ${g.hits}, ` +
     `damage ${g.damageEvents}, kills ${g.kills}, deaths ${g.deaths}, bots ${g.botsAlive}/${g.botCount} (moved ${g.botMoved}), ` +
     `hp ${g.playerHealth}, ammo ${g.playerAmmo}, weapon ${g.playerWeapon}`);
 }

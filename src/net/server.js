@@ -230,6 +230,32 @@ export class GameServer {
     }
   }
 
+  /**
+   * Adopt the newest snapshot this client has confirmed receiving.
+   *
+   * `cmd.tick` is the newest SERVER tick the client has seen, which it already sends for
+   * the round-trip estimate — so the ack costs no extra wire field. A client that missed a
+   * snapshot keeps reporting the older tick, the next delta is coded against THAT, and it
+   * recovers by itself. A tick we no longer hold (or never sent) simply does not match, and
+   * the baseline stays where it was; since `cmd.tick` is attacker-controlled, that failure
+   * has to be inert, and a Map lookup that misses is.
+   *
+   * Deliberately never rewinds: a reordered command carrying an older tick must not undo an
+   * ack we have already taken, or a jittery client codes against an ever-older baseline.
+   */
+  _ackBaseline(session, cmd) {
+    const t = cmd.tick >>> 0;
+    if (t <= session.baseTick) return;
+    const acked = session.pendingBaselines.get(t);
+    if (!acked) return;
+    session.baseline = acked;
+    session.baseTick = t;
+    // Everything older is confirmed delivered and can never be coded against again.
+    for (const k of session.pendingBaselines.keys()) {
+      if (k < t) session.pendingBaselines.delete(k);
+    }
+  }
+
   /** Buffer one feedback event for the next snapshot, respecting the cap. */
   _record(ev) {
     if (this._pendingEvents.length < MAX_PENDING_EVENTS) this._pendingEvents.push(ev);
@@ -249,6 +275,7 @@ export class GameServer {
       }
       session.stats.commands++;
       session.lastCommandSeq = cmd.seq;
+      this._ackBaseline(session, cmd);
       this._updateRtt(session, cmd);
       this._applyCommand(session, cmd);
       // Mark the shooter for lag compensation. The shot does NOT resolve here — the
@@ -410,20 +437,28 @@ export class GameServer {
       session.transport.send(buf);
       session.stats.snapshots++;
 
-      // Optimistic baselining: assume it arrives, and keep the previous one until the
-      // client acknowledges. A client that misses a snapshot will ack an older tick and
-      // the next delta is coded against THAT — which is why the acknowledged baseline,
-      // not the last one sent, is the only safe thing to code against.
+      // Held until the client ACKNOWLEDGES it — see `_ackBaseline`. The comment here used
+      // to concede that this was optimistic and that a real transport "would set this from
+      // the client's ack instead"; it now does.
+      //
+      // The optimistic version was not a theoretical risk. `decodeSnapshot` fills every
+      // field the delta omits from the baseline, and a client that lacks the baseline gets
+      // ZERO for all of them — so one dropped snapshot produced a 36.9 m entity error and
+      // read the local player as `health 0, alive false`, permanently, with no recovery
+      // path because no keyframe is ever re-sent. Loss is not even the only trigger:
+      // snapshots go out every 4 ticks (33.3 ms), so jitter above half that interval
+      // reorders two packets and lands in exactly the same state. Measured on a clean
+      // link at 120 ms RTT, 0% loss: 14 ms jitter cost 0.1 corrections/s and 23 mm of
+      // error; 18 ms jitter cost 14.7 corrections/s and 32.5 m.
+      //
+      // TCP hides this today. It would not survive the move to datagrams that
+      // `transport.js` already wants, and it means the loss cases in `nettest` were
+      // measuring a corrupted stream rather than the netcode.
       session.pendingBaselines.set(g.tick, snap);
       if (session.pendingBaselines.size > 64) {
         const oldest = session.pendingBaselines.keys().next().value;
         session.pendingBaselines.delete(oldest);
       }
-      // Loopback and any reliable transport acknowledge implicitly — nothing is lost, so
-      // the snapshot just sent IS the baseline. An unreliable transport would set this
-      // from the client's ack instead.
-      session.baseline = snap;
-      session.baseTick = g.tick;
     }
 
     this._pendingEvents.length = 0;

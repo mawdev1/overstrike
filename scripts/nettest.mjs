@@ -99,7 +99,14 @@ function run(session, n, shape = () => {}) {
   for (let t = 0; t < n; t++) {
     for (const c of conns) {
       const cmd = emptyCommand();
-      cmd.tick = server.game.tick;
+      // The client's OWN newest received tick, not the server's current one. A real client
+      // sends `net.latestTick` (see `MultiplayerSession.sendCommand`), and the server reads
+      // this field for two things: the round-trip estimate, and — since baselines became
+      // ack-driven — which snapshot to delta-code against. Claiming a tick the client has
+      // not actually received tells the server to code against a baseline the client does
+      // not hold, and `decodeSnapshot` then fills every omitted field with ZERO. That is
+      // the same corruption the ack was introduced to prevent, manufactured by the harness.
+      cmd.tick = c.client.latestTick;
       shape(cmd, t, c);
       c.client.sendCommand(cmd);
       c.sT.pump(ms);            // deliver client -> server
@@ -449,6 +456,49 @@ function runPredicted(s, n, shape = () => {}) {
     bad('replay happened at all', 'no commands were replayed, so this test proves nothing about silencing');
   }
   ok(`presentation fired ${plays} times across ${s.pred.stats.corrections} corrections`);
+}
+
+// ── a dropped snapshot must not poison the client's world ───────────────────────────
+//
+// Baselines used to be set optimistically the moment a snapshot was SENT, with no ack path
+// and no keyframe ever re-sent. `decodeSnapshot` fills every field a delta omits from the
+// baseline, so a client that never received that baseline filled them with ZERO: measured,
+// one dropped snapshot produced a 36.9 m entity error and read the local player as
+// `health 0, alive false`, and it never recovered. They are ack-driven now — the client
+// already reports its newest received tick for the RTT estimate, so the ack is free.
+{
+  const s = await makeSession({ clients: 1, bots: 2 });
+  const c = s.conns[0];
+
+  run(s, 120, (cmd) => { cmd.wishForward = 1; });
+
+  // Black out the DOWNSTREAM link for long enough to lose several snapshots, while the
+  // client keeps sending. Upstream stays clean so the server still hears the (now stale)
+  // acks.
+  c.cT.setConditions({ loss: 1 });
+  run(s, 60, (cmd) => { cmd.wishForward = 1; });
+  c.cT.setConditions({ loss: 0 });
+  run(s, 120, (cmd) => { cmd.wishForward = 1; });
+
+  const wire = c.client.latestEntity(c.entity.id);
+  if (!wire) {
+    bad('the client still has a view of itself after a blackout', 'no entity in the newest snapshot');
+  } else {
+    const err = Math.hypot(wire.x - c.entity.position.x, wire.y - c.entity.position.y, wire.z - c.entity.position.z);
+    if (err < 1) ok(`the client's world survives a snapshot blackout (${err.toFixed(3)} m off)`);
+    else {
+      bad("the client's world survives a snapshot blackout",
+        `${err.toFixed(2)} m off — the delta was coded against a baseline the client never ` +
+        'received, so every omitted field decoded as zero');
+    }
+    if (wire.health > 0 && (wire.flags & 1)) ok('and it does not read itself as dead at zero health');
+    else bad('the client does not read itself as dead', `health ${wire.health}, flags ${wire.flags} — the classic all-fields-zero signature`);
+  }
+
+  const others = c.client.snapshots.at(-1)?.entities.filter((e) => e.id !== c.entity.id) ?? [];
+  const sane = others.every((e) => e.health > 0 || !(e.flags & 1));
+  if (sane) ok(`the other ${others.length} entities decode sanely too`);
+  else bad('other entities decode sanely', JSON.stringify(others.map((e) => ({ id: e.id, h: e.health, f: e.flags }))));
 }
 
 console.log('\nlatency soak (80 ms RTT, 3% loss)');

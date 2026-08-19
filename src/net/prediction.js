@@ -267,6 +267,13 @@ export class Prediction {
       e.velocity.set(wire.vx, wire.vy, wire.vz);
     }
 
+    // A large health INCREASE is a respawn or a pickup — something the server did that the
+    // client could not have predicted, and it comes with a teleport. Under packet loss the
+    // client can miss the death snapshots entirely and see only alive -> alive, so the
+    // alive-transition check above never fires and the respawn's 3 m jump is scored as a
+    // movement misprediction. Regeneration cannot reach this in one snapshot interval.
+    if (wire.health > e.health + 25) this._lifeChangeTick = this.game.tick;
+
     e.health = wire.health;
     e.armor = wire.armor;
     // The side we are on is the server's to decide, and nothing else ever told us. The

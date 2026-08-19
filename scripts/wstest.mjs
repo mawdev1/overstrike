@@ -294,6 +294,27 @@ if (a.entityId && bC.entityId && a.entityId !== bC.entityId) {
 }
 
 const posOf = (state, id) => state.snap?.entities.find((e) => e.id === id);
+
+/**
+ * Entity `id` as seen by BOTH clients, at the newest snapshot tick they both hold.
+ *
+ * Comparing each client's own NEWEST snapshot compares two different moments: under load
+ * one socket can be a snapshot ahead of the other, and A moving at walking speed covers
+ * ~0.16 m in the 33 ms between sends. That reads as "they are not sharing a world" when
+ * the only difference is which packet had arrived when the test looked. Agreement is only
+ * meaningful at a shared tick.
+ */
+const posOfBoth = (s1, s2, id) => {
+  const ticks2 = new Set(s2.snaps.map((x) => x.tick));
+  for (let i = s1.snaps.length - 1; i >= 0; i--) {
+    const t = s1.snaps[i].tick;
+    if (!ticks2.has(t)) continue;
+    const e1 = s1.snaps[i].entities.find((e) => e.id === id);
+    const e2 = s2.snaps.find((x) => x.tick === t)?.entities.find((e) => e.id === id);
+    if (e1 && e2) return { tick: t, e1, e2 };
+  }
+  return null;
+};
 const aStartFromB = posOf(bC, a.entityId);
 
 // Only client A moves.
@@ -348,10 +369,11 @@ if (aStartFromB && aEndFromB) {
   if (seen > 0.3) ok(`client B watched client A move ${seen.toFixed(2)} m`);
   else bad('each client sees the other move', `B saw A move only ${seen.toFixed(3)} m — A may be jammed against geometry`);
 
-  const aSelf = posOf(a, a.entityId);
-  if (aSelf) {
-    const agree = Math.hypot(aEndFromB.x - aSelf.x, aEndFromB.y - aSelf.y, aEndFromB.z - aSelf.z);
-    if (agree < 0.01) ok(`B's view of A matches A's own to ${(agree * 1000).toFixed(2)} mm`);
+  const shared = posOfBoth(a, bC, a.entityId);
+  if (shared) {
+    const { e1: aSelf, e2: aFromB } = shared;
+    const agree = Math.hypot(aFromB.x - aSelf.x, aFromB.y - aSelf.y, aFromB.z - aSelf.z);
+    if (agree < 0.01) ok(`B's view of A matches A's own to ${(agree * 1000).toFixed(2)} mm (tick ${shared.tick})`);
     else bad("B's view of A matches A's own", `${agree.toFixed(3)} m apart — they are not sharing a world`);
   }
 } else {
