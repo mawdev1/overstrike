@@ -1501,9 +1501,18 @@ export class Player {
     const h = top.point.y - this.position.y;
     if (h < TUNE.MANTLE_MIN_H || h > TUNE.MANTLE_MAX_H) return false;
 
-    // (c) clearance above the ledge for at least a crouched body.
+    // (c) clearance above the ledge for the body we will actually deliver.
+    //
+    // This used to ask for a CROUCHED body's worth and then hand back a standing one, so
+    // a ledge with 1.3 m of headroom passed the gate and left the capsule embedded in the
+    // ceiling — measured at 1,066 of 11,072 sampled landings. `_depenetrate` recovers on
+    // the next tick, so it was never an escape, but it is a shove the player did not ask
+    // for at the exact moment they were committing to a climb.
+    //
+    // Requiring standing clearance costs mantling into crawlspaces, which nothing in the
+    // map is built around, and buys landings that are always immediately valid.
     _v3.set(top.point.x, top.point.y + 0.06, top.point.z);
-    if (world.raycast(_v3, _UP, TUNE.CROUCH_HEIGHT + 0.15)) return false;
+    if (world.raycast(_v3, _UP, TUNE.STAND_HEIGHT + 0.05)) return false;
 
     // Commit.
     this.moveState = 'mantle';

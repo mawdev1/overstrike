@@ -29,9 +29,17 @@ import { Builder } from './props.js';
 // ── site plan ─────────────────────────────────────────────────────────────────────────
 const EDGE = 43;          // outer wall face
 const IN = 41;            // inner wall face — playable extent
-// Tall enough that a player standing on the market-hall roof (eye 9.67) cannot see over
-// the perimeter into the void.
-const WALL_H = 12.0;
+// Tall enough that nothing a player can reach can see over the perimeter into the void.
+//
+// The binding constraint is not the market-hall roof deck (eye 9.67, comfortably held by
+// 12.0) but the rooftop plant a player can air-mantle onto: the warehouse AC unit puts
+// the eye at 12.32 and the market-hall plant at 12.07, and from either, 65% of horizontal
+// rays used to escape the level. 13.4 matches the east wall, which was already taller,
+// and clears the highest reachable eye by a metre.
+//
+// scripts/maptest.mjs asserts no surface within mantling reach of a perimeter face comes
+// within a jump-plus-mantle of its top, so a future prop cannot quietly reopen this.
+const WALL_H = 13.4;
 
 const PLINTH = 0.15;      // buildings sit on a low stone plinth
 const L1 = 4.15;          // first-floor walking level
@@ -1558,7 +1566,9 @@ function buildSpawnYards(B, rng) {
   B.prop('sandbags', 4.2, 0, -34.5, 0);
   B.prop('sandbags', 6.1, 0, -34.5, 0);
   B.prop('sandbags', 8.0, 0, -34.5, 0);
-  B.prop('jersey', -7.5, 0, -33.5, 0);
+  // 2.4 m pitch, matching the prop's own width. At 2.5 m the run had a 10 cm slit —
+  // not passable, but it reads as a barrier line nobody bothered to close.
+  B.prop('jersey', -7.6, 0, -33.5, 0);
   B.prop('jersey', -10, 0, -33.5, 0);
   B.prop('jersey', 5.2, 0, -29.5, 0);
   B.prop('container', 8.5, 0, -25.5, 0, { color: CONTAINER_COLORS[3] });
@@ -1583,7 +1593,7 @@ function buildSpawnYards(B, rng) {
   B.prop('sandbags', -5.2, 0, 34.5, 0);
   B.prop('sandbags', -7.1, 0, 34.5, 0);
   B.prop('sandbags', -9.0, 0, 34.5, 0);
-  B.prop('jersey', 7.5, 0, 33.5, 0);
+  B.prop('jersey', 7.6, 0, 33.5, 0);
   B.prop('jersey', 10, 0, 33.5, 0);
   B.prop('jersey', -5.2, 0, 29.5, 0);
   B.prop('container', -8.5, 0, 26.5, 0, { color: CONTAINER_COLORS[1] });

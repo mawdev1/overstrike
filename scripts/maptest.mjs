@@ -164,27 +164,100 @@ console.log(`\nmap integrity (${boxes.length} colliders, ${w.spawnPoints.length}
   const REACH = 0.91;          // player radius + mantle reach
   const climb = JUMP + MANTLE;
 
+  // Wall tops are MEASURED, not assumed. Hardcoding them meant the check kept testing
+  // against the old heights after the level changed, which is the failure mode a
+  // regression test can least afford.
+  const wallTop = (axis, at) => {
+    let top = 0;
+    for (const bx of boxes) {
+      const lo = axis === 'x' ? bx.min.x : bx.min.z;
+      const hi = axis === 'x' ? bx.max.x : bx.max.z;
+      if (at < 0 ? hi > at + 0.6 : lo < at - 0.6) continue;   // must straddle the face
+      if (Math.min(Math.abs(lo - at), Math.abs(hi - at)) > 2.5) continue;
+      if (bx.max.y > top) top = bx.max.y;
+    }
+    return top;
+  };
   const walls = [
-    { name: 'west', axis: 'x', at: -41, top: 12.0 },
-    { name: 'east', axis: 'x', at: 41, top: 13.4 },
-    { name: 'north', axis: 'z', at: -41, top: 12.0 },
-    { name: 'south', axis: 'z', at: 41, top: 12.0 },
+    { name: 'west', axis: 'x', at: -41, top: wallTop('x', -41) },
+    { name: 'east', axis: 'x', at: 41, top: wallTop('x', 41) },
+    { name: 'north', axis: 'z', at: -41, top: wallTop('z', -41) },
+    { name: 'south', axis: 'z', at: 41, top: wallTop('z', 41) },
   ];
+  // A surface only matters here if a player can actually REACH it. Footprint alone is not
+  // enough — it calls a 1x1 antenna mast at 13.5 m a standing surface, and the market-hall
+  // lantern at 11.67 m sits 7 cm above what anything below it can climb to.
+  //
+  // So: flood up from the ground. A surface joins the reachable set when it is within one
+  // jump-plus-mantle of a surface already in it and horizontally close enough to step
+  // across. This is the same question the containment argument rests on, asked directly.
+  // Area, not a minimum in each axis: a staircase tread is 2.4 m x 0.38 m and is very
+  // much standable, and excluding it breaks every route that goes up stairs — which
+  // collapsed the reachable set from 10.7 m to 5.4 m and made the whole check vacuous.
+  const standable = (bx) => (bx.max.x - bx.min.x) >= 0.3 && (bx.max.z - bx.min.z) >= 0.3
+    && (bx.max.x - bx.min.x) * (bx.max.z - bx.min.z) >= 0.5;
+  const surfaces = boxes.filter(standable);
+
+  const overlapsXZ = (a, c, pad) => a.min.x - pad <= c.max.x && a.max.x + pad >= c.min.x
+    && a.min.z - pad <= c.max.z && a.max.z + pad >= c.min.z;
+
+  const reachable = new Set();
+  for (const bx of surfaces) if (bx.max.y <= 1.4) reachable.add(bx);   // walk-on from ground
+  for (let pass = 0; pass < 12; pass++) {
+    let added = 0;
+    for (const bx of surfaces) {
+      if (reachable.has(bx)) continue;
+      for (const from of reachable) {
+        if (bx.max.y - from.max.y > climb) continue;
+        if (bx.max.y < from.max.y - 6) continue;                       // a drop, fine
+        if (!overlapsXZ(bx, from, REACH)) continue;
+        reachable.add(bx); added++; break;
+      }
+    }
+    if (!added) break;
+  }
+
   const risky = [];
   for (const wall of walls) {
-    for (const b of boxes) {
+    for (const b of reachable) {
       const near = wall.axis === 'x'
         ? Math.min(Math.abs(b.min.x - wall.at), Math.abs(b.max.x - wall.at))
         : Math.min(Math.abs(b.min.z - wall.at), Math.abs(b.max.z - wall.at));
       if (near > REACH + 1) continue;
-      if (b.max.y >= wall.top - 0.5) continue;         // the wall itself
+      if (b.max.y >= wall.top - 1.0) continue;         // part of the wall assembly
       if (b.max.y + climb >= wall.top) {
-        risky.push(`${wall.name}: surface at y=${b.max.y.toFixed(2)} + ${climb.toFixed(2)} climb >= ${wall.top}`);
+        risky.push(`${wall.name}: reachable surface at y=${b.max.y.toFixed(2)} + ${climb.toFixed(2)} climb >= wall top ${wall.top.toFixed(2)}`);
       }
     }
   }
-  if (risky.length === 0) ok(`no surface near a perimeter wall is within ${climb.toFixed(2)} m of its top`);
-  else bad('the perimeter cannot be climbed', `${risky.length}:\n       ${risky.slice(0, 5).join('\n       ')}`);
+
+  if (risky.length === 0) {
+    ok(`no reachable surface near a perimeter wall is within ${climb.toFixed(2)} m of its top (${reachable.size} surfaces reachable)`);
+  } else {
+    bad('the perimeter cannot be climbed', `${risky.length}:\n       ${risky.slice(0, 5).join('\n       ')}`);
+  }
+
+  // Climbing the wall is one failure; SEEING over it is the other, and it is the one that
+  // actually happened. Two rooftop props put the eye at 12.07 and 12.32 against a 12.0 m
+  // wall, and 65% of horizontal rays from them escaped into the void.
+  const EYE = 1.62;
+  const minTop = Math.min(...walls.map((x) => x.top));
+  let highest = 0, highestAt = null;
+  for (const bx of reachable) {
+    if (Math.abs(bx.max.x) > 41 || Math.abs(bx.min.x) > 41) continue;
+    if (Math.abs(bx.max.z) > 41 || Math.abs(bx.min.z) > 41) continue;
+    if (bx.max.y > 13) continue;                       // the perimeter itself
+    if (bx.max.y > highest) {
+      highest = bx.max.y;
+      highestAt = `(${((bx.min.x + bx.max.x) / 2).toFixed(1)}, ${bx.max.y.toFixed(2)}, ${((bx.min.z + bx.max.z) / 2).toFixed(1)})`;
+    }
+  }
+  if (highest + EYE < minTop) {
+    ok(`the highest standable surface (${highest.toFixed(2)} m) puts the eye ${(minTop - highest - EYE).toFixed(2)} m below the lowest wall top`);
+  } else {
+    bad('nothing reachable can see over the perimeter',
+      `standable surface at ${highest.toFixed(2)} m ${highestAt} gives eye ${(highest + EYE).toFixed(2)} vs wall top ${minTop}`);
+  }
 }
 
 // ── no accidental slits between wall segments ────────────────────────────────────────
