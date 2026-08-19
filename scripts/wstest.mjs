@@ -243,11 +243,19 @@ const aStartFromB = posOf(bC, a.entityId);
 // A sweeps its aim while walking. Both clients spawn near each other on a map with a
 // lot of geometry, and walking in one fixed direction just jams into whatever is in
 // front — which measures the map, not the netcode.
+// A cycles through all four cardinal directions rather than walking one way.
+//
+// Walking a single direction from a randomised spawn jams against geometry often enough
+// to redden this gate about a quarter of the time — measured, not guessed. Cycling means
+// A can only fail to move if it is boxed in on every side, which no playable spawn is.
 let aYaw = 0;
-for (let i = 0; i < 260; i++) {
+const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+for (let i = 0; i < 320; i++) {
   const cmd = emptyCommand();
   cmd.seq = a.seq++;
-  cmd.wishForward = 1;
+  const [wf, wr] = DIRS[Math.floor(i / 40) % DIRS.length];
+  cmd.wishForward = wf;
+  cmd.wishRight = wr;
   cmd.deltaYaw = 0.02;
   aYaw += Math.fround(0.02);
   cmd.baseYaw = aYaw;
@@ -268,10 +276,27 @@ const aEndFromB = posOf(bC, a.entityId);
 const bEndFromA = posOf(a, bC.entityId);
 const bEndFromB = posOf(bC, bC.entityId);
 
+// Two assertions, deliberately separated.
+//
+// The first version asserted only "B saw A move more than 1.5 m", which failed about a
+// quarter of the time: A walks from a randomised spawn and sometimes jams against map
+// geometry, so the threshold measured the MAP rather than the netcode. A CI gate that
+// reddens for reasons unrelated to the code under test is worse than no gate.
+//
+// So the load-bearing check is now AGREEMENT — B's view of A must match A's own view of
+// itself, which is the property that says they share one world — and movement is asserted
+// at a bar low enough that geometry cannot fail it.
 if (aStartFromB && aEndFromB) {
   const seen = Math.hypot(aEndFromB.x - aStartFromB.x, aEndFromB.z - aStartFromB.z);
-  if (seen > 1.5) ok(`client B watched client A move ${seen.toFixed(2)} m`);
-  else bad('each client sees the other move', `B saw A move only ${seen.toFixed(3)} m`);
+  if (seen > 0.3) ok(`client B watched client A move ${seen.toFixed(2)} m`);
+  else bad('each client sees the other move', `B saw A move only ${seen.toFixed(3)} m — A may be jammed against geometry`);
+
+  const aSelf = posOf(a, a.entityId);
+  if (aSelf) {
+    const agree = Math.hypot(aEndFromB.x - aSelf.x, aEndFromB.y - aSelf.y, aEndFromB.z - aSelf.z);
+    if (agree < 0.01) ok(`B's view of A matches A's own to ${(agree * 1000).toFixed(2)} mm`);
+    else bad("B's view of A matches A's own", `${agree.toFixed(3)} m apart — they are not sharing a world`);
+  }
 } else {
   bad('client B can see client A at all', `start=${!!aStartFromB} end=${!!aEndFromB}`);
 }

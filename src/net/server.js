@@ -18,7 +18,7 @@
  * ever running ahead of what it has been told or letting a client run the simulation
  * faster than everyone else by sending more.
  */
-import { FIXED_DT } from '../core/mathUtils.js';
+import { FIXED_DT, PITCH_LIMIT } from '../core/mathUtils.js';
 import {
   MSG_COMMANDS, MSG_WELCOME, decodeCommands, encodeSnapshot, entityToWire,
 } from './protocol.js';
@@ -48,13 +48,35 @@ const AIM_RESYNC_RAD = 0.05;
  */
 const MAX_QUEUED_COMMANDS = 32;
 
+/**
+ * Ceiling on the round trip a client may claim, in ms.
+ *
+ * `cmd.tick` comes from the client, so the derived RTT is attacker-controlled and decides
+ * how far lag compensation rewinds. Uncapped, a client claiming a two-second round trip
+ * could shoot people where they stood two seconds ago. 250 ms matches the history ring,
+ * past which the rewind clamps regardless.
+ */
+const MAX_RTT_MS = 250;
+
 class ClientSession {
   constructor(id, transport, entity) {
     this.id = id;
     this.transport = transport;
     this.entity = entity;
     this.queue = [];
-    /** Smoothed round trip, used to work out which tick this client was looking at. */
+    /**
+     * Smoothed round trip, in ms. Drives how far lag compensation rewinds.
+     *
+     * Measured from the command's `tick` field, which the client sets to the newest
+     * SERVER tick it has received. The gap between that and the server's tick now is a
+     * genuine round trip: server sent tick T -> client received it -> client sent this
+     * command -> server has it. No extra wire field and no ping exchange.
+     *
+     * This was 0 and never assigned in the first version, which meant every shooter was
+     * rewound by the interpolation delay alone and under-compensated by RTT/2 — shots
+     * that visibly landed on a moving target missed, which is the exact failure lag
+     * compensation exists to prevent.
+     */
     this.rttMs = 0;
     /** Highest command seq consumed. Sent back so the client knows what to stop resending. */
     this.lastCommandSeq = 0;
@@ -145,6 +167,7 @@ export class GameServer {
       }
       session.stats.commands++;
       session.lastCommandSeq = cmd.seq;
+      this._updateRtt(session, cmd);
       this._applyCommand(session, cmd);
       // Mark the shooter for lag compensation. The shot does NOT resolve here — the
       // weapon fires inside `_fixedUpdate` when its timer allows — so the rewind cannot
@@ -176,6 +199,25 @@ export class GameServer {
     }
   }
 
+  /**
+   * Fold this command's implied round trip into the session's smoothed estimate.
+   *
+   * Clamped hard at both ends, because `cmd.tick` is attacker-controlled: a client that
+   * claims to have seen a very old tick would otherwise get an arbitrarily deep rewind
+   * and could shoot people where they stood a second ago. The ceiling is the lag-comp
+   * ring itself — beyond it the rewind clamps anyway, so allowing more buys nothing.
+   *
+   * Smoothed rather than taken raw: a single late packet should not swing where the next
+   * shot is judged, and an exponential average with a slow rise is stable without needing
+   * to keep a window of samples.
+   */
+  _updateRtt(session, cmd) {
+    const observed = (this.game.tick - (cmd.tick >>> 0)) * FIXED_DT * 1000;
+    if (!Number.isFinite(observed)) return;
+    const clamped = Math.max(0, Math.min(MAX_RTT_MS, observed));
+    session.rttMs = session.rttMs === 0 ? clamped : session.rttMs * 0.9 + clamped * 0.1;
+  }
+
   _applyCommand(session, cmd) {
     const e = session.entity;
     if (!e) return;
@@ -205,7 +247,11 @@ export class GameServer {
     const dp = Math.abs(e.basePitch - cmd.basePitch);
     if (dy > AIM_RESYNC_RAD || dp > AIM_RESYNC_RAD) {
       e.baseYaw = cmd.baseYaw;
-      e.basePitch = cmd.basePitch;
+      // Clamped exactly as `applyCommand` clamps the normal path. Taking the client's
+      // value raw here let a client deliberately trip the threshold to push its pitch
+      // past the game's own limit — aim is client-authoritative by design, but the limit
+      // is not the client's to opt out of.
+      e.basePitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, cmd.basePitch));
       e._writeAngles();
       session.stats.resyncs++;
     }

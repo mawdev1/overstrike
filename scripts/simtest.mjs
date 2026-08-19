@@ -15,6 +15,7 @@ import { defineSnapshot } from '../src/core/snapshot.js';
 import {
   encodeCommands, decodeCommands, quantiseCommand, moveDirIndex, MOVE_DIRS,
   encodeSnapshot, decodeSnapshot, EDGE_BITS, HELD_BITS, COMMAND_BYTES,
+  MAX_COMMANDS_PER_BATCH,
 } from '../src/net/protocol.js';
 import { createLoopbackPair } from '../src/net/transport.js';
 
@@ -524,6 +525,45 @@ test('an empty batch is legal', () => {
 test('a command is the advertised size on the wire', () => {
   const bytes = encodeCommands([sampleCommand(1)]).byteLength;
   assertEq(bytes, 6 + COMMAND_BYTES, 'command size changed — update COMMAND_BYTES and the docs');
+});
+
+test('an oversized command count is rejected before anything is allocated', () => {
+  // The critical one. `n` is read from the wire, and `ws` accepts frames up to 100 MiB by
+  // default, so a single packet can declare ~3.5 million commands. Allocating an object
+  // for each BEFORE any queue cap applies was measured at 536 ms of blocked event loop
+  // and 739 MB of heap for 500k — an OOM kill on a 512 MB server, from one packet, from
+  // any client. Rejecting on the count alone is what makes that cheap.
+  const buf = new ArrayBuffer(6);
+  const v = new DataView(buf);
+  v.setUint8(0, 1);                       // MSG_COMMANDS
+  v.setUint32(2, 3_000_000, true);        // a hostile count, with no payload behind it
+  let msg = '';
+  const t0 = Date.now();
+  try { decodeCommands(buf); } catch (e) { msg = e.message; }
+  const ms = Date.now() - t0;
+  assert(/limit/.test(msg), `expected a limit error, got: ${msg || '(no throw)'}`);
+  assert(ms < 50, `rejection took ${ms} ms — it is doing work proportional to the claim`);
+});
+
+test('a batch at the limit still decodes', () => {
+  const many = Array.from({ length: MAX_COMMANDS_PER_BATCH }, (_, i) => quantiseCommand(sampleCommand(i + 1)));
+  assertEq(decodeCommands(encodeCommands(many)).length, MAX_COMMANDS_PER_BATCH,
+    'a legal maximum-size batch was rejected');
+});
+
+test('non-finite wire floats are neutralised at decode', () => {
+  // `applyCommand` does `baseYaw += deltaYaw`, so one NaN from the wire turns the
+  // sender's yaw, then their position, then the snapshot every OTHER client decodes and
+  // interpolates, and then their stored lag-comp hitboxes, all into NaN.
+  const buf = encodeCommands([sampleCommand(1)]);
+  const v = new DataView(buf);
+  v.setFloat32(18, NaN, true);            // deltaYaw
+  v.setFloat32(22, Infinity, true);       // deltaPitch
+  v.setFloat32(26, -Infinity, true);      // baseYaw
+  const [got] = decodeCommands(buf);
+  assert(Number.isFinite(got.deltaYaw), `deltaYaw came through as ${got.deltaYaw}`);
+  assert(Number.isFinite(got.deltaPitch), `deltaPitch came through as ${got.deltaPitch}`);
+  assert(Number.isFinite(got.baseYaw), `baseYaw came through as ${got.baseYaw}`);
 });
 
 test('a truncated batch is rejected, not silently half-decoded', () => {

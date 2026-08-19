@@ -87,6 +87,10 @@ export class MultiplayerSession {
     // the server think we have desynced and snap our aim on every command.
     const p = this.game.player;
     if (p) { cmd.baseYaw = p.baseYaw; cmd.basePitch = p.basePitch; }
+    // The newest SERVER tick we have seen. The server subtracts this from its own tick to
+    // get our round trip, which is what decides how far it rewinds for our shots — so
+    // this is not bookkeeping, it is what makes lag compensation work at all.
+    cmd.tick = this.net.latestTick;
     const sent = this.net.sendCommand(cmd);
     this.stats.commandsSent++;
     this.prediction?.predict(sent);

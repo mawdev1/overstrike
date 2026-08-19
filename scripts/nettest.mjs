@@ -71,6 +71,27 @@ async function makeSession({ clients = 1, bots = 0, latencyMs = 0, loss = 0, see
   return { game, server, conns };
 }
 
+/**
+ * Drive a plain session (no prediction) with the client reporting the newest server tick
+ * it has seen — which is what the server derives the round trip from.
+ */
+function runPredictedLike(session, n) {
+  const { server, conns } = session;
+  let ms = 0;
+  for (let t = 0; t < n; t++) {
+    for (const c of conns) {
+      const cmd = emptyCommand();
+      cmd.tick = c.client.latestTick;
+      cmd.wishForward = 1;
+      c.client.sendCommand(cmd);
+      c.sT.pump(ms);
+    }
+    server.tick();
+    for (const c of conns) c.cT.pump(ms);
+    ms += FIXED_DT * 1000;
+  }
+}
+
 /** Run `n` ticks, letting the caller shape each client's command. */
 function run(session, n, shape = () => {}) {
   const { server, conns } = session;
@@ -455,6 +476,48 @@ console.log('\nlatency soak (80 ms RTT, 3% loss)');
   const downBytes = s.conns[0].cT.stats.bytesSent;
   const secs = 2400 * FIXED_DT;
   ok(`bandwidth over the soak: up ${(upBytes / secs / 1024).toFixed(1)} KiB/s, down ${(downBytes / secs / 1024).toFixed(1)} KiB/s`);
+}
+
+console.log('\nround-trip estimation');
+
+{
+  // Lag compensation is only as good as the RTT it rewinds by, and `session.rttMs` was
+  // never assigned in the first version — every shooter was rewound by the interpolation
+  // delay alone and under-compensated by RTT/2. These check the estimate is both alive
+  // and honest.
+  const clean = await makeSession({ latencyMs: 0 });
+  runPredictedLike(clean, 200);
+  const rttClean = clean.conns[0].session.rttMs;
+  if (rttClean < 25) ok(`a 0 ms link estimates a near-zero RTT (${rttClean.toFixed(1)} ms)`);
+  else bad('a clean link estimates a low RTT', `${rttClean.toFixed(1)} ms`);
+
+  const slow = await makeSession({ latencyMs: 60 });     // 120 ms round trip
+  runPredictedLike(slow, 400);
+  const rttSlow = slow.conns[0].session.rttMs;
+  if (rttSlow > rttClean + 30) ok(`a 120 ms round trip is detected (${rttSlow.toFixed(1)} ms vs ${rttClean.toFixed(1)} ms)`);
+  else bad('latency raises the RTT estimate', `${rttSlow.toFixed(1)} ms on a 120 ms link vs ${rttClean.toFixed(1)} ms clean`);
+
+  // And it must decide how far the rewind goes, or the estimate is decoration.
+  const backClean = slow.server.lag.viewTickFor(1000, rttClean, 100);
+  const backSlow = slow.server.lag.viewTickFor(1000, rttSlow, 100);
+  if (backSlow < backClean) ok(`a slower client is rewound further (${1000 - backSlow} vs ${1000 - backClean} ticks)`);
+  else bad('RTT drives the rewind depth', 'both clients rewind the same distance');
+}
+
+{
+  // `cmd.tick` is attacker-controlled, so the derived RTT is too. Uncapped, a client
+  // claiming a two-second round trip could shoot people where they stood two seconds ago.
+  const s = await makeSession();
+  const sess = s.conns[0].session;
+  for (let i = 0; i < 50; i++) {
+    const cmd = emptyCommand();
+    cmd.tick = 0;                       // "I last saw tick 0", however far in we are
+    s.conns[0].client.sendCommand(cmd);
+    s.conns[0].sT.pump(i * 8);
+    s.server.tick();
+  }
+  if (sess.rttMs <= 250) ok(`a client claiming an ancient tick is capped at ${sess.rttMs.toFixed(0)} ms`);
+  else bad('the claimed RTT is capped', `${sess.rttMs.toFixed(0)} ms — a client can buy an arbitrarily deep rewind`);
 }
 
 console.log('\nlag compensation');

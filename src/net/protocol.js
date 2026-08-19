@@ -78,6 +78,20 @@ export function moveDirIndex(wishForward, wishRight) {
 export const COMMAND_BYTES = 30;
 
 /**
+ * Most commands one packet may carry.
+ *
+ * A client sends one command per fixed step, batched per rendered frame, plus three
+ * resent for redundancy — so four or five is normal and sixteen is already generous.
+ *
+ * This is a hard limit rather than a guideline because the count is read from the wire.
+ * Without it, a single 100 MiB frame declares ~3.5 million commands and `decodeCommands`
+ * allocates an object for every one BEFORE any queue cap applies: measured at 500k, that
+ * is 536 ms of blocked event loop and 739 MB of heap. On the 512 MB server that is an
+ * OOM kill — one hostile packet ends the match for everyone.
+ */
+export const MAX_COMMANDS_PER_BATCH = 16;
+
+/**
  * Force a command through the wire's value space WITHOUT sending it.
  *
  * The client has to predict using the values the server will decode, not the ones it
@@ -141,10 +155,19 @@ export function encodeCommands(commands) {
   return buf;
 }
 
+/** Wire floats are attacker-controlled; a non-finite one poisons everything downstream. */
+const finite = (x) => (Number.isFinite(x) ? x : 0);
+
 export function decodeCommands(buf) {
   const v = new DataView(buf);
   if (v.getUint8(0) !== MSG_COMMANDS) throw new Error(`not a command batch (type ${v.getUint8(0)})`);
   const n = v.getUint32(2, true);
+  // Checked BEFORE the length arithmetic and before a single allocation. The
+  // byte-length check below cannot stand in for this: a correctly-sized 100 MiB frame
+  // passes it and is exactly the attack.
+  if (n > MAX_COMMANDS_PER_BATCH) {
+    throw new Error(`command batch declares ${n} commands, limit is ${MAX_COMMANDS_PER_BATCH}`);
+  }
   const expect = 6 + n * COMMAND_BYTES;
   if (v.byteLength !== expect) {
     throw new Error(`command batch is ${v.byteLength} bytes, expected ${expect} for ${n} commands`);
@@ -169,10 +192,14 @@ export function decodeCommands(buf) {
 
     cmd.slot = v.getInt8(o); o += 1;
     cmd.wheel = v.getInt8(o); o += 1;
-    cmd.deltaYaw = v.getFloat32(o, true); o += 4;
-    cmd.deltaPitch = v.getFloat32(o, true); o += 4;
-    cmd.baseYaw = v.getFloat32(o, true); o += 4;
-    cmd.basePitch = v.getFloat32(o, true); o += 4;
+    // Every float from the wire is checked for finiteness. `applyCommand` does
+    // `baseYaw += deltaYaw`, so one NaN turns the sender's yaw, then their position, then
+    // the snapshot every OTHER client decodes and interpolates, and then their stored
+    // lag-comp hitboxes, all into NaN. Zero is a safe substitute: it means "no input".
+    cmd.deltaYaw = finite(v.getFloat32(o, true)); o += 4;
+    cmd.deltaPitch = finite(v.getFloat32(o, true)); o += 4;
+    cmd.baseYaw = finite(v.getFloat32(o, true)); o += 4;
+    cmd.basePitch = finite(v.getFloat32(o, true)); o += 4;
     out.push(cmd);
   }
   return out;

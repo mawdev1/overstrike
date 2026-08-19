@@ -138,7 +138,17 @@ const http_ = http.createServer((req, res) => {
   res.writeHead(404); res.end();
 });
 
-const wss = new WebSocketServer({ server: http_, perMessageDeflate: false });
+// `ws` defaults maxPayload to 100 MiB, which is three orders of magnitude more than any
+// legitimate message here: a full command batch is ~500 bytes. Two independent limits —
+// this and MAX_COMMANDS_PER_BATCH — because the decoder is also reachable from the
+// loopback transport, which has no socket to configure.
+const MAX_MESSAGE_BYTES = 4096;
+
+const wss = new WebSocketServer({
+  server: http_,
+  perMessageDeflate: false,
+  maxPayload: MAX_MESSAGE_BYTES,
+});
 
 wss.on('connection', (sock, req) => {
   if (server.clients.size >= MAX_CLIENTS) {
