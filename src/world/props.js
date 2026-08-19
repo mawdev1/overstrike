@@ -645,7 +645,17 @@ export class Builder {
     const t = opts.thickness ?? 0.26;
     const bx0 = alongX ? x0 : x0 - t / 2, bx1 = alongX ? x1 : x0 + t / 2;
     const bz0 = alongX ? z0 - t / 2 : z0, bz1 = alongX ? z0 + t / 2 : z1;
-    const ax0 = alongX ? x0 : z0, ax1 = alongX ? x1 : z1;
+    // Along-Z runs are extended half a thickness at each end so corners CLOSE.
+    //
+    // An along-X run covers x from x0 to x1 with its thickness centred on z0; an along-Z run
+    // covers z from z0 to z1 centred on x0. Where the two meet, the quadrant
+    // [x1, x1 + t/2] x [z0 - t/2, z0] belongs to neither, leaving a 0.13 x 0.13 m hole
+    // through the parapet for its full height. Enumerated across the map: 25 such corners,
+    // including all four on the market hall roof deck — see-through and shoot-through at
+    // ankle-to-chest height on a roof edge, with the coping cap above making it look closed.
+    // Extending one axis is enough to cover the square, and avoids double-overhang.
+    const ext = alongX ? 0 : t / 2;
+    const ax0 = (alongX ? x0 : z0) - ext, ax1 = (alongX ? x1 : z1) + ext;
     const gaps = (opts.gaps || []).slice().sort((p, q) => p[0] - q[0]);
     // A crenellation must be a firing slit, not a doorway.
     //

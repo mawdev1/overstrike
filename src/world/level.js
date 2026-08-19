@@ -565,9 +565,13 @@ function dressMarketInterior(B) {
   // Office (south-east): desk, screen wall, filing.
   B.box(8.4, y, 5.9, 9.5, y + 0.74, 8.1, 'wood', 'wood');
   B.deco(8.3, y + 0.74, 5.8, 9.6, y + 0.82, 8.2, 'concreteDark');
-  B.box(4.3, y, 9.8, 5.4, y + 1.35, 10.3, 'metal', 'metal');
-  B.deco(4.3, y + 0.32, 9.74, 5.4, y + 0.38, 9.8, 'metal', { cast: false });
-  B.deco(4.3, y + 0.86, 9.74, 5.4, y + 0.92, 9.8, 'metal', { cast: false });
+  // West of the south-east doorway (x 3.6..6.2), not across the middle of it. This screen
+  // stood 0.5 m behind the door covering 1.1 m of a 2.6 m opening, so only one of five
+  // lateral lanes could pass — the 0.80 m slot between its east face and the jamb, against
+  // a 0.72 m body. The mirror door opposite is clean, which is what gave it away.
+  B.box(1.6, y, 9.8, 2.7, y + 1.35, 10.3, 'metal', 'metal');
+  B.deco(1.6, y + 0.32, 9.74, 2.7, y + 0.38, 9.8, 'metal', { cast: false });
+  B.deco(1.6, y + 0.86, 9.74, 2.7, y + 0.92, 9.8, 'metal', { cast: false });
   B.prop('crate', 6.6, y, 10.0, 0.2, { variant: 'small' });
   board(B, 6.9, 2.5, 5.24, 0, 1.5, 0.5, PZ_PAINT);
 
@@ -592,9 +596,13 @@ function dressMarketInterior(B) {
   B.debris(9.0, -8.0, 0.8, 6, y, { mats: ['wood', 'rubber'] });
 
   // Upper floor: the room in the middle is somebody's office.
-  B.box(-2.6, L1, -3.5, -1.0, L1 + 0.76, -2.4, 'wood', 'wood');
+  // Beside the north doorway (x -2.2..0.2), not inside it — the desk overlapped 1.2 m of
+  // the 2.4 m opening, leaving a 0.49 m straight lane against a 0.72 m body.
+  B.box(0.6, L1, -3.5, 2.2, L1 + 0.76, -2.4, 'wood', 'wood');
   B.deco(-2.7, L1 + 0.76, -3.6, -0.9, L1 + 0.84, -2.3, 'concreteDark');
-  B.box(1.4, L1, 2.6, 2.6, L1 + 1.3, 3.6, 'metal', 'metal');
+  // Likewise beside the south doorway (x 0.4..2.8), which it used to stand in: 0.29 m of
+  // straight lane. The two pieces now sit on opposite sides of the room from their doors.
+  B.box(-2.6, L1, 2.6, -1.4, L1 + 1.3, 3.6, 'metal', 'metal');
   B.prop('crate', 2.1, L1, -3.0, 0.4, { variant: 'small' });
   B.prop('sandbags', 8.6, L1, 0, Math.PI / 2);
   B.prop('sandbags', -8.6, L1, 6.6, Math.PI / 2, { variant: 'low' });
@@ -1062,7 +1070,14 @@ function buildWarehouse(B) {
   B.parapet(X0, Z0, X1, Z0, ROOF, 1.0, 'metal', 'metal', { gaps: [[19, 23], [27, 31]], capMat: 'metal' });
   B.parapet(X0, Z1, X1, Z1, ROOF, 1.0, 'metal', 'metal', { gaps: [[18, 22], [28, 32]], capMat: 'metal' });
   B.parapet(X0, Z0, X0, Z1, ROOF, 1.0, 'metal', 'metal', { gaps: [[-30, -26], [-22, -18]], capMat: 'metal' });
-  B.parapet(X1, Z0, X1, Z1, ROOF, 1.0, 'metal', 'metal', { gaps: [[-33, -31.4], [-22, -18]], capMat: 'metal' });
+  // Split at the stair mouth, not a `gaps` entry — the same fault, and the same fix, as the
+  // market hall's south balcony. `Builder.parapet` LOWERS a gap to `y + MAX_STEP + 0.07`
+  // (0.62 m) rather than opening it, which is over the 0.55 m step limit. So the roof this
+  // building's whole external switchback exists to reach could not be walked onto: the
+  // player climbed both flights, stood on the landing at 7.90, and stopped dead at x 35.49.
+  // Measured, walk-only: 0 of 30,900 standing states on the warehouse roof. It was
+  // mantle-only, and the comment above claims it is reached by the stair.
+  B.parapet(X1, -31.4, X1, Z1, ROOF, 1.0, 'metal', 'metal', { gaps: [[-22, -18]], capMat: 'metal' });
   B.prop('acUnit', 22.5, ROOF, -19.5, 0);
   B.prop('acUnit', 24.2, ROOF, -19.5, 0);
   B.prop('acUnit', 30.5, ROOF, -28.5, 1.2);
@@ -1099,6 +1114,12 @@ function buildWarehouse(B) {
   B.stairs({ x0: 35.2, z0: -32.2, x1: 37.6, z1: -25.2, y0: MEZZ, y1: ROOF, dir: '-z', matName: 'metal', surface: 'metal', rail: true });
   B.slab(35, -33, 37.6, -31.4, ROOF_UNDER, ROOF, 'metal', 'metal');
   B.railing(37.6, -33, 37.6, -31.4, ROOF, {});
+  // NOT railed along z = -33. A reviewer flagged the landing's north edge as a 7.90 m fall,
+  // and it is — but so is every other roof edge on this map, by design. Railing it cost
+  // more than it bought: the rail sits 0.71 m beyond the top tread, which stalls anyone
+  // walking straight off the stair and, worse, blocked the nav link so the AI stopped
+  // routing up the run at all. The exit from this landing is WEST onto the roof deck,
+  // through the parapet opening above, not north over the edge.
 
   // Interior gantry + stock.
   for (const x of [19, 31]) B.deco(x - 0.2, PLINTH, -24.8, x + 0.2, 6.4, -24.4, 'metal');
@@ -1408,7 +1429,11 @@ function buildPlaza(B, rng) {
   // the northern approach real cover.
   B.box(-7, 0, -20, 7, 0.5, -14, 'concreteDark', 'concrete');
   B.box(-5.6, 0.5, -18.6, 5.6, 0.95, -15.4, 'concrete', 'concrete');
-  B.box(-2.2, 0.95, -18.0, 2.2, 1.5, -16.0, 'concreteDark', 'concrete');
+  // Top at 1.45, not 1.50. From tier 2 at 0.95 that was a rise of exactly 0.550 — and
+  // `_tryStepUp` measures `top + SKIN`, so 0.555 against a 0.55 limit: refused. The tier
+  // looked like a step, read like a step, and could not be climbed from any of its four
+  // sides. 0.50 clears with margin.
+  B.box(-2.2, 0.95, -18.0, 2.2, 1.45, -16.0, 'concreteDark', 'concrete');
   B.box(-1.1, 1.5, -17.5, 1.1, 5.6, -16.5, 'concrete', 'concrete');
   B.deco(-1.35, 5.6, -17.75, 1.35, 5.95, -16.25, 'concreteDark');
   for (const sx of [-4.4, 4.4]) B.prop('bollard', sx, 0.95, -17, 0);
@@ -1711,7 +1736,11 @@ function buildSpawnYards(B, rng) {
   B.prop('truck', 27, 0, 34, Math.PI, { color: 0x6d7a5e });
   B.prop('container', 22, 0, 39, 0, { color: CONTAINER_COLORS[5] });
   B.prop('container', 32, 0, 39, 0, { color: CONTAINER_COLORS[2] });
-  B.prop('container', 18, 0, 29, Math.PI / 2, { color: CONTAINER_COLORS[0] });
+  // Clear of the customs west wall (x 17.00-17.40). At x 18 this 2.44 m-wide container
+  // straddled the wall and reached 1.82 m INTO the ground floor, and it stood across the
+  // door relocated there — 1.07 m of a 2.60 m opening. Moving that door out from behind its
+  // own staircase had put it behind a container instead.
+  B.prop('container', 15, 0, 29, Math.PI / 2, { color: CONTAINER_COLORS[0] });
   B.prop('jersey', 25.5, 0, 30.5, 0);
   B.prop('tyres', 16.5, 0, 36, 0);
   B.prop('tyres', 17.4, 0, 36.8, 0.4);

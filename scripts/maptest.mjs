@@ -457,8 +457,12 @@ let reachable = new Set();
   for (let x = w.bounds.min.x + 0.25; x <= w.bounds.max.x; x += STEP) {
     for (let z = w.bounds.min.z + 0.25; z <= w.bounds.max.z; z += STEP) {
       sampled++;
+      // `sampleGroundHeight` returns NULL for an empty column, not -Infinity. `null > -Infinity`
+      // coerces to `0 > -Infinity` and is TRUE, so the original guard here passed every hole
+      // it was written to catch — this check asserted nothing at all until a reviewer
+      // mutation-tested it.
       const top = w.sampleGroundHeight(x, z, 20);
-      if (!(top > -Infinity) || top < w.bounds.min.y + 0.5) {
+      if (top == null || !Number.isFinite(top) || top < w.bounds.min.y + 0.5) {
         if (holes.length < 8) holes.push(`(${x.toFixed(1)}, ${z.toFixed(1)})`);
       }
     }

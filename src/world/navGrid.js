@@ -21,7 +21,18 @@ const CELL = 0.75;
 const MAX_LAYERS = 4;
 
 const STAND_CLEARANCE = 1.9;   // metres of headroom required to call a surface walkable
-const STEP_HEIGHT = 0.55;      // matches World's step-up (§5)
+/**
+ * The largest rise the MOVER will actually take, which is not the constant it advertises.
+ *
+ * `World._tryStepUp` computes `targetY = _sweepTop + SKIN` and then refuses when
+ * `targetY - y > MAX_STEP_HEIGHT` — so a step of exactly 0.55 is measured as 0.555 and
+ * rejected. Nav compared the raw 0.55 with `<=` and authorised it, which is how 27 links
+ * came to cross the plaza monument's third tier: a 0.550 m step no player can climb, that
+ * the AI was routed over and stalled on. Matching the mover's arithmetic here keeps the two
+ * honest with each other.
+ */
+const SKIN = 0.005;
+const STEP_HEIGHT = 0.55 - SKIN;
 const DROP_HEIGHT = 2.6;       // a one-way link a bot may fall down but not climb
 const INFLATE = 0.30;          // lateral padding so paths keep the 0.36 m body off walls
 const FOOT_EPS = 0.06;
