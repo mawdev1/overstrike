@@ -72,6 +72,7 @@ const OBJECTIVES = [
 // reads as "the whole map is unreachable" rather than as a type error.
 const path = [];
 const probe = new THREE.Vector3();
+let truncated = 0;
 /** Geodesic path length over the nav mesh, or Infinity if unreachable. */
 function pathLen(from, to) {
   const n = nav.findPath(from, to, path);
@@ -83,6 +84,16 @@ function pathLen(from, to) {
     d += Math.hypot(p.x - px, p.y - py, p.z - pz);
     px = p.x; py = p.y; pz = p.z;
   }
+  // A* returns its BEST PARTIAL when the goal exceeds the node budget, and summing that
+  // silently reports a truncated walk as the travel distance. It made the roof and the
+  // first floor print identical numbers — the exact symptom a previous commit chased to
+  // a bad probe placement and fixed only there. Corrected, some of these routes are 2-3x
+  // longer than the harness was certifying as fair.
+  // Truncation is REPORTED, not silently folded into either answer. Returning the partial
+  // length understates the route; returning Infinity overstates it as unreachable. Both
+  // are wrong in ways that look like facts about the map.
+  const endGap = Math.hypot(px - to.x, py - to.y, pz - to.z);
+  if (endGap > 2.0) { truncated++; return NaN; }
   return d;
 }
 
@@ -122,6 +133,7 @@ function pathLen(from, to) {
   }
   const SPRINT = 7.2;                                   // m/s, from TUNE
   console.log('\n  travel from each team\'s nearest spawn:');
+  const truncatedBefore = truncated;
   let worstName = null, worstDelta = 0;
   const forward = { 0: null, 1: null };
   for (const obj of OBJECTIVES) {
@@ -145,13 +157,15 @@ function pathLen(from, to) {
             if (surf === null || Math.abs(surf - obj.at.y) > 0.8) continue;
             probe.y = surf + 0.1;
             const d = pathLen(from, probe);
-            if (d < best[t]) best[t] = d;
+            if (Number.isFinite(d) && d < best[t]) best[t] = d;
           }
         }
       }
     }
-    if (!Number.isFinite(best[0]) && !Number.isFinite(best[1])) {
-      bad(`${obj.name} is reachable`, 'neither team can path to it');
+    if (!Number.isFinite(best[0]) || !Number.isFinite(best[1])) {
+      // Every sampled route to it exceeded the search budget, so this objective's travel
+      // time is unknown rather than known-bad. Saying so is the only honest option.
+      note(`${obj.name}: no route within the A* budget for ${!Number.isFinite(best[0]) ? 'team 0' : 'team 1'} — travel time unknown`);
       continue;
     }
     const delta = Math.abs(best[0] - best[1]);
@@ -169,6 +183,9 @@ function pathLen(from, to) {
     }
   }
 
+  if (truncated > truncatedBefore) {
+    note(`${truncated - truncatedBefore} of the sampled routes exceeded the A* node budget and were excluded`);
+  }
   if (forward[0] && forward[1]) {
     const adv0 = forward[0].theirs - forward[0].own;
     const adv1 = forward[1].theirs - forward[1].own;

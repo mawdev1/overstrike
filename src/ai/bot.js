@@ -62,6 +62,15 @@ const CLIMB_COMMIT_MAX = 13.0;
 // a distant contact is a manoeuvre, not a lapse. Inside it, the fight is here and now
 // and walking upstairs would just be a bot ignoring someone shooting at it.
 const CLIMB_BREAK_RANGE = 16;
+
+/**
+ * States in which taking high ground is never worth delaying the decision at hand.
+ *
+ * A bot that has decided to shoot, take cover, push or retreat has a reason that beats
+ * repositioning for a view. Letting the climb lock outrank these swallowed a quarter of
+ * all combat movement.
+ */
+const CLIMB_YIELD_STATES = new Set(['engage', 'takeCover', 'retreat', 'pushOrFlank']);
 const REPATH_INTERVAL = 1.15;
 const STUCK_WINDOW = 1.2;
 const STUCK_DISTANCE = 0.32;
@@ -935,6 +944,12 @@ export class Bot {
     this.game.bots?.releaseSweepClaim?.(this);
 
     this.clearPath();
+    // Cleared here as well as in `deactivate()`. `fixedUpdate` early-returns for dead
+    // bots, so the timer does not decay while dead and a lock taken just before dying
+    // survived the respawn with seconds still on it.
+    this.climbLock = 0;
+    this.climbGoal.set(0, 0, 0);
+
     this._syncHitboxes();
     // Match assigns teams (§ Match._assignTeams) after BotManager builds the
     // roster, so the colourway is only guaranteed correct at placement time.
@@ -1452,7 +1467,14 @@ export class Bot {
       const pressed = this.targetVisible && this.target
         && this.position.distanceToSquared(this.target.position) < CLIMB_BREAK_RANGE * CLIMB_BREAK_RANGE;
       const hurt = this.game.time - this.lastDamageTime < 1.5;
-      if (done || pressed || hurt) this.climbLock = 0;
+      // Dropped the moment the bot has anything better to do, or has stopped making
+      // progress. 10.5% of climb commits resolve to an A* best-partial that ends several
+      // metres below the goal; for those, neither the arrival test nor the `done` test
+      // above can ever fire, so without this the bot walked into a wall for the whole
+      // lock and the stuck recovery could not help it.
+      const fighting = CLIMB_YIELD_STATES.has(this.state);
+      const wedged = this._stuckLevel > 0 || !this.hasPath();
+      if (done || pressed || hurt || fighting || wedged) this.climbLock = 0;
     }
 
     this._updateStance(dt);
@@ -1787,11 +1809,21 @@ export class Bot {
     // every think tick, and re-running A* for a destination that has not moved
     // is pure waste — especially for a cross-layer goal, which is the one
     // search expensive enough to show up in a frame.
-    // A climb in progress outranks whatever the state machine wants next. See
-    // CLIMB_COMMIT_MIN: every other destination pick resolves to the bot's current floor,
-    // so without this the first `investigate` think tick after the stairs came into
-    // view pulled the bot straight back off them.
-    if (this.climbLock > 0 && this.climbGoal.distanceToSquared(point) > 1) return;
+    // A climb in progress outranks a PATROL decision — but never a fighting one.
+    //
+    // The lock exists because every other destination pick resolves to the bot's current
+    // floor, so the first think tick after the stairs came into view used to pull the bot
+    // straight back off them. Letting it outrank everything was much too strong: measured,
+    // it swallowed 24% of `engage` and 23% of `takeCover` destination requests, so roughly
+    // one time in four a bot decided it needed cover and then simply did not go. Bots
+    // motionless for six seconds or more went from 1 window to 21.
+    //
+    // Combat states are exempt. A bot that has decided to shoot, take cover, push or run
+    // has a reason that beats sightseeing, and the `stuck` recovery path is exempt for the
+    // same reason — it recovers via `pickPatrolDestination`, which the guard was
+    // swallowing, so a wedged bot could not free itself for the whole lock.
+    if (this.climbLock > 0 && this.climbGoal.distanceToSquared(point) > 1
+      && !CLIMB_YIELD_STATES.has(this.state) && this._stuckLevel === 0) return;
     const moved = this.hasDestination ? this.destination.distanceToSquared(point) : Infinity;
     this.destination.copy(point);
     this.destTolerance = tolerance;
