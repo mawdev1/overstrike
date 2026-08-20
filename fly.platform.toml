@@ -1,0 +1,86 @@
+# OVERSTRIKE platform control plane — accounts, profiles, matches, telemetry.
+#
+#   fly deploy --config fly.platform.toml --dockerfile Dockerfile.platform
+#
+# A THIRD app, alongside the static site (fly.toml) and the game server
+# (fly.gameserver.toml). The three fail differently and so are configured differently:
+# the site is stateless and idles to zero, the game server holds a live match and must
+# never stop, and this one holds no match state but owns the database connection and the
+# outbox relay.
+app = "overstrike-platform"
+primary_region = "yyz"        # ca-central-1 per docs/decisions/P0-decisions.md D2
+
+[build]
+
+[deploy]
+  # Migrations run ONCE per deployment, here, not on container boot.
+  #
+  # A container that migrates as it starts races every other container of the same
+  # release. The migrator takes an advisory lock, so the race does not corrupt anything —
+  # it just means N-1 machines block on boot behind a lock held by a machine that is also
+  # trying to pass its health check. A release command runs exactly once, before any new
+  # machine is started, which is the property actually wanted.
+  #
+  # `scripts/pgtest.mjs` asserts every deployment re-runs migrations as a clean no-op, so
+  # this is safe to run on every deploy including ones that change no schema.
+  release_command = "node platform/src/core/migrate.js"
+
+[env]
+  PLATFORM_STORAGE = "postgres"
+  PLATFORM_PORT = "8080"
+  PLATFORM_LOG_LEVEL = "info"
+
+  # Fly terminates TLS at its edge and forwards one hop. Without this the platform reads
+  # the proxy's address as the client's, which would key §9's per-IP auth limit and the
+  # session IP class on the edge — every player in the world sharing one bucket, and every
+  # session displaying the same location.
+  PLATFORM_TRUSTED_PROXY_HOPS = "1"
+
+# SECRETS — set with `fly secrets set`, never in this file, which is in git:
+#
+#   fly secrets set --app overstrike-platform \
+#     DATABASE_URL="postgres://...@...supabase.co:5432/postgres?sslmode=require" \
+#     PLATFORM_TOKEN_SECRET="$(openssl rand -hex 32)" \
+#     PLATFORM_SERVICE_TOKEN="$(openssl rand -hex 32)"
+#
+# PLATFORM_TOKEN_SECRET signs access tokens and every receipt; rotating it signs out every
+# player and invalidates every outstanding eligibility and consent receipt. PLATFORM_SERVICE_
+# TOKEN is what the game server presents to submit match results and read /v1/health/ready —
+# it is NOT a player credential and must never be shipped to a browser.
+#
+# config.js fails fast rather than defaulting on either: a platform that boots with a
+# development signing key would accept forged tokens in production and look healthy doing it.
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # Unlike the game server, this is stateless per request — an instance can stop and
+  # start freely. It is NOT allowed to idle to zero, though: the outbox relay is a
+  # background loop, and a suspended machine stops relaying events that a stopped machine
+  # has already committed to the outbox table. min_machines_running = 1 keeps one relay
+  # alive; the rest can scale on demand.
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    # /v1/health is LIVENESS — process up, no dependencies consulted. It is deliberately
+    # not /v1/health/ready: readiness checks the database, and a database blip would
+    # otherwise make Fly kill and restart every machine at once, turning a recoverable
+    # dependency outage into a full outage. Readiness is service-token gated anyway
+    # (§7.1), so Fly could not call it without shipping the token into this file.
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/v1/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

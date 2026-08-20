@@ -35,10 +35,8 @@
     { "pattern": "package.json", "lane": "CC" },
     { "pattern": "package-lock.json", "lane": "CC" },
     { "pattern": "vite.config.js", "lane": "CC" },
-    { "pattern": "Dockerfile", "lane": "CC" },
-    { "pattern": "Dockerfile.gameserver", "lane": "CC" },
-    { "pattern": "fly.toml", "lane": "CC" },
-    { "pattern": "fly.gameserver.toml", "lane": "CC" },
+    { "$comment": "Deployment descriptors are backend-owned as a CLASS, not file by file. Dockerfile.platform and fly.platform.toml were both UNOWNED when written, and the guard refused them - correctly, but the third app should not have needed a fourth and fifth rule. A pattern means the next service is owned the moment it exists.", "pattern": "Dockerfile*", "lane": "CC" },
+    { "pattern": "fly*.toml", "lane": "CC" },
     { "pattern": "nginx.conf", "lane": "CC" },
     { "pattern": ".github/**", "lane": "CC" },
 
