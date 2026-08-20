@@ -20,6 +20,7 @@
  * Timestamps cross the interface as ISO strings, matching the memory adapter. `pg` returns
  * `Date`; code written against one adapter must not break on the other.
  */
+import { pgConnectionConfig } from '../pgurl.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ApiError } from '../errors.js';
 import { ulid as defaultUlid } from '../ids.js';
@@ -203,7 +204,9 @@ export async function createPostgresStore(config = {}, deps = {}) {
 
   const pg = deps.pg ?? (await import('pg')).default;
   const pool = deps.pool ?? new pg.Pool({
-    connectionString: databaseUrl,
+    // Explicit fields rather than `connectionString`: pg-connection-string leaves the brackets
+    // on an IPv6 literal, so an IPv6 DATABASE_URL resolves to nothing. See core/pgurl.js.
+    ...pgConnectionConfig(databaseUrl),
     max: config.poolMax ?? 10,
     // A statement that has run for 30s inside a request is not going to save the request; it
     // is going to hold a connection while the client has already given up.

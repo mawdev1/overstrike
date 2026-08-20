@@ -21,6 +21,7 @@
  * this is the one place that is worth spending.
  */
 import { readdir, readFile } from 'node:fs/promises';
+import { pgConnectionConfig } from './pgurl.js';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -156,7 +157,10 @@ export async function runMigrations({ databaseUrl, client, dir = MIGRATIONS_DIR 
   if (!db) {
     if (!databaseUrl) throw new Error('migrate: need a client or a databaseUrl');
     const pg = await import('pg');
-    own = new pg.default.Client({ connectionString: databaseUrl });
+    // Explicit fields, not `connectionString` — see core/pgurl.js: an IPv6 host arrives
+    // bracketed and fails to resolve, which pushed this runner onto a pooled endpoint where
+    // its session-scoped advisory lock does not hold.
+    own = new pg.default.Client(pgConnectionConfig(databaseUrl));
     await own.connect();
     db = own;
   } else {
