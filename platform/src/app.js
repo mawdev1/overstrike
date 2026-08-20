@@ -24,7 +24,7 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 
 // The modules a production process MUST have. `stubs` is deliberately absent: in production
 // it is not mounted at all, which is a stronger guarantee than mounting it disabled.
-const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry'];
+const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
@@ -306,6 +306,18 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     // the module stays testable without an auth module present.
     deps.profile.routes(router, { auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth });
     mounted.push('profile');
+  }
+
+  // ── flags: the client-visible feature flag surface ───────────────────────────────────
+  //
+  // Contracted in feature-flags.md §3.1 and http-api.md, called by the shell on boot — and
+  // implemented only in the STUB layer, so the deployed shell 404'd on it three times per page
+  // while the suite stayed green. Mounted after auth because §3.1 marks the route `A`.
+  const flags = await load('flags', './modules/flags/index.js');
+  if (flags) {
+    deps.flags = flags.createFlagsModule({ config, clock: deps.clock, logger });
+    deps.flags.routes(router, { auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth });
+    mounted.push('flags');
   }
 
   // ── telemetry: the client ingest endpoint ────────────────────────────────────────────

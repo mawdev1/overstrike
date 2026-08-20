@@ -482,6 +482,50 @@ await withApp(async ({ call }) => {
     'a stub layer that answers unheadered requests is a stub layer serving real players');
 });
 
+// ── 4c. client-visible feature flags (feature-flags.md §3.1) ──────────────────────────
+//
+// Contracted in two documents, called by the shell on boot, and implemented ONLY in the stub
+// layer — so the deployed shell 404'd on it three times per page load while every check here
+// passed. A stub is a description of an implementation, not one.
+await withApp(async ({ call }) => {
+  section('feature flags');
+  const { signup } = await onboard(call, { sid: SID });
+  const auth = { authorization: `Bearer ${signup.body?.accessToken}` };
+
+  const anon = await call('GET', '/v1/config/flags');
+  check(anon.status === 401 && anon.body?.error?.code === 'AUTH_REQUIRED',
+    '§3.1 marks the route A: an unauthenticated caller is refused',
+    `${anon.status} ${anon.body?.error?.code}`);
+
+  const res = await call('GET', '/v1/config/flags', undefined, auth);
+  check(res.status === 200, 'an authenticated caller gets the flags', String(res.status));
+
+  const flags = res.body?.flags || {};
+  const keys = Object.keys(flags);
+  check(keys.length === 10, '§3.2 exactly: ten client-visible keys', `${keys.length}: ${keys.join(' ')}`);
+  check(keys.every((k) => typeof flags[k] === 'boolean'),
+    '§3.1: values are BOOLEANS — the answer, never the rule',
+    JSON.stringify(flags));
+
+  // The two that are not cosmetic. Shipping a rollout rule instead of the answer would let a
+  // modified client evaluate itself into any bucket it liked.
+  check(flags['mode.bomb.enabled'] === false && flags['map.the_square.enabled'] === false,
+    'unshipped work is OFF by compiled default (bomb, the_square)',
+    JSON.stringify({ bomb: flags['mode.bomb.enabled'], square: flags['map.the_square.enabled'] }));
+
+  check(!keys.some((k) => k.startsWith('match.allocation') || k.startsWith('platform.')),
+    'no server-side flag is exposed — a key\'s existence is information about unshipped work',
+    keys.join(' '));
+
+  check(Number.isInteger(res.body?.version)
+    && typeof res.body?.evaluatedAt === 'string' && typeof res.body?.expiresAt === 'string',
+    '§3.1 shape: version, evaluatedAt, expiresAt all present',
+    JSON.stringify({ v: res.body?.version, e: res.body?.evaluatedAt, x: res.body?.expiresAt }));
+
+  const ttl = Date.parse(res.body?.expiresAt) - Date.parse(res.body?.evaluatedAt);
+  check(ttl === 60_000, '§3.1: expiresAt agrees with the stated max-age of 60s', `${ttl}ms`);
+});
+
 // ── 5. rate limiting is actually consulted ────────────────────────────────────────────
 //
 // This section was named "rate limiting is actually consulted" and did not test that.

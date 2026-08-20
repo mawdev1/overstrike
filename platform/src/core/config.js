@@ -23,6 +23,11 @@ const SPEC = {
   minClientBuild:  { env: 'PLATFORM_MIN_CLIENT_BUILD', type: 'string', default: null },
   minimumAge:      { env: 'PLATFORM_MINIMUM_AGE', type: 'int', default: 13, min: 0, max: 120 },
   consentPolicyVersion: { env: 'PLATFORM_CONSENT_POLICY_VERSION', type: 'int', default: 1, min: 1, max: 1e6 },
+  // feature-flags.md §3, rule 5: a kill switch must be reachable in seconds. An env override is
+  // the fastest thing an operator has before a targeting service exists. Unknown keys and
+  // non-boolean values are REFUSED at boot (modules/flags), because a typo'd kill switch that
+  // silently does nothing fails at the exact moment it is most needed.
+  flagOverrides: { env: 'PLATFORM_FLAG_OVERRIDES', type: 'string', default: '' },
   termsVersion:    { env: 'PLATFORM_TERMS_VERSION', type: 'int', default: 1, min: 1, max: 1e6 },
   env:             { env: 'NODE_ENV', type: 'string', default: 'development' },
 };
