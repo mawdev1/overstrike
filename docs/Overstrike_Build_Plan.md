@@ -1,7 +1,23 @@
+> # ⚠️ SUPERSEDED — do not build from this document
+>
+> **Replaced by:** `Overstrike_Platform_Build_Plan.md` / `.docx` (plan version 2.0), which
+> tracks the current `Overstrike_Platform_Roadmap.docx`.
+>
+> **Why it was replaced:** this plan sequences the Extraction vertical slice (its P3) *before*
+> the multiplayer proof is complete. The current roadmap inverts that order — Multiplayer
+> Alpha (TDM + Bomb on The Square) → Public Alpha Readiness → Extraction — and freezes mode
+> breadth until G1 and G2 pass. Building from the order below would start Extraction several
+> phases early.
+>
+> It also assumes a third OpenCode lane, which the current plan does not use.
+>
+> Retained for its architecture and non-negotiable-rules sections, which v2.0 carries forward
+> largely intact. Superseded 2026-08-19 during P0.
+
 # OVERSTRIKE Platform Build Plan
 
 **Source:** `Overstrike_Platform_Roadmap(2).docx`  
-**Plan version:** 1.0  
+**Plan version:** 1.0 — **SUPERSEDED by 2.0**  
 **Prepared:** August 19, 2026  
 **Planning basis:** One primary Claude Code lane, one primary Codex lane, and one OpenCode lane working in parallel, with human product, design, security, finance, and legal approvals at the named gates.
 

@@ -1,0 +1,88 @@
+{
+  "$comment": "Machine-readable form of Build Plan v2.0 §1.4. This file is the authority the CI guard enforces. Patterns are matched most-specific-first: the LAST matching rule wins, so order general -> specific. Lane 'CC' = Claude Code (backend), 'CX' = Codex (frontend), 'SHARED' = either lane may touch (docs, single-writer files are enforced separately).",
+  "owner": "CC",
+  "rules": [
+    { "pattern": "src/**", "lane": "CC" },
+
+    { "pattern": "src/core/input.js", "lane": "CX" },
+    { "pattern": "src/core/settings.js", "lane": "CX" },
+    { "pattern": "src/core/assets.js", "lane": "CX" },
+
+    { "pattern": "src/player/playerCamera.js", "lane": "CX" },
+    { "pattern": "src/weapons/viewmodel.js", "lane": "CX" },
+
+    { "pattern": "src/world/level.js", "lane": "CX" },
+    { "pattern": "src/world/props.js", "lane": "CX" },
+
+    { "pattern": "src/fx/**", "lane": "CX" },
+    { "pattern": "src/audio/**", "lane": "CX" },
+    { "pattern": "src/ui/**", "lane": "CX" },
+    { "pattern": "src/main.js", "lane": "CX" },
+    { "pattern": "src/styles.css", "lane": "CX" },
+    { "pattern": "index.html", "lane": "CX" },
+    { "pattern": "web/**", "lane": "CX" },
+
+    { "pattern": "server/**", "lane": "CC" },
+    { "pattern": "platform/**", "lane": "CC" },
+
+    { "pattern": "scripts/**", "lane": "CC" },
+    { "pattern": "scripts/uiperf.mjs", "lane": "CX" },
+    { "pattern": "scripts/uiprobe.mjs", "lane": "CX" },
+    { "pattern": "scripts/beauty.mjs", "lane": "CX" },
+    { "pattern": "scripts/scopeshot.mjs", "lane": "CX" },
+    { "pattern": "scripts/opticglass.mjs", "lane": "CX" },
+    { "pattern": "scripts/audioprobe.mjs", "lane": "CX" },
+
+    { "pattern": "package.json", "lane": "CC" },
+    { "pattern": "package-lock.json", "lane": "CC" },
+    { "pattern": "vite.config.js", "lane": "CC" },
+    { "pattern": "Dockerfile", "lane": "CC" },
+    { "pattern": "Dockerfile.gameserver", "lane": "CC" },
+    { "pattern": "fly.toml", "lane": "CC" },
+    { "pattern": "fly.gameserver.toml", "lane": "CC" },
+    { "pattern": "nginx.conf", "lane": "CC" },
+    { "pattern": ".github/**", "lane": "CC" },
+
+    { "pattern": "ARCHITECTURE.md", "lane": "CC" },
+    { "pattern": "README.md", "lane": "CC" },
+
+    { "pattern": "docs/**", "lane": "SHARED" },
+    { "pattern": "docs/contracts/**", "lane": "CC" },
+    { "pattern": "docs/decisions/**", "lane": "CC" },
+    { "pattern": "docs/lane-ownership.json", "lane": "CC" },
+    { "pattern": "docs/design/**", "lane": "CX" },
+    { "pattern": "docs/handoff/requests-to-backend.md", "lane": "CX" },
+    { "pattern": "docs/handoff/requests-to-frontend.md", "lane": "CC" },
+    { "pattern": "docs/status/backend.md", "lane": "CC" },
+    { "pattern": "docs/status/frontend.md", "lane": "CX" },
+
+    { "pattern": "shots/**", "lane": "SHARED" },
+    { "pattern": "perf/**", "lane": "SHARED" },
+    { "pattern": "dist/**", "lane": "SHARED" },
+    { "pattern": ".gitignore", "lane": "SHARED" }
+  ],
+  "statusLineException": {
+    "$comment": "Build Plan §0.4: the receiving lane may edit ONLY the `- Status:` line of a request it did not write. The guard allows a cross-lane edit to a request file when every changed line starts with '- Status:' or '- Response:'.",
+    "files": [
+      "docs/handoff/requests-to-backend.md",
+      "docs/handoff/requests-to-frontend.md"
+    ],
+    "allowedLinePrefixes": ["- Status:", "- Response:"]
+  },
+  "protocolVersionGuard": {
+    "$comment": "Build Plan §0.6 and §5.3: any change to the wire format must bump the version constant in the same commit.",
+    "watch": "src/net/protocol.js",
+    "constantFile": "src/net/protocol.js",
+    "constantName": "PROTOCOL_VERSION"
+  },
+  "mapGuard": {
+    "$comment": "Build Plan §3.3: geometry changes must ship a fresh nav bake and pass the map guards.",
+    "watch": ["src/world/level.js", "src/world/props.js"],
+    "requiredHarnesses": [
+      "npm run maptest",
+      "node scripts/collisiontest.mjs --quick",
+      "npm run stairtest",
+      "npm run vertprobe"
+    ]
+  }
+}

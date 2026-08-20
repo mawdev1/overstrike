@@ -1,0 +1,228 @@
+# Contract 4 — Lobby realtime channel
+
+| | |
+|---|---|
+| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Version** | 1.1.0 |
+| **Owner** | [CC] Claude Code |
+| **Consumers** | [CX] shell UI, presence service, room service |
+
+---
+
+## 1. Shape
+
+One authenticated WebSocket per client, opened after `POST /v1/rooms/:id/join` returns a
+reservation. **JSON, not binary** — unlike the match protocol. This channel carries tens of
+messages a minute, not thousands a second; the debuggability is worth more than the bytes.
+
+```
+wss://<lobby>/v1/lobby?ticket=<lobbyTicket>
+```
+
+The ticket comes from the join reservation, is single-use, and expires with the reservation.
+Opening the socket is what converts a reservation into a seat.
+
+## 2. Envelope
+
+```json
+{ "t": "roster.delta", "seq": 41, "ts": "2026-08-19T18:42:03.221Z", "correlationId": "01J…", "d": { } }
+```
+
+- `seq` is per-connection and monotonic. **A gap means state was missed** — the client must
+  send `state.resync` rather than guessing.
+- Client→server frames carry a client-generated `correlationId`; the reply and every
+  resulting event carry it back.
+- Unknown `t` is ignored by both sides, so additive message types do not need a version bump.
+
+## 3. Handshake
+
+```
+→ open with ticket
+← lobby.welcome { … }      ← complete state, see below
+```
+
+`lobby.welcome` carries **complete** state. There is no "fetch the rest over REST" step — a
+client that has the welcome can render the whole lobby. Every later message is a delta
+against it.
+
+**Exact shape (REQ-CC-003).** `state.snapshot` returns this identical payload.
+
+```jsonc
+{ "t": "lobby.welcome", "seq": 0, "ts": "…", "correlationId": "…",
+  "d": {
+    "protocol": 1,
+    "serverTime": "…",          // authoritative clock; the client offsets against it
+    "heartbeatMs": 15000,
+    "graceMs": 90000,
+    "you": {
+      "accountId": "…", "displayName": "…",
+      "team": "alpha|bravo|unassigned",
+      "ready": false, "isOwner": false,
+      "seatHeldUntil": null      // non-null only while reconnecting
+    },
+    "room": {
+      "roomId": "…", "name": "…", "region": "yyz",
+      "map": "the-square", "mapVersion": "1.0.0",
+      "mode": "tdm|bomb", "rulesetVersion": "bomb-1.0.0", "build": "…",
+      "status": "open|countdown|in-progress|closing",
+      "capacity": 12, "playerCount": 6,
+      "hasPassword": false, "ownerAccountId": "…",
+      "rules": { "killLimit": 75, "roundsToWin": 7, "roundLengthSec": 105,
+                 "backfill": true, "requiredReady": 8, "minPlayers": 2 }
+    },
+    "roster": [ {
+      "accountId": "…", "displayName": "…",
+      "team": "alpha|bravo|unassigned",
+      "ready": false, "isOwner": false, "isLocal": false,
+      "connection": "connected|reconnecting|disconnected",
+      "estimatedRttMs": 24,
+      "loadout": { "primaryIdx": 0, "secondaryIdx": 3 },
+      "joinedAt": "…"
+    } ],
+    "countdown": null,           // or { "endsAt", "requiredReady", "currentReady" }
+    "chatHistory": [ ]           // this room only, bounded to the last 50
+  } }
+```
+
+Every field is required. `null` means present-and-empty; an omitted key is a contract
+violation. The room block matches `http-api.md` §11.3 exactly, so one renderer serves both.
+
+Failures close the socket with a code and an `errors.md` payload: bad ticket
+(`SESSION_TOKEN_INVALID`), expired reservation (`SLOT_RESERVATION_EXPIRED`), room gone
+(`ROOM_NOT_FOUND`), full (`ROOM_FULL`), sanctioned (`SANCTIONED`).
+
+## 4. Server → client
+
+| `t` | Payload | Notes |
+|---|---|---|
+| `lobby.welcome` | full state | Once, at open |
+| `roster.delta` | `{ added[], removed[], updated[] }` | Never a full roster after welcome, except after `state.resync` |
+| `presence.delta` | `{ accountId, state, joinable }` | Out-of-room presence for the online list |
+| `room.updated` | changed room fields | Name, capacity, mode, map, status |
+| `team.changed` | `{ accountId, team, byServer }` | `byServer: true` when balancing moved them, so the UI can explain it |
+| `ready.changed` | `{ accountId, ready, clearedReason? }` | `clearedReason` ∈ `roster-change`, `team-change`, `loadout-change`, `room-change` |
+| `countdown.started` | `{ endsAt, requiredReady, currentReady }` | |
+| `countdown.tick` | `{ remainingMs }` | 1 Hz. The UI animates between ticks; it does not invent the end time |
+| `countdown.aborted` | `{ reason, byAccountId? }` | `reason` ∈ `player-left`, `player-unready`, `team-imbalance`, `allocation-failed`, `owner-cancelled` |
+| `match.allocating` | `{ }` | Allocation started — may take seconds |
+| `match.ready` | `{ matchId, serverUrl, sessionTicket, expiresAt }` | **The handoff.** See §6 |
+| `match.failed` | `errors.md` payload | `MATCH_ALLOCATION_FAILED`, `MATCH_SERVER_UNREACHABLE` |
+| `chat.message` | `{ id, accountId, displayName, text, ts }` | Already policy-filtered |
+| `chat.removed` | `{ id, reason }` | Moderation retraction |
+| `ping.placed` | `{ accountId, kind, target? }` | Canned callouts |
+| `state.snapshot` | full state | Only in reply to `state.resync` |
+| `error` | `errors.md` payload | Non-fatal; fatal errors close the socket |
+| `heartbeat` | `{ serverTime }` | Every `heartbeatMs` |
+
+## 5. Client → server
+
+| `t` | Payload | Rate limit |
+|---|---|---|
+| `team.request` | `{ team: "alpha"\|"bravo"\|"auto" }` | 6/min |
+| `ready.set` | `{ ready: bool }` | 20/min |
+| `loadout.set` | `{ primaryIdx, secondaryIdx }` | 20/min |
+| `launch.request` | `{ }` | 6/min, owner only |
+| `chat.send` | `{ text }` | 10/30 s, 200 chars |
+| `ping.send` | `{ kind, target? }` | 12/min |
+| `state.resync` | `{ lastSeq }` | 3/min |
+| `heartbeat.ack` | `{ }` | — |
+| `leave` | `{ }` | — |
+
+**Every one of these is a request.** The server's answering event is the truth. `ready.set`
+does not make the player ready; the `ready.changed` that follows does. Codex may render
+optimistically, but must reconcile to — and visibly revert on — the server's answer.
+
+Exceeding a limit returns `error` with `CHAT_RATE_LIMITED` or `RATE_LIMITED`; it does not
+close the socket. Sustained abuse does.
+
+## 6. The launch handshake
+
+This is the sequence that turns a lobby into a match, and the roadmap's G1 gate runs straight
+through it.
+
+```
+client  launch.request
+server  validates: every required player ready, teams legal, room open
+server  countdown.started        roster FROZEN — joins refused from here
+server  countdown.tick × n
+server  match.allocating
+server  match.ready { matchId, serverUrl, sessionTicket }   → to each member individually
+client  opens the match socket with sessionTicket   (wire-protocol.md)
+server  room.updated { status: "in-progress" }
+```
+
+Binding rules:
+
+1. **The roster freezes at `countdown.started`**, not at `match.ready`. Otherwise a player who
+   joins during the countdown reaches a match server that was sized without them.
+2. A player leaving during countdown → `countdown.aborted` with `player-left`, or the
+   countdown re-arms — **per an explicit configured rule, never silently**.
+3. `sessionTicket` is per-account, single-use, 60 s (`auth.md` §6). One player's ticket cannot
+   admit another.
+4. If allocation fails, everyone gets `match.failed` and the room returns to `open` with
+   readiness cleared. Players are never left staring at a countdown that already died.
+5. Members who never connect within the ticket TTL are dropped from the match roster, and the
+   match starts without them rather than hanging.
+
+## 7. Readiness invalidation
+
+Ready is cleared, with `clearedReason`, whenever:
+
+- a player joins or leaves the room (`roster-change`)
+- any player changes team (`team-change`)
+- the readying player changes loadout (`loadout-change`)
+- room mode, map, or capacity changes (`room-change`)
+
+Nobody is launched into a match whose shape changed after they consented to it. The UI must
+show *why* readiness dropped — an unexplained green light going grey reads as a bug.
+
+## 8. Reconnect
+
+The socket is expected to drop.
+
+**Corrected by REQ-CC-003.** This section previously said the client could present "the same
+ticket, or a fresh one from `GET /v1/rooms/:id`". Both were impossible: the ticket is
+single-use and consumed at §3, and that endpoint returns no ticket. The real flow:
+
+```
+socket drops
+  → POST /v1/rooms/:id/reconnect-ticket        (authenticated, seat still held)
+      200 → { lobbyTicket, expiresAt, graceEndsAt }
+      409 → RECONNECT_GRACE_EXPIRED  → seat gone, re-join normally
+  → open the socket with the NEW ticket
+  → state.resync { lastSeq }
+  ← state.snapshot   (full state, §3 shape)
+```
+
+| Rule | Value |
+|---|---|
+| Grace window | `graceMs` from the welcome (90 s, `bomb-rules.md` §2) |
+| Attempts | Max 5, exponential backoff from 1 s with jitter, cap 15 s |
+| Ticket | Fresh and single-use every attempt. **Never cache or replay a consumed one** |
+| Seat | Held for the whole window; `connection: "reconnecting"` is broadcast to the roster |
+| Heartbeat | 15 s; two missed heartbeats start the grace window |
+| On expiry | Seat released, `RECONNECT_GRACE_EXPIRED`, roster delta removes the player |
+
+Heartbeat-driven staleness is also what **drives presence expiry**, so a crashed client stops
+showing as online within one grace period rather than forever.
+
+A `seq` gap on resync means state was missed; the client must take `state.snapshot` as
+authoritative and discard local deltas rather than merging.
+
+## 9. Chat rules
+
+- Rate-limited, length-limited, policy-filtered **server-side**. A client-side filter is a
+  display convenience and is never the enforcement point.
+- History does not cross rooms. Joining a room does not reveal what was said before.
+- `chat.removed` lets moderation retract a message that already shipped.
+- Mute is client-applied for display, **and** server-enforced for delivery — a muted player's
+  messages are not sent to the muter at all, so a modified client cannot un-mute someone.
+- Every message is retained per `telemetry.md` retention for moderation, and is linkable from
+  a report.
+- **Voice is out of scope** until P5 moderation and privacy land.
+
+## 10. Stub
+
+`lobby.stub` replays scripted timelines with no server: `happy-path`, `player-joins-mid`,
+`team-full`, `ready-cleared`, `countdown-abort`, `allocation-failed`, `disconnect-resync`,
+`sanctioned`, `chat-flood`. Codex builds every lobby state against these in P1.

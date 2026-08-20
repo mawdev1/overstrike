@@ -24,6 +24,25 @@
  * client must predict with too (see `quantiseCommand`).
  */
 
+/**
+ * Wire format version.
+ *
+ * Bumped by ANY change to the shape of the bytes in this file: a new message type, a field
+ * appended to `ENTITY_FIELDS`, a kind appended to `EV_KINDS`, a changed command layout.
+ * `scripts/lanecheck.mjs` fails a change set that edits this file without touching this
+ * constant, because a wire change that ships without a version is a client and a server
+ * quietly disagreeing about what a byte means.
+ *
+ * **Not yet negotiated.** `MSG_WELCOME` currently carries ids, the match seed and the kill
+ * limit, and the client infers what the server supports from `byteLength` — which works
+ * only while every change is a pure append. There is no version field, so a client running
+ * an older layout is not rejected; it decodes whatever it is sent and diverges silently.
+ * Closing that is a P2 deliverable (see `docs/contracts/wire-protocol.md` §7): the welcome
+ * handshake gains a version, and a mismatch must fail the connection cleanly with an
+ * upgrade message rather than be allowed to corrupt state.
+ */
+export const PROTOCOL_VERSION = 1;
+
 // ── message types ─────────────────────────────────────────────────────────────────────
 export const MSG_COMMANDS = 1;
 export const MSG_SNAPSHOT = 2;
@@ -271,6 +290,7 @@ export const EV_KINDS = [
   'hitmarker', 'kill', 'fire', 'damaged', 'death', 'respawn',
   // Appended, never reordered — the wire code IS the index.
   'explosion', 'blood', 'flash',
+  'roundEnd',
 ];
 const EV_CODE = new Map(EV_KINDS.map((k, i) => [k, i]));
 /**
