@@ -264,18 +264,27 @@ function renderEligibility({ actions }) {
 
 function renderConsent({ actions, view }) {
   const data = view.data || {};
-  const canSubmit = Number.isInteger(data.policyVersion) && Boolean(actions.getClientSessionId());
+  // `currentPolicyVersion` (the version in force), NOT `policyVersion` (the version the player
+  // decided under, which is null until they decide). Reading the decided field meant both
+  // buttons were disabled for every first-time player — the one state this screen exists for —
+  // so onboarding stopped at step 2 of 7 with nothing clickable and no error. http-api.md
+  // 1.11.0 added the key; the fallback keeps a player who has already decided able to change
+  // their mind against an older server.
+  const policyVersion = Number.isInteger(data.currentPolicyVersion)
+    ? data.currentPolicyVersion
+    : data.policyVersion;
+  const canSubmit = Number.isInteger(policyVersion) && Boolean(actions.getClientSessionId());
   return element('section', {}, [
     element('p', {}, data.summary || 'Choose whether optional personal telemetry may be collected. Declining does not block account creation.'),
-    data.policyVersion ? element('p', {}, `Policy version: ${data.policyVersion}`) : null,
+    Number.isInteger(policyVersion) ? element('p', {}, `Policy version: ${policyVersion}`) : null,
     actionsRow([
-      actionButton('Allow optional telemetry', () => actions.submit('setConsent', { telemetryPersonal: true, policyVersion: data.policyVersion, clientSessionId: actions.getClientSessionId() }, {
+      actionButton('Allow optional telemetry', () => actions.submit('setConsent', { telemetryPersonal: true, policyVersion, clientSessionId: actions.getClientSessionId() }, {
         onSuccess: (result) => {
           actions.updateDraft({ consentReceipt: result?.receipt, consentAllowed: true });
           actions.navigate('/auth/create-account');
         },
       }), { className: 'os-button os-button--primary', disabled: !canSubmit }),
-      actionButton('Decline optional telemetry', () => actions.submit('setConsent', { telemetryPersonal: false, policyVersion: data.policyVersion, clientSessionId: actions.getClientSessionId() }, {
+      actionButton('Decline optional telemetry', () => actions.submit('setConsent', { telemetryPersonal: false, policyVersion, clientSessionId: actions.getClientSessionId() }, {
         onSuccess: (result) => {
           actions.updateDraft({ consentReceipt: result?.receipt, consentAllowed: false });
           actions.navigate('/auth/create-account');
