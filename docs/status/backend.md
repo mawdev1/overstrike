@@ -116,6 +116,45 @@ Two notes the human owner should read even though the decisions were delegated:
   unblock schema and profile design and no further. To keep it cheap to revise, no feature
   outside P8/P11 may read the eligibility flag.
 
+### Codex review amendments — COMPLETE
+
+Codex returned **10 of 13 contracts insufficient** with five cross-contract contradictions.
+All nine requests (`REQ-CC-001`…`009`) are resolved and marked `DONE` with responses; every
+amended contract is at **1.1.0**. Detail in `docs/contracts/CHANGELOG.md`.
+
+Three of the five were real defects, not misreadings:
+
+1. **Refresh transport contradicted itself** — `auth.md` said httpOnly cookie, `http-api.md`
+   said body. The cookie is correct and the body reference was an error; a refresh credential
+   the page can put in a request body is one XSS can steal, which defeats the two-token design.
+2. **The lobby reconnect flow was impossible** — the ticket is consumed on socket open, yet the
+   contract told the client to reuse it or fetch one from an endpoint that returns none.
+3. **The map budgets were 4× over the binding ceiling** — I wrote 900 draw calls / 1.4M
+   triangles without opening `ARCHITECTURE.md` §11, which binds `< 220` / `< 450k`. Authoring
+   to those numbers would have produced a map that only failed at `geomtest`.
+
+The other two — `AUTH_SESSION_REPLACED` missing from a "closed" enum, and two Bomb states
+needing one remaining flag bit — were also correct.
+
+### Map envelope — disagreement resolved at 88 m
+
+Codex's art direction called for 88–104 m; my first pass was 80 m ±10% (72–88 m). **The bands
+touch at exactly one value.** 88 m is not a split difference — it is the only figure neither
+spec has to be relaxed to accept. Reasoning in `P0-decisions.md` §D3.1.
+
+Knock-on: worst-case rotation 20 s → 22 s, so the bomb timer's floor rises to 29 s and 40 s now
+carries 11 s of margin rather than 13 s. The timer holds, but `REQ-CX-002`'s measurement is now
+load-bearing rather than confirmatory. Codex's full 104 m would have broken 40 s outright.
+
+### Deployment state
+
+Committed in two lane-clean commits — `b59a982` (fe) and `a148a09` (be) — each passing
+`lanecheck` on its own file set. Nothing of the pre-existing uncommitted working tree was swept
+in; 28 modified files from prior sessions remain untouched.
+
+**Not pushed.** `origin/master` is 62 commits behind local, so publishing P0 would also publish
+the entire multiplayer phase history. That is well outside P0's scope and is a human decision.
+
 ### Still blocked — the other lane
 
 `REQ-CX-001`, the Codex contract sufficiency sign-off, is the only remaining G0A blocker.
