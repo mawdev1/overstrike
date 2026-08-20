@@ -1,0 +1,82 @@
+# OVERSTRIKE CI.
+#
+# Two things this workflow exists to make non-skippable, because both were claimed before they
+# were true:
+#
+#   1. The platform suite runs against a REAL PostgreSQL. `storetest` skips its Postgres half
+#      when DATABASE_URL is absent, so a memory-only run reports green while five separate
+#      defects hid in that gap — an audit table that was not append-only as deployed, SQL
+#      injection through object keys, `pg` writing an array column as garbage, a false CAS
+#      success, and silent-vs-throwing divergences. CI sets CI=1, under which pgtest FAILS
+#      rather than skips when no database is reachable.
+#
+#   2. The lane guard classifies the actual commit range. Locally it can check the index; in CI
+#      the index is empty, so it has to be told the range or it passes by seeing nothing.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  platform:
+    name: platform (real postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: overstrike-test
+        ports: ['5432:5432']
+        # Without this the job races the database: `docker run` returns before Postgres
+        # accepts connections, and a connection refused looks exactly like a broken adapter.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CI: '1'
+      DATABASE_URL: postgres://postgres:overstrike-test@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci --ignore-scripts || npm install --ignore-scripts
+      - name: static check
+        run: npm run check
+      - name: platform suite (memory)
+        run: npm run platformtest
+      - name: platform suite (real postgres) + migration replay
+        run: node scripts/pgtest.mjs --no-docker
+
+  lanes:
+    name: lane ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # The guard compares against the base, so it needs history rather than a shallow clone.
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: cross-lane guard over the real range
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=$(git rev-parse HEAD~1)
+          fi
+          FILES=$(git diff --name-only "$BASE" HEAD | paste -sd, -)
+          if [ -z "$FILES" ]; then echo "no files changed"; exit 0; fi
+          node scripts/lanecheck.mjs --files="$FILES"
+
+  game:
+    name: game simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci --ignore-scripts || npm install --ignore-scripts
+      - name: simulation and map harnesses
+        run: npm run simtest && npm run maptest && npm run nettest

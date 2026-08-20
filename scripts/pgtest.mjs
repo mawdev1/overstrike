@@ -63,7 +63,16 @@ let databaseUrl = process.env.DATABASE_URL || null;
 
 if (!flag('no-docker')) {
   if (!dockerAvailable()) {
+    // Locally, a missing Docker is an environment fact and skipping is honest. In CI it is a
+    // silently memory-only run wearing a green tick — which is the exact failure this harness
+    // exists to end. CI must set CI=1 (or --require-db) so absence of a database FAILS.
+    const mustHaveDb = flag('require-db') || process.env.CI === '1' || process.env.CI === 'true';
     console.log('pgtest: docker is not available.');
+    if (mustHaveDb) {
+      console.error('pgtest: CI requires a real database. A memory-only run is not a pass.');
+      console.error('pgtest: provide DATABASE_URL and pass --no-docker, or make docker available.');
+      process.exit(1);
+    }
     console.log('pgtest: this is a SKIP, and a skip is not a pass — the Postgres adapter was not exercised.');
     process.exit(0);
   }
