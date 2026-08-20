@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -108,9 +108,15 @@ is to never store the most sensitive field at all. `details.category` never echo
 the computed age.
 
 Signup therefore takes `{ email, password, displayName, eligibilityReceipt, clientSessionId,
-consentReceipt }` — **no `dateOfBirth`**. The last two migrate the signed-out consent decision
-onto the new account (§3a.3); signup returns a fresh account-scoped `consentReceipt` which
-replaces the session-scoped one on subsequent telemetry batches.
+consentReceipt }` — **no `dateOfBirth`**. `clientSessionId` and `consentReceipt` are **required, not optional** (REQ-CC-034): the
+approved order always reaches a consent decision before signup, so a signup without them is a
+client that skipped a step. They migrate the signed-out decision onto the new account, and
+signup returns a fresh account-scoped `consentReceipt` that replaces the session-scoped one on
+subsequent telemetry batches.
+
+The only exception is an account created before this policy version existed; such accounts
+carry `consent: null` (undecided) and are prompted on next sign-in. There is no exception for
+new signups.
 
 Signup errors include **`ELIGIBILITY_RECEIPT_INVALID`** — expired, forged, or issued against a
 different policy version.
@@ -160,11 +166,9 @@ Auth-optional because the funnel starts before an account exists. Signed out, th
 keyed to `clientSessionId`; at signup the decision migrates to the account and a new
 account-scoped receipt is issued.
 
-**Consent is captured at the landing step, before signup (REQ-CC-022, REQ-CC-026).** Two
-problems forced this. Signup returns a profile whose `privacy.consent` had to be non-null
-before any consent endpoint had been called; and dropping personal events until after signup
-made the first four funnel steps — landing, eligibility, signup, verification — permanently
-unmeasurable, while §3.1 promised to measure exactly those. Asking at landing fixes both.
+**Consent is captured after eligibility and before signup**, per the approved order above.
+An earlier draft placed it at landing; that is superseded, because it would have asked for
+consent before establishing that the visitor can give it (REQ-CC-034).
 
 `consent: null` in a profile means **undecided** — an account predating this policy version has
 no decision recorded and is treated as no consent. The profile field is explicitly
@@ -200,17 +204,6 @@ against a later "yes" would mean collecting first and asking afterwards. `intern
 events flow throughout (`telemetry.md` §3.4) — declining analytics is not a reason to stop
 being able to diagnose a crash.
 
-The consent record lives in `accounts.privacy` (`db-schema.md` §2), which this contract now
-schematises:
-
-```jsonc
-"privacy": {
-  "presenceVisibility": "everyone|friends|nobody",
-  "statsVisibility": "everyone|nobody",
-  "consent": { "telemetryPersonal": bool, "policyVersion": int, "decidedAt": "…" }
-}
-```
-
 ### 3a.4 Two conventions this fixes
 
 - **`VALIDATION_FAILED` is always HTTP 400.** §11.2 returned 428 for a missing `If-Match`; that
@@ -238,8 +231,10 @@ schematises:
 {
   "accountId": "01J…", "displayName": "…", "createdAt": "…",
   "privacy": { "presenceVisibility": "everyone|friends|nobody",
-               "statsVisibility": "everyone|nobody",
-               "consent": { "telemetryPersonal": true, "policyVersion": 1, "decidedAt": "…" } },
+               "statsVisibility": "everyone|nobody" },
+  // Object-or-null, never absent. null = undecided (§3a.3). Projected from the typed
+  // columns in db-schema.md §2, which are the source of truth — not from `privacy`.
+  "consent": { "telemetryPersonal": true, "policyVersion": 1, "decidedAt": "…" } | null,
   "moderation": { "status": "clear|restricted|banned", "activeSanctions": [] },
   "flags": { "nameChangeAvailableAt": "…" },
   "correlationId": "…"
@@ -298,8 +293,10 @@ membership, so it cannot be used to jump a queue or re-enter a room the player h
 { "items": [ /* RoomCore */ ], "nextCursor": "…"|null, "correlationId": "…" }
 ```
 
-Query: `?region=&mode=&hasSpace=&limit=&cursor=&rttSource=`. `hasSpace` is a boolean;
+Query: `?region=&mode=&hasSpace=&limit=&cursor=`. `hasSpace` is a boolean;
 `region` and `mode` are closed enums; unknown parameters are rejected rather than ignored.
+`rttSource` briefly appeared in this list with no type or meaning and is removed —
+`X-Region-Rtt` (§11.6) is the only RTT input (REQ-CC-033).
 
 A bare `RoomCore[]` was declared here for one round, which contradicted §1 (every response
 carries `correlationId`), §10 (lists are `{ items, nextCursor }`), and the `browser-empty`
@@ -408,8 +405,13 @@ the edge **and** in the service — the edge can be bypassed.
 
 ## 10. Pagination
 
-Cursor-based. `?limit=` (default 25, max 100) and `?cursor=`. Response:
-`{ "items": [...], "nextCursor": "…"|null }`. No offset pagination anywhere — it double-counts
+Cursor-based. `?limit=` (default 25, max 100) and `?cursor=`. Response, **including
+`correlationId` like every other response** (§1):
+
+```json
+{ "items": [ … ], "nextCursor": "…"|null, "correlationId": "…" }
+```
+ No offset pagination anywhere — it double-counts
 and skips rows under concurrent insert, which for a match history is a support ticket.
 
 ## 11. Exact schemas
@@ -527,9 +529,10 @@ Two responses embed those components:
 | `RoomDetailResponse` | `{ ...RoomCore, roster: RosterMember[], countdown: CountdownState\|null, correlationId }` | `GET /v1/rooms/:id`, `POST /rooms/:id/{team,ready,loadout}` |
 | `RoomRealtimeState` | `{ room: RoomCore, roster: RosterMember[], countdown: CountdownState\|null, you: {…} }` inside the socket envelope | `lobby.welcome.d`, `state.snapshot.d` |
 
-`GET /v1/rooms` returns `RoomCore[]` only — no roster. A browser listing forty rooms does not
-need four hundred roster entries, and sending them makes the list slow at exactly the moment
-it should feel instant.
+`GET /v1/rooms` carries `RoomCore` items and **no roster** — a browser listing forty rooms does
+not need four hundred roster entries, and sending them makes the list slow at exactly the
+moment it should feel instant. **Its response envelope is defined once, in §6**; this section
+defines the components only, and deliberately does not restate the wrapper (REQ-CC-033).
 
 **`room.updated` is `Partial<RoomCore>`** restricted to exactly this closed set — the
 **mutable** keys, and no others:
@@ -641,7 +644,8 @@ left to inference.
 ```jsonc
 // POST /v1/auth/signup
 //   { "email", "password", "displayName", "eligibilityReceipt",
-//     "clientSessionId"?, "consentReceipt"? }     ← migrate the signed-out decision
+//     "clientSessionId", "consentReceipt" }   ← REQUIRED: the approved order always
+//                                                decides consent before signup
 //   dateOfBirth is NOT sent here — see §3a.1; it never leaves the preflight
 // POST /v1/auth/signin   { "email", "password" }
 201/200 → { "accessToken", "expiresAt", "session": { "sessionId", "deviceLabel", "createdAt" },
@@ -698,8 +702,7 @@ left to inference.
   category ∈ cheating | harassment | offensive-name | griefing | other
   errors: REPORT_DUPLICATE · RATE_LIMITED · VALIDATION_FAILED
 
-// GET /v1/health        → 200 { "ok": true }              (no dependency detail, ever)
-// GET /v1/health/ready  → 200 { "ok", "dependencies": { "db": "up|down", … } }   [S]
+// GET /v1/health, /v1/health/ready → defined once in §7.1; not restated here
 
 // POST /v1/matches/:matchId/result   [S]  Idempotency-Key: match-result:<matchId>
   body: the full match-result.md §4 record
@@ -776,7 +779,7 @@ with an empty state nobody ever saw. Deterministic named scenarios, selected by 
 |---|---|
 | `default` | Signed-in account, 3 rooms across 2 regions, 20 matches of history |
 | `first-run` | No account; signup/signin succeed; empty history |
-| `browser-empty` | `GET /v1/rooms` → `{ items: [], nextCursor: null }` |
+| `browser-empty` | `GET /v1/rooms` → `{ items: [], nextCursor: null, correlationId }` — the canonical §6 envelope, not a bare array |
 | `browser-unreachable` | `SERVICE_UNAVAILABLE` on room endpoints only; auth still works |
 | `room-full` | Join returns `ROOM_FULL` |
 | `room-in-progress` | Join returns `ROOM_IN_PROGRESS` |

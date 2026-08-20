@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -74,7 +74,9 @@ cannot both be the source. It now carries only `spectatorPolicyVersion`, and eve
 producer, no overlap.
 
 **`matchState.matchId` comes from here**, and is required — without it the facade cannot even
-form the reconnect URL, which is the endpoint that keeps a dropped player in the match.
+form the reconnect URL, which is the endpoint that keeps a dropped player in the match. It is
+a field of the §5.1 schema, not prose about one: the source table cannot add a key the shape
+does not have (REQ-CC-035).
 
 **Reload safety.** The descriptor is what a reconnect must restore, so
 `POST /v1/matches/:matchId/reconnect-ticket` returns the identical `MatchHandoff` alongside
@@ -135,6 +137,10 @@ frames; entity objects are pooled and their contents change under you.
 ```js
 {
   version: 1,
+  matchId: string,            // REQUIRED. From MatchHandoff on first connect, and from the
+                              // reconnect-ticket handoff after active-match discovery.
+                              // Stable for the facade's lifetime; identical to the id in
+                              // MSG_OUTCOME (wire §8.9) and in the result record.
   serverNow: number,          // ms, server clock — offset local time against THIS
   sampledAt: number,          // ms, local receipt; (serverNow - sampledAt) is the offset
   mode: 'tdm' | 'bomb',
@@ -163,6 +169,8 @@ frames; entity objects are pooled and their contents change under you.
     carrierId: number|null,     // null when unknown to you — see §5.1.1
     siteId: 'A'|'B'|null,
     position: { x, y, z } | null,   // null iff bombPositionVisible == 0 (wire §8.6).
+                                    // ALWAYS null while state is 'carried' — a carried bomb's
+                                    // location is the carrier's; use carrierId.
                                     // Never inferred from zero coordinates
   } | null,
 
@@ -269,7 +277,7 @@ client cannot have, and REQ-CC-012 correctly caught three of them.
 | `versionMismatch` | `{ clientVersion, serverVersion }` | `MSG_REJECT` (§8.3) |
 | `interactionRefused` | `{ kind, reason }` | **`interactRefused` event (§8.7 kind 20)** — its own kind, because a refusal is not a cancellation |
 | `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
-| `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` only when the match had **no** winner — an aborted forfeit/abandon carries a real winner (`match-result.md` §4.0). `null` and `'draw'` are different facts |
+| `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, outcomeReason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` — **`outcomeReason`**, the same name and enum as the result record; `reason` is round-level only | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` only when the match had **no** winner — an aborted forfeit/abandon carries a real winner (`match-result.md` §4.0). `null` and `'draw'` are different facts |
 | `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
 
 **`interactionRefused` maps from `interactRefused` (kind 20) and from nothing else.** An

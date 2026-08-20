@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -77,6 +77,7 @@ binding additions:
 ```jsonc
 {
   "matchId": "01J…",              // assigned at ALLOCATION, not completion
+  "status": "completed|aborted|invalidated",   // REQUIRED discriminant of the §4.2 union
   "rulesetVersion": "bomb-1.0.0",
   // Immutable copy of the ruleset, discriminated by mode (REQ-CC-019, REQ-CC-025)
   "rulesSnapshot": {
@@ -139,8 +140,10 @@ The previous placeholder comment was not buildable. Exact, every key required:
 } ]
 ```
 
-`winnerTeam` is `draw` when regulation ends 6-6 (`bomb-rules.md` §2.1a — no overtime in Alpha),
-and `null` **only when the match had no winner at all** — a no-contest or an invalidation. An
+`status` is required on every variant and is what a client branches on; `terminationReason`
+and `outcomeReason` then describe how and why. `winnerTeam` is `draw` when regulation ends 6-6
+(`bomb-rules.md` §2.1a — no overtime in Alpha), and `null` **only when the match had no winner
+at all** — a no-contest or an invalidation. An
 aborted match ended by forfeit or abandon carries a real winner; see the §4.0 matrix, which
 this sentence used to contradict. Per-player win/loss is derived from
 `winnerTeam` and the player's team; it is not stored per player, because storing it twice
@@ -166,9 +169,14 @@ as "your match vanished" and invites a client to try to supply its own stats.
   "endedAt": null,          // null while LIVE; the real timestamp once ended and queued
   "retryAfterMs": 2000, "correlationId": "…" }
 
-// invalidated
+// invalidated — the FULL record, not a short form. Same field set as completed/aborted.
 { "matchId": "…", "status": "invalidated",
-  "invalidationReason": "…", "correlationId": "…" }
+  "terminationReason": "invalidated",
+  "outcomeReason": "no-contest",
+  "winnerTeam": null,
+  "invalidationReason": "…",
+  /* …every other field of the §4 record; stats are recorded but NOT aggregated… */
+  "correlationId": "…" }
 
 // aborted — a full, durable record. May carry a winner (forfeit/abandon) or not (no-contest)
 { "matchId": "…", "status": "aborted",
@@ -188,7 +196,7 @@ the discriminant of the union:
 | `pending` | The short form above. No `players`, no `rounds` |
 | `completed` | The full §4 record. `winnerTeam` is `alpha`, `bravo`, or `draw` |
 | `aborted` | The full §4 record. `winnerTeam` may be a team **or** `null` |
-| `invalidated` | The full §4 record plus `invalidationReason`. `winnerTeam` is `null` |
+| `invalidated` | The full §4 record plus `invalidationReason`. `winnerTeam` is `null`, `outcomeReason` is `no-contest` |
 
 `completed`, `aborted`, and `invalidated` share the same field set; only the values differ. A
 client renders one shape and branches on `status`.

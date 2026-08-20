@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
 
@@ -211,7 +211,7 @@ stated here as the implementation rule:
 | Disconnect mid-plant/defuse | Progress resets to zero |
 | Team drops below 1 living | Round ends by elimination |
 | Team drops to zero connected | Match ends, `terminationReason: aborted`; the remaining team wins |
-| Both teams drop to zero | Match `invalidated`; stats recorded but not aggregated |
+| Both teams drop to zero | Match **`aborted`** with `outcomeReason: no-contest` and `winnerTeam: null`; stats recorded but not aggregated. **Not `invalidated`** — invalidation is a review decision, not an outcome the server reaches on its own (`match-result.md` §4.0) |
 
 ## 10. Scoring
 

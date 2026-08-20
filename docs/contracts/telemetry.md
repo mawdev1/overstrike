@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -45,7 +45,8 @@ its own.
 
 | Event | Measures |
 |---|---|
-| `flow.step` | Each first-run step, with its outcome — the spine of the funnel |
+| `flow.step` | Each first-run step from `consent` onward, with its outcome — the spine of the funnel |
+| `funnel.preconsent` | Landing and eligibility, as **unlinked internal counts**. The only lawful measurement of the two steps that precede consent |
 | `session.first_match` | Time to first match and whether it completed |
 | `lobby.abandoned` | Left before launch, with the last state reached |
 | `connection.failure` | Failed connect, by stage and `errors.md` code |
@@ -99,7 +100,7 @@ Metrics were named but had no way to leave the browser. The endpoint:
 POST /v1/telemetry/client        auth OPTIONAL
 Content-Type: application/json
 
-{ "clientSessionId": "01J…",     // client-generated ULID, non-authoritative
+{ "clientSessionId": "01J…",     // OMITTED on internal-only pre-consent batches (§3.5)
   "consentReceipt": "…",         // from http-api.md §3a.3; REQUIRED for personal-class events
   "schemaVersion": 1,
   "events": [ {
@@ -151,7 +152,8 @@ Every payload below is closed: unlisted keys are dropped server-side, not stored
 
 | `name` | v | Class | Payload |
 |---|---:|---|---|
-| `flow.step` | 1 | personal | `{ step, outcome }` — step `landing`\|`signup`\|`signin`\|`eligibility`\|`verify`\|`terms`\|`consent`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results`; outcome `viewed`\|`completed`\|`failed`; `errorCode` required when `failed`, else null |
+| `flow.step` | 1 | personal | `{ step, outcome }` — step `consent`\|`signup`\|`signin`\|`verify`\|`terms`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results`; outcome `viewed`\|`completed`\|`failed`; `errorCode` required when `failed`, else null. **`landing` and `eligibility` are absent** — they precede the consent decision and can never be lawfully emitted here (REQ-CC-034) |
+| `funnel.preconsent` | 1 | internal | `{ step, outcome }` — step `landing`\|`eligibility`; outcome `viewed`\|`completed`\|`failed`. **Unlinked**: no `clientSessionId`, no account, no correlation to any later event. Carries the top-of-funnel counts §3.1 promises |
 | `session.first_match` | 1 | personal | `{ completed: bool, mode, timeToFirstMatchSec: 0–86400 }` |
 | `lobby.abandoned` | 1 | personal | `{ lastState, dwellSec: 0–86400 }` — lastState `browsing`\|`joining`\|`in-lobby`\|`countdown` |
 | `room.join_failure` | 1 | personal | `{ code, joinBlockedReason }` — both closed enums from `errors.md` / `http-api.md` §11.3; `joinBlockedReason` null when the failure was not a block |
@@ -221,7 +223,10 @@ diagnose a crash is not a privacy win for anyone. They produce no `personal` eve
 - No raw chat text, display names of *other* players, IP addresses, or precise geolocation.
 - Error messages are classified to a known set before sending; raw strings can contain
   player-authored content.
-- Every batch carries the correlation ID and `clientSessionId`, and nothing else identifying.
+- Every batch carries the correlation ID. **`clientSessionId` is present only when the batch
+  contains at least one personal-class event** and a consent decision exists; an internal-only
+  pre-consent batch omits it entirely, which is what makes those counts genuinely unlinked
+  rather than merely unlabelled (REQ-CC-034). Nothing else identifying is ever carried.
   **The client never sends `accountId`** — it is derived server-side from the bearer token
   (§3.3), which is both why pre-auth funnel events work and why attribution cannot be forged.
 

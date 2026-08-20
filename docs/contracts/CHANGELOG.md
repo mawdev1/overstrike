@@ -32,6 +32,43 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — Sixth cross-reference review, `REQ-CC-033`…`038` (additive)
+
+Six resolved; contracts to **1.6.0**. The settings/capability chain passed this round — the
+first chain to close completely.
+
+### The one that mattered most
+
+**`REQ-CC-038` — an off-by-one at the decoder's untrusted-input boundary.** Event wire codes
+are zero-based indices into `EV_KINDS`, so the first invalid code is exactly `EV_KINDS.length`.
+The guard said `>`, which let precisely that value through into `EV_KINDS[code]` and yielded
+`undefined`. Now `>=`, with both boundary vectors required in decoder tests.
+
+Every other bounds check in this contract is deliberate — `MAX_COMMANDS_PER_BATCH` before
+allocation, finiteness on every wire float. A single `>` where `>=` belonged, at the one place
+that parses hostile bytes, is exactly the defect that survives review by looking reasonable.
+
+### Two more that were real
+
+- **The Bomb presence bit contradicted itself.** It was set for attackers in *every* state,
+  while the coordinates were only meaningful for `dropped`/`planted` — so a `carried` bomb sent
+  `visible = 1` with zeroes, and the mapping exposed a real position at the world origin. The
+  bit now means "meaningful **and** authorised", state checked first. A carried bomb's location
+  is the carrier's.
+- **`matchState.matchId` was prose, not a field.** The source table claimed the handoff
+  populated it; the schema had no such key. A source table cannot add a field a shape lacks.
+
+### The rest were stale projections, again
+
+Room list, health bodies, pagination, and the superseded onboarding blocks all still carried
+the shapes their replacements had already superseded. Same failure mode as rounds four and
+five: the amendment lands, the old projection stays.
+
+**What changed in my process this round:** I ran a cross-file consistency sweep *before*
+submitting rather than after, and it caught two of my own residuals — the facade's missing
+carried→null rule and the KPI table's missing `funnel.preconsent` row. That is the first time
+the sweep found my own defects instead of the review finding them.
+
 ## 2026-08-20 — Fifth cross-reference review, `REQ-CC-027`…`032` (additive)
 
 Six residual groups, all resolved. Affected contracts go to **1.5.0**. `REQ-CX-005` landed in

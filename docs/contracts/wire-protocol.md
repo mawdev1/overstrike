@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -313,13 +313,30 @@ the canonical site example in `map-data.md` uses an origin centre — so a decod
 a hidden bomb from one sitting at the origin. `bombState` cannot stand in either, because every
 recipient still learns `dropped`/`planted`; only the *coordinates* are filtered.
 
-Coordinates are read **only** when the flag is 1, and map to `bomb.position: null` in the
-facade when it is 0. One byte, no in-band sentinel, no valid position excluded.
+The flag means **"position is meaningful *and* authorised"** — both conditions, not just the
+second (REQ-CC-036). Encoder invariant, in order:
 
-**Visibility filtering (REQ-CC-024).** The flag is set per recipient by the same rule as
-`bombCarrierId` (§8.8): attackers always; defenders only when the bomb is **planted** (its
-position is then public — they must find it to defuse) or when a dropped bomb is in their line
-of sight. Sending true coordinates to everyone
+```
+1. bombState is 'dropped' or 'planted' ?   no  → visible = 0   (nothing meaningful to send)
+2. recipient authorised for it ?           no  → visible = 0
+3. otherwise                                   → visible = 1, coordinates follow
+```
+
+**Step 1 is what was missing.** The rule previously said attackers *always* receive
+`visible = 1`, while the coordinates were only meaningful for `dropped`/`planted` — so during
+`carried` an attacker got `visible = 1` with zero coordinates, and the mapping below then
+exposed that as a real position at the world origin. The bit has to be false whenever the
+position is not a thing that exists.
+
+A carried bomb's location is the **carrier's** location: the carrier is a visible entity in
+the snapshot, and `bomb.carrierId` names them. `bomb.position` stays `null` in that state.
+
+Coordinates are read **only** when the flag is 1, and map to `bomb.position: null` when it is
+0. One byte, no in-band sentinel, no valid position excluded.
+
+**Authorisation (step 2, REQ-CC-024)** follows the same rule as `bombCarrierId` (§8.8):
+attackers always; defenders only when the bomb is **planted** (its position is then public —
+they must find it to defuse) or when a dropped bomb is in their line of sight. Sending true coordinates to everyone
 and hiding them in the UI would be a wallhack shipped in the protocol.
 
 **Bomb position is state, not an event (REQ-CC-018).** `bombDropped` (§8.7) fires once; a
@@ -418,6 +435,10 @@ The two bold rows were missing. **An aborted match can have a winner** — a for
 common abnormal ending and the winning team earns the win. `winner: 0` means no winner;
 `winner: 3` means draw; they are different facts.
 
+An earlier sentence here stated the opposite — that `forfeit`/`abandon` pair with a decided
+winner *and* that every aborted match has none — sitting immediately above the rows that permit
+it. It is deleted; this table is the only statement of the rule in this contract.
+
 `matchId` travels as 16 raw bytes rather than its 26-character text form — a ULID is a 128-bit
 value, and sending it as text would cost 10 extra bytes on a message that already carries
 everything the results screen needs.
@@ -467,7 +488,16 @@ lasting 49.7 days is not the case this handles — a *server* running that long 
 | Known type, wrong length | Connection closed. A truncated frame means a desynced stream |
 | `interact` kind `3` | Treated as `0`. Reserved values are never rendered |
 | Enum out of range | Clamped to `0` (none), and counted as an anti-cheat signal |
-| Event kind > `EV_KINDS.length` | Skipped, and the rest of the event block is abandoned — variable-size events make resynchronisation impossible |
+| Event kind **`>= EV_KINDS.length`** | Skipped, and the rest of the event block is abandoned — variable-size events make resynchronisation impossible |
+
+**The comparison is `>=`, not `>` (REQ-CC-038).** Wire codes are zero-based indices into
+`EV_KINDS`, so the first invalid code *is* `EV_KINDS.length`. Writing `>` let exactly that
+value through the guard and into `EV_KINDS[code]`, which yields `undefined` — at the decoder's
+untrusted-input boundary, where every other check in this contract is deliberate about
+bounds. Off-by-one at a trust boundary is the one place it is never cosmetic.
+
+Decoder tests must include both boundary vectors: the **last valid** appended kind
+(`interactRefused`, currently 20) and the **first invalid** (`EV_KINDS.length`, currently 21).
 
 ## 9. Change rules
 
