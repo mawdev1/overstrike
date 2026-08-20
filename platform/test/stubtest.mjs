@@ -33,10 +33,14 @@ import {
   ROAM_WRITE, DEVICE_WRITE,
 } from '../src/modules/stubs/coverage.js';
 import { createLobbyStub, LOBBY_SCENARIO_NAMES } from '../src/modules/stubs/lobby.js';
+import {
+  createNetFacadeStub, NET_FACADE_SCENARIO_NAMES, NET_FACADE_EXTRA,
+} from '../src/modules/stubs/netfacade.js';
 import * as fx from '../src/modules/stubs/fixtures.js';
 import { VOCABULARY } from '../src/modules/profile/vocabulary.generated.js';
 import { defaultRoamingValues } from '../src/modules/profile/settings.js';
 import { CODES } from '../src/core/errors.js';
+import { isUlid } from '../src/core/ids.js';
 import { loadConfig } from '../src/core/config.js';
 import { buildApp } from '../src/app.js';
 
@@ -70,6 +74,7 @@ const ticked = (cell) => [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
 
 const httpApi = md('docs/contracts/http-api.md');
 const lobbyMd = md('docs/contracts/realtime-lobby.md');
+const facadeMd = md('docs/contracts/net-facade.md');
 const shellIa = md('docs/design/shell-ia.md');
 
 /** §11.10 — every scenario name, including the three sharing one row. */
@@ -78,12 +83,25 @@ for (const cells of tableRows(section(httpApi, '### 11.10', '### 11.11'))) {
   for (const name of ticked(cells[0])) contractScenarios.push(name);
 }
 
-/** §11.11 — route label → owning scenario names. */
+/** §11.11 — route label → owning scenario names. Stops at the §11.11.1 matrix below it. */
 const contractCoverage = {};
-for (const cells of tableRows(section(httpApi, '### 11.11', '## 12. Stub mode'))) {
+for (const cells of tableRows(section(httpApi, '### 11.11', '#### 11.11.1'))) {
   const label = cells[0].replace(/`/g, '').trim();
   const owners = ticked(cells[1]);
   if (owners.length) contractCoverage[label] = owners;
+}
+
+/**
+ * §11.11.1 — the route × variant matrix, the row-with-no-owner build failure (REQ-CC-045).
+ *
+ * Parsed rather than restated: the contract is the source, so a route added to `shell-ia.md` and
+ * absorbed here fails this suite until a scenario owns each of its five states.
+ */
+const contractMatrix = {};
+for (const cells of tableRows(section(httpApi, '#### 11.11.1', '\n## 12. Stub mode'))) {
+  const route = cells[0].replace(/`/g, '').trim();
+  if (!route.startsWith('/')) continue;                 // the header row
+  contractMatrix[route] = cells.slice(1, 6).map((c) => c.replace(/`/g, '').trim());
 }
 
 /** realtime-lobby.md §10 — the lobby timelines. */
@@ -126,6 +144,37 @@ function shellRoutes() {
 }
 const contractRoutes = shellRoutes();
 
+/**
+ * net-facade.md §8 — the timelines the facade stub owes.
+ *
+ * §8 used to be one prose sentence naming eight generic scenarios, and this parser read the
+ * backticked list after "Scenarios:". It is now a table, and the names are the first column.
+ *
+ * The history matters more than the parse. Answering REQ-CC-041 the backend claimed §8 had
+ * gained the Bomb-position and outcome-matrix rows without making that edit, then answering
+ * REQ-CC-045 cited the claim back at the reviewer to dismiss an accurate finding. The rows
+ * existed in the stub layer and in two responses, and nowhere in the contract.
+ *
+ * So the assertion below does not merely count. It names the rows that were falsely claimed,
+ * because a count of 20 is satisfied by any 20 strings, and the specific failure to guard
+ * against is these exact names going missing while the number stays plausible.
+ */
+const contractFacade = section(facadeMd, '## 8. Stub', '\n## ')
+  .split('\n')
+  .map((l) => /^\|\s*`([a-z0-9-]+)`\s*\|/.exec(l))
+  .filter(Boolean)
+  .map((m) => m[1]);
+
+/** Every `match-result.md` §4.0 outcome and every Bomb position state, named not counted. */
+const FACADE_REQUIRED = [
+  'bomb-carried', 'bomb-dropped-visible', 'bomb-dropped-hidden', 'bomb-planted',
+  'outcome-completed-elimination', 'outcome-completed-defuse',
+  'outcome-completed-detonation', 'outcome-completed-timer-draw',
+  'outcome-aborted-forfeit', 'outcome-aborted-abandon',
+  'outcome-aborted-nocontest', 'outcome-invalidated',
+  'spectator-policy-phases',
+];
+
 console.log('\n--- contract parse ---');
 check(contractScenarios.length >= 30, 'http-api.md §11.10 parsed',
   `found ${contractScenarios.length} scenario names`);
@@ -133,6 +182,15 @@ check(Object.keys(contractCoverage).length >= 12, 'http-api.md §11.11 parsed',
   `found ${Object.keys(contractCoverage).length} coverage rows`);
 check(contractLobby.length >= 14, 'realtime-lobby.md §10 parsed',
   `found ${contractLobby.length} lobby scenarios`);
+check(Object.keys(contractMatrix).length === 27,
+  'http-api.md §11.11.1 route × variant matrix parsed',
+  `found ${Object.keys(contractMatrix).length} rows`);
+const facadeMissing = FACADE_REQUIRED.filter((s) => !contractFacade.includes(s));
+check(contractFacade.length === 21 && contractFacade.includes('bomb-round'),
+  'net-facade.md §8 scenario table parsed', `found ${contractFacade.length}: ${contractFacade.join(' ')}`);
+check(facadeMissing.length === 0,
+  'net-facade.md §8 names every outcome-matrix row and Bomb position state',
+  facadeMissing.length ? `MISSING from the contract: ${facadeMissing.join(' ')}` : `all ${FACADE_REQUIRED.length} present`);
 check(contractRoutes.length >= 24 && contractRoutes.includes('/auth/recover')
   && contractRoutes.includes('/system/:condition') && contractRoutes.includes('/room/:roomId/chat'),
 'design/shell-ia.md route hierarchy parsed',
@@ -220,6 +278,20 @@ const raw = (stub, scenario, sessionId, req, headers = {}) => stub.handle({
   headers: { 'X-Stub-Scenario': scenario, 'X-Client-Session-Id': sessionId, ...headers },
 });
 
+/**
+ * Sign in and return the token the layer ISSUED.
+ *
+ * Every check that needs a credential goes through here. Hand-writing `Bearer stub.access.x`
+ * was how the suite passed while the layer accepted forged tokens: the fixture and the forgery
+ * were the same string.
+ */
+function tokenFor(stub, scenario, sessionId, build = CLIENT_BUILD, extra = {}) {
+  const res = raw(stub, scenario, sessionId,
+    { method: 'POST', path: '/v1/auth/signin', body: { email: 'a@b.invalid', password: 'p' } },
+    { 'X-Client-Build': build, ...extra });
+  return res.body?.accessToken ?? null;
+}
+
 // ── 2. §1 build and §2 auth are enforced ────────────────────────────────────────────────────
 
 console.log('\n--- §1 build and §2 auth enforcement ---');
@@ -228,31 +300,39 @@ console.log('\n--- §1 build and §2 auth enforcement ---');
   const rooms = { method: 'GET', path: '/v1/rooms' };
   const signinReq = { method: 'POST', path: '/v1/auth/signin', body: { email: 'a@b.invalid', password: 'p' } };
 
-  const noBuild = raw(stub, 'default', 'gate-1', rooms, { Authorization: 'Bearer stub.access.x' });
+  // One account across these probes, because a token belongs to an account rather than to the
+  // client session that happened to fetch it (accounts.js). Each check still uses its own
+  // client session, which is exactly the two-tab case.
+  const acct = { 'X-Stub-Account-Id': 'gate-account' };
+  const issued = tokenFor(stub, 'default', 'gate-token', CLIENT_BUILD, acct);
+  const bearer = { Authorization: `Bearer ${issued}`, ...acct };
+
+  const noBuild = raw(stub, 'default', 'gate-1', rooms, bearer);
   check(noBuild.status === 426 && noBuild.body.error.code === 'UNSUPPORTED_CLIENT'
     && noBuild.body.error.details.reason === 'build',
   'a request with no X-Client-Build is UNSUPPORTED_CLIENT, as production refuses it',
   `${noBuild.status}/${noBuild.body?.error?.code}`);
 
   const junkBuild = raw(stub, 'default', 'gate-2', rooms,
-    { 'X-Client-Build': '2garbage', Authorization: 'Bearer stub.access.x' });
+    { 'X-Client-Build': '2garbage', ...bearer });
   check(junkBuild.status === 426,
     'a malformed build is refused, not read as a numeric prefix', `${junkBuild.status}`);
 
   // The failing control: the same request WITH the header must succeed, or the check above
   // would pass for a layer that refuses everything.
   const withBuild = raw(stub, 'default', 'gate-3', rooms,
-    { 'X-Client-Build': CLIENT_BUILD, Authorization: 'Bearer stub.access.x' });
+    { 'X-Client-Build': CLIENT_BUILD, ...bearer });
   check(withBuild.status === 200, 'control: the same request with a valid build succeeds',
     `${withBuild.status}/${withBuild.body?.error?.code}`);
 
   const floored = createStubApi({
     config: { env: 'test', minClientBuild: '2.0.0' }, flags: { [STUB_FLAG]: true }, env: {},
   });
+  const floorToken = tokenFor(floored, 'default', 'gate-floor', '2.10.0', acct);
   const below = raw(floored, 'default', 'gate-4', rooms,
-    { 'X-Client-Build': '1.9.9', Authorization: 'Bearer stub.access.x' });
+    { 'X-Client-Build': '1.9.9', Authorization: `Bearer ${floorToken}`, ...acct });
   const above = raw(floored, 'default', 'gate-5', rooms,
-    { 'X-Client-Build': '2.10.0', Authorization: 'Bearer stub.access.x' });
+    { 'X-Client-Build': '2.10.0', Authorization: `Bearer ${floorToken}`, ...acct });
   check(below.status === 426 && above.status === 200,
     'the configured floor is applied numerically (2.10.0 is above 2.0.0, 1.9.9 is below)',
     `${below.status} / ${above.status}`);
@@ -271,6 +351,34 @@ console.log('\n--- §1 build and §2 auth enforcement ---');
   check(junkToken.status === 401 && junkToken.body.error.code === 'AUTH_TOKEN_INVALID',
     'a credential this layer never issued is AUTH_TOKEN_INVALID',
     `${junkToken.status}/${junkToken.body?.error?.code}`);
+
+  // The forgery that used to work. `stub.access.` is the shape of an issued token, and the
+  // layer checked only the shape — so a token nobody minted was honoured on every A endpoint.
+  const forged = raw(stub, 'default', 'gate-forged', rooms,
+    { 'X-Client-Build': CLIENT_BUILD, Authorization: 'Bearer stub.access.deadbeef' });
+  check(forged.status === 401 && forged.body.error.code === 'AUTH_TOKEN_INVALID',
+    'a hand-crafted token wearing the right prefix is AUTH_TOKEN_INVALID, not accepted',
+    `${forged.status}/${forged.body?.error?.code}`);
+
+  // Same shape, one character longer than a real one: a prefix check cannot tell these apart
+  // and this suite must.
+  const nearMiss = raw(stub, 'default', 'gate-forged-2', rooms,
+    { 'X-Client-Build': CLIENT_BUILD, Authorization: `Bearer ${issued}0` });
+  check(nearMiss.status === 401 && nearMiss.body.error.code === 'AUTH_TOKEN_INVALID',
+    'a near-miss of an issued token is refused too', `${nearMiss.status}/${nearMiss.body?.error?.code}`);
+
+  // The failing control: the token this layer DID issue still works, or the two checks above
+  // would pass for a layer that refuses every credential.
+  const real = raw(stub, 'default', 'gate-real', rooms, { 'X-Client-Build': CLIENT_BUILD, ...bearer });
+  check(real.status === 200, 'control: the token the layer issued is accepted',
+    `${real.status}/${real.body?.error?.code}`);
+
+  // A token issued under one ACCOUNT is not a credential for another. Two tabs of one account
+  // share tokens; two accounts never do.
+  const otherAccount = raw(stub, 'default', 'gate-other', rooms,
+    { 'X-Client-Build': CLIENT_BUILD, ...bearer, 'X-Stub-Account-Id': 'someone-else' });
+  check(otherAccount.status === 401 && otherAccount.body.error.code === 'AUTH_TOKEN_INVALID',
+    "one account's token is not a credential for another", `${otherAccount.status}`);
 
   const publicRoute = raw(stub, 'default', 'gate-9', signinReq, { 'X-Client-Build': CLIENT_BUILD });
   check(publicRoute.status === 200, 'control: a P endpoint still answers with no credential',
@@ -583,6 +691,16 @@ function specFor(pattern, body) {
         })),
         ...CORRELATION,
       });
+    case 'POST /v1/auth/display-name/check':
+      // §3b: exactly these keys. `policy` is object-or-null and never absent, and it carries the
+      // rule id and nothing else — no holder, no ruleset.
+      return S.obj({
+        available: S.bool,
+        policy: S.nullable(S.obj({
+          rule: S.enum('length', 'charset', 'reserved', 'impersonation', 'profanity', 'confusable'),
+        })),
+        ...CORRELATION,
+      });
     case 'POST /v1/onboarding/eligibility':
       return S.obj({ eligible: S.bool, receipt: S.str, expiresAt: S.iso, policyVersion: S.int, ...CORRELATION });
     case 'GET /v1/onboarding/consent':
@@ -860,10 +978,51 @@ console.log('\n--- shell-ia route × variant coverage (REQ-CC-045) ---');
   const stub = api();
   const missingRoutes = contractRoutes.filter((r) => !ROUTE_COVERAGE[r]);
   const inventedRoutes = Object.keys(ROUTE_COVERAGE).filter((r) => !contractRoutes.includes(r));
-  check(missingRoutes.length === 0, 'every route in the shell-ia hierarchy has a coverage entry',
-    `uncovered: ${missingRoutes.join(' | ')}`);
-  check(inventedRoutes.length === 0, 'the coverage map invents no route the IA does not declare',
-    `invented: ${inventedRoutes.join(' | ')}`);
+
+  /**
+   * §11.11.1 is the contract; `ROUTE_COVERAGE` is the executable copy. Diffed cell for cell, so
+   * a row absorbed into the matrix with no owner fails the build here rather than being found
+   * later as a screen nobody could build.
+   */
+  const diffMatrix = (map) => {
+    const out = [];
+    for (const route of contractRoutes) {
+      const row = contractMatrix[route];
+      if (!row) { out.push(`${route}: no row in §11.11.1`); continue; }
+      VARIANTS.forEach((variant, i) => {
+        const declared = row[i];
+        const cell = (map[route] || {})[variant];
+        if (!declared) { out.push(`${route}.${variant}: contract cell is empty — a row with no owner`); return; }
+        if (!cell) { out.push(`${route}.${variant}: contract names ${declared}, the stub layer has no cell`); return; }
+        const owner = cell.scenario === null ? 'n/a' : cell.scenario;
+        if (owner !== declared) out.push(`${route}.${variant}: contract ${declared} vs stub ${owner}`);
+        // "Not applicable" has to say why, or "no fixture yet" hides inside it.
+        if (cell.scenario === null && !cell.why) out.push(`${route}.${variant}: n/a with no reason`);
+      });
+    }
+    for (const r of Object.keys(contractMatrix)) {
+      if (!contractRoutes.includes(r)) out.push(`${r}: a matrix row for a route the IA does not declare`);
+    }
+    return out;
+  };
+
+  {
+    const cellProblems = diffMatrix(ROUTE_COVERAGE);
+    check(cellProblems.length === 0,
+      'every §11.11.1 cell has an owner or a reason, and matches the executable map',
+      `${cellProblems.length} problems, first 6:\n       ${cellProblems.slice(0, 6).join('\n       ')}`);
+
+    // The failing control: an unowned row and a disowned cell both have to be visible, or the
+    // check above is a count of rows rather than an audit of them.
+    const tampered = { ...ROUTE_COVERAGE };
+    tampered['/welcome'] = { ...ROUTE_COVERAGE['/welcome'], error: { scenario: 'not-a-scenario', requests: [] } };
+    tampered['/sessions'] = { ...ROUTE_COVERAGE['/sessions'], empty: { scenario: null, why: '' } };
+    const seen = diffMatrix(tampered);
+    check(seen.length === 3 && seen.some((p) => p.includes('/welcome.error'))
+      && seen.some((p) => p.includes('n/a with no reason')),
+    'control: a disowned cell and a reasonless n/a are both build failures',
+    seen.join(' | '));
+  }
 
   const problems = [];
   for (const route of contractRoutes) {
@@ -1201,10 +1360,13 @@ console.log('\n--- stateful transitions ---');
 
   // name-taken, in both the places a name is chosen.
   {
-    const [signupRes, , renamed] = await run(stub, 'name-taken', 'nt', SCENARIO_PROBES['name-taken']);
+    const [checked, signupRes, , renamed] = await run(stub, 'name-taken', 'nt', SCENARIO_PROBES['name-taken']);
     check(signupRes.status === 409 && signupRes.body.error.code === 'NAME_TAKEN'
       && renamed.status === 409 && renamed.body.error.code === 'NAME_TAKEN',
     'name-taken: signup and rename both refuse', `${signupRes.status}/${renamed.status}`);
+    check(checked.status === 200 && checked.body.available === false && checked.body.policy === null,
+      'name-taken: the §3b preflight says taken first, and says only that',
+      JSON.stringify(checked.body));
   }
 
   // browser-empty: the empty envelope, not a bare array and not an error.
@@ -1273,8 +1435,10 @@ console.log('\n--- stateful transitions ---');
 
   // §11.6: RTT is client-measured or it is absent. It is never invented.
   {
-    const auth = { 'X-Client-Build': CLIENT_BUILD, Authorization: 'Bearer stub.access.probe' };
     const stub2 = api();
+    const rttAcct = { 'X-Stub-Account-Id': 'rtt-account' };
+    const auth = { 'X-Client-Build': CLIENT_BUILD, ...rttAcct,
+      Authorization: `Bearer ${tokenFor(stub2, 'default', 'rtt-token', CLIENT_BUILD, rttAcct)}` };
     const withHeader = raw(stub2, 'default', 'rtt', { path: '/v1/rooms' }, { ...auth, 'X-Region-Rtt': 'yyz=24,ord=41' });
     const malformed = raw(stub2, 'default', 'rtt2', { path: '/v1/rooms' }, { ...auth, 'X-Region-Rtt': 'yyz=abc' });
     const absent = raw(stub2, 'default', 'rtt3', { path: '/v1/rooms' }, auth);
@@ -1509,6 +1673,409 @@ console.log('\n--- slow actually delays ---');
     `${elapsed}ms`);
 }
 
+// ── 6a. correlation ids (§1, errors.md §2) ──────────────────────────────────────────────────
+
+console.log('\n--- correlation ids ---');
+{
+  const stub = api();
+  const health = { method: 'GET', path: '/v1/health' };
+  const CLIENT_ID = '01HZZK7N4TVWXYZ0123456789A';
+
+  const echoed = raw(stub, 'default', 'corr-1', health, { 'X-Correlation-Id': CLIENT_ID });
+  check(echoed.body.correlationId === CLIENT_ID && echoed.headers['X-Correlation-Id'] === CLIENT_ID,
+    "a client-supplied ULID is echoed in the body AND the header, as production echoes it",
+    `${echoed.headers['X-Correlation-Id']} / ${echoed.body?.correlationId}`);
+
+  // core/http.js validates before echoing, because an unvalidated header is reflected into a
+  // response, a body and every log line. The stub reflected it verbatim, so the two layers
+  // answered the same request with different ids.
+  const junk = raw(stub, 'default', 'corr-2', health, { 'X-Correlation-Id': '<script>alert(1)</script>' });
+  check(junk.body.correlationId !== '<script>alert(1)</script>' && ULID.test(junk.body.correlationId),
+    'a non-ULID correlation id is rejected and regenerated, never reflected',
+    JSON.stringify(junk.body?.correlationId));
+
+  const almost = raw(stub, 'default', 'corr-3', health, { 'X-Correlation-Id': `${CLIENT_ID}X` });
+  check(ULID.test(almost.body.correlationId) && almost.body.correlationId !== `${CLIENT_ID}X`,
+    'a 27-character near-ULID is not a ULID and is not echoed', almost.body?.correlationId);
+
+  // Every id this layer generates has to be a real ULID: `isUlid` is what core/ids.js and every
+  // downstream consumer test it with, and an id that fails there is an id support cannot trace.
+  const generated = new Set();
+  const problems = [];
+  for (const name of Object.keys(SCENARIOS)) {
+    for (const res of await run(api(), name, `corr-${name}`, SCENARIO_PROBES[name] || [])) {
+      if (res.transport === 'failed') continue;
+      const id = res.correlationId;
+      if (!isUlid(id)) problems.push(`${name}: ${id}`);
+      // errors.md §2: the envelope's own id is the response's id, not a second one.
+      if (res.body?.error && res.body.error.correlationId !== id) {
+        problems.push(`${name}: envelope carries ${res.body.error.correlationId}, response carries ${id}`);
+      }
+      generated.add(id);
+    }
+  }
+  const refusal = raw(stub, 'default', 'corr-4', { method: 'GET', path: '/v1/rooms' }, { 'X-Client-Build': CLIENT_BUILD });
+  check(refusal.status === 401 && refusal.headers['X-Correlation-Id'] === refusal.body.error.correlationId,
+    'a refusal puts the same id in the header and in the envelope support will be quoted',
+    `${refusal.headers['X-Correlation-Id']} / ${refusal.body?.error?.correlationId}`);
+
+  check(problems.length === 0, 'every generated correlation id passes core/ids.js isUlid, and the error envelope carries the same one',
+    problems.slice(0, 4).join('\n       '));
+  check(generated.size > 20, 'ids vary across requests rather than being one constant', `${generated.size} distinct`);
+
+  // The failing control: `isUlid` must be able to reject, or the loop above proves nothing.
+  check(!isUlid('stub-no-correlation') && !isUlid('01HZZK7N4TVWXYZ0123456789AX'),
+    'control: isUlid rejects a placeholder and an over-length id', 'it accepts them');
+}
+
+// ── 6b. account scope: two tabs, one account (cross-tab revocation) ─────────────────────────
+
+console.log('\n--- account-scoped state across tabs ---');
+{
+  const stub = api();
+  const ACCOUNT = { 'X-Stub-Account-Id': 'two-tabs' };
+  const signinReq = { method: 'POST', path: '/v1/auth/signin', body: { email: 'a@b.invalid', password: 'p' } };
+  const sessionsReq = { method: 'GET', path: '/v1/auth/sessions' };
+  const meReq = { method: 'GET', path: '/v1/profile/me' };
+
+  const tabA = tokenFor(stub, 'default', 'tab-a', CLIENT_BUILD, ACCOUNT);
+  const tabB = tokenFor(stub, 'default', 'tab-b', CLIENT_BUILD, ACCOUNT);
+  const authA = { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${tabA}` };
+  const authB = { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${tabB}` };
+
+  const listA = raw(stub, 'default', 'tab-a', sessionsReq, authA);
+  const listB = raw(stub, 'default', 'tab-b', sessionsReq, authB);
+  const currentOf = (res) => res.body.sessions.find((x) => x.isCurrent)?.sessionId;
+  check(listA.body.sessions.length === 2 && listB.body.sessions.length === 2
+    && currentOf(listA) !== currentOf(listB),
+  'two tabs see one session list and each knows which row is itself',
+  `${currentOf(listA)} vs ${currentOf(listB)}`);
+
+  // The state that was unreachable: revoke in one tab, and the OTHER tab is signed out. Keyed
+  // per clientSessionId, tab B never learned about it and stayed live forever.
+  const revoked = raw(stub, 'default', 'tab-a',
+    { method: 'DELETE', path: `/v1/auth/sessions/${currentOf(listB)}` }, authA);
+  const bAfter = raw(stub, 'default', 'tab-b', meReq, authB);
+  const aAfter = raw(stub, 'default', 'tab-a', meReq, authA);
+  check(revoked.status === 204 && bAfter.status === 401
+    && bAfter.body.error.code === 'AUTH_SESSION_REVOKED' && aAfter.status === 200,
+  'a session revoked in one tab signs out the other, and only the other',
+  `revoke ${revoked.status}, B ${bAfter.status}/${bAfter.body?.error?.code}, A ${aAfter.status}`);
+
+  const listAfter = raw(stub, 'default', 'tab-a', sessionsReq, authA);
+  check(listAfter.body.sessions.length === 1 && listAfter.body.sessions[0].isCurrent === true,
+    'the revoked session leaves the list the surviving tab reads', JSON.stringify(listAfter.body.sessions.map((x) => x.sessionId)));
+
+  // §3: signout-all revokes EVERY session including the caller's, so the tab that pressed it is
+  // signed out too. Revoking all-but-me is a different endpoint.
+  const stub2 = api();
+  const t1 = tokenFor(stub2, 'default', 'all-a', CLIENT_BUILD, ACCOUNT);
+  const t2 = tokenFor(stub2, 'default', 'all-b', CLIENT_BUILD, ACCOUNT);
+  const all = raw(stub2, 'default', 'all-a', { method: 'POST', path: '/v1/auth/signout-all', body: {} },
+    { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${t1}` });
+  const after1 = raw(stub2, 'default', 'all-a', meReq, { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${t1}` });
+  const after2 = raw(stub2, 'default', 'all-b', meReq, { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${t2}` });
+  check(all.status === 204 && after1.status === 401 && after2.status === 401
+    && after1.body.error.code === 'AUTH_SESSION_REVOKED',
+  'signout-all revokes every session including the caller\'s',
+  `${all.status} / ${after1.status} / ${after2.status}`);
+
+  // signout is the current session ONLY — the failing control for the check above.
+  const stub3 = api();
+  const s1 = tokenFor(stub3, 'default', 'one-a', CLIENT_BUILD, ACCOUNT);
+  const s2 = tokenFor(stub3, 'default', 'one-b', CLIENT_BUILD, ACCOUNT);
+  raw(stub3, 'default', 'one-a', { method: 'POST', path: '/v1/auth/signout', body: {} },
+    { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${s1}` });
+  const own = raw(stub3, 'default', 'one-a', meReq, { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${s1}` });
+  const other = raw(stub3, 'default', 'one-b', meReq, { 'X-Client-Build': CLIENT_BUILD, ...ACCOUNT, Authorization: `Bearer ${s2}` });
+  check(own.status === 401 && other.status === 200,
+    'control: signout revokes the caller only, so the other tab survives it',
+    `${own.status} / ${other.status}`);
+
+  // And the isolation that keeps replay deterministic: without the header, a tab is its own
+  // account, so one scenario's revocations cannot leak into the next replay.
+  const stub4 = api();
+  const iso1 = tokenFor(stub4, 'default', 'iso-a');
+  raw(stub4, 'default', 'iso-a', { method: 'POST', path: '/v1/auth/signout-all', body: {} },
+    { 'X-Client-Build': CLIENT_BUILD, Authorization: `Bearer ${iso1}` });
+  const iso2 = tokenFor(stub4, 'default', 'iso-b');
+  const isoRead = raw(stub4, 'default', 'iso-b', meReq, { 'X-Client-Build': CLIENT_BUILD, Authorization: `Bearer ${iso2}` });
+  check(isoRead.status === 200,
+    'without X-Stub-Account-Id a tab is its own account, so a replay starts clean',
+    `${isoRead.status}/${isoRead.body?.error?.code}`);
+}
+
+// ── 6c. display-name availability (§3b, REQ-CC-046) ─────────────────────────────────────────
+
+console.log('\n--- display-name availability check (§3b) ---');
+{
+  const stub = api();
+  const checkName = (name) => ({ method: 'POST', path: '/v1/auth/display-name/check', body: { displayName: name } });
+  const one = async (scenario, sid, name) => (await run(stub, scenario, sid, [checkName(name)]))[0];
+
+  const free = await one('default', 'dn-1', 'Nova Prime');
+  check(free.status === 200 && free.body.available === true && free.body.policy === null,
+    'available: { available: true, policy: null }', JSON.stringify(free.body));
+
+  const taken = await one('default', 'dn-2', fx.DISPLAY_NAME);
+  check(taken.status === 200 && taken.body.available === false && taken.body.policy === null,
+    'taken: available false, policy null', JSON.stringify(taken.body));
+
+  // The enumeration boundary: a taken answer and a free answer differ in one boolean, and the
+  // body carries no field that could name the holder.
+  const leak = JSON.stringify(taken.body);
+  check(Object.keys(taken.body).sort().join(',') === 'available,correlationId,policy'
+    && !leak.includes(fx.ACCOUNT_ID) && !/accountId|holder|owner|profile/i.test(leak),
+  'taken never reveals the owning account: same key set, no identifier anywhere', leak);
+
+  const policy = await one('default', 'dn-3', 'admin');
+  check(policy.status === 200 && policy.body.available === false && policy.body.policy.rule === 'reserved',
+    'policy-refused: the server names the rule, so the client reproduces no ruleset',
+    JSON.stringify(policy.body));
+
+  const short = await one('default', 'dn-4', 'ab');
+  check(short.body.policy?.rule === 'length' && Object.keys(short.body.policy).join(',') === 'rule',
+    'a policy object carries the rule id and nothing else', JSON.stringify(short.body.policy));
+
+  // Policy is evaluated BEFORE existence, or the endpoint becomes a directory of which reserved
+  // names are in use.
+  const both = await one('default', 'dn-5', 'Overstrike Staff');
+  check(both.body.policy?.rule === 'impersonation',
+    'a name that fails policy answers with the rule whether or not it is also taken',
+    JSON.stringify(both.body));
+
+  // Normalisation is the server's: the same candidate with different spacing and case is one
+  // name, so the client never has to hold a second copy of the rule.
+  const spaced = await one('default', 'dn-6', '  stubRUNNER  ');
+  check(spaced.body.available === false,
+    'the verdict is about the NORMALISED name: case, NFKC and collapsed whitespace',
+    JSON.stringify(spaced.body));
+
+  const rateLimited = await one('name-check-rate-limited', 'dn-7', 'Nova Prime');
+  check(rateLimited.status === 429 && rateLimited.body.error.code === 'RATE_LIMITED'
+    && rateLimited.body.error.retryAfterMs > 0,
+  'rate-limited: RATE_LIMITED with a retryAfterMs the field can back off against',
+  `${rateLimited.status}/${rateLimited.body?.error?.code}`);
+
+  const down = await one('name-check-unavailable', 'dn-8', 'Nova Prime');
+  check(down.status === 503 && down.body.error.code === 'SERVICE_UNAVAILABLE',
+    'unavailable: the preflight is down and says so', `${down.status}/${down.body?.error?.code}`);
+
+  // The base limit is real, not only a scenario: a per-keystroke client reaches it.
+  const many = await run(stub, 'default', 'dn-9',
+    Array.from({ length: fx.NAME_CHECK_PER_MINUTE + 2 }, (_, i) => checkName(`Candidate ${i}`)));
+  check(many.slice(0, fx.NAME_CHECK_PER_MINUTE).every((r) => r.status === 200)
+    && many[fx.NAME_CHECK_PER_MINUTE].status === 429,
+  `the §9 name-check class is enforced at ${fx.NAME_CHECK_PER_MINUTE}/min, not only fixtured`,
+  many.map((r) => r.status).join(','));
+
+  // `checking` is the loading state, and `slow` is what makes it observable.
+  sleepRequests = [];
+  const checking = await run(stub, 'slow', 'dn-10', [checkName('Nova Prime')]);
+  check(JSON.stringify(sleepRequests) === '[2000]' && checking[0].status === 200,
+    'checking: the in-flight state is reachable by driving the check under `slow`',
+    JSON.stringify(sleepRequests));
+
+  // The endpoint reserves nothing. Signup remains authoritative and may still refuse a name the
+  // check just called free — the race the contract says the client must still handle.
+  const raced = await run(stub, 'name-taken', 'dn-11', [checkName('Nova Prime'), SCENARIO_PROBES['name-taken'][1]]);
+  check(raced[1].status === 409 && raced[1].body.error.code === 'NAME_TAKEN',
+    'a check is advisory: signup still refuses, so the NAME_TAKEN path stays live',
+    `${raced[0].status} then ${raced[1].status}/${raced[1].body?.error?.code}`);
+
+  // The failing control: a body without the field is a client bug, not a verdict.
+  const malformed = (await run(stub, 'default', 'dn-12', [{ method: 'POST', path: '/v1/auth/display-name/check', body: {} }]))[0];
+  check(malformed.status === 400 && malformed.body.error.code === 'VALIDATION_FAILED',
+    'control: an absent displayName is VALIDATION_FAILED, never an "available" verdict',
+    `${malformed.status}/${malformed.body?.error?.code}`);
+}
+
+// ── 6d. the net-facade stub (net-facade.md §8) ──────────────────────────────────────────────
+
+console.log('\n--- net-facade stub (net-facade.md §8) ---');
+{
+  const missing = contractFacade.filter((n) => !NET_FACADE_SCENARIO_NAMES.includes(n));
+  check(missing.length === 0, 'every §8 scenario exists in the facade stub', `missing: ${missing.join(', ')}`);
+
+  // The reverse direction, which is the one that actually failed in practice.
+  //
+  // Until §8 was completed the stub carried timelines the contract did not name, and the escape
+  // hatch was NET_FACADE_EXTRA: declare the row you serve and the build stays green. That let the
+  // implementation run ahead of the contract indefinitely — which is how a response came to cite
+  // §8 rows that only ever existed in code. §8 now names all 21, so the hatch is checked rather
+  // than trusted: an undeclared extra still fails, and a STALE declaration fails too, because a
+  // permanent exemption list is how the two drift apart again quietly.
+  const extra = NET_FACADE_SCENARIO_NAMES.filter((n) => !contractFacade.includes(n));
+  const undeclared = extra.filter((n) => !Object.hasOwn(NET_FACADE_EXTRA, n));
+  check(undeclared.length === 0,
+    'every timeline beyond §8 declares the contract row it serves',
+    extra.length ? `undeclared: ${undeclared.join(', ')}` : 'vacuous — §8 names every timeline');
+
+  const stale = Object.keys(NET_FACADE_EXTRA).filter((n) => contractFacade.includes(n));
+  check(stale.length === 0,
+    'NET_FACADE_EXTRA holds no entry §8 now names',
+    stale.length ? `stale, delete from netfacade.js: ${stale.join(', ')}` : 'none');
+
+  // Deterministic, and cheap: a scenario about 240 ms of latency must not take 240 ms to run.
+  const replayProblems = [];
+  for (const name of NET_FACADE_SCENARIO_NAMES) {
+    const a = createNetFacadeStub({ scenario: name }).runAll();
+    const b = createNetFacadeStub({ scenario: name }).runAll();
+    if (JSON.stringify(a.events()) !== JSON.stringify(b.events())) replayProblems.push(`${name}: events differ`);
+    if (JSON.stringify(a.matchState) !== JSON.stringify(b.matchState)) replayProblems.push(`${name}: final state differs`);
+    if (!a.steps().length) replayProblems.push(`${name}: empty timeline`);
+    if (a.matchState.matchId !== a.handoff.matchId) replayProblems.push(`${name}: matchState.matchId is not the handoff's`);
+  }
+  check(replayProblems.length === 0, 'every facade timeline replays byte-identically and carries matchId',
+    replayProblems.slice(0, 4).join('\n       '));
+
+  // §3.2: the connection states Codex has to design screens for.
+  const finalState = (n) => createNetFacadeStub({ scenario: n }).runAll().state;
+  check(finalState('version-mismatch') === 'version-mismatch' && finalState('rejected') === 'rejected'
+    && finalState('reconnect-success') === 'live' && finalState('reconnect-timeout') === 'closed'
+    && finalState('bomb-round') === 'closed',
+  'the §3.2 terminal states are each reachable from their own timeline',
+  [finalState('version-mismatch'), finalState('rejected'), finalState('reconnect-success'), finalState('reconnect-timeout')].join(','));
+
+  // §5.4: `net.reconnect` is null until the ticket response arrives. A UI that counts down
+  // before then is counting a number it invented.
+  {
+    const stub = createNetFacadeStub({ scenario: 'reconnect-success' });
+    const seen = [];
+    stub.on('reconnectUpdate', (p) => seen.push(p));
+    let sawNullDuringReconnecting = false;
+    let label = stub.next();
+    while (label !== null) {
+      if (stub.state === 'reconnecting' && stub.reconnect === null) sawNullDuringReconnecting = true;
+      label = stub.next();
+    }
+    check(sawNullDuringReconnecting && seen.length === 1 && seen[0].maxAttempts === 5 && seen[0].canCancel === true,
+      'reconnect: null until the ticket answers, then the real deadline and the §5.4 policy',
+      JSON.stringify(seen));
+    const exhausted = createNetFacadeStub({ scenario: 'reconnect-timeout' }).runAll();
+    check(exhausted.reconnect === null && exhausted.events().some((e) => e.type === 'disconnected'
+      && e.payload.reason === 'RECONNECT_GRACE_EXPIRED' && e.payload.retryable === false),
+    'reconnect-timeout: five attempts, then a terminal RECONNECT_GRACE_EXPIRED that is not retryable',
+    JSON.stringify(exhausted.reconnect));
+  }
+
+  // §5.1/§5.1.1: the Bomb rows the HUD is built from.
+  {
+    const at = (name) => createNetFacadeStub({ scenario: name }).runAll().matchState.bomb;
+    const carried = at('bomb-carried');
+    const visible = at('bomb-dropped-visible');
+    const hidden = at('bomb-dropped-hidden');
+    const planted = at('bomb-planted');
+    check(carried.state === 'carried' && carried.position === null && carried.carrierId !== null,
+      'bomb carried: position is ALWAYS null — a carried bomb is at its carrier',
+      JSON.stringify(carried));
+    check(visible.state === 'dropped' && visible.position !== null,
+      'bomb dropped-visible: a real position', JSON.stringify(visible));
+    check(hidden.state === 'dropped' && hidden.position === null && hidden.carrierId === null,
+      'bomb dropped-hidden: null, never zero coordinates the UI could mistake for a location',
+      JSON.stringify(hidden));
+    check(planted.state === 'planted' && planted.siteId === 'A',
+      'bomb planted: a site the HUD can name', JSON.stringify(planted));
+
+    // §5.1.1: a null carrier is "not visible to you", and the stub must be able to produce it
+    // mid-timeline or the UI never builds the absence path.
+    const round = createNetFacadeStub({ scenario: 'bomb-round' });
+    const carriers = [];
+    while (round.next() !== null) if (round.matchState.bomb.state === 'carried') carriers.push(round.matchState.bomb.carrierId);
+    check(carriers.includes(null) && carriers.some((c) => c !== null),
+      'bomb-round shows a carrier both visible and filtered out', JSON.stringify(carriers));
+  }
+
+  // §5.1.0a: the policy is derived per phase, not frozen at handoff.
+  {
+    const stub = createNetFacadeStub({ scenario: 'spectator-policy-phases' });
+    const rows = [];
+    while (stub.next() !== null) {
+      rows.push({ phase: stub.matchState.phase, alive: stub.matchState.localPlayer.alive,
+        ...stub.matchState.localPlayer.spectatorPolicy });
+    }
+    const row = (phase, alive) => rows.find((r) => r.phase === phase && r.alive === alive);
+    check(row('live', true).canFreeCam === false && row('live', false).canUseTeamChat === false
+      && row('roundEnd', false).canFreeCam === true && row('roundEnd', false).canUseTeamChat === true
+      && row('warmup', true).canFreeCam === true
+      && rows.every((r) => r.canSpectateEnemies === false),
+    'spectator policy matches the §5.1.0a table row for row, including the dead relay rule',
+    JSON.stringify(rows.map((r) => `${r.phase}/${r.alive}:${r.canFreeCam}${r.canUseTeamChat}`)));
+
+    // The failing control: a frozen policy would answer the same in every phase.
+    const distinct = new Set(rows.map((r) => `${r.canFreeCam}${r.canUseTeamChat}`));
+    check(distinct.size > 1, 'control: the policy actually varies by phase rather than being frozen',
+      [...distinct].join(','));
+  }
+
+  // match-result.md §4.2: one timeline per outcome row, and `null` winner is not `'draw'`.
+  {
+    const outcome = (n) => createNetFacadeStub({ scenario: `outcome-${n}` }).runAll()
+      .events().find((e) => e.type === 'matchEnded').payload;
+    const problems = [];
+    const rows = {
+      'completed-elimination': ['completed', 'elimination', 'alpha'],
+      'completed-defuse': ['completed', 'defuse', 'alpha'],
+      'completed-detonation': ['completed', 'detonation', 'bravo'],
+      'completed-timer-draw': ['completed', 'timer', 'draw'],
+      'aborted-forfeit': ['aborted', 'forfeit', 'alpha'],
+      'aborted-abandon': ['aborted', 'abandon', 'bravo'],
+      'aborted-nocontest': ['aborted', 'no-contest', null],
+      'invalidated': ['invalidated', 'no-contest', null],
+    };
+    for (const [name, [termination, reason, winner]] of Object.entries(rows)) {
+      const p = outcome(name);
+      if (p.terminationReason !== termination || p.outcomeReason !== reason || p.winner !== winner) {
+        problems.push(`${name}: ${p.terminationReason}/${p.outcomeReason}/${JSON.stringify(p.winner)}`);
+      }
+      if (Object.hasOwn(p, 'reason')) problems.push(`${name}: carries a round-level 'reason'`);
+    }
+    check(problems.length === 0, 'every outcome-matrix row has a timeline, with outcomeReason and a winner that is null or a team',
+      problems.join('\n       '));
+    check(outcome('completed-timer-draw').winner === 'draw' && outcome('aborted-nocontest').winner === null
+      && outcome('aborted-forfeit').winner === 'alpha',
+    "a draw, no winner, and an aborted match WITH a winner stay three different facts",
+    'they collapsed');
+  }
+
+  // §2: the surface asks, it never decides. This is the rule the whole facade exists to encode.
+  {
+    const stub = createNetFacadeStub({ scenario: 'bomb-round' });
+    stub.next(); stub.next(); stub.next(); stub.next();
+    const before = JSON.stringify(stub.matchState.interaction);
+    stub.requestInteraction('plant');
+    stub.sendLoadout({ primaryIdx: 1, secondaryIdx: 2 });
+    check(JSON.stringify(stub.matchState.interaction) === before && stub.intents().length === 2,
+      'requestInteraction records intent and changes nothing: the server decides',
+      `${before} -> ${JSON.stringify(stub.matchState.interaction)}`);
+    const refusal = createNetFacadeStub({ scenario: 'bomb-round' }).runAll()
+      .events().find((e) => e.type === 'interactionRefused');
+    check(refusal && refusal.payload.kind === 'defuse' && refusal.payload.reason === 'not-carrier',
+      'a refusal arrives as interactionRefused with its own reason, not as a cancellation',
+      JSON.stringify(refusal?.payload));
+  }
+
+  // §6: a throwing handler is caught and unsubscribed; the timeline keeps running.
+  {
+    const stub = createNetFacadeStub({ scenario: 'tdm-basic' });
+    let calls = 0;
+    stub.on('matchState', () => { calls++; throw new Error('a HUD widget has a bug'); });
+    stub.runAll();
+    check(calls === 1 && stub.state === 'closed',
+      'a throwing subscriber is unsubscribed and the netcode carries on', `${calls} calls, state ${stub.state}`);
+  }
+
+  // Degraded links report what they measured, with the window attached (§5.2).
+  {
+    const loss = createNetFacadeStub({ scenario: 'packet-loss' }).runAll().netStats;
+    const lat = createNetFacadeStub({ scenario: 'high-latency' }).runAll().netStats;
+    check(loss.lossPct > 0 && loss.baselineState === 'keyframe-pending' && loss.windowMs === 5000
+      && lat.rttMs > 200 && lat.jitterMs > 20,
+    'packet-loss and high-latency move the measured numbers, window included',
+    `${loss.lossPct}% / ${lat.rttMs}ms`);
+  }
+}
+
 // ── 7. determinism ──────────────────────────────────────────────────────────────────────────
 
 console.log('\n--- determinism ---');
@@ -1665,14 +2232,14 @@ console.log('\n--- mounted over a real socket (app.js preRoute) ---');
   const boundPort = app.server.address().port;
   const base = `http://127.0.0.1:${boundPort}`;
 
-  const call = async (method, path, { scenario, body, headers = {} } = {}) => {
+  const call = async (method, path, { scenario, body, headers = {}, session = 'socket-session' } = {}) => {
     const res = await fetch(base + path, {
       method,
       headers: {
         'content-type': 'application/json',
         'x-client-build': CLIENT_BUILD,
         'x-stub-scenario': scenario,
-        'x-client-session-id': 'socket-session',
+        'x-client-session-id': session,
         ...headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -1719,7 +2286,99 @@ console.log('\n--- mounted over a real socket (app.js preRoute) ---');
     check(dropped, 'offline: the socket is dropped rather than answered with a synthetic 5xx',
       'the request completed');
 
-    // 4. and the platform still behaves as production without the header.
+    // 4. `name-check`: the §3b endpoint, over the wire, in all three verdicts.
+    const free = await call('POST', '/v1/auth/display-name/check',
+      { scenario: 'default', body: { displayName: 'Nova Prime' } });
+    const takenOnSocket = await call('POST', '/v1/auth/display-name/check',
+      { scenario: 'default', body: { displayName: fx.DISPLAY_NAME } });
+    const refused = await call('POST', '/v1/auth/display-name/check',
+      { scenario: 'default', body: { displayName: 'admin' } });
+    check(free.body?.available === true && takenOnSocket.body?.available === false
+      && takenOnSocket.body.policy === null && refused.body?.policy?.rule === 'reserved',
+    'display-name check: available, taken and policy-refused all answer over the socket',
+    JSON.stringify([free.body, takenOnSocket.body, refused.body]));
+
+    // 5. the forged token, over a real socket. This is the one that mattered: a shell pointed at
+    // a mounted stub must be refused exactly as production refuses it.
+    const forged = await call('GET', '/v1/rooms',
+      { scenario: 'default', headers: { authorization: 'Bearer stub.access.deadbeef' } });
+    check(forged.status === 401 && forged.body.error.code === 'AUTH_TOKEN_INVALID',
+      'a forged bearer token is AUTH_TOKEN_INVALID over the socket too',
+      `${forged.status}/${forged.body?.error?.code}`);
+    check(rooms.status === 200,
+      'control: the issued token was accepted on the same endpoint moments earlier',
+      `${rooms.status}`);
+
+    // 6. correlation, over the socket. §1: the client's id is echoed, in the header and the
+    // body, and both layers have to agree on which id that is.
+    const CID = '01HZZK7N4TVWXYZ0123456789A';
+    const corr = await call('GET', '/v1/health', { scenario: 'default', headers: { 'x-correlation-id': CID } });
+    check(corr.headers.get('x-correlation-id') === CID && corr.body.correlationId === CID,
+      'the correlation id a client sends comes back in the header AND the body, identical',
+      `${corr.headers.get('x-correlation-id')} / ${corr.body?.correlationId}`);
+
+    const junkCorr = await call('GET', '/v1/health',
+      { scenario: 'default', headers: { 'x-correlation-id': 'not-a-ulid' } });
+    check(junkCorr.headers.get('x-correlation-id') === junkCorr.body.correlationId
+      && isUlid(junkCorr.body.correlationId) && junkCorr.body.correlationId !== 'not-a-ulid',
+    'a junk id is replaced by ONE freshly generated ULID, in the header and the body alike',
+    `${junkCorr.headers.get('x-correlation-id')} / ${junkCorr.body?.correlationId}`);
+
+    const noCorr = await call('GET', '/v1/health', { scenario: 'default' });
+    check(noCorr.headers.get('x-correlation-id') === noCorr.body.correlationId
+      && isUlid(noCorr.body.correlationId),
+    'with no id supplied the response still carries one, and the header and body agree',
+    `${noCorr.headers.get('x-correlation-id')} / ${noCorr.body?.correlationId}`);
+
+    // 7. two tabs, one account, over the socket: revoking in one signs the other out.
+    const acct = { 'x-stub-account-id': 'socket-tabs' };
+    const tabA = await call('POST', '/v1/auth/signin',
+      { scenario: 'default', session: 'sock-a', headers: acct, body: { email: 'a@b.invalid', password: 'p' } });
+    const tabB = await call('POST', '/v1/auth/signin',
+      { scenario: 'default', session: 'sock-b', headers: acct, body: { email: 'a@b.invalid', password: 'p' } });
+    const revoke = await call('DELETE', `/v1/auth/sessions/${tabB.body.session.sessionId}`,
+      { scenario: 'default', session: 'sock-a', headers: { ...acct, authorization: `Bearer ${tabA.body.accessToken}` } });
+    const bRead = await call('GET', '/v1/profile/me',
+      { scenario: 'default', session: 'sock-b', headers: { ...acct, authorization: `Bearer ${tabB.body.accessToken}` } });
+    const aRead = await call('GET', '/v1/profile/me',
+      { scenario: 'default', session: 'sock-a', headers: { ...acct, authorization: `Bearer ${tabA.body.accessToken}` } });
+    check(revoke.status === 204 && bRead.status === 401
+      && bRead.body.error.code === 'AUTH_SESSION_REVOKED' && aRead.status === 200,
+    'cross-tab revocation works over the socket: the other tab is signed out, this one is not',
+    `${revoke.status} / ${bRead.status}/${bRead.body?.error?.code} / ${aRead.status}`);
+
+    // 8. `name-check-rate-limited`, a fourth distinct scenario over the wire.
+    const limited = await call('POST', '/v1/auth/display-name/check',
+      { scenario: 'name-check-rate-limited', body: { displayName: 'Nova Prime' } });
+    check(limited.status === 429 && limited.body.error.code === 'RATE_LIMITED'
+      && limited.headers.get('x-correlation-id') === limited.body.error.correlationId,
+    'name-check-rate-limited: 429 over the socket, and the envelope id matches the header',
+    `${limited.status}/${limited.body?.error?.code}`);
+
+    // 9. `onboarding-happy`, a fifth — and the only one that proves scenario STATE survives
+    // real HTTP: three separate connections, and signup only works because the two requests
+    // before it happened on the same client session.
+    const sid = 'socket-onboarding';
+    const elig = await call('POST', '/v1/onboarding/eligibility',
+      { scenario: 'onboarding-happy', session: sid, body: { dateOfBirth: '1994-03-02', jurisdiction: 'CA-ON' } });
+    const consent = await call('PUT', '/v1/onboarding/consent',
+      { scenario: 'onboarding-happy', session: sid, body: { telemetryPersonal: true, policyVersion: 1, clientSessionId: sid } });
+    const signedUp = await call('POST', '/v1/auth/signup', {
+      scenario: 'onboarding-happy', session: sid,
+      body: { email: 'a@b.invalid', password: 'p', displayName: 'Nova Prime', clientSessionId: sid,
+        eligibilityReceipt: elig.body?.receipt, consentReceipt: consent.body?.receipt },
+    });
+    const skipped = await call('POST', '/v1/auth/signup', {
+      scenario: 'onboarding-happy', session: 'socket-onboarding-skip',
+      body: { email: 'a@b.invalid', password: 'p', displayName: 'Nova Prime', clientSessionId: 'socket-onboarding-skip',
+        eligibilityReceipt: 'invented', consentReceipt: 'invented' },
+    });
+    check(elig.status === 200 && consent.status === 200 && signedUp.status === 201
+      && signedUp.body.profile.flags.setupNextStep === 'verify' && skipped.status === 403,
+    'onboarding-happy: the approved order carries across real requests, and skipping it is refused',
+    `${elig.status}/${consent.status}/${signedUp.status}/${skipped.status} step=${signedUp.body?.profile?.flags?.setupNextStep}`);
+
+    // 10. and the platform still behaves as production without the header.
     const noScenario = await fetch(`${base}/v1/health`, { headers: { 'x-client-build': CLIENT_BUILD } });
     check(noScenario.status === 200, 'without X-Stub-Scenario the real platform answers',
       `${noScenario.status}`);

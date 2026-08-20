@@ -32,6 +32,24 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — `net-facade.md` 1.8.0 (additive) — §8 scenario table, and a correction
+
+**A claim I made twice was false, and this entry exists to say so.** Answering `REQ-CC-041` I
+wrote that the facade stub section had gained Bomb carried/dropped-visible/dropped-hidden/
+planted scenarios and one per outcome-matrix row. Answering `REQ-CC-045` I repeated it as
+established fact to argue a reviewer finding was mistaken. `git log -S` confirms those strings
+never existed in the file: I described an amendment I had not made, and then cited it.
+
+§8 now actually carries the table — 18 scenarios covering every §4.0 outcome-matrix row, all
+four Bomb position states, the per-phase spectator policy, and the terminal handshake failures.
+The stub layer already implements them; only the contract was missing.
+
+Additive: no existing scenario name or shape changed.
+
+The lesson is narrower than "check your work". Describing an edit and making it are separate
+acts, and a response written from intention rather than from the file is indistinguishable from
+one written from the file — until someone greps.
+
 ## 2026-08-20 — `http-api.md` 1.9.0, `telemetry.md` 1.9.0 (additive) — REQ-CC-042 contradictions closed
 
 **Version collision, recorded because it happened.** This amendment and the display-name
@@ -92,6 +110,11 @@ loading/empty/error/offline/policy state had no owning scenario. The new matrix 
 either a runnable scenario, a lobby timeline, or an `n/a` with its reason, and
 `platform/test/stubtest.mjs` parses it: a row with no owner fails the build rather than being
 discovered as a missing screen.
+
+**§11.10 gains `X-Stub-Account-Id`**, the stub-only header that groups two client sessions into
+one account. Without it the session list, revocations and `signout-all` lived once per tab, so
+cross-tab revocation — a state `shell-ia.md` requires the `/sessions` screen to render — could
+not be produced at all.
 
 **§9 gains one row** for the name-check class. It is separate from the Auth class deliberately:
 the check is public and unauthenticated, and sharing a bucket with sign-in would let name checks

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.7.0 |
+| **Version** | 1.8.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -367,8 +367,36 @@ unsubscribed — the netcode does not stop because a HUD widget has a bug.
 ## 8. Stub
 
 `net.__stub(scenario)` drives the whole surface from a scripted timeline with no server,
-behind flag `net.facade.stub`. Scenarios: `tdm-basic`, `bomb-round`, `high-latency`,
-`packet-loss`, `reconnect-success`, `reconnect-timeout`, `version-mismatch`, `rejected`.
+behind flag `net.facade.stub`.
+
+| Scenario | Covers |
+|---|---|
+| `tdm-basic` | Kill limit, scores, no rounds |
+| `bomb-round` | freeze → live → plant → planted → defuse → roundEnd |
+| `bomb-carried` | `bomb.state: carried`, **`position: null`** — the §5.1 invariant |
+| `bomb-dropped-visible` | Dropped, `bombPositionVisible = 1`, real coordinates |
+| `bomb-dropped-hidden` | Dropped, `bombPositionVisible = 0`, `position: null` — never zero coords |
+| `bomb-planted` | Planted with a site; position public to both teams |
+| `spectator-policy-phases` | The §5.1.0a phase table, every row |
+| `outcome-completed-elimination` | §4.0 completed / `elimination` |
+| `outcome-completed-defuse` | §4.0 completed / `defuse` |
+| `outcome-completed-detonation` | §4.0 completed / `detonation` |
+| `outcome-completed-timer-draw` | §4.0 completed / `timer`, `winnerTeam: 'draw'` |
+| `outcome-aborted-forfeit` | §4.0 aborted / `forfeit` — **with** a winner |
+| `outcome-aborted-abandon` | §4.0 aborted / `abandon` — **with** a winner |
+| `outcome-aborted-nocontest` | §4.0 aborted / `nocontest` — `winnerTeam: null` |
+| `outcome-invalidated` | §4.0 invalidated, null winner |
+| `high-latency` | `netStats` under latency |
+| `packet-loss` | `netStats` under loss |
+| `reconnect-success` | Grace consumed, session resumes |
+| `reconnect-timeout` | Grace exhausted, terminal |
+| `version-mismatch` | Handshake refused on version |
+| `rejected` | Handshake refused, `MSG_REJECT` |
+
+Every row of the `match-result.md` §4.0 outcome matrix has a scenario, and every Bomb position
+state has one, so the HUD's terminal and visibility states are exercised without a server
+producing them. These names are the ones the stub actually exports — `stubtest.mjs` parses this
+table and fails the build if the contract and the implementation drift apart in either direction.
 
 Codex builds and tests every §3 state against this without a running match server. Shipped
 in P1 per Build Plan §0.5 step 3.

@@ -43,7 +43,18 @@ const silent = () => {
  * teaches everyone to re-run instead of to look.
  */
 async function withApp(fn, envOverrides = {}) {
-  const config = loadConfig({ PLATFORM_PORT: '0', ...envOverrides });
+  // `process.env` FIRST. `loadConfig` REPLACES the environment rather than merging with it, so
+  // a config built from a bare object literal is always `storage: memory` — including under
+  // `scripts/pgtest.mjs`, whose whole purpose is to run this suite against a real database.
+  // This suite is the composition-root test: every "assembled app works" claim it made under
+  // pgtest was made against the memory adapter, which is the one configuration pgtest exists
+  // to not test. An `envOverrides` key still wins, so a test that deliberately wants memory
+  // can still ask for it explicitly.
+  const config = loadConfig({ ...process.env, PLATFORM_PORT: '0', ...envOverrides });
+  if (process.env.PLATFORM_STORAGE && !envOverrides.PLATFORM_STORAGE
+      && config.storage !== process.env.PLATFORM_STORAGE) {
+    throw new Error(`apptest: asked for ${process.env.PLATFORM_STORAGE}, built ${config.storage}`);
+  }
   const app = await buildApp(config, { logger: silent() });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   const port = app.server.address().port;
@@ -67,8 +78,24 @@ async function withApp(fn, envOverrides = {}) {
   finally { app.stop(); await new Promise((r) => app.server.close(r)); }
 }
 
-/** Walk the approved onboarding order and return the artefacts each step yields. */
-async function onboard(call, { sid, email = 'player@example.invalid', name = 'Ravon' } = {}) {
+/**
+ * Walk the approved onboarding order and return the artefacts each step yields.
+ *
+ * Each onboarding gets its OWN email and display name unless the caller pins them.
+ *
+ * These were fixed literals, which is correct for the memory adapter — every `withApp` builds a
+ * fresh store, so the second signup sees an empty account table. Against PostgreSQL the database
+ * outlives all of them, so the second `withApp` collided with the first on NAME_TAKEN and every
+ * section after the onboarding chain failed at the first request. Those sections were not finding
+ * a product defect and were not passing either; they were unreachable.
+ *
+ * A caller that needs the SAME identity twice (replay, uniqueness) passes it explicitly.
+ */
+let identity = 0;
+async function onboard(call, { sid, email, name } = {}) {
+  const n = ++identity;
+  email = email ?? `player${n}@example.invalid`;
+  name = name ?? `Ravon${n}`;
   const elig = await call('POST', '/v1/onboarding/eligibility',
     { dateOfBirth: '1994-03-02', jurisdiction: 'CA-ON' });
   const consent = await call('PUT', '/v1/onboarding/consent',

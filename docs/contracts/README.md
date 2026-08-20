@@ -39,7 +39,7 @@ buildable — a single open question does not freeze a whole document.
 | 3 | [`auth.md`](auth.md) | FROZEN | Tokens, sessions, revocation, recovery |
 | 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN | Lobby WebSocket: presence, roster, teams, ready, launch |
 | 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN | The binary match protocol, as it exists and as it must change |
-| 6 | [`net-facade.md`](net-facade.md) | FROZEN | The only surface Codex uses to reach netcode |
+| 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.8.0 | The only surface Codex uses to reach netcode |
 | 7 | [`match-result.md`](match-result.md) | FROZEN | Canonical stat definitions and the immutable result record |
 | 8 | [`event-envelope.md`](event-envelope.md) | FROZEN | Canonical platform event envelope and catalogue |
 | 9 | [`map-data.md`](map-data.md) | FROZEN | What `level.js` must export for the server to consume |
