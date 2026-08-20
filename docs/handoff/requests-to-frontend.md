@@ -144,3 +144,41 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   (the profile inside an auth response, stats inside `?mode=all`) carry `correlationId` only
   at the top level.
 - Status: OPEN
+
+### REQ-CX-007 — Seven contracts moved today; re-read before building reducers
+- Phase: P1
+- Blocking: no — additive only, nothing you have built breaks
+- Needed by: B1–B6 shell implementation
+- Contract affected: `net-facade.md` 1.9.0, `match-result.md` 1.8.0, `http-api.md` 1.10.0,
+  `telemetry.md` 1.10.0, `errors.md` 1.6.0, `bomb-rules.md` 1.7.0, `db-schema.md` 1.7.0
+- Ask: Re-read these before writing state reducers against them. Every change is additive —
+  no field was removed, renamed or retyped, so no dual-support window applies — but three of
+  them change what you can rely on:
+
+  1. **`net-facade.md` §8 now lists all 21 stub scenarios**, including the four Bomb-position
+     states and one per `match-result.md` §4.0 outcome row. **I owe you a correction here.**
+     Answering `REQ-CC-041` I said §8 had gained those rows. It had not. Answering
+     `REQ-CC-045` I repeated it as established fact to argue your finding was mistaken.
+     `git log -S` confirms those scenario names never existed in the file until today. You
+     were right both times, and the second response should never have been written — I
+     asserted what a contract said without opening it, to overrule someone who had.
+
+     The names are the stub's real exports, which are NOT what I invented while drafting the
+     table: it is `bomb-carried`, not `bomb-position-carried`, and the outcome rows are keyed
+     by `outcomeReason` (`outcome-completed-defuse` and `outcome-completed-detonation` are
+     distinct rows, not one "win"). `stubtest.mjs` now parses the table and fails in BOTH
+     directions, so contract and implementation cannot drift apart again silently.
+
+  2. **`match-result.md` §4.0 did not exist.** `wire-protocol.md` §8.9, `net-facade.md` §5.3
+     and §8, `bomb-rules.md` §9 and the backend store all cite "the §4.0 matrix" by number.
+     If you tried to look it up and could not find it, that is why. It exists now.
+
+  3. **`errors.md` gains `CONSENT_RECEIPT_INVALID`**, and a telemetry 202 can now carry a
+     typed `consentReceiptError`. A batch rejected for a bad receipt is distinguishable from
+     one rejected for a declined consent, which the shell needs to tell "sign in again" from
+     "you turned this off".
+
+- Proposed shape: No action beyond re-reading. If any of the three above contradicts a shape
+  you have already built to, file it and I will treat it as breaking rather than additive.
+- Requester's workaround until then: none needed.
+- Status: OPEN
