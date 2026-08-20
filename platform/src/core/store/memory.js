@@ -31,6 +31,7 @@ import {
   STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
   MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
   assertMatchTransition, assertPageArgs, TERMINAL_MATCH_STATUSES,
+  INITIAL_SETTINGS_VERSION, casMayCreateProfile, assertExpectedVersion,
 } from '../store.js';
 
 /** Handles are tagged so a handle from another store (or a stray object) fails loudly. */
@@ -250,8 +251,22 @@ const PROFILE_COLUMNS = columns({
   // It has a column because the module writes it; without one, memory rejected the write and
   // Postgres discarded it silently, which is the worse of the two failures.
   legacyImport: null,
-  settingsVersion: 1,
+  settingsVersion: INITIAL_SETTINGS_VERSION,
 });
+
+/**
+ * `settings_version` is NOT NULL integer (0003), so "present and null" and "present and a
+ * string" are not operations it has. Shared by `upsert` and `upsertIfVersion` because the CAS
+ * did not have it: it wrote `settingsVersion: "9"` and every later comparison then failed
+ * against a version no caller could name.
+ */
+function assertProfileVersionPatch(patch) {
+  if (patch && Object.hasOwn(patch, 'settingsVersion') && !Number.isInteger(patch.settingsVersion)) {
+    throw new ApiError('VALIDATION_FAILED', 'profiles.settingsVersion must be an integer.', {
+      details: { table: 'profiles', column: 'settingsVersion' },
+    });
+  }
+}
 
 const FLAG_COLUMNS = columns({
   enabled: false,
@@ -653,14 +668,8 @@ export function createMemoryStore(config = {}, deps = {}) {
           updatedAt: nowIso(),
         };
         assertKnown(patch ?? {}, PROFILE_COLUMNS, 'profiles');
-        for (const k of Object.keys(patch ?? {})) {
-          if (k === 'settingsVersion' && !Number.isInteger(patch[k])) {
-            throw new ApiError('VALIDATION_FAILED', 'profiles.settingsVersion must be an integer.', {
-              details: { table: 'profiles', column: 'settingsVersion' },
-            });
-          }
-          next[k] = patch[k];
-        }
+        assertProfileVersionPatch(patch);
+        for (const k of Object.keys(patch ?? {})) next[k] = patch[k];
         st.profiles.set(accountId, next);
         return clone(next);
       });
@@ -676,15 +685,25 @@ export function createMemoryStore(config = {}, deps = {}) {
      *
      * Returns null when the expected version no longer holds, so the caller raises CONFLICT
      * with the current state rather than guessing why.
+     *
+     * The ARGUMENT checks run before the comparison, and that ordering is contract (store.js
+     * `assertExpectedVersion`). They used to run after it, so a typo'd column or a string
+     * version came back as `null` — "your version moved, retry" — and the client retried a
+     * request that could never succeed, forever.
      */
     upsertIfVersion(accountId, expectedVersion, patch, txh) {
       assertCloneable(patch, 'profiles patch');
+      assertExpectedVersion(expectedVersion);
+      assertKnown(patch ?? {}, PROFILE_COLUMNS, 'profiles');
+      assertProfileVersionPatch(patch);
       return write(txh, (st) => {
         requireAccount(st, accountId, 'profiles');
         const cur = st.profiles.get(accountId);
-        const actual = cur?.settingsVersion ?? 1;
+        // Absence IS the initial version (store.js), so the first-ever write lands and a CAS
+        // holding any other version finds nothing to match rather than inventing a row.
+        if (!cur && !casMayCreateProfile(expectedVersion)) return null;
+        const actual = cur?.settingsVersion ?? INITIAL_SETTINGS_VERSION;
         if (actual !== expectedVersion) return null;
-        assertKnown(patch ?? {}, PROFILE_COLUMNS, 'profiles');
         const next = {
           accountId,
           roamingSettings: cur?.roamingSettings ?? null,

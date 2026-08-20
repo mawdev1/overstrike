@@ -1227,9 +1227,14 @@ console.log('\nA rename goes through the canonical identity path, with its event
   await store.close();
 }
 
-// ------------------------------------------------------------------ 11. If-Match is a CAS
+// ------------------------------------------------------------ 11a. the service's If-Match check
 
-console.log('\nhttp-api.md §11.2 — If-Match is compare-and-set, not read-then-write');
+// This block was titled "If-Match is compare-and-set, not read-then-write" and tested the
+// opposite: every check in it passes with the adapter CAS deleted outright, because what it
+// exercises is the service's own read-then-write pre-check in profile/settings.js — the very
+// thing the old title said it was not. It is worth keeping, so it is kept under an honest
+// name; §11b below is the part the old title claimed.
+console.log('\nhttp-api.md §11.2 — the settings service validates If-Match against the stored version');
 
 {
   const store = createMemoryStore({ storage: 'memory' });
@@ -1239,6 +1244,11 @@ console.log('\nhttp-api.md §11.2 — If-Match is compare-and-set, not read-then
   const mod = moduleWith(store);
 
   // Two writers, both holding the same fresh ETag. One must win and one must be told.
+  //
+  // On this path the transaction's serialisation plus the pre-check are enough, so this pair
+  // says nothing about the adapter CAS — it says the SERVICE returns 409 rather than 200 to
+  // the loser, and that the loser's values are not what ends up stored. That is a real claim
+  // and this is the right place for it. The claim it is NOT making is §11b's.
   const [a, b] = await Promise.allSettled([
     mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 100 } }, '"1"'),
     mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 110 } }, '"1"'),
@@ -1265,6 +1275,69 @@ console.log('\nhttp-api.md §11.2 — If-Match is compare-and-set, not read-then
   await expectCode(
     () => mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 90 } }, '"2"'),
     'CONFLICT', 'CONTROL: the now-stale version is refused');
+  await store.close();
+}
+
+// -------------------------------------------------- 11b. the write is conditional on the version
+
+// The claim §11a cannot make: that the version the service validated is re-compared BY THE
+// WRITE. A read-then-write check can only see the world as it was when it ran; the whole point
+// of §11.2 is the window after it.
+//
+// The store here is a REAL memory store and the service is the real service — only the
+// INTERLEAVING is injected. A competing write lands between the pre-check and the write, which
+// is precisely the state the pre-check has already stopped being able to see. Delete
+// `store.profiles.upsertIfVersion` from settings.js (it falls back to a plain upsert) or delete
+// the comparison from the adapter, and this block fails: the request is answered 200 and the
+// competing writer's rebind is gone.
+//
+// The adapter method itself is proved directly, against both adapters including real
+// PostgreSQL, in platform/test/storetest.mjs §8a. This is only the delegation.
+console.log('\nhttp-api.md §11.2 — the settings write is conditional on the version it validated');
+
+{
+  const store = createMemoryStore({ storage: 'memory' });
+  const account = await store.accounts.create({
+    accountId: ACCOUNT, displayName: 'Racer', displayNameFolded: 'racer',
+  });
+  // A known pre-race value, so "nothing was written" is a row we can name rather than the
+  // absence of one.
+  await store.profiles.upsert(account.accountId, { roamingSettings: { fov: 100 }, settingsVersion: 1 });
+
+  const realCas = store.profiles.upsertIfVersion.bind(store.profiles);
+  let interleaved = 0;
+  store.profiles.upsertIfVersion = async (accountId, expectedVersion, patch, tx) => {
+    if (interleaved++ === 0) {
+      // The other device, getting in after our If-Match was validated and before we wrote.
+      await store.profiles.upsert(accountId, { roamingSettings: { fov: 44 }, settingsVersion: 2 }, tx);
+    }
+    return realCas(accountId, expectedVersion, patch, tx);
+  };
+  const mod = moduleWith(store);
+
+  await expectCode(
+    () => mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 105 } }, '"1"'),
+    'CONFLICT', 'a writer that loses the race AFTER its If-Match was validated is still refused');
+  // Without this the check above would also pass if the service never reached the CAS and the
+  // request failed for some entirely unrelated reason.
+  expect(interleaved === 1, 'the service reached the adapter CAS exactly once',
+    `upsertIfVersion was called ${interleaved} time(s)`);
+  // The refusal rolls the whole transaction back, injected write included, so the row is
+  // exactly what it was before the request. With the CAS gone it reads version 2, fov 105.
+  const after = await mod.settings.read(account.accountId);
+  expect(after.version === 1 && after.values.fov === 100,
+    'the refused writer stored nothing and consumed no version',
+    JSON.stringify({ version: after.version, fov: after.values.fov }));
+
+  // CONTROL: with no interleaving the same service, store and version accept the write, so the
+  // refusal above is about losing the race and not about a settings path that has stopped
+  // working. `interleaved` is 1 now, so the injection no longer fires.
+  const won = await mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 77 } }, '"1"');
+  expect(won.version === 2 && won.values.fov === 77,
+    'CONTROL: an uncontested write with the current version is accepted',
+    JSON.stringify({ version: won.version, fov: won.values.fov }));
+  expect(interleaved === 2, 'CONTROL: and it went through the adapter CAS too',
+    `upsertIfVersion was called ${interleaved} time(s)`);
   await store.close();
 }
 

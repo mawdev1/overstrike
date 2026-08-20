@@ -152,8 +152,13 @@ export const isWellFormedBuild = (b) => typeof b === 'string' && b !== '' && BUI
  * past 1.9.x. And `parseInt('2garbage')` is 2, so a malformed build sailed past floor 2 —
  * the comparison happily read a prefix and ignored the rest. Format is validated by the
  * caller before this runs, so anything reaching here is already dot-separated integers.
+ *
+ * EXPORTED because the stub layer needs the identical comparison. It previously held a verbatim
+ * copy with a comment claiming it "matched core/http.js" — and the only test of numeric floor
+ * comparison asserted against the copy, leaving this original unguarded and free to drift.
+ * One implementation, one call site per consumer, one test target.
  */
-function buildBelowFloor(build, floor) {
+export function buildBelowFloor(build, floor) {
   const a = String(build).split('.').map(Number);
   const b = String(floor).split('.').map(Number);
   const len = Math.max(a.length, b.length);

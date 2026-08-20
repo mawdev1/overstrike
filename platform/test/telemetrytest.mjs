@@ -499,6 +499,181 @@ console.log('\n§3.3 unknown names, stale events, and batch caps');
 }
 
 // =============================================================================================
+console.log('\n§3.3.1 the field checks, and §3.3 the timestamp checks');
+// =============================================================================================
+// A mutation sweep deleted each of these guards in turn and this suite stayed green every
+// time — the payload section above covers bounds, enums, missing keys and the invariant, and
+// nothing covered nullability, primitive type, integrality, or an unparseable timestamp. Each
+// case below was watched to fail with its guard removed.
+{
+  const clock = fakeClock();
+  const { service, sink } = harness({ clock });
+
+  // validate.js:41 — `null` in a field that is not declared nullable. Deleting the guard
+  // stores `errorClass: null`, which is a row in the warehouse that answers no question and
+  // silently widens every closed enum to "or nothing".
+  const nulled = await service.ingest({
+    body: batch([ev('client.error', { errorClass: null, fatal: false }, clock)]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('a null in a non-nullable field is rejected',
+    nulled.accepted === 0 && nulled.rejections[0].reason === 'field_null:errorClass',
+    JSON.stringify(nulled.rejections));
+  assert('the null never reaches the sink',
+    !sink.records.some((r) => r.name === 'client.error'),
+    JSON.stringify(sink.records.map((r) => r.name)));
+
+  // validate.js:48 — a bool field that is not a boolean. `'yes'` and `1` are both truthy, and
+  // a truthiness test downstream would read them as `true` while a strict one reads them as
+  // neither: the same stored row means two different things to two consumers.
+  const bools = await service.ingest({
+    body: batch([
+      ev('client.error', { errorClass: 'other', fatal: 'yes' }, clock),
+      ev('client.error', { errorClass: 'other', fatal: 1 }, clock),
+      ev('client.webgl_context_lost', { recovered: 'true', uptimeSec: 10 }, clock),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('a string, a number and the word "true" are all refused where a boolean belongs',
+    bools.accepted === 0 && bools.rejections.length === 3
+    && bools.rejections.every((r) => /^field_type:(fatal|recovered)$/.test(r.reason)),
+    JSON.stringify(bools.rejections));
+
+  // validate.js:56 — a number field that is not a finite number. `'60' > 1000` is false and
+  // `NaN > 1000` is false, so the bounds check below waves both straight through: without the
+  // type guard the range guard is not a second line of defence, it is no defence at all.
+  const numbers = await service.ingest({
+    body: batch([
+      ev('client.fps', { p50: '60', p01: 30, windowSec: 60 }, clock),
+      ev('client.fps', { p50: NaN, p01: 30, windowSec: 60 }, clock),
+      ev('client.fps', { p50: Infinity, p01: 30, windowSec: 60 }, clock),
+      ev('client.heap', { usedMb: null, sampledAtSec: 5 }, clock),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('a numeric string, NaN and Infinity are all refused where a number belongs',
+    numbers.accepted === 0
+    && numbers.rejections.filter((r) => r.reason === 'field_type:p50').length === 3,
+    JSON.stringify(numbers.rejections));
+  assert('a null in a numeric field is refused as a null, before the type check',
+    numbers.rejections.some((r) => r.reason === 'field_null:usedMb'),
+    JSON.stringify(numbers.rejections));
+  assert('no fps row reached the sink carrying a non-number',
+    !sink.records.some((r) => r.name === 'client.fps'),
+    JSON.stringify(sink.records.map((r) => r.name)));
+
+  // validate.js:57 — a fractional value in a field declared `integer`. A browser major of
+  // 120.5 is a sender bug, and storing it produces a version nobody shipped.
+  const fractional = await service.ingest({
+    body: batch([ev('client.unsupported',
+      { reason: 'webgl2', browser: 'chrome', browserMajor: 120.5, os: 'macos' }, clock)]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('a fractional value in an integer field is rejected',
+    fractional.accepted === 0
+    && fractional.rejections[0].reason === 'field_not_integer:browserMajor',
+    JSON.stringify(fractional.rejections));
+
+  // CONTROLS. Every rejection above must be about the VALUE, not about the field being
+  // unusable — so the same events with correct values are accepted and stored.
+  const { service: sOk, sink: sinkOk } = harness({ clock });
+  const good = await sOk.ingest({
+    body: batch([
+      ev('client.error', { errorClass: 'other', fatal: false }, clock),
+      ev('client.webgl_context_lost', { recovered: true, uptimeSec: 10 }, clock),
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock),
+      ev('client.heap', { usedMb: 512, sampledAtSec: 5 }, clock),
+      ev('client.unsupported',
+        { reason: 'webgl2', browser: 'chrome', browserMajor: 120, os: 'macos' }, clock),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('CONTROL: the same five events with well-typed values are all accepted',
+    good.accepted === 5 && good.rejections.length === 0, JSON.stringify(good.rejections));
+  assert('CONTROL: `false` and `0` survive — the type check is not a truthiness check',
+    sinkOk.records.find((r) => r.name === 'client.error').payload.fatal === false,
+    JSON.stringify(sinkOk.records.map((r) => r.payload)));
+
+  // CONTROL for nullability: a field the registry DOES declare nullable takes a null. Without
+  // this, "a null is rejected" would also pass for a validator that banned null everywhere.
+  const { service: sNull, sink: sinkNull, consent: cNull } = harness({ clock });
+  const receipt = cNull.issue({ subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 1 });
+  const nullable = await sNull.ingest({
+    body: batch([ev('flow.step', { step: 'verify', outcome: 'completed', errorCode: null }, clock)],
+      { consentReceipt: receipt, clientSessionId: ulid() }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: a null in a field the registry declares nullable is accepted and stored',
+    nullable.accepted === 1
+    && sinkNull.records.find((r) => r.name === 'flow.step').payload.errorCode === null,
+    JSON.stringify(nullable.rejections));
+
+  // validate.js:212 — an `occurredAt` that is a string but not a date. Deleting this guard is
+  // not a quiet acceptance: `checkFreshness` returns null, the service then calls
+  // `new Date(NaN).toISOString()` and THROWS, so one malformed timestamp takes down the whole
+  // batch — the exact opposite of §3.3's "one bad event must not cost the other forty-nine".
+  const { service: sTime, sink: sinkTime } = harness({ clock });
+  const invalidTime = await sTime.ingest({
+    body: batch([
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock, { occurredAt: 'not-a-date' }),
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock, { occurredAt: '2026-13-45T99:99:99Z' }),
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('an unparseable occurredAt is rejected as occurred_at_invalid',
+    invalidTime.rejections.length === 2
+    && invalidTime.rejections.every((r) => r.reason === 'occurred_at_invalid'),
+    JSON.stringify(invalidTime.rejections));
+  assert('and the batch still succeeds — the sibling event lands',
+    invalidTime.accepted === 1 && sinkTime.records.length === 1,
+    `accepted=${invalidTime.accepted} stored=${sinkTime.records.length}`);
+  assert('nothing was stored with an Invalid Date',
+    sinkTime.records.every((r) => !Number.isNaN(Date.parse(r.occurredAt))),
+    JSON.stringify(sinkTime.records.map((r) => r.occurredAt)));
+
+  // An occurredAt that is not a string at all is a different reason, and the epoch number a
+  // client might send must not be read as a date.
+  const notString = await sTime.ingest({
+    body: batch([ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock,
+      { occurredAt: clock.now() })]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('a numeric epoch where an ISO string belongs is occurred_at_missing',
+    notString.rejections[0].reason === 'occurred_at_missing', JSON.stringify(notString.rejections));
+
+  // validate.js:214 — the future skew bound. A client with a wrong clock, or one deliberately
+  // post-dating, otherwise writes events that a retention sweep will not reach for as long as
+  // it likes and that sort ahead of everything real.
+  const { service: sFuture, sink: sinkFuture } = harness({ clock });
+  const future = await sFuture.ingest({
+    body: batch([
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock,
+        { occurredAt: new Date(clock.now() + LIMITS.maxFutureSkewMs + 1000).toISOString() }),
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock,
+        { occurredAt: new Date(clock.now() + 365 * 24 * 3600 * 1000).toISOString() }),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('an event dated past the skew allowance is dropped as occurred_in_future',
+    future.accepted === 0 && future.rejections.length === 2
+    && future.rejections.every((r) => r.reason === 'occurred_in_future'),
+    JSON.stringify(future.rejections));
+  assert('the future-dated event never reaches the sink', sinkFuture.records.length === 0,
+    JSON.stringify(sinkFuture.records.map((r) => r.occurredAt)));
+
+  // CONTROL: modest clock skew is TOLERATED. Rejecting everything ahead of the server clock
+  // would drop honest traffic, so the bound is a bound and not a ban.
+  const withinSkew = await sFuture.ingest({
+    body: batch([ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock,
+      { occurredAt: new Date(clock.now() + LIMITS.maxFutureSkewMs - 1000).toISOString() })]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('CONTROL: an event inside the two-minute skew allowance is accepted',
+    withinSkew.accepted === 1, JSON.stringify(withinSkew.rejections));
+}
+
+// =============================================================================================
 console.log('\n§3.5 nothing identifying is carried');
 // =============================================================================================
 {

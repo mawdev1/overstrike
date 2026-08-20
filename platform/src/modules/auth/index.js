@@ -69,4 +69,3 @@ export function createAuthModule(deps) {
 
 export { createRateLimiter, createReceipts, createEphemeralTokens, createSessionService, createAuthService, createAuthRoutes };
 export { fold, normaliseDisplayName, assertCooldown } from './names.js';
-export { applyCookies } from './routes.js';

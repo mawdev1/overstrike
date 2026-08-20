@@ -34,6 +34,17 @@ export const PRE_AUTH_CONSENT_TTL_MS = 30 * 24 * 3600 * 1000;
  */
 export const RECOVERY_FLOOR_MS = 40;
 
+/**
+ * The advisory-lock key a rename serialises on, scoped to one account.
+ *
+ * Not an idempotency key — it is passed through `store.idempotency.acquire` because that is
+ * where the transaction-scoped advisory lock lives (see `postgres.js`), and a second way to
+ * take the same kind of lock would be a second place to get it wrong. It is a constant rather
+ * than a caller-supplied string so that every rename of one account contends on ONE key; the
+ * account id is the other half of the lock identity and is supplied at the call site.
+ */
+export const NAME_CHANGE_LOCK = 'account:display-name';
+
 /** A real hash to verify against when the account does not exist — see `signin`. */
 const DUMMY_PASSWORD_HASH = hashPassword(opaqueToken());
 
@@ -115,8 +126,12 @@ export function createAuthService(deps) {
    * is `profile.updated` because that is what the catalogue registers for a change to the
    * account projection; auth may not invent a type (event-envelope.md §6).
    */
-  async function updateAccountWithEvent(actor, patch, { action, capability = 'account:update', reasonCode, correlationId, summaryKeys, spec, alsoInTransaction = null }) {
-    const before = await store.accounts.byId(actor.accountId);
+  async function updateAccountWithEvent(actor, patch, { action, capability = 'account:update', reasonCode, correlationId, summaryKeys, spec, alsoInTransaction = null, tx: openTx = undefined }) {
+    // `openTx` is for a caller that has already opened the transaction and taken a lock in it
+    // — the rename does. Reading `before` on the pool instead would read around that
+    // transaction's own uncommitted writes, so the audit row's `before` would describe a state
+    // that never existed. Undefined for every other caller, which reads on the pool as before.
+    const before = await store.accounts.byId(actor.accountId, openTx);
     if (!before) throw new ApiError('NOT_FOUND', 'No such account.');
     const { result } = await internalise(() => audit.recordWithEvent(
       outbox,
@@ -676,18 +691,62 @@ export function createAuthService(deps) {
    */
   async function changeDisplayName({ actor, displayName, correlationId = null }) {
     requireCapability(actor, 'profile:update', { accountId: actor.accountId });
-    const account = await store.accounts.byId(actor.accountId);
-    if (!account) throw new ApiError('NOT_FOUND', 'No such account.');
+    // Normalisation and the §9 name policy are decided on the INPUT and need no account, so
+    // they run before the lock is taken — a request that could never be applied should not
+    // queue behind one that can.
     const { displayName: name, folded } = normaliseDisplayName(displayName);
-    const now = clock.now();
 
-    const foldChanged = folded !== account.displayNameFolded;
-    if (foldChanged) {
-      const holder = await store.accounts.byNameFolded(folded);
-      if (holder && holder.accountId !== account.accountId) throw new ApiError('NAME_TAKEN', 'That name is taken.');
-      assertCooldown(account.nameChangedAt, now);
-    }
+    // ── Everything below is ONE serialised read-decide-write, per account ────────────────
+    //
+    // It was not. The account was read, `assertCooldown` was checked against the row it
+    // returned, and the write happened in a separate transaction opened further down — with
+    // nothing holding the three together. Two renames that arrive at once both read
+    // `nameChangedAt: null`, both pass the cooldown check, and both write: a 30-day rule
+    // bypassed by sending two requests instead of one, and two `account_name_history` rows
+    // retained for a change §9 permits once. Ten concurrent requests landed three renames
+    // against a real database.
+    //
+    // `display_name_folded` is UNIQUE, so the database refuses two racers who pick the SAME
+    // name. Nothing refuses two racers who pick DIFFERENT ones, and a uniqueness constraint
+    // was never the cooldown's enforcement — it just happened to hide the race whenever the
+    // test used one name.
+    //
+    // The lock is the transaction-scoped advisory lock `profile.js` takes around its
+    // idempotency key and `postgres.js` documents on `idempotency.acquire`: it needs no row to
+    // exist, it is released on commit or rollback so a crash cannot strand it, and it is a
+    // documented no-op on the memory adapter, where every transaction is already serialised.
+    // Expressed once here rather than per adapter. The key is the ACCOUNT, so two different
+    // accounts renaming at the same time do not queue behind each other.
+    //
+    // `store.tx` is reentrant, so when the profile module has already opened a transaction for
+    // its idempotency key this joins it rather than taking a second connection — and the lock
+    // ordering (idempotency key, then account) is the same on every path, so it cannot deadlock.
+    return store.tx(async (tx) => {
+      if (store.idempotency?.acquire) {
+        await store.idempotency.acquire(NAME_CHANGE_LOCK, actor.accountId, tx);
+      }
+      // Read AFTER the lock, and inside the transaction. A read taken before it, or outside
+      // it, is the stale row the whole guard exists to not decide on.
+      const account = await store.accounts.byId(actor.accountId, tx);
+      if (!account) throw new ApiError('NOT_FOUND', 'No such account.');
+      const now = clock.now();
 
+      const foldChanged = folded !== account.displayNameFolded;
+      if (foldChanged) {
+        const holder = await store.accounts.byNameFolded(folded, tx);
+        if (holder && holder.accountId !== account.accountId) throw new ApiError('NAME_TAKEN', 'That name is taken.');
+        assertCooldown(account.nameChangedAt, now);
+      }
+
+      return applyRename({ actor, account, name, folded, foldChanged, now, correlationId, tx });
+    });
+  }
+
+  /**
+   * The write half of `changeDisplayName`, run inside its lock. Separated only so the
+   * serialised section above reads as the read-decide-write it is.
+   */
+  async function applyRename({ actor, account, name, folded, foldChanged, now, correlationId, tx }) {
     const patch = { displayName: name, displayNameFolded: folded, updatedAt: iso(now) };
     // A case-only edit skips the cooldown check — the name is the same name — so it must not
     // restart the cooldown clock either. It did, which meant `ada` → `Ada` bought another 30
@@ -700,6 +759,9 @@ export function createAuthService(deps) {
       reasonCode: 'account_self_service',
       correlationId,
       summaryKeys: ['displayName'],
+      // The transaction the lock is held in. `store.tx` is reentrant, so the event, the audit
+      // row and the history insert all enrol in it rather than opening a second one.
+      tx,
       spec: {
         type: 'account.name_changed',
         actor: playerActor(account.accountId, actor.roles),
@@ -721,7 +783,7 @@ export function createAuthService(deps) {
        * name to retain, and (account_id, changed_at) is the primary key, so a stream of
        * identical writes at one instant would collide for no reason.
        */
-      alsoInTransaction: name === account.displayName ? null : async (_updated, tx) => {
+      alsoInTransaction: name === account.displayName ? null : async (_updated, innerTx) => {
         await store.accountNameHistory.insert({
           accountId: account.accountId,
           previousName: account.displayName,
@@ -730,7 +792,7 @@ export function createAuthService(deps) {
           // moderator, or the row cannot answer who did it.
           changedBy: actor.id ?? actor.accountId ?? null,
           reason: 'account_self_service',
-        }, tx);
+        }, innerTx);
       },
     });
     return projectProfile(updated);

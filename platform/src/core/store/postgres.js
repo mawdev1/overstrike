@@ -27,6 +27,7 @@ import {
   STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
   MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
   assertMatchTransition, assertPageArgs, TERMINAL_MATCH_STATUSES,
+  INITIAL_SETTINGS_VERSION, casMayCreateProfile, assertExpectedVersion,
 } from '../store.js';
 
 const TX = Symbol('overstrike.pgtx');
@@ -452,9 +453,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
           });
         }
       }
-      if (!Number.isInteger(expectedVersion)) {
-        throw new ApiError('VALIDATION_FAILED', 'expectedVersion must be an integer.');
-      }
+      assertExpectedVersion(expectedVersion);
       const hasRoaming = Object.hasOwn(p, 'roamingSettings');
       const hasLegacy = Object.hasOwn(p, 'legacyImport');
       const hasVersion = Object.hasOwn(p, 'settingsVersion');
@@ -463,9 +462,17 @@ export async function createPostgresStore(config = {}, deps = {}) {
           details: { table: 'profiles', column: 'settingsVersion' },
         });
       }
+      // `on conflict (account_id) do update ... where` gates the DO UPDATE branch and NOTHING
+      // else, so the plain INSERT path ignored expectedVersion entirely: a CAS against version
+      // 42 on an account with no profile row CREATED one and reported success, while memory
+      // refused. The insert has to be gated too, and the only way to gate it in the same
+      // statement — so the gate cannot be raced apart from the write — is INSERT … SELECT …
+      // WHERE. `$9` is `casMayCreateProfile(expectedVersion)` (store.js); the EXISTS covers the
+      // ordinary case where the row is already there and DO UPDATE will do the comparing.
       const { rows } = await q(txh,
         `insert into profiles (account_id, roaming_settings, settings_version, legacy_import)
-         values ($1, $2::jsonb, coalesce($3::int, 1), $4::jsonb)
+         select $1, $2::jsonb, coalesce($3::int, $10::int), $4::jsonb
+          where $9::boolean or exists (select 1 from profiles where account_id = $1)
          on conflict (account_id) do update set
            roaming_settings = case when $5::boolean then $2::jsonb else profiles.roaming_settings end,
            legacy_import    = case when $6::boolean then $4::jsonb else profiles.legacy_import end,
@@ -477,11 +484,19 @@ export async function createPostgresStore(config = {}, deps = {}) {
           hasRoaming && p.roamingSettings != null ? JSON.stringify(p.roamingSettings) : null,
           hasVersion ? p.settingsVersion : null,
           hasLegacy && p.legacyImport != null ? JSON.stringify(p.legacyImport) : null,
-          hasRoaming, hasLegacy, hasVersion, expectedVersion]);
-      // A brand-new row inserts (no conflict) and is correct only when the caller expected the
-      // initial version; otherwise it would create a row the caller did not think existed.
-      if (!rows[0]) return null;
-      return mapRow(rows[0]);
+          hasRoaming, hasLegacy, hasVersion, expectedVersion,
+          casMayCreateProfile(expectedVersion), INITIAL_SETTINGS_VERSION]);
+      if (rows[0]) return mapRow(rows[0]);
+      // Zero rows is "the version moved" — but only for an account that EXISTS. Before the gate
+      // above, an unknown account always reached the insert and the foreign key answered
+      // NOT_FOUND, as memory does; now the gate can swallow it and return null, which tells the
+      // caller its If-Match was stale when the truth is that the account is not there. One
+      // extra query, on the refusal path only, keeps the two adapters saying the same thing.
+      const { rows: account } = await q(txh, 'select 1 from accounts where account_id = $1', [accountId]);
+      if (!account[0]) {
+        throw new ApiError('NOT_FOUND', 'profiles: no such account', { details: { accountId } });
+      }
+      return null;
     },
 
     async upsert(accountId, patch, txh) {

@@ -17,27 +17,20 @@
  * route declares.
  */
 import { ApiError } from '../../core/errors.js';
-import { isWellFormedBuild } from '../../core/http.js';
+import { isWellFormedBuild, buildBelowFloor } from '../../core/http.js';
 
 /** Tokens this layer mints. Anything else is a token we did not issue — production says so too. */
 const STUB_ACCESS_PREFIX = 'stub.access.';
 
 /**
- * Numeric build comparison, matching core/http.js.
+ * Numeric build comparison is `core/http.js`'s `buildBelowFloor`, IMPORTED — not restated.
  *
- * `'1.10.0' < '1.2.0'` as strings, which locks out every client past 1.9.x. Format is validated
- * before this runs, so every component parses.
+ * This file used to carry a verbatim copy under a comment asserting it "matched core/http.js".
+ * Nothing enforced that claim: the only test of numeric floor comparison drove `createStubApi`,
+ * so it asserted against the copy while the production comparator in `core/http.js` had no test
+ * at all. Deleting the `x !== y` line there disabled the build floor entirely and the suite
+ * stayed green. A comment is not a link; an import is.
  */
-function belowFloor(build, floor) {
-  const a = String(build).split('.').map(Number);
-  const b = String(floor).split('.').map(Number);
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const x = Number.isInteger(a[i]) ? a[i] : 0;
-    const y = Number.isInteger(b[i]) ? b[i] : 0;
-    if (x !== y) return x < y;
-  }
-  return false;
-}
 
 /**
  * §1: "Every request carries `X-Client-Build`. Below the supported floor is UNSUPPORTED_CLIENT."
@@ -63,7 +56,7 @@ export function checkClientBuild(headers, { requireBuild = true, minClientBuild 
     throw new ApiError('SERVICE_UNAVAILABLE', 'Client version policy is misconfigured.',
       { details: { reason: 'floor-malformed' } });
   }
-  if (belowFloor(build, minClientBuild)) {
+  if (buildBelowFloor(build, minClientBuild)) {
     throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
       { details: { reason: 'build' } });
   }

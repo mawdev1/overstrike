@@ -59,6 +59,11 @@ import { ApiError } from './errors.js';
  *                                      // null when the version moved; the caller raises
  *                                      // CONFLICT. See http-api.md §11.2 — a read-then-write
  *                                      // If-Match is a race both writers win.
+ *                                      // A row that does not exist yet IS `INITIAL_SETTINGS_VERSION`
+ *                                      // (that is the version §11.2 reports for it), so a CAS
+ *                                      // holding that version creates it and a CAS holding any
+ *                                      // other version returns null rather than inventing one.
+ *                                      // An unknown account is NOT_FOUND, never null.
  *   upsert(accountId, patch, tx) -> profile
  *   byAccountId(accountId, tx) -> profile|null
  *
@@ -145,6 +150,55 @@ export function assertStorable(value, what) {
     });
   }
   return value;
+}
+
+/**
+ * The settings version a profile has BEFORE its row exists.  http-api.md §11.2.
+ *
+ * `GET /v1/profile/me/settings` answers `version: 1` with the documented defaults for an
+ * account that has never written settings — there is no "no version yet" state on the wire —
+ * so absence of the row and version 1 are the same fact, and `profiles.settings_version`
+ * defaults to it in migration 0003.
+ */
+export const INITIAL_SETTINGS_VERSION = 1;
+
+/**
+ * May a compare-and-set CREATE the profile row?
+ *
+ * Only when the caller expected the version that absence already reports. Anything else is a
+ * caller acting on a row it believes exists, and inventing one for it is a false CAS success:
+ * the client is told its `If-Match: "42"` held when there was nothing to match.
+ *
+ * Refusing ALL fresh inserts would be the other obvious answer and it is wrong, because it
+ * breaks the first settings write of every account that ever registers — the normal path, not
+ * an edge case.
+ *
+ * Both adapters import this. Postgres expressed the comparison as `on conflict (account_id) do
+ * update ... where settings_version = $n`, which gates the DO UPDATE branch and NOTHING ELSE,
+ * so its plain INSERT path answered "yes" to every expectedVersion in existence.
+ */
+export function casMayCreateProfile(expectedVersion) {
+  return expectedVersion === INITIAL_SETTINGS_VERSION;
+}
+
+/**
+ * The arguments a CAS shares with any other profile write, checked in the same ORDER on both
+ * adapters.
+ *
+ * Order is the contract here, not a detail: memory compared versions first and so answered
+ * `null` — "your version moved, retry" — to a caller whose actual mistake was a typo'd column
+ * or a string version, which is a CONFLICT the client retries forever. Postgres validated
+ * first. One of the two had to be wrong, and it is the one that reports the wrong error.
+ */
+export function assertExpectedVersion(expectedVersion) {
+  if (!Number.isInteger(expectedVersion)) {
+    throw new ApiError('VALIDATION_FAILED', 'expectedVersion must be an integer.', {
+      details: { table: 'profiles', column: 'settingsVersion',
+        fields: [{ key: 'expectedVersion', reason: 'integer', path: 'expectedVersion', rule: 'integer',
+          got: typeof expectedVersion === 'number' ? expectedVersion : typeof expectedVersion }] },
+    });
+  }
+  return expectedVersion;
 }
 
 /** Career counters (db-schema.md §3). Anything not listed is not a stat, and a typo must not be swallowed. */

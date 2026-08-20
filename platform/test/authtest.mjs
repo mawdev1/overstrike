@@ -35,7 +35,8 @@ import { ApiError } from '../src/core/errors.js';
 import { createAuthModule } from '../src/modules/auth/index.js';
 import { fold, resolveScript } from '../src/modules/auth/names.js';
 import { RECOVERY_FLOOR_MS } from '../src/modules/auth/service.js';
-import { sign } from '../src/modules/auth/crypto.js';
+import { sign, handleOf, hashPassword, verifyPassword } from '../src/modules/auth/crypto.js';
+import { classifyIp, classifyUserAgent } from '../src/modules/auth/sessions.js';
 import { createAuditLog } from '../src/modules/events/audit.js';
 import { createOutbox } from '../src/modules/events/outbox.js';
 import { check, capabilitiesOf } from '../src/modules/events/rbac.js';
@@ -238,6 +239,234 @@ section('2. REFRESH ROTATES; A REPLAY REVOKES THE FAMILY — AND THE REVOCATION 
   const b = await newAccount(h, { email: 'bystander@example.com', displayName: 'BystandTwo' });
   ok('control: a bystander session still rotates',
     await codeOf(() => h.sessions.rotate(b.refreshToken)) === null);
+}
+
+// -------------------------------------------- 2b. a refresh token STOPS at its own expiry
+
+/**
+ * §1 above proves the ACCESS token expires at fifteen minutes. Nothing proved the same of the
+ * refresh token, and it is the durable half of the pair: `rotateOnce`'s expiry line could be
+ * deleted and a token issued four hundred days ago — thirteen times its 30-day TTL, long after
+ * the session it belongs to should have ended — still minted a fresh access token, with the
+ * whole suite green. A credential with a stated lifetime that outlives it is not a lifetime.
+ */
+section('2b. A REFRESH TOKEN STOPS ROTATING AT ITS TTL');
+{
+  const h = mk();
+  const ttlMs = h.config.refreshTokenTtlSec * 1000;
+  ok('control: the configured refresh TTL is 30 days',
+    ttlMs === 30 * 24 * 3600 * 1000, `${h.config.refreshTokenTtlSec}s`);
+
+  const a = await newAccount(h, { email: 'ttl@example.com', displayName: 'TtlTwoB' });
+  const stored = await h.store.refreshTokens.byId(handleOf(a.refreshToken));
+  ok('control: the token row carries an expiry 30 days out',
+    Date.parse(stored.expiresAt) === h.clock.now() + ttlMs,
+    `${stored.expiresAt} vs now+${ttlMs}`);
+
+  // One second SHORT of the TTL: still inside its life, so the refusal below is the boundary
+  // and not the token having been broken all along.
+  h.clock.advance(ttlMs - 1000);
+  const stillGood = await codeOf(() => h.sessions.rotate(a.refreshToken));
+  ok('CONTROL: one second before expiry the token still rotates', stillGood === null, `code=${stillGood}`);
+
+  // A SECOND account, so the expiry is tested on a token that was never used — a used token
+  // is refused by reuse detection, which would pass this test for the wrong reason.
+  const b = await newAccount(h, { email: 'ttl2@example.com', displayName: 'TtlTwoC' });
+  ok('control: the session behind it is live and unrevoked',
+    (await h.store.sessions.byId(b.session.sessionId)).revokedAt === null);
+  ok('control: and the token itself is unused, so reuse detection is not what refuses it',
+    (await h.store.refreshTokens.byId(handleOf(b.refreshToken))).usedAt === null);
+
+  h.clock.advance(400 * 24 * 3600 * 1000);      // 400 days: >13x the 30-day TTL
+  const expired = await codeOf(() => h.sessions.rotate(b.refreshToken));
+  ok('a refresh token presented 400 days after issue is REFUSED',
+    expired === 'AUTH_TOKEN_INVALID', `code=${expired}`);
+
+  // And it minted nothing on the way out. `codeOf` proves a throw; this proves no side effect.
+  let leaked = null;
+  try { leaked = await h.sessions.rotate(b.refreshToken); } catch { /* expected */ }
+  ok('and it issues no access token at all', leaked === null, JSON.stringify(leaked));
+
+  // CONTROL: a token issued AFTER the clock moved is inside its own window and rotates, so
+  // the refusal above is about the token's age and not about the clock being far from zero.
+  const c = await newAccount(h, { email: 'ttl3@example.com', displayName: 'TtlTwoD' });
+  ok('CONTROL: a freshly issued token rotates at the same far-future clock',
+    await codeOf(() => h.sessions.rotate(c.refreshToken)) === null);
+}
+
+// --------------------------------------------- 2c. the IP and user-agent CLASS ladders
+
+/**
+ * §4 asserts `s.ipClass` is truthy. Every rung of `classifyIp` could be deleted and that stayed
+ * true, because the fall-through returns the non-empty string `'unknown'` — so a suite that
+ * only asks "is there a class" is satisfied by a function that has stopped classifying. The
+ * class is what auth.md §5 puts in the session list INSTEAD of the address, so "it returned
+ * something" is not the claim; "it returned the right thing, for the right address" is.
+ */
+section('2c. IP AND USER-AGENT CLASSIFICATION IS A LADDER, NOT A CONSTANT');
+{
+  const cases = [
+    [undefined, 'unknown', 'no address at all'],
+    [null, 'unknown', 'null'],
+    ['', 'unknown', 'empty'],
+    ['127.0.0.1', 'local', 'IPv4 loopback'],
+    ['::1', 'local', 'IPv6 loopback'],
+    ['::ffff:127.0.0.1', 'local', 'IPv4-mapped loopback — the form Node hands us'],
+    ['10.0.0.5', 'private', 'RFC1918 10/8'],
+    ['192.168.1.1', 'private', 'RFC1918 192.168/16'],
+    ['172.16.0.1', 'private', 'RFC1918 172.16/12, bottom of the range'],
+    ['172.31.255.255', 'private', 'RFC1918 172.16/12, top of the range'],
+    ['::ffff:10.0.0.5', 'private', 'IPv4-mapped RFC1918'],
+    ['fd00::1', 'private', 'IPv6 unique-local'],
+    ['203.0.113.9', 'unknown', 'a PUBLIC address with no geo provider'],
+    ['172.15.0.1', 'unknown', 'just BELOW the 172.16/12 block — public, not private'],
+    ['172.32.0.1', 'unknown', 'just ABOVE the 172.16/12 block — public, not private'],
+    ['8.8.8.8', 'unknown', 'a public resolver'],
+  ];
+  for (const [ip, want, why] of cases) {
+    const got = classifyIp(ip);
+    ok(`classifyIp(${JSON.stringify(ip)}) === '${want}' — ${why}`, got === want, `got '${got}'`);
+  }
+  // Every rung must be REACHABLE: if the table above only ever produced one answer, each
+  // assertion could be satisfied by a constant.
+  ok('control: the ladder produces more than one class',
+    new Set(cases.map(([ip]) => classifyIp(ip))).size === 3,
+    [...new Set(cases.map(([ip]) => classifyIp(ip)))].join(','));
+
+  // A geo provider supplies the class for a PUBLIC address, and must never be consulted for
+  // an absent one — `classifyIp(null, geo)` handing `'null'` or `''` to a resolver is how a
+  // non-address becomes a location.
+  const geo = { calls: [], classify(addr) { this.calls.push(addr); return 'CA-ON'; } };
+  ok('a geo provider classifies a public address', classifyIp('203.0.113.9', geo) === 'CA-ON');
+  ok('control: it was asked about the bare address, with the IPv4-mapped prefix stripped',
+    classifyIp('::ffff:203.0.113.9', geo) === 'CA-ON' && geo.calls[1] === '203.0.113.9',
+    geo.calls.join(','));
+  const before = geo.calls.length;
+  ok('a MISSING address is never handed to the geo provider',
+    classifyIp(null, geo) === 'unknown' && classifyIp(undefined, geo) === 'unknown'
+      && classifyIp('', geo) === 'unknown' && geo.calls.length === before,
+    `calls=${geo.calls.join(',')}`);
+  ok('nor is a loopback or private address — those are decided locally',
+    classifyIp('127.0.0.1', geo) === 'local' && classifyIp('10.0.0.5', geo) === 'private'
+      && geo.calls.length === before,
+    `calls=${geo.calls.join(',')}`);
+
+  const uaCases = [
+    [undefined, 'unknown', 'absent'],
+    ['', 'unknown', 'empty'],
+    [null, 'unknown', 'null'],
+    ['Mozilla/5.0 (Windows NT 10.0) Chrome/120.0', 'chrome-desktop', 'desktop Chrome'],
+    ['Mozilla/5.0 (X11; Linux) Firefox/121.0', 'firefox-desktop', 'desktop Firefox'],
+    ['Mozilla/5.0 (Windows NT 10.0) Chrome/120.0 Edg/120.0', 'edge-desktop', 'Edge, which also says Chrome'],
+    ['Mozilla/5.0 (Macintosh) Version/17.0 Safari/605.1', 'safari-desktop', 'desktop Safari'],
+    ['Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Version/17.0 Mobile/15E Safari/604.1', 'safari-mobile', 'iPhone Safari'],
+    ['Mozilla/5.0 (Linux; Android 14) Chrome/120.0 Mobile Safari/537.36', 'chrome-mobile', 'Android Chrome'],
+    ['curl/8.4.0', 'other-desktop', 'not a browser at all'],
+  ];
+  for (const [ua, want, why] of uaCases) {
+    const got = classifyUserAgent(ua);
+    ok(`classifyUserAgent(${JSON.stringify(ua)?.slice(0, 44)}) === '${want}' — ${why}`,
+      got === want, `got '${got}'`);
+  }
+  ok('control: the user-agent ladder produces more than one class',
+    new Set(uaCases.map(([ua]) => classifyUserAgent(ua))).size >= 6);
+
+  // And it is the SERVICE that applies them, not just the exported helper: a session started
+  // from a private address is listed as `private`, and the address is nowhere in the row.
+  const h = mk();
+  const s = await newAccount(h, {
+    email: 'class@example.com', displayName: `Klass${uniqueTag()}`, ip: '10.11.12.13',
+  });
+  const actor = await actorFor(h, s);
+  const listed = (await h.sessions.list(actor, actor.sessionId))[0];
+  ok('the session list carries the CLASS the address maps to, not merely a non-empty string',
+    listed.ipClass === 'private', `ipClass=${listed.ipClass}`);
+  ok('control: and the address itself appears nowhere in the row',
+    !JSON.stringify(listed).includes('10.11.12.13'), JSON.stringify(listed));
+  ok('the user-agent class is the one the header maps to',
+    listed.userAgentClass === 'chrome-desktop', `userAgentClass=${listed.userAgentClass}`);
+}
+
+// ------------------------------------------- 2d. a stored password hash must BE a scrypt hash
+
+/**
+ * `verifyPassword`'s two entry guards — "the stored value is a string" and "its scheme is
+ * scrypt" — both survived deletion. They are what stands between a corrupt, absent or
+ * foreign-scheme `password_hash` column and `String.prototype.split` being called on `null`:
+ * signin calls `verifyPassword` OUTSIDE `internalise`, so the throw is not translated into a
+ * platform error at all. The contracted answer to a credential that cannot be verified is
+ * `AUTH_INVALID_CREDENTIALS` — a refusal — and never a 500 that tells the caller the account
+ * exists and is broken.
+ */
+section('2d. A NON-SCRYPT STORED HASH IS A REFUSAL, NOT A CRASH');
+{
+  const junk = [
+    [null, 'null — an account row with no hash at all'],
+    [undefined, 'undefined — a column the adapter did not return'],
+    [123456, 'a number'],
+    [{}, 'an object'],
+    ['', 'the empty string'],
+    ['plaintext-password', 'a plaintext password left in the column'],
+    ['bcrypt$2b$10$abcdefghijklmnopqrstuv', 'a bcrypt hash — a different scheme entirely'],
+    ['argon2id$v=19$m=65536,t=3,p=4$c2FsdA$a2V5', 'an argon2 hash'],
+    ['scrypt', 'the scheme name and nothing else'],
+    ['$16384$8$1$c2FsdA$a2V5', 'scrypt-SHAPED but with an EMPTY scheme field'],
+    // Everything below carries the RIGHT scheme and is still not a usable record. These are
+    // the cases the scheme check cannot catch, and every one of them threw before this suite:
+    // `Buffer.from(undefined)`, `scryptSync` with a NaN cost, `scryptSync` with keylen 0.
+    ['scrypt$16384$8$1$c2FsdA', 'the right scheme, truncated before the key'],
+    ['scrypt$16384$8$1', 'the right scheme, truncated before the salt'],
+    ['scrypt$$$$c2FsdA$a2V5', 'the right scheme with EMPTY cost parameters'],
+    ['scrypt$abc$def$ghi$c2FsdA$a2V5', 'the right scheme with non-numeric cost parameters'],
+    ['scrypt$16384$8$1$c2FsdA$', 'the right scheme with an EMPTY key — a zero-length compare '
+      + 'is TRUE, so this must be refused before it reaches timingSafeEqual'],
+    ['scrypt$0$0$0$c2FsdA$a2V5', 'the right scheme with zero cost parameters'],
+    ['scrypt$-1$8$1$c2FsdA$a2V5', 'the right scheme with a negative cost'],
+    ['scrypt$16385$8$1$c2FsdA$a2V5', 'the right scheme with an N that is not a power of two'],
+  ];
+  for (const [stored, why] of junk) {
+    let result = 'THREW';
+    try { result = verifyPassword(PASSWORD, stored); } catch { /* result stays THREW */ }
+    ok(`verifyPassword against ${why} returns false without throwing`,
+      result === false, `got ${JSON.stringify(result)}`);
+  }
+  const real = hashPassword(PASSWORD);
+
+  /**
+   * The scheme check, isolated.
+   *
+   * Every junk record above is ALSO caught by the field checks — a bcrypt or argon2 string
+   * simply does not split into six parts — so none of them can tell whether the scheme is
+   * being read at all. This one is a byte-for-byte valid scrypt record with the scheme label
+   * swapped: every field is well-formed, the salt and key are real, and the password is the
+   * right one. If the scheme is not checked, it verifies TRUE — a record explicitly labelled
+   * as another algorithm, accepted as scrypt because it happened to be shaped like one.
+   */
+  const mislabelled = real.replace(/^scrypt\$/, 'md5$');
+  ok('control: the mislabelled record differs from the real one ONLY in its scheme',
+    mislabelled !== real && mislabelled.slice(mislabelled.indexOf('$')) === real.slice(real.indexOf('$')));
+  ok('a record labelled with ANOTHER scheme never verifies, even when its fields are a valid '
+    + 'scrypt record and the password is correct',
+    verifyPassword(PASSWORD, mislabelled) === false,
+    String(verifyPassword(PASSWORD, mislabelled)));
+
+  // CONTROL: a real scrypt hash still verifies, and a wrong password against it still does
+  // not — so "returns false" above is the guard and not the function being inert.
+  ok('CONTROL: the correct password against a real scrypt hash verifies',
+    verifyPassword(PASSWORD, real) === true);
+  ok('CONTROL: the wrong password against the same hash does not',
+    verifyPassword(`${PASSWORD}!`, real) === false);
+
+  // End to end, on the production path: signin against an account whose stored hash is not a
+  // scrypt hash must answer the ordinary credential refusal.
+  const h = mk();
+  const acct = await newAccount(h, { email: 'junkhash@example.com', displayName: `Junk${uniqueTag()}` });
+  ok('control: the account signs in normally before the column is corrupted',
+    await codeOf(() => h.service.signin({ email: 'junkhash@example.com', password: PASSWORD })) === null);
+  await h.store.accounts.update(acct.profile.accountId, { passwordHash: 'bcrypt$2b$10$abcdefghijklmnopqrstuv' });
+  const code = await codeOf(() => h.service.signin({ email: 'junkhash@example.com', password: PASSWORD }));
+  ok('signin against a foreign-scheme stored hash is AUTH_INVALID_CREDENTIALS, not a crash',
+    code === 'AUTH_INVALID_CREDENTIALS', `code=${code}`);
 }
 
 // ------------------------------------------------- 3. ten concurrent refreshes, one winner
@@ -479,6 +708,82 @@ section('7. ELIGIBILITY NEVER RETURNS THE MINIMUM AGE OR STORES THE BIRTHDATE');
   }
 }
 
+// ------------------------- 7b. a malformed birthdate is a refusal, not an eligible player
+
+/**
+ * The age gate has to REJECT before it can hide anything.
+ *
+ * §7 above proves the gate keeps the birthdate out of the store and the threshold out of the
+ * response. It never once fed it a birthdate that is not a birthdate. With both validation
+ * lines removed — the `YYYY-MM-DD` shape check and the real-calendar-date check — `"banana"`,
+ * `"1994-02-31"` and `"94-3-2"` all returned `eligible: true` AND A SIGNED RECEIPT, and signup
+ * accepted that receipt as proof of an age check that never ran. The whole suite stayed green.
+ *
+ * Each case below is chosen to fail exactly one of the two guards on its own, so neither can
+ * be deleted without a red suite:
+ *   - `1994-3-2`   passes the calendar check (it is a real date) and fails the SHAPE check;
+ *   - `1994-02-31` passes the shape check and fails the CALENDAR check;
+ *   - `1900-02-29` likewise — 1900 is divisible by 100 and not by 400, so it is not a leap year.
+ */
+section('7b. A MALFORMED BIRTHDATE IS REFUSED, AND MINTS NO RECEIPT');
+{
+  const h = mk();
+  const refused = [
+    ['1994-3-2', 'a real date in the wrong shape — only the format guard catches this'],
+    ['1994-02-31', 'the right shape, an impossible date — only the calendar guard catches this'],
+    ['1900-02-29', '1900 is not a leap year — a real calendar, not a divisible-by-four rule'],
+    ['banana', 'not a date in any sense'],
+    ['', 'empty'],
+    ['1994-13-02', 'month 13'],
+    ['0000-00-00', 'all zeroes'],
+    [19940302, 'a number, not a string'],
+    [null, 'null'],
+  ];
+
+  for (const [value, why] of refused) {
+    // Not `codeOf` alone: a verdict is only half the failure. The endpoint MINTS A SIGNED
+    // CREDENTIAL, so what must be true is that nothing came back at all.
+    let issued = null;
+    const code = await codeOf(() => { issued = h.service.eligibilityPreflight({ dateOfBirth: value, jurisdiction: 'CA-ON' }); });
+    ok(`${JSON.stringify(value)} is a VALIDATION_FAILED — ${why}`,
+      code === 'VALIDATION_FAILED', `code=${code} returned=${JSON.stringify(issued)}`);
+    ok(`${JSON.stringify(value)} mints no eligibility receipt`,
+      issued === null, JSON.stringify(issued));
+  }
+
+  // The escalation, end to end: a receipt is only dangerous because signup honours it. Drive
+  // the whole approved chain from an impossible date and require it to die at the gate.
+  const chain = await codeOf(async () => {
+    const el = h.service.eligibilityPreflight({ dateOfBirth: '1994-02-31', jurisdiction: 'CA-ON' });
+    return newAccount(h, {
+      email: `feb31-${uniqueTag()}@example.com`, displayName: `Feb${uniqueTag()}`,
+      eligibilityReceipt: el.receipt,
+    });
+  });
+  ok('no account can be created from an impossible birthdate',
+    chain === 'VALIDATION_FAILED', `code=${chain}`);
+
+  // CONTROLS. Without these the refusals above are satisfied by a gate that refuses every
+  // date, which would be a different defect wearing the same green tick.
+  const good = h.service.eligibilityPreflight({ dateOfBirth: DOB, jurisdiction: 'CA-ON' });
+  ok('CONTROL: a well-formed birthdate is eligible and DOES mint a receipt',
+    good.eligible === true && typeof good.receipt === 'string', JSON.stringify(Object.keys(good)));
+  const leap = h.service.eligibilityPreflight({ dateOfBirth: '2000-02-29', jurisdiction: 'CA-ON' });
+  ok('CONTROL: 29 February 2000 IS a real date (divisible by 400) and is accepted',
+    leap.eligible === true && typeof leap.receipt === 'string');
+  const endOfMonth = h.service.eligibilityPreflight({ dateOfBirth: '1994-12-31', jurisdiction: 'CA-ON' });
+  ok('CONTROL: the last day of a 31-day month is accepted',
+    endOfMonth.eligible === true, JSON.stringify(endOfMonth));
+
+  // And the created account is real — so `newAccount` above failed at the gate rather than
+  // because the harness cannot make an account at all.
+  const control = await newAccount(h, {
+    email: `feb-control-${uniqueTag()}@example.com`, displayName: `FebOk${uniqueTag()}`,
+  });
+  ok('CONTROL: the same chain from a VALID birthdate creates the account',
+    typeof control.accessToken === 'string', JSON.stringify(control.profile?.status));
+}
+
 // ------------------------------- 8. the eligibility receipt is required AND single-use
 
 section('8. THE ELIGIBILITY RECEIPT IS REQUIRED, AND CONSUMED');
@@ -625,6 +930,61 @@ section('9. CONSENT MIGRATES, AND IS NEITHER CALLER-VERSIONED NOR IMMORTAL');
     await codeOf(() => h.service.signup({ email: 'stale@example.com', password: PASSWORD, displayName: 'StaleNine',
       eligibilityReceipt: h.service.eligibilityPreflight({ dateOfBirth: DOB }).receipt,
       clientSessionId: ageing, consentReceipt: receipt })) === 'VALIDATION_FAILED');
+
+  /**
+   * A receipt is also bound to the POLICY it was given under, and that binding was asserted
+   * nowhere: `readConsent`'s policy-version line could be deleted and a receipt recording
+   * agreement to policy 1 still read as a live claim once the platform had moved to policy 2.
+   * Consent is agreement to a specific text. Carrying it forward across a version bump is the
+   * one thing a version bump exists to prevent — a decision the player never made.
+   *
+   * Two modules over ONE store and ONE clock, differing only in configured policy version.
+   * The signing secret is identical, so the HMAC still verifies: only the version refuses.
+   */
+  {
+    const shared = recording(createMemoryStore({}, {}));
+    const sharedClock = makeClock();
+    const v1 = moduleOn(shared, sharedClock);
+    const v2 = moduleOn(shared, sharedClock, { env: { PLATFORM_CONSENT_POLICY_VERSION: '2' } });
+    ok('control: the two modules really are on different policy versions',
+      v1.config.consentPolicyVersion === 1 && v2.config.consentPolicyVersion === 2,
+      `${v1.config.consentPolicyVersion} vs ${v2.config.consentPolicyVersion}`);
+
+    const sid = ulid(sharedClock.now());
+    const under1 = (await v1.service.putConsent({ telemetryPersonal: true, policyVersion: 1, clientSessionId: sid })).receipt;
+    ok('control: the receipt reads as a claim under the policy it was ISSUED under',
+      v1.receipts.readConsent(under1)?.policyVersion === 1,
+      JSON.stringify(v1.receipts.readConsent(under1)));
+    ok('control: and it is a genuine grant, not a decline',
+      v1.receipts.readConsent(under1)?.telemetryPersonal === true);
+
+    ok('a policy-1 receipt is NOT a claim once the platform is on policy 2',
+      v2.receipts.readConsent(under1) === null,
+      JSON.stringify(v2.receipts.readConsent(under1)));
+
+    sharedClock.advance(61_000);
+    const staleSignup = await codeOf(() => v2.service.signup({
+      email: `policy-${uniqueTag()}@example.com`, password: PASSWORD, displayName: `Pol${uniqueTag()}`,
+      eligibilityReceipt: v2.service.eligibilityPreflight({ dateOfBirth: DOB }).receipt,
+      clientSessionId: sid, consentReceipt: under1,
+    }));
+    ok('and a signup under policy 2 presenting a policy-1 consent receipt is refused',
+      staleSignup === 'VALIDATION_FAILED', `code=${staleSignup}`);
+
+    // CONTROL: the same chain with a receipt actually issued under policy 2 succeeds — so the
+    // refusal above is the version and not the second module being unable to sign anyone up.
+    sharedClock.advance(61_000);
+    const sid2 = ulid(sharedClock.now());
+    const under2 = (await v2.service.putConsent({ telemetryPersonal: true, policyVersion: 2, clientSessionId: sid2 })).receipt;
+    ok('CONTROL: a receipt issued under policy 2 reads as a policy-2 claim',
+      v2.receipts.readConsent(under2)?.policyVersion === 2);
+    const freshSignup = await codeOf(() => v2.service.signup({
+      email: `policy2-${uniqueTag()}@example.com`, password: PASSWORD, displayName: `Pol2${uniqueTag()}`,
+      eligibilityReceipt: v2.service.eligibilityPreflight({ dateOfBirth: DOB }).receipt,
+      clientSessionId: sid2, consentReceipt: under2,
+    }));
+    ok('CONTROL: and that signup completes', freshSignup === null, `code=${freshSignup}`);
+  }
 
   // A signed-out GET after migration must not keep serving the migrated decision.
   const afterMigration = await h.service.getConsent({ clientSessionId });

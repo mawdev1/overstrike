@@ -333,13 +333,20 @@ console.log('\n--- §1 build and §2 auth enforcement ---');
     { 'X-Client-Build': '1.9.9', Authorization: `Bearer ${floorToken}`, ...acct });
   const above = raw(floored, 'default', 'gate-5', rooms,
     { 'X-Client-Build': '2.10.0', Authorization: `Bearer ${floorToken}`, ...acct });
+  // The STUB's floor, and only the stub's. The comparator itself now lives once, in
+  // core/http.js, and is driven directly by platform/test/coretest.mjs — this check used to be
+  // the suite's only test of numeric floor comparison, and gates.js held a verbatim copy of
+  // the comparator, so it asserted against the copy while the production original had no test
+  // at all. Deleting `x !== y` in core/http.js disabled the build floor and this stayed green.
   check(below.status === 426 && above.status === 200,
-    'the configured floor is applied numerically (2.10.0 is above 2.0.0, 1.9.9 is below)',
+    'the stub applies the configured floor numerically (2.10.0 is above 2.0.0, 1.9.9 is below)',
     `${below.status} / ${above.status}`);
 
   const health = raw(stub, 'default', 'gate-6', { path: '/v1/health' });
   check(health.status === 200,
-    'GET /v1/health is build-exempt, exactly as core/http.js exempts it', `${health.status}`);
+    'the stub layer exempts GET /v1/health from the build check (core/http.js\'s own '
+    + 'requireBuild:false exemption is asserted in coretest.mjs, not inferred from here)',
+    `${health.status}`);
 
   const noAuth = raw(stub, 'default', 'gate-7', rooms, { 'X-Client-Build': CLIENT_BUILD });
   check(noAuth.status === 401 && noAuth.body.error.code === 'AUTH_REQUIRED',

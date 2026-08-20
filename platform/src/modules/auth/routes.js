@@ -5,12 +5,17 @@
  * decides anything about identity, so a rule cannot be enforced on one route and forgotten on
  * another.
  *
- * **One seam this needs from `core/http.js`.** `createApp` has no hook for response headers,
- * and signup, signin, refresh, signout, and signout-all all have to set or clear the refresh
- * cookie (§3a.4, §11.1). Handlers therefore push cookie strings onto `ctx.cookies` and the
- * composition root applies them with `applyCookies(ctx, res)` below. That file is owned
- * elsewhere; until it grows the hook, the cookie is assembled correctly and simply not
- * written, which is a wiring gap and not a policy gap.
+ * **The cookie seam.** Signup, signin, refresh, signout, signout-all and recovery-complete all
+ * have to set or clear the refresh cookie (§3a.4, §11.1), and a handler cannot express a
+ * response header through a return value. Handlers therefore push cookie strings onto
+ * `ctx.cookies`, and `core/http.js` writes them in `finish()` — on the error path too, because
+ * signout must clear the credential even when the response it accompanies fails.
+ *
+ * This file used to also export an `applyCookies(ctx, res)` for a composition root to call,
+ * written when `createApp` had no such hook. `core/http.js` grew the hook and nothing ever
+ * called the stand-in, so it was a second, dead implementation of the one rule that decides
+ * whether a session persists — removed rather than left as a thing to keep in step. The
+ * behaviour it described is asserted over a real socket in `apptest.mjs` §7d.
  */
 import { ApiError } from '../../core/errors.js';
 import { raw } from '../../core/http.js';
@@ -21,15 +26,22 @@ const bearer = (headers) => {
   return m ? m[1].trim() : null;
 };
 
-/** Apply whatever the handlers queued. Called by the composition root once it has `res`. */
-export function applyCookies(ctx, res) {
-  if (ctx.cookies?.length) res.setHeader('Set-Cookie', ctx.cookies);
-}
-
 export function createAuthRoutes({ service, sessions, limiter }) {
   const queueCookie = (ctx, value) => { (ctx.cookies ??= []).push(value); };
 
-  /** **A** — required. Throws `AUTH_REQUIRED` before the handler sees a request. */
+  /**
+   * **A** — required. Throws `AUTH_REQUIRED` before the handler sees a request.
+   *
+   * The `!token` line below is a BACKSTOP, not the only check: `sessions.verifyAccessToken`
+   * opens with the same refusal, with the same code and the same message. A mutation sweep
+   * therefore cannot kill this line — deleting it was measured against every shape a missing
+   * credential takes (no header, `Bearer` with only whitespace, a `Basic` header) and the
+   * status, code, message and side effects are byte-identical either way. That is a redundancy
+   * fact rather than an untested line, and the OBSERVABLE contract it belongs to — an
+   * unauthenticated call to an `A` route is 401 `AUTH_REQUIRED` — is asserted over a socket in
+   * `apptest.mjs` §7d. Kept because a middleware that reaches into the session service to find
+   * out whether it was given a credential is a worse shape than one that checks first.
+   */
   const requireAuth = async (ctx) => {
     const token = bearer(ctx.headers);
     if (!token) throw new ApiError('AUTH_REQUIRED', 'Sign in to continue.');
@@ -78,6 +90,11 @@ export function createAuthRoutes({ service, sessions, limiter }) {
     async refresh(ctx) {
       limiter.enforceAuth({ ip: ctx.ip, subject: null });
       const cookie = sessions.readRefreshCookie(ctx.headers);
+      // Same backstop relationship as `requireAuth` above: `sessions.rotate` refuses a
+      // non-string or empty handle with this exact code, so deleting this line changes no
+      // observable behaviour for any cookie shape (absent, or present but not `os_rt`). The
+      // contract — refresh without the credential is 401 `AUTH_TOKEN_INVALID` — is asserted
+      // over a socket in `apptest.mjs` §7d.
       if (!cookie) throw new ApiError('AUTH_TOKEN_INVALID', 'Sign in again.');
       const issued = await sessions.rotate(cookie, { correlationId: ctx.correlationId });
       queueCookie(ctx, sessions.refreshCookie(issued.refreshToken));

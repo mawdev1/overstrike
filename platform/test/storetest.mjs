@@ -22,6 +22,7 @@ import {
   loadMigrations, planMigrations, runMigrations, MIGRATIONS_DIR,
 } from '../src/core/migrate.js';
 import { ulid } from '../src/core/ids.js';
+import { INITIAL_SETTINGS_VERSION } from '../src/core/store.js';
 
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
@@ -919,6 +920,139 @@ async function testMatchPagination(store, a) {
 }
 
 // ---------------------------------------------------------------------------------------
+// 8a. profiles.upsertIfVersion — the CAS itself, on BOTH adapters.
+//
+// This method's entire value is what it REFUSES, so an adapter that quietly succeeds has no
+// visible symptom at all until two devices rebind a key and one rebind is gone. That makes it
+// exactly the kind of rule store.js's preamble rule 5 is about, and it belonged in the
+// conformance block from the start: it was tested nowhere, on either adapter — `grep -rn
+// upsertIfVersion platform/test` returned nothing — and the Postgres adapter was wrong.
+//
+// It is called here directly, not through the settings service. The service does its own
+// read-then-write version check first, so a service-level test passes with the adapter CAS
+// deleted outright; only the adapter method can prove the adapter method.
+// ---------------------------------------------------------------------------------------
+async function testProfileCas(store) {
+  // --- absence is the initial version, and nothing else ---------------------------------
+  //
+  // An account with no profile row reads as version 1 (profile/settings.js `read`), so a CAS
+  // holding version 1 legitimately CREATES the row and a CAS holding any other version is a
+  // caller who believes in a row that does not exist. Postgres put the version comparison in
+  // the `on conflict do update ... where`, which gates only the UPDATE branch: the plain
+  // INSERT path ignored expectedVersion entirely and manufactured a row at version 1 for a
+  // caller who had asked for 42.
+  const virgin = newAccount();
+  await store.accounts.create(virgin);
+  const ghost = await store.profiles.upsertIfVersion(virgin.accountId, 42,
+    { roamingSettings: { fov: 120 }, settingsVersion: 43 });
+  check('a CAS against a version no row has is refused, not inserted',
+    ghost === null, `it returned ${JSON.stringify(ghost)}`);
+  check('and the refused CAS left the account with no profile row at all',
+    (await store.profiles.byAccountId(virgin.accountId)) === null,
+    'a profile row exists for an account that never had one');
+
+  // CONTROL: the first-ever settings write, which is every account's normal path.
+  const born = await store.profiles.upsertIfVersion(virgin.accountId, INITIAL_SETTINGS_VERSION,
+    { roamingSettings: { fov: 100 }, settingsVersion: INITIAL_SETTINGS_VERSION + 1 });
+  check('control: a CAS holding the initial version creates the row',
+    born?.settingsVersion === 2 && born?.roamingSettings?.fov === 100, JSON.stringify(born));
+
+  // --- once the row exists, only the current version may write --------------------------
+  const stale = await store.profiles.upsertIfVersion(virgin.accountId, INITIAL_SETTINGS_VERSION,
+    { roamingSettings: { fov: 70 }, settingsVersion: 2 });
+  check('a CAS on a version that has moved is refused', stale === null, JSON.stringify(stale));
+  check('and the refused CAS changed no column',
+    (await store.profiles.byAccountId(virgin.accountId))?.roamingSettings?.fov === 100,
+    'the stale write landed anyway');
+  const current = await store.profiles.upsertIfVersion(virgin.accountId, 2,
+    { roamingSettings: { fov: 95 }, settingsVersion: 3 });
+  check('control: a CAS on the current version is accepted',
+    current?.settingsVersion === 3 && current?.roamingSettings?.fov === 95, JSON.stringify(current));
+
+  // --- eight concurrent writers, one winner ---------------------------------------------
+  //
+  // The claim the method exists to make, and the one a sequential test cannot make: delete the
+  // comparison from either adapter and all eight of these succeed. Refusals are counted as
+  // strict `=== null` and successes as a row carrying the version that was written, so an
+  // adapter that threw eight times would fail this rather than pass it as "seven refused".
+  const racer = newAccount();
+  await store.accounts.create(racer);
+  await store.profiles.upsert(racer.accountId, { roamingSettings: { fov: 0 }, settingsVersion: 7 });
+  const outcomes = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+    store.profiles.upsertIfVersion(racer.accountId, 7,
+      { roamingSettings: { fov: 100 + i }, settingsVersion: 8 })
+      .then((row) => ({ row }), (err) => ({ err }))));
+  const winners = outcomes.filter((o) => o.row !== undefined && o.row !== null);
+  const refused = outcomes.filter((o) => o.row === null);
+  const threw = outcomes.filter((o) => o.err !== undefined);
+  check('exactly one of eight concurrent CAS writers on the same version wins',
+    winners.length === 1 && refused.length === 7 && threw.length === 0,
+    `won ${winners.length}, refused ${refused.length}, threw ${threw.length}`
+      + (threw.length ? `: ${threw[0].err?.code ?? threw[0].err?.message}` : ''));
+  const settled = await store.profiles.byAccountId(racer.accountId);
+  check('the stored row is the winner\'s and the seven losers wrote nothing',
+    settled?.settingsVersion === 8
+      && settled?.roamingSettings?.fov === winners[0]?.row?.roamingSettings?.fov,
+    `${JSON.stringify(settled)} vs winner ${JSON.stringify(winners[0]?.row)}`);
+  check('control: exactly one version was consumed by the eight',
+    settled?.settingsVersion === 8, `settingsVersion=${settled?.settingsVersion}`);
+
+  // --- the refusals a CAS shares with an upsert -----------------------------------------
+  //
+  // These were where the two adapters disagreed for a second reason: Postgres validated the
+  // patch and expectedVersion before touching storage, memory compared versions first and so
+  // answered `null` — "your version moved" — to a caller whose real mistake was a typo'd
+  // column or a string version. A CONFLICT the client retries forever is a worse answer than
+  // the VALIDATION_FAILED it deserves.
+  // String(), not JSON.stringify(): NaN and null both serialise to `null` and the two checks
+  // would then share one name, which is how a duplicated case hides behind its twin.
+  for (const bad of ['7', 7.5, null, undefined, Number.NaN, 8n]) {
+    await throwsCode(
+      `a CAS with expectedVersion ${typeof bad === 'string' ? `"${bad}"` : String(bad)} is refused`,
+      'VALIDATION_FAILED',
+      () => store.profiles.upsertIfVersion(racer.accountId, bad, { settingsVersion: 9 }));
+  }
+  await throwsCode('a CAS patch is held to the same columns as an upsert, even on a stale version',
+    'VALIDATION_FAILED',
+    () => store.profiles.upsertIfVersion(racer.accountId, 999, { legacyimport: {} }));
+  await throwsCode('a CAS patch cannot set updatedAt either', 'VALIDATION_FAILED',
+    () => store.profiles.upsertIfVersion(racer.accountId, 8, { updatedAt: '1999-01-01T00:00:00.000Z' }));
+  await throwsCode('a CAS with a non-integer settingsVersion is refused', 'VALIDATION_FAILED',
+    () => store.profiles.upsertIfVersion(racer.accountId, 8, { settingsVersion: '9' }));
+
+  // An account that does not exist is NOT_FOUND, not a version conflict — on both paths,
+  // because the insert path is the only one Postgres's foreign key ever sees.
+  await throwsCode('a CAS for an account that does not exist is NOT_FOUND (initial version)',
+    'NOT_FOUND', () => store.profiles.upsertIfVersion(ulid(), INITIAL_SETTINGS_VERSION,
+      { settingsVersion: 2 }));
+  await throwsCode('a CAS for an account that does not exist is NOT_FOUND (any other version)',
+    'NOT_FOUND', () => store.profiles.upsertIfVersion(ulid(), 42, { settingsVersion: 43 }));
+
+  // CONTROL: after all of those refusals the method still writes, so the block above is about
+  // the arguments and not about a CAS that has stopped working.
+  const afterRefusals = await store.profiles.upsertIfVersion(racer.accountId, 8,
+    { roamingSettings: { fov: 111 }, settingsVersion: 9 });
+  check('control: a valid CAS still succeeds after every refusal above',
+    afterRefusals?.settingsVersion === 9 && afterRefusals?.roamingSettings?.fov === 111,
+    JSON.stringify(afterRefusals));
+
+  // --- a CAS enrols in the caller's transaction and rolls back with it -------------------
+  // Rule 4 of the interface. A CAS that committed outside the transaction it was written
+  // inside would consume a version the rolled-back request never spent.
+  await store.tx(async (tx) => {
+    const inTx = await store.profiles.upsertIfVersion(racer.accountId, 9,
+      { roamingSettings: { fov: 5 }, settingsVersion: 10 }, tx);
+    check('control: a CAS inside a transaction succeeds', inTx?.settingsVersion === 10,
+      JSON.stringify(inTx));
+    throw new Error('storetest: roll back the CAS');
+  }).catch(() => {});
+  const rolledBack = await store.profiles.byAccountId(racer.accountId);
+  check('a rolled-back CAS consumed no version',
+    rolledBack?.settingsVersion === 9 && rolledBack?.roamingSettings?.fov === 111,
+    JSON.stringify(rolledBack));
+}
+
+// ---------------------------------------------------------------------------------------
 // 8. Conformance: the rules both adapters must answer identically.
 // ---------------------------------------------------------------------------------------
 async function testConformance(store, tag) {
@@ -1029,8 +1163,104 @@ async function testConformance(store, tag) {
     'the rejected reason was stored anyway');
 
   // --- one behaviour per method, both adapters ------------------------------------------
-  await throwsCode('revoking a session that does not exist is NOT_FOUND', 'NOT_FOUND',
-    () => store.sessions.revoke(ulid(), 'conformance'));
+  //
+  // "There is no such row" is the single most divergence-prone answer in this interface, and
+  // it is the class the pgtest header records as already having bitten: memory threw NOT_FOUND
+  // where Postgres was silent. Exactly ONE method was pinned here — sessions.revoke — so the
+  // other twenty answers agreed by luck and by nobody having changed them. The whole table is
+  // asserted now, on both adapters, because a divergence in any row of it is a deployment bug
+  // no memory-backed test can see.
+  const gone = ulid();
+
+  // The WRITES: a write to a row that is not there is NOT_FOUND, never a silent no-op. A
+  // silent no-op is the one answer that lets a caller believe it changed something.
+  for (const [name, call] of [
+    ['sessions.revoke', () => store.sessions.revoke(gone, 'conformance')],
+    ['sessions.touch', () => store.sessions.touch(gone, iso())],
+    ['refreshTokens.markUsed', () => store.refreshTokens.markUsed(gone, iso())],
+    ['outbox.recordFailure', () => store.outbox.recordFailure(gone, 'conformance')],
+    ['outbox.deadLetter', () => store.outbox.deadLetter(gone, iso())],
+    ['accounts.update', () => store.accounts.update(gone, { status: 'active' })],
+    ['profiles.upsert', () => store.profiles.upsert(gone, { settingsVersion: 2 })],
+    ['stats.applyDelta', () => store.stats.applyDelta(gone, 'tdm', 'v1', { kills: 1 })],
+    ['weaponStats.applyDelta', () => store.weaponStats.applyDelta(gone, 'tdm', 'ar_default', 'v1', { shots: 1 })],
+    ['matches.markResultApplied', () => store.matches.markResultApplied(gone, iso())],
+  ]) {
+    await throwsCode(`${name} on a row that does not exist is NOT_FOUND`, 'NOT_FOUND', call);
+  }
+
+  // The READS: null, and `=== null` rather than falsiness — `undefined` satisfies every falsy
+  // check there is, and an adapter that returned it would pass a `!row` assertion while
+  // breaking every `row === null` branch in the modules.
+  for (const [name, call] of [
+    ['accounts.byId', () => store.accounts.byId(gone)],
+    ['accounts.byEmailHash', () => store.accounts.byEmailHash(`h_${gone}`)],
+    ['accounts.byNameFolded', () => store.accounts.byNameFolded(`nobody_${gone.toLowerCase()}`)],
+    ['sessions.byId', () => store.sessions.byId(gone)],
+    ['refreshTokens.byId', () => store.refreshTokens.byId(gone)],
+    ['profiles.byAccountId', () => store.profiles.byAccountId(gone)],
+    ['stats.get', () => store.stats.get(gone, 'tdm', 'v1')],
+    ['matches.byId', () => store.matches.byId(gone)],
+    ['flags.get', () => store.flags.get('conformance.no.such.flag')],
+    ['idempotency.get', () => store.idempotency.get(`no-${gone}`, gone)],
+    ['preAuthConsent.get', () => store.preAuthConsent.get(gone)],
+  ]) {
+    const got = await call();
+    check(`${name} answers null for a row that does not exist`, got === null,
+      `it answered ${got === undefined ? 'undefined' : JSON.stringify(got)}`);
+  }
+
+  // The COUNTS and the LISTS: a number or an empty page, and no exception. These are the
+  // methods whose caller is a loop or a sweep, and NOT_FOUND from any of them turns "nothing
+  // matched" into an incident.
+  const revokedNone = await store.sessions.revokeAllForAccount(gone, 'conformance', iso());
+  check('revokeAllForAccount on an unknown account is 0, not NOT_FOUND', revokedNone === 0,
+    `it returned ${JSON.stringify(revokedNone)}`);
+  const familyNone = await store.sessions.revokeFamily(gone, 'conformance', iso());
+  check('revokeFamily on an unknown family is 0, not NOT_FOUND', familyNone === 0,
+    `it returned ${JSON.stringify(familyNone)}`);
+  const deletedNone = await store.preAuthConsent.deleteFor(gone);
+  check('deleteFor on a consent row that is not there is false, not NOT_FOUND',
+    deletedNone === false, `it returned ${JSON.stringify(deletedNone)}`);
+  // §4 of the outbox contract: the relay marks a batch, and an id already swept or never
+  // written must not abort the batch around it.
+  await expectOk('markPublished tolerates an event id that is not there',
+    () => store.outbox.markPublished([gone], iso()));
+  for (const [name, call] of [
+    ['sessions.listForAccount', () => store.sessions.listForAccount(gone)],
+    ['stats.listForAccount', () => store.stats.listForAccount(gone)],
+    ['weaponStats.listForAccount', () => store.weaponStats.listForAccount(gone, 'tdm')],
+    ['audit.list', () => store.audit.list({ subjectId: gone })],
+  ]) {
+    const rows = await call();
+    check(`${name} answers an empty array for an account with nothing`,
+      Array.isArray(rows) && rows.length === 0, `it answered ${JSON.stringify(rows)?.slice(0, 80)}`);
+  }
+  const emptyPage = await store.matches.listForAccount(gone, { limit: 5 });
+  check('matches.listForAccount answers an empty page with a null cursor, not NOT_FOUND',
+    Array.isArray(emptyPage?.items) && emptyPage.items.length === 0 && emptyPage.nextCursor === null,
+    JSON.stringify(emptyPage));
+
+  // CONTROLS for the whole table: the same reads and counts against rows that DO exist. An
+  // adapter that answered null to everything, or 0 to everything, would satisfy every check
+  // above; these are what make the twenty-odd "nothing there" answers mean anything.
+  const liveSession = await store.sessions.create({
+    sessionId: ulid(), accountId: acct.accountId, refreshFamilyId: ulid(), ipClass: 'ca-on',
+  });
+  check('control: byId finds a session that does exist',
+    (await store.sessions.byId(liveSession.sessionId))?.sessionId === liveSession.sessionId,
+    'the reader cannot see a row it just wrote');
+  check('control: byId finds an account that does exist',
+    (await store.accounts.byId(acct.accountId))?.accountId === acct.accountId,
+    'the reader cannot see an account it just wrote');
+  check('control: byEmailHash finds the account it was created with',
+    (await store.accounts.byEmailHash(acct.emailHash))?.accountId === acct.accountId,
+    'the folded/hashed lookups answer null for everything');
+  check('control: listForAccount lists a session that does exist',
+    (await store.sessions.listForAccount(acct.accountId)).length >= 1, 'the list is empty for a live account');
+  const revokedSome = await store.sessions.revokeAllForAccount(acct.accountId, 'conformance', iso());
+  check('control: revokeAllForAccount counts the sessions it revoked', revokedSome >= 1,
+    `it returned ${revokedSome}, so the 0 above proves nothing`);
 
   const patched = await store.accounts.update(acct.accountId,
     { status: 'active', updatedAt: '1999-01-01T00:00:00.000Z' });
@@ -1064,6 +1294,8 @@ async function testConformance(store, tag) {
     'the import did not survive the round trip');
   await throwsCode('control: a profile column that does not exist is still refused', 'VALIDATION_FAILED',
     () => store.profiles.upsert(acct.accountId, { legacyimport: record }));
+
+  await testProfileCas(store);
 
   // A new consent decision replaces the old one and is never stamped as already-migrated.
   const consentId = ulid();
