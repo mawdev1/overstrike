@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -194,7 +194,7 @@ intentions. This is the byte layout. `PROTOCOL_VERSION` becomes **2** only when 
 |---|---:|---|---|
 | `MSG_HELLO` | 5 | c→s | 4 + `n` (ticket) |
 | `MSG_REJECT` | 6 | s→c | 4 + `n` (reason) |
-| `MSG_MATCHSTATE` | 7 | s→c | 40 |
+| `MSG_MATCHSTATE` | 7 | s→c | 41 |
 | `MSG_OUTCOME` | 8 | s→c | 32 |
 
 ### 8.2 `MSG_HELLO` — authenticated handshake (closes G1 + G2)
@@ -278,7 +278,7 @@ all of them. 6-bit progress is ~1.6% granularity, far finer than a progress bar 
 (`net-facade.md` §5.1). A bar that keeps filling through a dropped packet tells the player they
 are safe when the server has already cancelled the plant.
 
-### 8.6 `MSG_MATCHSTATE` — 40 bytes, sent on change only
+### 8.6 `MSG_MATCHSTATE` — 41 bytes, sent on change only
 
 Not per tick, and not inside the snapshot: match state changes a few times a round while
 snapshots go out at `SNAPSHOT_INTERVAL`, so folding it in would resend unchanged bytes
@@ -302,14 +302,24 @@ thousands of times a match.
 | 22 | u8 | `interactProgress` 0–63 |
 | 23 | u8 | `sideSwitched` — 0/1 |
 | 24 | u32 | `serverTimeMs` (low 32 bits) |
-| 28 | f32 | `bombX` |
-| 32 | f32 | `bombY` |
-| 36 | f32 | `bombZ` |
+| 28 | u8 | `bombPositionVisible` — 0 hidden, 1 present |
+| 29 | f32 | `bombX` |
+| 33 | f32 | `bombY` |
+| 37 | f32 | `bombZ` |
 
-**Visibility filtering (REQ-CC-024).** `bombX/Y/Z` is filtered per recipient by the same rule
-as `bombCarrierId` (§8.8): attackers always receive it; defenders receive it only when the
-bomb is **planted** (its position is then public — they must find it to defuse) or when a
-dropped bomb is in their line of sight. Otherwise zero. Sending true coordinates to everyone
+**`bombPositionVisible` is the presence signal, not the coordinates (REQ-CC-030).** The
+previous rule wrote zeroes when hidden, but `(0, 0, 0)` is a perfectly valid world position —
+the canonical site example in `map-data.md` uses an origin centre — so a decoder could not tell
+a hidden bomb from one sitting at the origin. `bombState` cannot stand in either, because every
+recipient still learns `dropped`/`planted`; only the *coordinates* are filtered.
+
+Coordinates are read **only** when the flag is 1, and map to `bomb.position: null` in the
+facade when it is 0. One byte, no in-band sentinel, no valid position excluded.
+
+**Visibility filtering (REQ-CC-024).** The flag is set per recipient by the same rule as
+`bombCarrierId` (§8.8): attackers always; defenders only when the bomb is **planted** (its
+position is then public — they must find it to defuse) or when a dropped bomb is in their line
+of sight. Sending true coordinates to everyone
 and hiding them in the UI would be a wallhack shipped in the protocol.
 
 **Bomb position is state, not an event (REQ-CC-018).** `bombDropped` (§8.7) fires once; a
@@ -384,7 +394,8 @@ cannot substitute — it says a round ended, not who won or why.
 | 12 | u32 | `actorId` — planter, defuser, or 0 |
 | 16 | bytes[16] | `matchId`, the ULID's 16 raw bytes |
 
-`reason`: `0` elimination, `1` defuse, `2` detonation, `3` timer, `4` forfeit, `5` abandon.
+`reason` (`outcomeReason` everywhere else — one name, one enum): `0` elimination, `1` defuse,
+`2` detonation, `3` timer, `4` forfeit, `5` abandon, `6` no-contest.
 
 **`winner: 0` is "no winner", not "draw" (REQ-CC-019).** Draw is `3`. The two are different
 facts and the earlier encoding could not tell them apart: an aborted or invalidated match has
@@ -392,15 +403,20 @@ no winner at all, which `match-result.md` represents as `winnerTeam: null`, whil
 is a genuine draw. Collapsing them would have made every invalidated match look like a tie in
 the results screen and in career stats.
 
-| `winner` | `terminationReason` | `winnerTeam` in the result |
-|---|---|---|
-| 1 or 2 | 0 completed | `"alpha"` / `"bravo"` |
-| 3 | 0 completed | `"draw"` |
-| 0 | 1 aborted | `null` |
-| 0 | 2 invalidated | `null` |
+Every row of the `match-result.md` §4.0 matrix, with no row omitted (REQ-CC-031):
 
-`forfeit` and `abandon` pair with a decided `winner` and `terminationReason: 1` — the match
-ended abnormally but someone still won it.
+| `winner` | `terminationReason` | `reason` | `winnerTeam` |
+|---|---|---|---|
+| 1 or 2 | 0 completed | elimination / defuse / detonation / timer | `"alpha"` / `"bravo"` |
+| 3 | 0 completed | timer | `"draw"` |
+| **1 or 2** | **1 aborted** | **forfeit** | **`"alpha"` / `"bravo"`** |
+| **1 or 2** | **1 aborted** | **abandon** | **`"alpha"` / `"bravo"`** |
+| 0 | 1 aborted | no-contest | `null` |
+| 0 | 2 invalidated | no-contest | `null` |
+
+The two bold rows were missing. **An aborted match can have a winner** — a forfeit is the most
+common abnormal ending and the winning team earns the win. `winner: 0` means no winner;
+`winner: 3` means draw; they are different facts.
 
 `matchId` travels as 16 raw bytes rather than its 26-character text form — a ULID is a 128-bit
 value, and sending it as text would cost 10 extra bytes on a message that already carries

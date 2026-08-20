@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -59,13 +59,19 @@ MatchHandoff = {
   matchId, serverUrl, sessionTicket, expiresAt, reconnectGraceMs,
   mapId, mapVersion, mode, rulesetVersion,
   region, serverBuild, protocolVersion,
-  series, spectatorPolicy, sites,
+  series, sites,
+  spectatorPolicyVersion,     // NOT the booleans — see below
 }
 ```
 
 Pass `match.ready`'s payload through unmodified. The facade stores it as the **immutable
-descriptor** for the match and merges it into `matchState`; nothing in it changes for the
-life of the match.
+descriptor** and merges it into `matchState`; nothing in it changes for the life of the match.
+
+**The handoff carries no spectator booleans (REQ-CC-029).** It used to carry all three while
+§5.1.0a recomputed two of them per phase — an immutable descriptor and a phase-derived value
+cannot both be the source. It now carries only `spectatorPolicyVersion`, and every boolean in
+`matchState.localPlayer.spectatorPolicy` is derived from that version's phase table. One
+producer, no overlap.
 
 **`matchState.matchId` comes from here**, and is required — without it the facade cannot even
 form the reconnect URL, which is the endpoint that keeps a dropped player in the match.
@@ -156,7 +162,8 @@ frames; entity objects are pooled and their contents change under you.
     state: 'none'|'carried'|'dropped'|'planted'|'defused'|'detonated',
     carrierId: number|null,     // null when unknown to you — see §5.1.1
     siteId: 'A'|'B'|null,
-    position: { x, y, z } | null,   // resync-safe; from MSG_MATCHSTATE, not from an event
+    position: { x, y, z } | null,   // null iff bombPositionVisible == 0 (wire §8.6).
+                                    // Never inferred from zero coordinates
   } | null,
 
   interaction: {                                       // ¹
@@ -201,10 +208,12 @@ the 49.7-day wrap — full rules in `wire-protocol.md` §8.10.
 
 #### 5.1.0a Spectator policy is derived per phase, not frozen at handoff
 
-`match.ready` carries the policy's **static** part (`canSpectateEnemies: false` for all of
-Alpha). The other two are phase-dependent and the facade recomputes them on every
-`matchState` (REQ-CC-024) — freezing them at handoff would have kept a dead player locked out
-of free camera for the whole match, which `bomb-rules.md` §8 explicitly allows at round end:
+`match.ready` carries `spectatorPolicyVersion` and nothing else; **all three booleans are
+derived** from that version's table below. Freezing them at handoff would have kept a dead
+player locked out of free camera for the whole match, which `bomb-rules.md` §8 explicitly
+allows at round end.
+
+Policy version 1 (`canSpectateEnemies` is `false` in every phase for all of Alpha):
 
 | Phase | `canFreeCam` | `canUseTeamChat` |
 |---|---|---|
@@ -260,7 +269,7 @@ client cannot have, and REQ-CC-012 correctly caught three of them.
 | `versionMismatch` | `{ clientVersion, serverVersion }` | `MSG_REJECT` (§8.3) |
 | `interactionRefused` | `{ kind, reason }` | **`interactRefused` event (§8.7 kind 20)** — its own kind, because a refusal is not a cancellation |
 | `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
-| `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` for aborted/invalidated — distinct from `'draw'` |
+| `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` only when the match had **no** winner — an aborted forfeit/abandon carries a real winner (`match-result.md` §4.0). `null` and `'draw'` are different facts |
 | `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
 
 **`interactionRefused` maps from `interactRefused` (kind 20) and from nothing else.** An

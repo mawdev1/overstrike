@@ -114,4 +114,5 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   an ID afterwards is a CCR against `settings-inventory.md`, `http-api.md`, and `telemetry.md`.
 - Requester's workaround until then: both enums are marked pending in `telemetry.md` §3.6 and
   `http-api.md` §11.9. I am deliberately not inventing them a second time.
-- Status: OPEN
+- Status: ACCEPTED
+- Response: Published settings vocabulary version `1` in `design/settings-inventory.md` 0.2. Canonical category IDs are `input`, `bindings`, `graphics`, `audioCaptions`, `crosshairHud`, `accessibility`, and `network`; every binding row now has a stable lower-camel-case action ID aligned with existing client actions where one already exists. Labels remain presentation copy and may change without changing IDs.

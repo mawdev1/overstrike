@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform endpoint, the lobby socket, the client HTTP layer |
 
@@ -77,7 +77,7 @@ a code is an additive amendment, changing what one *means* is breaking.
 | `IDEMPOTENCY_KEY_REUSED` | 409 | Same key, different payload. See `http-api.md` §8 |
 | `PAYLOAD_TOO_LARGE` | 413 | Over the endpoint limit |
 | `RATE_LIMITED` | 429 | General rate limit; honour `retryAfterMs` |
-| `UNSUPPORTED_CLIENT` | 426 | Client build **or capability** outside the D5 matrix. `details.reason` is the closed set shared with `client.unsupported` telemetry: `build`, `browser-version`, `os-version`, `webgl2`, `pointer-lock`, `websocket-binary`, `memory`, `vram`, `cpu-cores`, `mobile-or-tablet`. Upgrade/unsupported message, never retry |
+| `UNSUPPORTED_CLIENT` | 426 | Client build or capability outside the D5 matrix. `details.reason` is `UnsupportedReason` (§3.1). Upgrade/unsupported message, never retry |
 
 ### Profile and identity
 
@@ -108,6 +108,20 @@ a code is an additive amendment, changing what one *means* is breaking.
 | `ROOM_REMOVED` | 403 | Kicked or removed by owner/moderation | Return to browser. `details.reason`, `details.until` if temporary. **No auto-rejoin** |
 | `RECONNECT_GRACE_EXPIRED` | 409 | Returned after the grace window | Seat released; re-join subject to backfill rules |
 | `MATCH_ABORTED` | 409 | Match ended abnormally (`match-result.md` §4) | Results screen with `details.terminationReason` |
+
+### 3.1 `UnsupportedReason` — one enum, two consumers
+
+Defined once here and consumed unchanged by `telemetry.md` §3.3.1 `client.unsupported.reason`.
+Neither side restates it.
+
+```
+build · browser-version · os-version · webgl2 · pointer-lock
+websocket-binary · memory · vram · cpu-cores · mobile-or-tablet
+```
+
+`build` is in the set because the build floor is a real failure mode with its own error branch;
+it was previously in the error's list and missing from the event's, so the one failure the
+server rejects most often could not be measured (REQ-CC-032).
 
 ### Reconnect and session codes — required `details`
 

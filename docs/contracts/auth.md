@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Client HTTP layer, lobby socket, match server, Admin Portal |
 
@@ -187,6 +187,9 @@ change. Open questions are listed in [`../decisions/P0-decisions.md`](../decisio
 
 What this contract fixes regardless of where the policy lands:
 
+- Onboarding order is **landing → eligibility → consent → signup → verify → terms**
+  (`http-api.md` §3a). Eligibility precedes consent so consent is never solicited from a
+  visitor who cannot validly give it.
 - Age/eligibility is captured **before** any sensitive profile data is collected, via the
   §3a.1 preflight that evaluates a birthdate and **discards it**, persisting only the derived
   boolean and policy version —

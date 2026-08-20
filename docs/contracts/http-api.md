@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -54,13 +54,29 @@ posted a birthdate with everything else; `errors.md` routed `AUTH_VERIFICATION_R
 `AUTH_TERMS_ACCEPTANCE_REQUIRED` to UI states no endpoint could clear; and `telemetry.md`
 gated personal events on a consent state that lived nowhere. The chain, in order:
 
+**The approved order (REQ-CC-028).** This is the one order recorded here, in `auth.md` §11,
+in `telemetry.md` §3.4, and in `design/first-run-flow.md`:
+
 ```
-1. POST /v1/onboarding/eligibility   → preflight. No account, no birthdate retained
-2. POST /v1/auth/signup              → account created; refresh cookie set
-3. POST /v1/onboarding/verify/...    → clears AUTH_VERIFICATION_REQUIRED
-4. GET/POST /v1/onboarding/terms     → clears AUTH_TERMS_ACCEPTANCE_REQUIRED
-5. PUT /v1/onboarding/consent        → telemetry consent, separate from all of the above
+1. landing                            → internal-class telemetry only (see §3a.5)
+2. POST /v1/onboarding/eligibility    → age gate. No account, no birthdate retained
+3. PUT  /v1/onboarding/consent        → telemetry consent, asked ONLY of eligible visitors
+4. POST /v1/auth/signup               → account created; consent migrated; refresh cookie set
+5. POST /v1/onboarding/verify/...     → clears AUTH_VERIFICATION_REQUIRED
+6. GET/POST /v1/onboarding/terms      → clears AUTH_TERMS_ACCEPTANCE_REQUIRED
 ```
+
+**Eligibility precedes consent, deliberately.** `auth.md` §11 records that under-13 visitors
+generally cannot give valid consent alone, so asking for consent first would mean soliciting it
+from exactly the people who cannot give it. Gating first means we never ask.
+
+The cost is that steps 1 and 2 happen before any consent decision exists, so they cannot emit
+personal-class telemetry — see §3a.5. That is a real limitation, stated rather than papered
+over.
+
+**This ordering rides on the D6 working default and needs the same legal review.** Whether a
+13-year-old's own consent is sufficient in every jurisdiction served is a question for that
+review, not for this contract.
 
 ### 3a.1 Eligibility preflight — **no birthdate is stored**
 
@@ -91,8 +107,13 @@ requires eligibility *before* sensitive data is collected, and the cleanest way 
 is to never store the most sensitive field at all. `details.category` never echoes the date or
 the computed age.
 
-Signup therefore takes `{ email, password, displayName }` — **no `dateOfBirth`**, correcting
-§11.8 — plus the eligibility receipt from this call.
+Signup therefore takes `{ email, password, displayName, eligibilityReceipt, clientSessionId,
+consentReceipt }` — **no `dateOfBirth`**. The last two migrate the signed-out consent decision
+onto the new account (§3a.3); signup returns a fresh account-scoped `consentReceipt` which
+replaces the session-scoped one on subsequent telemetry batches.
+
+Signup errors include **`ELIGIBILITY_RECEIPT_INVALID`** — expired, forged, or issued against a
+different policy version.
 
 ### 3a.2 Verification and terms
 
@@ -145,8 +166,34 @@ before any consent endpoint had been called; and dropping personal events until 
 made the first four funnel steps — landing, eligibility, signup, verification — permanently
 unmeasurable, while §3.1 promised to measure exactly those. Asking at landing fixes both.
 
-`consent: null` in a profile means **undecided**, which is a legal state: an account created
-before this policy version existed has no decision recorded, and is treated as no consent.
+`consent: null` in a profile means **undecided** — an account predating this policy version has
+no decision recorded and is treated as no consent. The profile field is explicitly
+**object-or-null**, never absent.
+
+**Storage.** The typed columns in `db-schema.md` §2 (`consent_telemetry`,
+`consent_policy_ver`, `consent_decided_at`) are the source of truth. `accounts.privacy` holds
+visibility only; the §3a.3 sketch that put consent inside it is superseded, because a legally
+significant decision belongs in constrained columns rather than a JSON blob nothing validates.
+
+**Signed-out consent** is stored keyed by `clientSessionId` with a **30-day TTL**, holding the
+decision, policy version, and decision time. It is deleted on migration at signup, or on
+expiry. It is not an account and is never joined to one except by the receipt presented at
+signup.
+
+### 3a.5 What is intentionally unmeasurable (REQ-CC-028)
+
+Steps 1 and 2 precede the consent decision, so their events cannot be personal-class. Rather
+than claim a complete funnel:
+
+| Step | Class | Linkage |
+|---|---|---|
+| `landing`, `eligibility` | **internal** | **Unlinked aggregate counts.** No `clientSessionId`, so no per-visitor path |
+| `consent` onward | personal, if consented | Linked by `clientSessionId`, then by account |
+
+So funnel **volume** at the top is measurable; per-visitor **paths** through the first two
+steps are not, and `time_to_first_match_sec` is measured from the consent step rather than from
+the first byte. `telemetry.md` §3.1 states the same limitation so the two documents cannot
+drift apart on what the KPI means.
 
 **Until a decision exists, personal-class events are dropped, not queued.** Queuing them
 against a later "yes" would mean collecting first and asking afterwards. `internal`-class
@@ -244,15 +291,25 @@ were impossible.
 Requires an authenticated account that still **holds a seat** in the room. It does not create
 membership, so it cannot be used to jump a queue or re-enter a room the player has left.
 
-`GET /v1/rooms` returns **`RoomCore[]`** exactly as defined in §11.3 — no roster, no separate
-field list here. An earlier duplicate example in this section still used `map` and `players`
-where §11.3 says `mapId`/`mapVersion` and `playerCount`; it is deleted rather than corrected,
-because a second copy of a schema is the thing that drifts (REQ-CC-021).
+`GET /v1/rooms` returns the **paginated envelope** every list endpoint uses (§10), carrying
+`RoomCore` items as defined in §11.3 — no roster, no separate field list here:
+
+```json
+{ "items": [ /* RoomCore */ ], "nextCursor": "…"|null, "correlationId": "…" }
+```
+
+Query: `?region=&mode=&hasSpace=&limit=&cursor=&rttSource=`. `hasSpace` is a boolean;
+`region` and `mode` are closed enums; unknown parameters are rejected rather than ignored.
+
+A bare `RoomCore[]` was declared here for one round, which contradicted §1 (every response
+carries `correlationId`), §10 (lists are `{ items, nextCursor }`), and the `browser-empty`
+fixture that already returned the wrapper (REQ-CC-027).
 
 `POST /v1/rooms/:id/join` returns a reservation, not a seat:
 
 ```json
-{ "reservationId": "…", "expiresAt": "…", "lobbySocketUrl": "wss://…", "lobbyTicket": "…" }
+{ "reservationId": "…", "expiresAt": "…",
+  "lobbySocketUrl": "wss://…", "lobbyTicket": "…", "correlationId": "…" }
 ```
 
 The client must open the lobby socket with `lobbyTicket` before `expiresAt` or the slot is
@@ -265,13 +322,23 @@ two simultaneous joiners for one seat resolve deterministically.
 |---|---|---|---|
 | GET | `/v1/matches/:matchId` | A | Authoritative result. `match-result.md` |
 | POST | `/v1/matches/:matchId/result` | **S** | Match server → platform. Idempotent. Never browser-reachable |
-| POST | `/v1/matches/:matchId/reconnect-ticket` | A | **REQ-CC-018.** Fresh single-use match ticket while the entity is still held |
+| POST | `/v1/matches/:matchId/reconnect-ticket` | A | Fresh single-use match ticket while the entity is still held |
+| GET | `/v1/matches/active` | A | **REQ-CC-029.** The caller's currently-held match, for reload discovery |
 | POST | `/v1/reports` | A | Player report; returns a reference |
+| GET | `/v1/config/flags` | A | Client-visible flags only. `feature-flags.md` §3.1 |
+| GET | `/v1/config/regions` | P | Region list with probe endpoints |
+| GET | `/v1/health` | P | Liveness. No dependency detail |
+| GET | `/v1/health/ready` | **S** | Readiness, per dependency |
 
-`POST /v1/matches/:matchId/reconnect-ticket` is the match-socket analogue of the lobby's
-§6 endpoint, and exists for the same reason: the session ticket is consumed at `MSG_HELLO`, so
-without a way to mint another, a client that dropped could never rejoin its own live match —
-`net.reconnecting` was a state with no exit.
+The config and health rows previously sat outside this table, orphaned below the prose that
+followed it (REQ-CC-027).
+
+**`POST /v1/matches/:matchId/result` is service-only.** If a browser can reach it, the client
+can write its own stats, and the entire G1 gate is decorative.
+
+`POST /v1/matches/:matchId/reconnect-ticket` is the match-socket analogue of the lobby's §6
+endpoint, and exists for the same reason: the session ticket is consumed at `MSG_HELLO`, so
+without a way to mint another, a dropped client could never rejoin its own live match.
 
 ```json
 200 → { "handoff": { /* the complete MatchHandoff from realtime-lobby.md §6.1,
@@ -286,13 +353,32 @@ without a way to mint another, a client that dropped could never rejoin its own 
 `graceEndsAt` is authoritative here and nowhere else: a dropped socket cannot deliver it, and a
 client counting down from its own drop timestamp would disagree with the server about when its
 seat expires.
-| GET | `/v1/config/flags` | A | Client-visible flags only. `feature-flags.md` |
-| GET | `/v1/config/regions` | P | Region list with probe endpoints |
-| GET | `/v1/health` | P | Liveness. No dependency detail |
-| GET | `/v1/health/ready` | **S** | Readiness, per dependency |
 
-**`POST /v1/matches/:matchId/result` is service-only.** If a browser can reach it, the client
-can write its own stats, and the entire G1 gate is decorative.
+### 7.1 `GET /v1/matches/active` — reload discovery (REQ-CC-029)
+
+The reconnect endpoint restores everything **once the client knows `matchId`** — and a page
+reload loses `match.ready`, so it does not. This is the missing first step.
+
+```json
+200 → { "matchId": "…", "roomId": "…", "graceEndsAt": "…", "serverNow": "…",
+        "correlationId": "…" }
+204 → no held match
+```
+
+Authenticated, derived server-side from the account's held entity. The client asks "am I in a
+match?" rather than remembering across a reload, so nothing depends on client persistence
+surviving a crash, a new tab, or a different device.
+
+`matchId` is not a secret and needs no protection, but it is also not something the client
+should have to store: the server already knows, and asking is one request.
+
+```json
+// GET /v1/health        → { "ok": true, "correlationId": "…" }
+// GET /v1/health/ready  → { "ok": true, "dependencies": { "db": "up|down", … }, "correlationId": "…" }
+```
+
+Health responses carry `correlationId` like every other response (§1); they previously omitted
+it.
 
 ## 8. Idempotency
 
@@ -481,7 +567,8 @@ Idempotency-Key: …
 { "password": "…" | null, "preferredTeam": "alpha|bravo|auto" }
 
 200 → { "reservationId": "…", "expiresAt": "…",
-        "lobbySocketUrl": "wss://…", "lobbyTicket": "…", "correlationId": "…" }
+        "lobbySocketUrl": "wss://…", "lobbyTicket": "…",
+        "correlationId": "…" }
 401 → ROOM_PASSWORD_REQUIRED
 403 → ROOM_PASSWORD_INVALID | SANCTIONED | ROOM_REMOVED
 409 → ROOM_FULL | ROOM_CLOSED | ROOM_IN_PROGRESS
@@ -527,9 +614,20 @@ eventually disagree, and only one is right.
   "correlationId": "…" }
 ```
 
-The client measures RTT itself against `probeUrl` (3 samples, median) and sends the result as
-`estimatedRttMs` on room queries. **The server never invents a ping from geography** — a
-fabricated latency number is worse than an absent one, because the player trusts it.
+The client measures RTT itself against `probeUrl` (3 samples, median) and submits the results
+with the room query as a **header**, not a body — `GET` has no body:
+
+```http
+GET /v1/rooms?region=yyz
+X-Region-Rtt: yyz=24,ord=41,iad=58
+```
+
+Closed format: `region=integerMs` pairs, comma-separated, max 8 regions, each 0–5000. Malformed
+or absent → `estimatedRttMs: null` on every returned room, and the UI shows the ping as unknown.
+
+**The server never invents a ping from geography** — a fabricated latency number is worse than
+an absent one, because the player trusts it. The header is client-measured and therefore
+advisory: it affects display and sort order only, never allocation or authorisation.
 
 ### 11.7 Flags
 
@@ -541,13 +639,17 @@ See `feature-flags.md` §3.1 for the exact `GET /v1/config/flags` response.
 left to inference.
 
 ```jsonc
-// POST /v1/auth/signup   { "email", "password", "displayName", "eligibilityReceipt" }
+// POST /v1/auth/signup
+//   { "email", "password", "displayName", "eligibilityReceipt",
+//     "clientSessionId"?, "consentReceipt"? }     ← migrate the signed-out decision
 //   dateOfBirth is NOT sent here — see §3a.1; it never leaves the preflight
 // POST /v1/auth/signin   { "email", "password" }
 201/200 → { "accessToken", "expiresAt", "session": { "sessionId", "deviceLabel", "createdAt" },
             "profile": { /* §4 GET /profile/me */ }, "correlationId" }
+  signup additionally returns { "consentReceipt": "…" }   ← account-scoped, replaces the session one
   errors: VALIDATION_FAILED · AUTH_INVALID_CREDENTIALS · AUTH_RATE_LIMITED ·
-          NAME_TAKEN · NAME_POLICY_VIOLATION · AUTH_ELIGIBILITY_DENIED
+          NAME_TAKEN · NAME_POLICY_VIOLATION · AUTH_ELIGIBILITY_DENIED ·
+          ELIGIBILITY_RECEIPT_INVALID
 
 // POST /v1/auth/signout        {} → 204
 // POST /v1/auth/signout-all    {} → 204          (both clear the refresh cookie)
@@ -641,15 +743,19 @@ speakers to a laptop is a setting arriving wrong on a machine that had it right.
 (`Crouch/slide` ships `Left Ctrl` + `C`). A single action→code map cannot express that:
 
 ```jsonc
-"keybinds": { "<actionId>": { "primary": "ControlLeft", "secondary": "KeyC" },
-              "<actionId>": { "primary": "Space",       "secondary": null } }
+"keybinds": { "<bindingActionId>": { "primary": "ControlLeft", "secondary": "KeyC" },
+              "<bindingActionId>": { "primary": "Space",       "secondary": null } }
 ```
 
-**`<actionId>` is pending CX (REQ-CC-026).** The inventory's binding table carries labels
-(`Move forward`, `Crouch/slide`) but no stable IDs, so a validator cannot yet be generated from
-it. The earlier example here invented `crouchSlide` and `jump` — inventing them a second time
-would recreate the drift REQ-CC-016 was raised about. Filed as `REQ-CX-005`; the validator
-binds to that vocabulary when it lands, and restates none of it.
+**`RoamingSettingsV1` consumes settings vocabulary version 1** (REQ-CC-032). Keys are the
+inventory's ROAM setting IDs; `keybinds` keys are its 31 canonical binding action IDs. The
+validator is generated from that vocabulary and this contract restates none of it — the
+placeholder IDs that used to sit here were invented, did not match, and are gone.
+
+A key outside vocabulary v1, or a value outside its stated range, step, or enum, is rejected.
+`schemaVersion: 1` means `RoamingSettingsV1` against vocabulary version 1; a vocabulary bump
+that adds a ROAM row is additive, and one that renames or removes an ID is a CCR against both
+documents.
 
 **Validation** is generated from the inventory rather than hand-maintained here, so a change to
 a range in the design doc cannot silently disagree with the server. A key outside the ROAM set,

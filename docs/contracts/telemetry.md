@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -158,8 +158,8 @@ Every payload below is closed: unlisted keys are dropped server-side, not stored
 | `match.handoff_failure` | 1 | personal | `{ stage, code }` — stage `allocating`\|`ticket`\|`connect`\|`welcome` |
 | `match.return_outcome` | 1 | personal | `{ outcome, returnedToLobby: bool }` — outcome `completed`\|`disconnected`\|`kicked`\|`aborted`\|`grace-expired` |
 | `connection.failure` | 1 | personal | `{ stage, code }` — stage `platform`\|`lobby`\|`match`; code from `errors.md` |
-| `settings.friction` | 1 | personal | `{ category, duringFirstSession: bool }` — category is a **canonical category ID** from `design/settings-inventory.md` — see §3.6. Not a settings key, and not a display label |
-| `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — reason covers every D5 check: `webgl2`\|`browser-version`\|`os-version`\|`pointer-lock`\|`websocket-binary`\|`memory`\|`vram`\|`cpu-cores`\|`mobile-or-tablet` |
+| `settings.friction` | 1 | personal | `{ category, duringFirstSession: bool }` — `category` is a canonical category ID from settings vocabulary **version 1** (§3.6). Not a settings key, and not a display label |
+| `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — `reason` is `UnsupportedReason` (`errors.md` §3.1), including `build` |
 | `client.fps` | 1 | internal | `{ p50: 0–1000, p01: 0–1000, windowSec: 1–600 }` |
 | `client.frame_time` | 1 | internal | `{ p50Ms, p95Ms, p99Ms }` each 0–10000 |
 | `client.webgl_context_lost` | 1 | internal | `{ recovered: bool, uptimeSec: 0–604800 }` |
@@ -183,23 +183,22 @@ display names and chat.
 Adding an event is additive — a new row plus a version. Changing an existing payload's meaning
 is a CCR, because the warehouse already has rows under the old interpretation.
 
-### 3.6 Bound vocabularies — pending CX (REQ-CC-026)
+### 3.6 Bound vocabulary (REQ-CC-032)
 
-Two enums in this contract are **owned by `design/settings-inventory.md`**, not by me:
+`design/settings-inventory.md` **vocabulary version 1** is published and this contract
+consumes it. Neither enum is restated here, because restating is what drifted before.
 
-| Enum | Used by | Status |
+| Enum | Source | Consumed by |
 |---|---|---|
-| Settings **category IDs** | `settings.friction.category` | **Blocked on CX** — the inventory has display labels (`Input`, `Bindings`, `Graphics`, `Audio & captions`, `Crosshair & HUD`, `Accessibility`, `Network`) but no stable IDs |
-| Binding **action IDs** | `http-api.md` §11.9 keybind validation | **Blocked on CX** — same reason |
+| Category IDs (7) | settings vocabulary v1 | `settings.friction.category` |
+| Binding action IDs (31) | settings vocabulary v1 | `http-api.md` §11.9 keybind validation |
 
-I guessed both once (`controls|bindings|video|audio|…`, and `crouchSlide`/`jump`) and the
-guesses did not match the inventory. Guessing again would reproduce exactly the drift that
-`REQ-CC-016` was raised about, so these stay open until Codex publishes canonical IDs —
-filed as `REQ-CX-005`.
+IDs are transport identifiers, not display copy: not localised, stable across a retitle, and
+renaming a shipped one is a coordinated change across `settings-inventory.md`, `http-api.md`,
+and this contract.
 
-Display labels cannot serve as IDs: they are copy, they get retitled, and they are the first
-thing localisation changes. When the IDs land, both this enum and the §11.9 validator bind to
-that versioned vocabulary and neither restates it.
+A `settings.friction` event whose `category` is not in vocabulary v1 is **rejected**, not
+stored — the same rule as any other closed enum in §3.3.1.
 
 ### 3.4 Consent and eligibility gating
 
@@ -207,7 +206,12 @@ that versioned vocabulary and neither restates it.
 |---|---|
 | `internal` health and performance | Sent always. No personal data, needed to keep the game running |
 | `personal` funnel and KPI | Requires `consent.telemetryPersonal` from `http-api.md` §3a.3 — a record distinct from eligibility and from profile visibility |
-| Before any consent decision | Only `internal` class is sent. Personal events are **dropped, not queued** — queuing against a later "yes" is collecting first and asking afterwards |
+| Before any consent decision | Only `internal` class is sent, **unlinked** — no `clientSessionId`. Personal events are **dropped, not queued**: queuing against a later "yes" is collecting first and asking afterwards |
+
+The landing and eligibility steps therefore contribute aggregate counts and nothing else
+(`http-api.md` §3a.5). This is a deliberate limit on what the funnel can answer, not an
+oversight — consent is asked after the age gate so it is never solicited from someone who
+cannot give it.
 
 A player who declines consent still produces `internal` telemetry, because refusing to
 diagnose a crash is not a privacy win for anyone. They produce no `personal` events at all.

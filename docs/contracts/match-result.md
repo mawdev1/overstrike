@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -81,10 +81,17 @@ binding additions:
   // Immutable copy of the ruleset, discriminated by mode (REQ-CC-019, REQ-CC-025)
   "rulesSnapshot": {
     // mode "bomb":
+    // mode "bomb" — every key present:
+    "killLimit": null,
     "roundsToWin": 7, "maxRounds": 12, "sideSwitchAfter": 6,
     "roundLengthSec": 105, "bombTimerSec": 40, "defuseSec": 7, "plantSec": 3,
-    "freezeSec": 8, "overtime": false, "killLimit": null
-    // mode "tdm":  { "killLimit": 75, everything above null }
+    "freezeSec": 8, "overtime": false
+
+    // mode "tdm" — the same keys, discriminated:
+    // { "killLimit": 75,
+    //   "roundsToWin": null, "maxRounds": null, "sideSwitchAfter": null,
+    //   "roundLengthSec": null, "bombTimerSec": null, "defuseSec": null,
+    //   "plantSec": null, "freezeSec": null, "overtime": null }
   },
   "statDefinitionVersion": "1.0.0",  // which definitions in §3 produced these numbers
   "serverBuild": "…", "mapId": "the-square", "mapVersion": "1.0.0", "region": "yyz",
@@ -132,8 +139,10 @@ The previous placeholder comment was not buildable. Exact, every key required:
 } ]
 ```
 
-`winnerTeam` is `draw` when regulation ends 6-6 (`bomb-rules.md` §2.2 — no overtime in Alpha),
-and `null` for an aborted or invalidated match. Per-player win/loss is derived from
+`winnerTeam` is `draw` when regulation ends 6-6 (`bomb-rules.md` §2.1a — no overtime in Alpha),
+and `null` **only when the match had no winner at all** — a no-contest or an invalidation. An
+aborted match ended by forfeit or abandon carries a real winner; see the §4.0 matrix, which
+this sentence used to contradict. Per-player win/loss is derived from
 `winnerTeam` and the player's team; it is not stored per player, because storing it twice
 means it can disagree with itself.
 
@@ -161,8 +170,28 @@ as "your match vanished" and invites a client to try to supply its own stats.
 { "matchId": "…", "status": "invalidated",
   "invalidationReason": "…", "correlationId": "…" }
 
+// aborted — a full, durable record. May carry a winner (forfeit/abandon) or not (no-contest)
+{ "matchId": "…", "status": "aborted",
+  "terminationReason": "aborted",
+  "outcomeReason": "forfeit|abandon|no-contest",
+  "winnerTeam": "alpha|bravo|null",
+  /* …every other field of the §4 record… */ }
+
 // completed → the full §4 record with "status": "completed"
 ```
+
+**`status` is a required top-level field on every response**, including the full record, and is
+the discriminant of the union:
+
+| `status` | Carries |
+|---|---|
+| `pending` | The short form above. No `players`, no `rounds` |
+| `completed` | The full §4 record. `winnerTeam` is `alpha`, `bravo`, or `draw` |
+| `aborted` | The full §4 record. `winnerTeam` may be a team **or** `null` |
+| `invalidated` | The full §4 record plus `invalidationReason`. `winnerTeam` is `null` |
+
+`completed`, `aborted`, and `invalidated` share the same field set; only the values differ. A
+client renders one shape and branches on `status`.
 
 | Case | Response |
 |---|---|

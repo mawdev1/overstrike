@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — host resolved; awaiting REQ-CX-001 |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |
 | **Scope** | P1–P5. Economy, ownership, creator, and agent tables are later contracts |
@@ -76,6 +76,17 @@ accounts(
 )
 
 account_name_history(account_id, previous_name, changed_at, changed_by, reason)
+
+-- Signed-out consent, before an account exists (http-api.md §3a.3). 30-day TTL, deleted on
+-- migration at signup. Never joined to an account except by the receipt presented at signup.
+pre_auth_consent(
+  client_session_id text primary key,
+  telemetry_personal boolean not null,
+  policy_version     int not null,
+  decided_at         timestamptz not null,
+  expires_at         timestamptz not null,
+  migrated_at        timestamptz
+)
 
 sessions(
   session_id text primary key, account_id text references accounts,

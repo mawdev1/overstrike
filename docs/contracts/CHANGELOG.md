@@ -32,6 +32,49 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — Fifth cross-reference review, `REQ-CC-027`…`032` (additive)
+
+Six residual groups, all resolved. Affected contracts go to **1.5.0**. `REQ-CX-005` landed in
+the same round, so the settings vocabulary is now consumed rather than pending.
+
+| Request | Residual |
+|---|---|
+| `REQ-CC-027` | Room list declared a bare array against three of this contract's own conventions |
+| `REQ-CC-028` | Consent ordering, signed-out persistence, and signup migration still disagreed |
+| `REQ-CC-029` | Reload reconnect had no way to discover `matchId` |
+| `REQ-CC-030` | Hidden Bomb position used `(0,0,0)`, a valid world coordinate |
+| `REQ-CC-031` | The outcome matrix was not applied by the schemas naming it |
+| `REQ-CC-032` | Vocabulary published but not consumed; `build` missing from the shared enum |
+
+### Three that were genuine defects rather than untidiness
+
+1. **`(0,0,0)` cannot mean "hidden".** It is a valid world position and the canonical site
+   example uses an origin centre, so a decoder could not distinguish a concealed bomb from one
+   at the origin. `bombState` could not disambiguate either — every recipient still learns
+   `dropped`/`planted`; only the coordinates are filtered. Added an explicit
+   `bombPositionVisible` byte; `MSG_MATCHSTATE` is 41 bytes.
+2. **Reload reconnect had no entry point.** The reconnect endpoint restores everything *once
+   the client knows `matchId`*, and a reload is exactly when it does not. Added
+   `GET /v1/matches/active`, derived server-side from the held entity — asking is one request,
+   and making the client persist the id would have made reconnect depend on storage surviving
+   a crash or a new tab.
+3. **The handoff and the phase table both claimed to own spectator policy.** An immutable
+   descriptor and a phase-derived value cannot both be the source. The handoff now carries
+   `spectatorPolicyVersion` only.
+
+### One ordering decision with a legal edge
+
+Consent now sits **after** the age gate: `landing → eligibility → consent → signup → verify →
+terms`. `auth.md` §11 records that under-13 visitors generally cannot consent alone, so asking
+before gating would solicit consent from precisely the people who cannot give it.
+
+The cost is stated rather than hidden. Landing and eligibility emit **unlinked internal-class
+counts only**, so top-of-funnel volume is measurable and per-visitor paths through those two
+steps are not — and `time_to_first_match_sec` is measured from the consent step, not the first
+byte. Both contracts say so, so they cannot drift on what the KPI means.
+
+This ordering rides on the D6 working default and belongs in the same legal review.
+
 ## 2026-08-20 — Fourth-pass graph audit, `REQ-CC-021`…`026` (additive)
 
 Codex re-walked the six chains amended by `REQ-CC-015`…`020` and found residual breaks in all

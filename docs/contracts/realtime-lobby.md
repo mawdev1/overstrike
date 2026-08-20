@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.4.0 |
+| **Version** | 1.5.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] shell UI, presence service, room service |
 
@@ -157,7 +157,7 @@ not from `MSG_WELCOME`:
   "mode": "bomb", "rulesetVersion": "bomb-1.0.0",
   "region": "yyz", "serverBuild": "…", "protocolVersion": 2,
   "series": { "roundsToWin": 7, "maxRounds": 12, "sideSwitchAfter": 6, "overtime": false },
-  "spectatorPolicy": { "canSpectateEnemies": false, "canFreeCam": false, "canUseTeamChat": false },
+  "spectatorPolicyVersion": 1,      // booleans are phase-derived — net-facade.md §5.1.0a
   "sites": [ { "id": "site-A", "site": "A", "callout": "Fountain",
                "center": { "x": 0, "y": 0, "z": 0 },
                "box": { "min": {…}, "max": {…} } } ] }
