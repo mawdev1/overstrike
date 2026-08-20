@@ -230,6 +230,11 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
       // The result-application transition emits `match.result_applied` through the SAME outbox
       // everything else uses, so a career change is traceable like any other state change.
       outbox: deps.events?.outbox,
+      // `PATCH /v1/profile/me` renames through the auth service, which owns the name policy,
+      // the `account.name_changed` event and the §10 audit row. Auth is mounted above, so the
+      // service exists by here; without it the profile module refuses a rename rather than
+      // performing one nothing records.
+      identity: deps.auth?.service,
     });
     // Profile routes take the auth middleware from the wiring rather than importing it, so
     // the module stays testable without an auth module present.

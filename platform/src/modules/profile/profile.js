@@ -12,11 +12,16 @@
  *     on it. The public projection always returns 200 with the visible subset; only a subject
  *     that does not exist is a 404.
  */
+import { createHash } from 'node:crypto';
 import { ApiError } from '../../core/errors.js';
 import { STAT_DEFINITION_VERSION } from './stats.js';
 
-const NAME_MIN = 3;
-const NAME_MAX = 16;
+// The 3–16 length rule lives with the rest of the name policy in `auth/names.js` (auth.md §9).
+// The copies that used to sit here named the same numbers a second time and were enforced by
+// nothing, which is how a second, weaker policy starts.
+
+/** §8: gameplay keys are retained 24 h. Nothing on this endpoint is value-bearing. */
+const IDEMPOTENCY_TTL_MS = 24 * 3600e3;
 
 /**
  * Display-name policy lives in ONE place: `auth/names.js`.  auth.md §9.
@@ -56,6 +61,68 @@ export function normalizePrivacy(raw) {
       ? p.statsVisibility : 'nobody',
   };
 }
+
+const PRIVACY_ENUMS = {
+  presenceVisibility: PRESENCE_VISIBILITY,
+  statsVisibility: STATS_VISIBILITY,
+};
+
+/**
+ * Validate a submitted `privacy` patch against the two closed §4 enums.
+ *
+ * A WRITE is rejected, not folded to the most restrictive member. `normalizePrivacy` fails
+ * closed because it is reading a jsonb blob that may hold anything and still has to answer;
+ * a write has an author who can be told. Silently storing `nobody` when the client asked for
+ * `friends` is the clamped-setting failure from §11.9 wearing a privacy costume: the player
+ * sees a value they did not choose and cannot tell that they did not get it.
+ *
+ * @returns {{errors: Array<object>, value: object}} — `value` is the patch to merge.
+ */
+export function validatePrivacyPatch(raw) {
+  const errors = [];
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { errors: [{ key: 'privacy', reason: 'type', expected: 'object' }], value: {} };
+  }
+  const value = {};
+  for (const [key, given] of Object.entries(raw)) {
+    // Own-property lookup: `privacy: { "toString": … }` must not find a member on the
+    // prototype chain and treat it as a documented field.
+    if (!Object.hasOwn(PRIVACY_ENUMS, key)) {
+      errors.push({ key: `privacy.${key}`, reason: 'unknown-field' });
+      continue;
+    }
+    const allowed = PRIVACY_ENUMS[key];
+    if (!allowed.includes(given)) {
+      errors.push({ key: `privacy.${key}`, reason: 'enum', allowed, got: given });
+      continue;
+    }
+    value[key] = given;
+  }
+  return { errors, value };
+}
+
+/**
+ * Key-sorted JSON, so `{a:1,b:2}` and `{b:2,a:1}` are the SAME request under §8.
+ *
+ * `JSON.stringify` preserves insertion order, and a client that serialises its patch from an
+ * object literal has no contract with us about that order. Hashing the raw text would make a
+ * genuine retry look like key reuse and answer a correct client with 409.
+ */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+/**
+ * §8 `requestHash`. Scoped by endpoint as well as payload: the key is stored under
+ * `(key, actor)`, and the same client may legitimately use one key for one logical operation
+ * across endpoints — a bare payload hash would let `PATCH /profile/me` replay the response of
+ * whatever else was submitted under that key first.
+ */
+const patchRequestHash = (patch) =>
+  createHash('sha256').update(`PATCH /v1/profile/me\n${stableStringify(patch ?? {})}`).digest('hex');
 
 /** §3a.3: object-or-null, from `consent_telemetry` / `consent_policy_ver` / `consent_decided_at`. */
 export function projectConsent(account) {
@@ -106,6 +173,16 @@ export function createProfileService({
   // presence service exists. Defaulting to null keeps the key present without inventing state.
   readPresence = null,
   readActiveSanctions = null,
+  /**
+   * The canonical rename, `auth.service.changeDisplayName`, injected by the composition root.
+   *
+   * A rename is an identity change: auth.md §9 requires the previous name to be retained for
+   * impersonation review, §10 requires the audit row, and `account.name_changed` is a
+   * catalogued event type. All three are written by that one function. Reimplementing the
+   * store write here — which is what this service used to do — produced a rename with no
+   * event, no audit row and no history, and a second copy of the folding rules to drift.
+   */
+  changeDisplayName = null,
 }) {
   async function requireAccount(accountId) {
     const account = await store.accounts.byId(accountId);
@@ -130,87 +207,165 @@ export function createProfileService({
   }
 
   /**
-   * §4 `PATCH /v1/profile/me` — display name only in this service. Stats are absent from the
-   * accepted field set on purpose: they change through `applyMatchResult` or not at all, and
-   * an unknown field is rejected rather than ignored so a client cannot believe it wrote one.
+   * The actor a capability check reads (`events/rbac.js`).
+   *
+   * Handlers hand over the authenticated actor. Internal callers and tests hold only an
+   * account id, and for those the actor is synthesised at the LOWEST privilege that can do
+   * the job — one `player` role, targeting itself. Synthesising anything else here would be
+   * this module minting authority it was not given.
    */
-  async function patchProfile(accountId, patch) {
-    const allowed = new Set(['displayName']);
+  function actorFor(actorOrId) {
+    if (actorOrId && typeof actorOrId === 'object') {
+      if (!actorOrId.accountId) throw new ApiError('AUTH_REQUIRED', 'Sign in to continue.');
+      return actorOrId;
+    }
+    if (!actorOrId) throw new ApiError('AUTH_REQUIRED', 'Sign in to continue.');
+    return { kind: 'player', id: actorOrId, accountId: actorOrId, role: 'player', roles: ['player'] };
+  }
+
+  /**
+   * §4 / §11.8 `PATCH /v1/profile/me` — `{ displayName?, privacy? }`.
+   *
+   * `privacy` is patchable and used not to be: the allowlist named `displayName` alone, so the
+   * two visibility settings §4 documents as writable were answered `unknown-field` and a
+   * player had no way to hide their career at all. Stats stay absent from the accepted set on
+   * purpose — they change through `applyMatchResult` or not at all — and an unknown field is
+   * rejected rather than ignored so a client cannot believe it wrote one.
+   *
+   * §8: `Idempotency-Key` is honoured here rather than in the handler because the replay has
+   * to be atomic with the write it replays. Same key + same payload returns the STORED
+   * response without re-executing; same key + a different payload is `IDEMPOTENCY_KEY_REUSED`.
+   */
+  async function patchProfile(actorOrId, patch, { idempotencyKey = null, correlationId = null } = {}) {
+    const actor = actorFor(actorOrId);
+    const accountId = actor.accountId;
+
+    const allowed = new Set(['displayName', 'privacy']);
     const unknown = Object.keys(patch || {}).filter((k) => !allowed.has(k));
     if (unknown.length) {
       throw new ApiError('VALIDATION_FAILED', 'Unknown profile fields.', {
         details: { fields: unknown.map((key) => ({ key, reason: 'unknown-field' })) },
       });
     }
-    if (!('displayName' in (patch || {}))) {
+    const wantsName = 'displayName' in (patch || {});
+    const wantsPrivacy = 'privacy' in (patch || {});
+    if (!wantsName && !wantsPrivacy) {
       throw new ApiError('VALIDATION_FAILED', 'Nothing to change.', {
         details: { fields: [{ key: 'displayName', reason: 'required' }] },
       });
     }
 
-    const account = await requireAccount(accountId);
-    const name = String(patch.displayName ?? '').normalize('NFKC').trim();
-    // Policy — length, charset, reserved words, single-script — comes from the shared
-    // implementation, so a rename cannot slip past a check the signup path applies.
-    // Length, charset, reserved words and the single-script rule all come from the shared
-    // implementation, which also returns the canonical fold — so the rename path cannot apply
-    // a weaker check than signup did.
-    const { displayName: normalisedName, folded } = normaliseDisplayName(name);
-    if (folded !== foldName(account.displayName || '')) {
-      const taken = await store.accounts.byNameFolded(folded);
-      if (taken && taken.accountId !== accountId) {
-        throw new ApiError('NAME_TAKEN', 'That name is taken.');
-      }
-      const now = clock.now();
-      const availableAt = nameChangeAvailableAt(account, nameChangeCooldownMs);
-      const availableAtMs = availableAt === null ? 0 : Date.parse(availableAt);
-      if (availableAtMs > now) {
-        throw new ApiError('NAME_CHANGE_COOLDOWN', 'You changed your name too recently.', {
-          retryAfterMs: availableAtMs - now,
-          details: { availableAt },
-        });
-      }
-      // `name_changed_at` is the column that exists (0008). The availability instant is derived
-      // from it on the way out, so there is one fact stored and one place it can be wrong.
-      await store.accounts.update(accountId, {
-        displayName: normalisedName,
-        displayNameFolded: folded,
-        nameChangedAt: new Date(now).toISOString(),
+    // Validate BEFORE the idempotency row is consulted: a request that could never execute
+    // must not consume a key, or the client's retry of the corrected request is refused as
+    // reuse of a key that never did anything.
+    const privacyPatch = wantsPrivacy ? validatePrivacyPatch(patch.privacy) : { errors: [], value: {} };
+    if (privacyPatch.errors.length) {
+      throw new ApiError('VALIDATION_FAILED', 'One or more privacy settings were rejected.', {
+        details: { fields: privacyPatch.errors },
       });
     }
-    return getOwnProfile(accountId);
+    await requireAccount(accountId);
+
+    if (!idempotencyKey) return execute();
+
+    const requestHash = patchRequestHash(patch);
+    // One transaction around read-decide-write: without it two retries that arrive together
+    // both find no prior row and both execute, which is the duplicate the key exists to stop.
+    return store.tx(async (tx) => {
+      const prior = await store.idempotency.get(idempotencyKey, accountId, tx);
+      if (prior) {
+        if (prior.requestHash !== requestHash) {
+          throw new ApiError('IDEMPOTENCY_KEY_REUSED', 'That idempotency key was used for a different request.', {
+            details: { key: idempotencyKey },
+          });
+        }
+        return prior.responseBody;      // §8: the stored response, not a re-execution
+      }
+      const response = await execute(tx);
+      await store.idempotency.put({
+        key: idempotencyKey,
+        actorId: accountId,
+        requestHash,
+        responseStatus: 200,
+        responseBody: response,
+        createdAt: new Date(clock.now()).toISOString(),
+        expiresAt: new Date(clock.now() + IDEMPOTENCY_TTL_MS).toISOString(),
+      }, tx);
+      return response;
+    });
+
+    async function execute(tx) {
+      if (wantsPrivacy) {
+        // A PATCH is partial: a body naming only `statsVisibility` must not reset presence to
+        // a default the player never chose. Merged onto the normalised current value, which
+        // is also where a junk stored blob is repaired rather than carried forward.
+        const account = await requireAccount(accountId);
+        await store.accounts.update(accountId, {
+          privacy: { ...normalizePrivacy(account.privacy), ...privacyPatch.value },
+        }, tx);
+      }
+      if (wantsName) {
+        if (!changeDisplayName) {
+          // Refusing beats renaming without the §10 audit row, the `account.name_changed`
+          // event, and the retained previous name auth.md §9 requires for impersonation
+          // review. A rename we cannot account for is one we are not permitted to perform.
+          throw new ApiError('SERVICE_UNAVAILABLE', 'Renaming is unavailable right now.', {
+            details: { reason: 'identity-service-unavailable' },
+          });
+        }
+        await changeDisplayName({ actor, displayName: patch.displayName, correlationId });
+      }
+      return getOwnProfile(accountId);
+    }
   }
 
   /**
-   * §4 `GET /v1/profile/:accountId` — public projection, filtered by the SUBJECT's privacy.
+   * Whether a viewer may see the subject's stats and presence.
    *
-   * A hidden field is null. The owner viewing themselves sees everything, because privacy is
-   * about other people.
+   * Deliberately NOT a response field. §11.8 closes the public projection to five keys, and a
+   * `statsVisible` flag riding along in the body both breaks that schema and announces the
+   * subject's setting to everyone who asks. The endpoints that need the decision — stats and
+   * match history — call this.
    */
-  async function getPublicProfile(subjectId, viewerId) {
+  async function visibilityFor(subjectId, viewerId) {
     const account = await requireAccount(subjectId);
     const privacy = normalizePrivacy(account.privacy);
     const isSelf = subjectId === viewerId;
+    return {
+      isSelf,
+      // The owner sees everything about themselves: privacy is about other people.
+      stats: isSelf || privacy.statsVisibility === 'everyone',
+      presence: isSelf || privacy.presenceVisibility === 'everyone',
+    };
+  }
 
-    const statsVisible = isSelf || privacy.statsVisibility === 'everyone';
-    const presenceVisible = isSelf || privacy.presenceVisibility === 'everyone';
+  /**
+   * §4 / §11.8 `GET /v1/profile/:accountId` — the public projection, and it is a CLOSED
+   * schema: `accountId`, `displayName`, `createdAt`, `stats`, `presence`. Nothing else.
+   *
+   * It used to return `moderation`, `consent` and a `statsVisible` flag as well. `moderation`
+   * and `consent` were self-only and so leaked nothing to a stranger, but a closed schema that
+   * grows fields for one caller is a schema no client can rely on, and both are already served
+   * by `GET /profile/me`, which is the endpoint that owns them. `statsVisible` was worse: it
+   * published the setting whose whole purpose is not to be published.
+   *
+   * A hidden field is null — never omitted, never a 403, both of which disclose that the
+   * setting exists and is set.
+   */
+  async function getPublicProfile(subjectId, viewerId) {
+    const account = await requireAccount(subjectId);
+    const visible = await visibilityFor(subjectId, viewerId);
 
     return {
       accountId: account.accountId,
       displayName: account.displayName,
       createdAt: account.createdAt,
-      // Every key present in both states so one renderer handles both and a missing key is a
-      // bug rather than a state (the §4.3 convention, applied here for the same reason).
-      statsVisible,
       // The definitions that produced the counters are a property of the stats service, not a
       // column on the account — `accounts.stat_definition_version` does not exist.
-      stats: statsVisible ? { statDefinitionVersion: STAT_DEFINITION_VERSION } : null,
-      presence: presenceVisible && readPresence ? (await readPresence(subjectId)) ?? null : null,
-      // Moderation state is owner-only; a public banner is a pillory, not a product feature.
-      moderation: isSelf ? projectModeration(account, await sanctionsFor(subjectId)) : null,
-      consent: isSelf ? projectConsent(account) : null,
+      stats: visible.stats ? { statDefinitionVersion: STAT_DEFINITION_VERSION } : null,
+      presence: visible.presence && readPresence ? (await readPresence(subjectId)) ?? null : null,
     };
   }
 
-  return { getOwnProfile, patchProfile, getPublicProfile };
+  return { getOwnProfile, patchProfile, getPublicProfile, visibilityFor };
 }

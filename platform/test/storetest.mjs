@@ -540,9 +540,35 @@ function newResult(matchId, players, overrides = {}) {
     rulesSnapshot: { roundsToWin: 7, maxRounds: 12 },
     teamScores: { alpha: 7, bravo: 5 },
     rounds: [{ index: 0, winner: 'alpha', reason: 'elimination' }],
+    // `roster` is a §4.2 required key and this fixture never had one, which is how a result
+    // missing required fields looked like a valid one to every check in this file.
+    roster: players.map((p) => ({ accountId: p.accountId, team: p.team, joinedAt: p.joinedAt, leftAt: p.leftAt })),
     evidenceRef: `ev_${matchId}`,
     startedAt: iso(-600e3),
     endedAt: iso(),
+    players,
+    ...overrides,
+  };
+}
+
+/**
+ * The allocation-time row: match-result.md §4 assigns `matchId` at ALLOCATION, so this is what
+ * exists for the whole life of the match before any result is submitted.
+ */
+function newAllocation(matchId, players, overrides = {}) {
+  return {
+    matchId,
+    status: 'allocated',
+    mode: 'bomb',
+    mapId: 'the-square',
+    mapVersion: '1.0.0',
+    region: 'yyz',
+    rulesetVersion: 'bomb-1.0.0',
+    statDefinitionVersion: '1.0.0',
+    serverBuild: 'storetest',
+    rulesSnapshot: { roundsToWin: 7, maxRounds: 12 },
+    startedAt: null,
+    endedAt: null,
     players,
     ...overrides,
   };
@@ -654,6 +680,236 @@ async function testMatches(store, tag) {
   check('a result whose participant fails leaves no match row behind',
     !after.items.some((m) => m.matchId === atomicId),
     'the match row committed without its participants');
+
+  await testMatchLifecycle(store, a, b);
+  await testMatchResultValidation(store, a);
+  await testMatchPagination(store, a);
+}
+
+// ---------------------------------------------------------------------------------------
+// 7a. The match LIFECYCLE: allocate → in-progress → terminal, exactly once.
+//
+// match-result.md §4 assigns `matchId` at allocation, so by the time a result arrives the row
+// already exists. `record` treated any existing row as CONFLICT, which made the documented
+// lifecycle — allocate, play, finalise — the one path it refused: no allocated match could ever
+// record a result. Every check below has its control, because "the write was refused" passes
+// just as happily on a method that refuses everything.
+// ---------------------------------------------------------------------------------------
+async function testMatchLifecycle(store, a, b) {
+  console.log('\n[lifecycle] allocated → in-progress → terminal');
+
+  const id = ulid();
+  const roster = [newPlayer(a.accountId, 'alpha', { kills: 0, deaths: 0, score: 0 })];
+
+  await expectOk('a match row is created at allocation, before any result exists',
+    () => store.matches.record(newAllocation(id, roster)));
+  const allocated = await store.matches.byId(id);
+  check('the allocated row reads back as allocated with no outcome',
+    allocated?.status === 'allocated' && allocated.winnerTeam === null
+      && allocated.outcomeReason === null && allocated.endedAt === null,
+    JSON.stringify(allocated && { s: allocated.status, w: allocated.winnerTeam, e: allocated.endedAt }));
+  check('an allocated match has no result_applied_at yet (db-schema.md §4)',
+    allocated?.resultAppliedAt === null, JSON.stringify(allocated?.resultAppliedAt));
+
+  await expectOk('the match starts: allocated → in-progress',
+    () => store.matches.record(newAllocation(id, roster, { status: 'in-progress', startedAt: iso(-300e3) })));
+
+  // THE FIX: the finalise that used to be impossible.
+  await expectOk('the match finalises: in-progress → completed',
+    () => store.matches.record(newResult(id, [newPlayer(a.accountId, 'alpha', { kills: 21 })])));
+  const finalised = await store.matches.byId(id);
+  check('the finalised row carries the terminal result, not the allocation',
+    finalised?.status === 'completed' && finalised.winnerTeam === 'alpha'
+      && finalised.outcomeReason === 'elimination' && finalised.endedAt !== null,
+    JSON.stringify(finalised && { s: finalised.status, w: finalised.winnerTeam }));
+  check('the participant row was updated in place, not duplicated',
+    finalised?.participants?.length === 1 && finalised.participants[0].stats.kills === 21,
+    JSON.stringify(finalised?.participants?.map((p) => p.stats.kills)));
+  check('the allocation timestamp survives the finalise',
+    finalised?.allocatedAt === allocated?.allocatedAt,
+    `${allocated?.allocatedAt} vs ${finalised?.allocatedAt}`);
+
+  // CONTROL: exactly once. §5.5 — a second, different truth for a finalised match is a bug or
+  // an attack, and it stays CONFLICT even though the allocated → terminal edge now exists.
+  await throwsCode('a second terminal write for the same match is CONFLICT', 'CONFLICT',
+    () => store.matches.record(newResult(id, [newPlayer(a.accountId, 'alpha', { kills: 99 })])));
+  await throwsCode('a finalised match cannot be re-invalidated by re-recording', 'CONFLICT',
+    () => store.matches.record(newResult(id, [newPlayer(a.accountId, 'alpha')], {
+      status: 'invalidated', terminationReason: 'invalidated', outcomeReason: 'no-contest',
+      winnerTeam: null, invalidationReason: 'cheat-detected',
+    })));
+  const stillFinal = await store.matches.byId(id);
+  check('control: the refused writes did not move the row',
+    stillFinal?.status === 'completed' && stillFinal.participants[0].stats.kills === 21,
+    JSON.stringify({ s: stillFinal?.status, k: stillFinal?.participants?.[0]?.stats?.kills }));
+
+  // CONTROL: a terminal match cannot go BACKWARDS either, or a live match could be resurrected
+  // over a recorded result.
+  await throwsCode('completed → in-progress is refused', 'CONFLICT',
+    () => store.matches.record(newAllocation(id, roster, { status: 'in-progress' })));
+  // CONTROL: allocating an id that already exists is CONFLICT — the row is not up for grabs.
+  await throwsCode('re-allocating an existing match id is refused', 'CONFLICT',
+    () => store.matches.record(newAllocation(id, roster)));
+
+  // --- result_applied_at ---------------------------------------------------------------
+  // db-schema.md §4 declares the column; nothing wrote it, so "ended and queued" and "ended and
+  // applied" were the same row and §4.2/§5 could not tell them apart.
+  check('the finalised row still has no result_applied_at until a career application says so',
+    finalised?.resultAppliedAt === null, JSON.stringify(finalised?.resultAppliedAt));
+  const stamp = iso();
+  await expectOk('markResultApplied stamps the column',
+    () => store.matches.markResultApplied(id, stamp));
+  const applied = await store.matches.byId(id);
+  check('result_applied_at is persisted on the match row',
+    applied?.resultAppliedAt === stamp, JSON.stringify(applied?.resultAppliedAt));
+
+  // CONTROLS for the stamp: it cannot be applied twice, cannot be applied to a match that never
+  // finalised, and cannot be applied to a match that does not exist.
+  await throwsCode('applying a result twice is refused', 'CONFLICT',
+    () => store.matches.markResultApplied(id, iso()));
+  const liveId = ulid();
+  await store.matches.record(newAllocation(liveId, [newPlayer(b.accountId, 'bravo')]));
+  await throwsCode('a non-terminal match cannot have a result applied', 'CONFLICT',
+    () => store.matches.markResultApplied(liveId, iso()));
+  await throwsCode('applying a result to a match that does not exist is NOT_FOUND', 'NOT_FOUND',
+    () => store.matches.markResultApplied(ulid(), iso()));
+  const untouched = await store.matches.byId(liveId);
+  check('control: the refused stamps left result_applied_at alone',
+    untouched?.resultAppliedAt === null && (await store.matches.byId(id)).resultAppliedAt === stamp,
+    JSON.stringify({ live: untouched?.resultAppliedAt }));
+
+  // §4.2's pending variant: an ended-but-unfinalised match keeps its endedAt while still
+  // reading as pending, which is the "ended, result queued" case the projection has to render.
+  const queuedId = ulid();
+  await store.matches.record(newAllocation(queuedId, [newPlayer(b.accountId, 'bravo')], {
+    status: 'in-progress', startedAt: iso(-300e3), endedAt: iso(-1e3),
+  }));
+  const queued = await store.matches.byId(queuedId);
+  check('an ended, unfinalised match keeps its endedAt and stays non-terminal',
+    queued?.status === 'in-progress' && queued.endedAt !== null,
+    JSON.stringify({ s: queued?.status, e: queued?.endedAt }));
+
+  check('byId returns null for a match that never existed',
+    (await store.matches.byId(ulid())) === null, 'byId invented a match');
+}
+
+// ---------------------------------------------------------------------------------------
+// 7b. §4.2 required fields. A result missing one is unstorable, not a variant: the row it makes
+// cannot be rendered by the detail endpoint and cannot be interpreted by the career recompute.
+// ---------------------------------------------------------------------------------------
+async function testMatchResultValidation(store, a) {
+  console.log('\n[matches] §4.2 required fields and status invariants');
+
+  const complete = () => newResult(ulid(), [newPlayer(a.accountId, 'alpha')]);
+
+  // CONTROL FIRST: the complete result goes through, so every refusal below is about the field
+  // that was removed and not about a method that has stopped accepting results.
+  await expectOk('control: a complete §4.2 TerminalResult is accepted', () => store.matches.record(complete()));
+
+  const requiredFields = [
+    'rulesetVersion', 'statDefinitionVersion', 'serverBuild', 'mapVersion',
+    'startedAt', 'endedAt', 'terminationReason', 'outcomeReason', 'evidenceRef',
+    'rulesSnapshot', 'teamScores', 'rounds', 'roster', 'players',
+    'winnerTeam', 'invalidationReason',
+  ];
+  for (const field of requiredFields) {
+    const result = complete();
+    delete result[field];
+    // eslint-disable-next-line no-loop-func
+    await throwsCode(`a result with no ${field} is refused`, 'VALIDATION_FAILED',
+      () => store.matches.record(result));
+    let named = false;
+    try { await store.matches.record(result); } catch (err) {
+      named = (err?.details?.fields || []).some((f) => f.key === field);
+    }
+    check(`the refusal names ${field}`, named, 'the error did not say which field was missing');
+  }
+
+  // The §4.0 matrix, through the store rather than through the career path — the two used to
+  // hold two copies of it, and only the career one was ever checked here.
+  const bad = [
+    ['a completed match with no winner', { winnerTeam: null }],
+    ['a completed match ended by forfeit', { outcomeReason: 'forfeit' }],
+    ['a completed match carrying an invalidation reason', { invalidationReason: 'cheat-detected' }],
+    ['a terminationReason that disagrees with the status', { terminationReason: 'aborted' }],
+    ['an aborted match recorded as a draw', {
+      status: 'aborted', terminationReason: 'aborted', outcomeReason: 'forfeit', winnerTeam: 'draw' }],
+    ['a no-contest abort carrying a winner', {
+      status: 'aborted', terminationReason: 'aborted', outcomeReason: 'no-contest', winnerTeam: 'alpha' }],
+    ['an invalidated match with no invalidation reason', {
+      status: 'invalidated', terminationReason: 'invalidated', outcomeReason: 'no-contest',
+      winnerTeam: null, invalidationReason: null }],
+    ['an invalidated match carrying a winner', {
+      status: 'invalidated', terminationReason: 'invalidated', outcomeReason: 'no-contest',
+      winnerTeam: 'alpha', invalidationReason: 'admin-review' }],
+    ['a mode outside the closed enum', { mode: 'ffa' }],
+  ];
+  for (const [name, over] of bad) {
+    await throwsCode(`${name} is refused`, 'VALIDATION_FAILED',
+      () => store.matches.record(newResult(ulid(), [newPlayer(a.accountId, 'alpha')], over)));
+  }
+
+  // CONTROLS: every legal row of the matrix is still accepted.
+  await expectOk('control: an aborted forfeit WITH a winner is accepted (§4.2)',
+    () => store.matches.record(newResult(ulid(), [newPlayer(a.accountId, 'alpha')], {
+      status: 'aborted', terminationReason: 'aborted', outcomeReason: 'forfeit', winnerTeam: 'bravo' })));
+  await expectOk('control: an aborted no-contest with no winner is accepted',
+    () => store.matches.record(newResult(ulid(), [newPlayer(a.accountId, 'alpha')], {
+      status: 'aborted', terminationReason: 'aborted', outcomeReason: 'no-contest', winnerTeam: null })));
+  await expectOk('control: an invalidated match with a reason from the enum is accepted',
+    () => store.matches.record(newResult(ulid(), [newPlayer(a.accountId, 'alpha')], {
+      status: 'invalidated', terminationReason: 'invalidated', outcomeReason: 'no-contest',
+      winnerTeam: null, invalidationReason: 'cheat-detected' })));
+  await expectOk('control: a 6-6 draw is accepted',
+    () => store.matches.record(newResult(ulid(), [newPlayer(a.accountId, 'alpha')], {
+      outcomeReason: 'timer', winnerTeam: 'draw' })));
+
+  // A non-terminal row is held to the ALLOCATION shape, not the terminal one: it has no outcome
+  // yet, and a row carrying one would contradict the status beside it.
+  await throwsCode('an allocated match carrying a winner is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(a.accountId, 'alpha')], { winnerTeam: 'alpha' })));
+  await throwsCode('an allocated match carrying an outcome reason is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(a.accountId, 'alpha')], { outcomeReason: 'timer' })));
+  await expectOk('control: the same allocation without an outcome is accepted',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(a.accountId, 'alpha')])));
+}
+
+// ---------------------------------------------------------------------------------------
+// 7c. http-api.md §10 pagination: validated, never clamped. `limit=0` silently becoming 25 and
+// a malformed cursor silently becoming "from the top" return a plausible page for a request
+// that was wrong, which is how a paging bug ships.
+// ---------------------------------------------------------------------------------------
+async function testMatchPagination(store, a) {
+  console.log('\n[matches] §10 pagination is validated, not clamped');
+
+  for (const limit of [0, -1, 101, 2.5, '25', Number.NaN, Number.POSITIVE_INFINITY]) {
+    // String(), not JSON.stringify(): NaN and Infinity both serialise to `null` and the two
+    // checks would then share one name, which is how a duplicated case hides behind its twin.
+    await throwsCode(`limit ${typeof limit === 'string' ? `"${limit}"` : String(limit)} is refused`, 'VALIDATION_FAILED',
+      () => store.matches.listForAccount(a.accountId, { limit }));
+  }
+  for (const cursor of ['', '   ', 'not a cursor', { toString: () => '01J' }, 12, ['01J']]) {
+    await throwsCode(`cursor ${JSON.stringify(cursor)} is refused`, 'VALIDATION_FAILED',
+      () => store.matches.listForAccount(a.accountId, { cursor }));
+  }
+
+  // CONTROLS: the boundaries and the absent case all work, so the refusals above are about the
+  // arguments and not about a method that has stopped listing.
+  for (const limit of [1, 25, 100]) {
+    await expectOk(`control: limit ${limit} is accepted`,
+      () => store.matches.listForAccount(a.accountId, { limit }));
+  }
+  await expectOk('control: no page argument at all uses the §10 default',
+    () => store.matches.listForAccount(a.accountId));
+  await expectOk('control: an explicit null cursor is the first page',
+    () => store.matches.listForAccount(a.accountId, { limit: 5, cursor: null }));
+  const first = await store.matches.listForAccount(a.accountId, { limit: 1 });
+  check('control: the default page is the documented 25',
+    (await store.matches.listForAccount(a.accountId)).items.length <= 25);
+  if (first.nextCursor) {
+    await expectOk('control: the cursor a page hands back is itself accepted',
+      () => store.matches.listForAccount(a.accountId, { limit: 1, cursor: first.nextCursor }));
+  }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1181,6 +1437,68 @@ if (!databaseUrl) {
            where published_at is null and dead_lettered_at is null
            order by occurred_at, event_id limit 100`);
       console.log(`  note relay poll plan: ${plan.map((r) => r['QUERY PLAN']).join(' / ')}`);
+
+      // --- the §4.0 matrix at the DATABASE level (migration 0012) ----------------------
+      // The adapters validate it too, but application validation only protects rows the
+      // application writes. A backfill, an admin console or a second service writes rows it
+      // never sees, so the table has to refuse them itself.
+      console.log('\n[postgres] the §4.0 outcome matrix is enforced by the table');
+      const matchRow = (over) => {
+        const cols = {
+          match_id: ulid(), region: 'yyz', map_id: 'the-square', mode: 'bomb',
+          rules_snapshot: '{}', status: 'completed', termination_reason: 'completed',
+          outcome_reason: 'timer', winner_team: 'alpha', invalidation_reason: null,
+          ended_at: new Date().toISOString(), result_applied_at: null, ...over,
+        };
+        const keys = Object.keys(cols);
+        return raw.query(
+          `insert into matches (${keys.join(', ')}) values (${keys.map((_, i) => `$${i + 1}`).join(', ')})`,
+          keys.map((k) => cols[k]));
+      };
+      const refusedByTable = async (name, over) => {
+        try {
+          await matchRow(over);
+          bad(name, 'the table accepted a row the §4.0 matrix forbids');
+        } catch (err) {
+          // 23514 is check_violation. Any other code means the row was refused for an unrelated
+          // reason and the constraint is still unproven.
+          if (err.code === '23514') ok(name);
+          else bad(name, `expected 23514 check_violation, got ${err.code}: ${err.message}`);
+        }
+      };
+
+      // CONTROL FIRST: a row that satisfies the matrix inserts, so every refusal below is about
+      // the column that was changed and not about a table that refuses everything.
+      await expectOk('control: a matrix-satisfying row inserts directly', () => matchRow({}));
+      await refusedByTable('the table refuses a completed match with no winner', { winner_team: null });
+      await refusedByTable('the table refuses a completed match ended by forfeit', { outcome_reason: 'forfeit' });
+      await refusedByTable('the table refuses a completed match with an invalidation reason',
+        { invalidation_reason: 'cheat-detected' });
+      await refusedByTable('the table refuses a termination_reason that disagrees with status',
+        { termination_reason: 'aborted' });
+      await refusedByTable('the table refuses an aborted draw',
+        { status: 'aborted', termination_reason: 'aborted', outcome_reason: 'forfeit', winner_team: 'draw' });
+      await refusedByTable('the table refuses a no-contest abort with a winner',
+        { status: 'aborted', termination_reason: 'aborted', outcome_reason: 'no-contest', winner_team: 'alpha' });
+      await refusedByTable('the table refuses an invalidated match with no reason',
+        { status: 'invalidated', termination_reason: 'invalidated', outcome_reason: 'no-contest',
+          winner_team: null, invalidation_reason: null });
+      await refusedByTable('the table refuses a terminal row with no ended_at', { ended_at: null });
+      await refusedByTable('the table refuses an allocated row carrying an outcome',
+        { status: 'allocated', termination_reason: null, outcome_reason: 'timer',
+          winner_team: null, ended_at: null });
+      await refusedByTable('the table refuses result_applied_at on a match that never finalised',
+        { status: 'in-progress', termination_reason: null, outcome_reason: null, winner_team: null,
+          ended_at: null, result_applied_at: new Date().toISOString() });
+      // CONTROLS: the other legal rows of the matrix still insert.
+      await expectOk('control: an aborted forfeit with a winner inserts', () => matchRow({
+        status: 'aborted', termination_reason: 'aborted', outcome_reason: 'forfeit', winner_team: 'bravo' }));
+      await expectOk('control: an invalidated match with a reason inserts', () => matchRow({
+        status: 'invalidated', termination_reason: 'invalidated', outcome_reason: 'no-contest',
+        winner_team: null, invalidation_reason: 'server-fault' }));
+      await expectOk('control: an allocated row with no outcome inserts', () => matchRow({
+        status: 'allocated', termination_reason: null, outcome_reason: null, winner_team: null,
+        ended_at: null }));
     } finally {
       await raw.end();
     }

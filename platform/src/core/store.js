@@ -72,11 +72,21 @@ import { ApiError } from './errors.js';
  *   listForAccount(accountId, mode, tx) -> row[]
  *
  * @property {object} matches
- *   record(result, tx) -> { matchId }  // the immutable match row + its participants
- *                                      // `result` is a TerminalResult (match-result.md §4/§4.2)
+ *   record(result, tx) -> { matchId, status, transitioned }
+ *                                      // Creates the row, or advances an existing non-terminal
+ *                                      // one along MATCH_STATUS_TRANSITIONS. matchId is assigned
+ *                                      // at ALLOCATION (§4), so allocate → play → finalise is the
+ *                                      // normal lifecycle and NOT a conflict. A second TERMINAL
+ *                                      // write is CONFLICT (§5.5).
+ *   byId(matchId, tx) -> row|null      // the match row plus `participants[]`, for the §4.2
+ *                                      // `GET /v1/matches/:matchId` projection
+ *   markResultApplied(matchId, at, tx) -> row
+ *                                      // stamps matches.result_applied_at (db-schema.md §4), the
+ *                                      // only thing that tells "ended, queued" from "applied"
  *   listForAccount(accountId, {limit, cursor}, tx) -> { items, nextCursor }
  *                                      // newest first, cursor-paginated; items are §4.3 rows
- *                                      // carrying `participant: { team, stats }`
+ *                                      // carrying `participant: { team, stats }`. limit and
+ *                                      // cursor are VALIDATED, never clamped (http-api.md §10)
  *
  * @property {object} preAuthConsent
  *   put(row, tx) -> row                // { clientSessionId, telemetryPersonal, policyVersion, decidedAt, expiresAt }
@@ -214,13 +224,227 @@ export function toHistoryMatchStatus(stored) {
   return (stored === 'allocated' || stored === 'in-progress') ? 'pending' : stored;
 }
 
-/** Exactly the columns of `matches` (migration 0004) that a result record populates. */
+/**
+ * Exactly the columns of `matches` (migration 0004) that a result record populates.
+ *
+ * `resultAppliedAt` is here because db-schema.md §4 declares the column and NOTHING wrote it:
+ * without it a row that ended and a row whose career application committed are the same row,
+ * and §4.2/§5 need to tell them apart to answer "is this result queued or applied".
+ */
 export const MATCH_COLUMNS = [
   'matchId', 'roomId', 'region', 'serverId', 'mapId', 'mapVersion', 'mode',
   'rulesetVersion', 'statDefinitionVersion', 'serverBuild', 'status',
   'terminationReason', 'outcomeReason', 'invalidationReason', 'winnerTeam',
   'rulesSnapshot', 'teamScores', 'rounds', 'evidenceRef', 'startedAt', 'endedAt',
+  'resultAppliedAt',
 ];
+
+/**
+ * The match lifecycle, as a transition table.  match-result.md §4, db-schema.md §4.
+ *
+ * The row is created at ALLOCATION and finalised later, so "the row already exists" is the
+ * NORMAL path, not a conflict — treating every existing row as CONFLICT made it impossible for
+ * any allocated match to ever record a result, which is every match that follows the documented
+ * lifecycle.
+ *
+ * What must stay impossible is a SECOND terminal truth: §5.5 makes a second, different result
+ * for a finalised match a bug or an attack. So terminal states have no outgoing edges at all,
+ * and an invalidation is a review decision applied through its own path, not a re-record.
+ */
+export const MATCH_STATUS_TRANSITIONS = Object.assign(Object.create(null), {
+  allocated: ['in-progress', 'completed', 'aborted', 'invalidated'],
+  'in-progress': ['completed', 'aborted', 'invalidated'],
+  completed: [],
+  aborted: [],
+  invalidated: [],
+});
+
+/** Throw the contract error for a transition the lifecycle does not have. */
+export function assertMatchTransition(from, to, matchId) {
+  const allowed = MATCH_STATUS_TRANSITIONS[from] ?? [];
+  if (allowed.includes(to)) return;
+  // A finalised match being written again is the §5.5 case and reads as CONFLICT. So does an
+  // allocation of an id that already exists — both are "this row is not yours to write".
+  throw new ApiError('CONFLICT', `A match cannot go from ${from} to ${to}.`, {
+    details: { matchId, from, to, allowed, reason: TERMINAL_MATCH_STATUSES.includes(from)
+      ? 'result-already-finalised' : 'illegal-status-transition' },
+  });
+}
+
+/**
+ * The §4.0 outcome matrix, executable, and the single copy of it.
+ *
+ * It lives here rather than in the stats service because BOTH the write path (this file's
+ * `normaliseMatchResult`, called by both adapters) and the aggregation path (profile/stats.js)
+ * have to apply the identical rule. Two copies is how a result the store accepts becomes a
+ * result the career refuses, with no test able to see the difference.
+ */
+export const OUTCOME_REASONS = Object.assign(Object.create(null), {
+  completed: ['elimination', 'defuse', 'detonation', 'timer'],
+  aborted: ['forfeit', 'abandon', 'no-contest'],
+  invalidated: ['no-contest'],
+});
+
+export const INVALIDATION_REASONS = ['cheat-detected', 'server-fault', 'roster-fault', 'admin-review'];
+
+export const MATCH_MODES = ['tdm', 'bomb'];
+
+/**
+ * The §4.2 status-dependent invariants, over the fields that are PRESENT.
+ *
+ * Separate from the required-field check because the two have different callers: the career
+ * recompute reads history rows carrying `status` and `winnerTeam` and nothing else, and must
+ * still be able to check the matrix on them without demanding a whole result record.
+ *
+ * @returns {Array<object>} field-level problems, empty when the result satisfies the matrix
+ */
+export function matchOutcomeProblems(result) {
+  const { status, winnerTeam = null, outcomeReason, invalidationReason, terminationReason } = result || {};
+  const problems = [];
+  if (!TERMINAL_MATCH_STATUSES.includes(status)) {
+    return [{ key: 'status', reason: 'enum', allowed: TERMINAL_MATCH_STATUSES, got: status ?? null }];
+  }
+  // §4.2: terminationReason repeats the status. They are two names for one fact, and a row where
+  // they disagree is a row with two truths in it.
+  if (terminationReason !== undefined && terminationReason !== null && terminationReason !== status) {
+    problems.push({ key: 'terminationReason', reason: 'must-equal-status', expected: status, got: terminationReason });
+  }
+  if (outcomeReason !== undefined && !OUTCOME_REASONS[status].includes(outcomeReason)) {
+    problems.push({ key: 'outcomeReason', reason: 'enum', allowed: OUTCOME_REASONS[status], got: outcomeReason ?? null });
+  }
+
+  // winnerTeam, per row. `draw` exists only for a completed match; an abort is never a draw.
+  if (status === 'completed') {
+    if (!['alpha', 'bravo', 'draw'].includes(winnerTeam)) {
+      problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo', 'draw'], got: winnerTeam });
+    }
+  } else if (status === 'aborted') {
+    if (outcomeReason === 'no-contest') {
+      if (winnerTeam !== null) problems.push({ key: 'winnerTeam', reason: 'must-be-null', got: winnerTeam });
+    } else if (outcomeReason === 'forfeit' || outcomeReason === 'abandon') {
+      // §4.2 and wire-protocol §8.9: a forfeit is an aborted match WITH a winner.
+      if (!['alpha', 'bravo'].includes(winnerTeam)) {
+        problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo'], got: winnerTeam });
+      }
+    } else if (![null, 'alpha', 'bravo'].includes(winnerTeam)) {
+      problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo', null], got: winnerTeam });
+    }
+  } else if (winnerTeam !== null) {
+    problems.push({ key: 'winnerTeam', reason: 'must-be-null', got: winnerTeam });
+  }
+
+  // invalidationReason is non-null from the enum for `invalidated`, and null for everything
+  // else. A completed match carrying "cheat-detected" is two truths in one row.
+  if (status === 'invalidated') {
+    if (invalidationReason !== undefined && !INVALIDATION_REASONS.includes(invalidationReason)) {
+      problems.push({ key: 'invalidationReason', reason: 'enum', allowed: INVALIDATION_REASONS, got: invalidationReason ?? null });
+    }
+  } else if (invalidationReason !== undefined && invalidationReason !== null) {
+    problems.push({ key: 'invalidationReason', reason: 'must-be-null', got: invalidationReason });
+  }
+  return problems;
+}
+
+/**
+ * §4.2 required fields — "no ellipses, no comment standing in for a variant".
+ *
+ * Every key of the TerminalResult union, by the type the union gives it. A result missing one is
+ * unstorable, not a variant: the row it produces cannot be rendered by the detail endpoint, and
+ * `rulesSnapshot` in particular makes the whole record uninterpretable once the ruleset is
+ * retuned (db-schema.md §4).
+ */
+const TERMINAL_REQUIRED_STRINGS = [
+  'matchId', 'rulesetVersion', 'statDefinitionVersion', 'serverBuild',
+  'mapId', 'mapVersion', 'region', 'mode', 'startedAt', 'endedAt',
+  'terminationReason', 'outcomeReason', 'evidenceRef',
+];
+
+/** Non-terminal rows exist from allocation, before anything about the outcome is known. */
+const PENDING_REQUIRED_STRINGS = ['matchId', 'mapId', 'region', 'mode'];
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * The complete §4.2 check: required fields, then the outcome matrix.
+ *
+ * @returns {Array<object>} field-level problems, empty when the result is a valid TerminalResult
+ */
+export function terminalResultProblems(result) {
+  const problems = [];
+  if (!isPlainObject(result)) return [{ key: 'result', reason: 'type', expected: 'object' }];
+  for (const field of TERMINAL_REQUIRED_STRINGS) {
+    if (typeof result[field] !== 'string' || result[field].length === 0) {
+      problems.push({ key: field, reason: 'required', expected: 'non-empty string', got: result[field] ?? null });
+    }
+  }
+  if (typeof result.mode === 'string' && !MATCH_MODES.includes(result.mode)) {
+    problems.push({ key: 'mode', reason: 'enum', allowed: MATCH_MODES, got: result.mode });
+  }
+  if (!isPlainObject(result.rulesSnapshot)) {
+    problems.push({ key: 'rulesSnapshot', reason: 'required', expected: 'object' });
+  }
+  if (!isPlainObject(result.teamScores)) {
+    problems.push({ key: 'teamScores', reason: 'required', expected: 'object' });
+  }
+  for (const field of ['roster', 'rounds', 'players']) {
+    if (!Array.isArray(result[field])) {
+      problems.push({ key: field, reason: 'required', expected: 'array', got: result[field] ?? null });
+    }
+  }
+  // `winnerTeam` and `invalidationReason` are nullable, so "present" means the KEY is there —
+  // an absent key is a field the producer forgot, and defaulting it to null invents an outcome.
+  for (const field of ['winnerTeam', 'invalidationReason']) {
+    if (!Object.hasOwn(result, field)) {
+      problems.push({ key: field, reason: 'required', expected: 'value or explicit null' });
+    }
+  }
+  return problems.concat(matchOutcomeProblems(result));
+}
+
+/** Throwing form. §4.2 violations are malformed submissions, not variants of the union. */
+export function assertTerminalResult(result) {
+  const problems = terminalResultProblems(result);
+  if (problems.length) {
+    throw new ApiError('VALIDATION_FAILED', 'The match result is not a valid §4.2 TerminalResult.', {
+      details: { table: 'matches', fields: problems },
+    });
+  }
+}
+
+/**
+ * Cursor pagination arguments.  http-api.md §10.
+ *
+ * VALIDATED, not clamped. Silently turning `limit=0` into 25 and `limit=1e9` into 100 answers a
+ * question the caller did not ask and hides a paging bug behind plausible-looking pages; §10
+ * gives a default and a maximum, and anything outside them is a request that failed schema
+ * (errors.md `VALIDATION_FAILED`).
+ */
+export const PAGE_LIMIT_DEFAULT = 25;
+export const PAGE_LIMIT_MAX = 100;
+
+/** A cursor is an opaque id echoed back from a previous page, never a caller-authored value. */
+const CURSOR_RE = /^[0-9A-Za-z][0-9A-Za-z_.:-]{0,63}$/;
+
+export function assertPageArgs({ limit, cursor } = {}) {
+  const fields = [];
+  if (limit !== undefined && limit !== null) {
+    if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > PAGE_LIMIT_MAX) {
+      fields.push({ key: 'limit', reason: 'range', min: 1, max: PAGE_LIMIT_MAX, got: limit });
+    }
+  }
+  if (cursor !== undefined && cursor !== null) {
+    if (typeof cursor !== 'string' || !CURSOR_RE.test(cursor)) {
+      fields.push({ key: 'cursor', reason: 'malformed', got: typeof cursor === 'string' ? cursor.slice(0, 32) : typeof cursor });
+    }
+  }
+  if (fields.length) {
+    throw new ApiError('VALIDATION_FAILED', 'Invalid pagination arguments.', { details: { fields } });
+  }
+  return {
+    limit: limit === undefined || limit === null ? PAGE_LIMIT_DEFAULT : limit,
+    cursor: cursor === undefined ? null : cursor,
+  };
+}
 
 /**
  * Split a TerminalResult into the row `matches` stores and the rows `match_participants`
@@ -234,20 +458,51 @@ export function normaliseMatchResult(result) {
   if (!result || typeof result !== 'object') {
     throw new ApiError('VALIDATION_FAILED', 'A match result must be an object.');
   }
-  for (const required of ['matchId', 'status', 'mode', 'mapId', 'region']) {
-    if (!result[required] || typeof result[required] !== 'string') {
-      throw new ApiError('VALIDATION_FAILED', `matches.${required} is required`, {
-        details: { table: 'matches', column: required },
+  if (typeof result.status !== 'string') {
+    throw new ApiError('VALIDATION_FAILED', 'matches.status is required', {
+      details: { table: 'matches', column: 'status', fields: [{ key: 'status', reason: 'required' }] },
+    });
+  }
+  const status = toStoredMatchStatus(result.status);
+  const terminal = TERMINAL_MATCH_STATUSES.includes(status);
+
+  if (terminal) {
+    // §4.2 in full. The previous check read five string fields and stopped, so a result with no
+    // rulesSnapshot, no endedAt, no outcomeReason and no players was stored as a completed match
+    // — a row the detail endpoint cannot render and the career recompute cannot interpret.
+    assertTerminalResult({ ...result, status });
+  } else {
+    // Allocation knows the identifiers and nothing else: the outcome fields do not exist yet.
+    for (const required of PENDING_REQUIRED_STRINGS) {
+      if (typeof result[required] !== 'string' || !result[required]) {
+        throw new ApiError('VALIDATION_FAILED', `matches.${required} is required`, {
+          details: { table: 'matches', column: required, fields: [{ key: required, reason: 'required' }] },
+        });
+      }
+    }
+    if (!MATCH_MODES.includes(result.mode)) {
+      throw new ApiError('VALIDATION_FAILED', `Unknown mode: ${result.mode}`, {
+        details: { table: 'matches', column: 'mode', fields: [{ key: 'mode', reason: 'enum', allowed: MATCH_MODES }] },
+      });
+    }
+    // A non-terminal row has no outcome, so carrying one is a producer that has confused the
+    // two shapes — and the column would then contradict the status it sits beside.
+    for (const key of ['winnerTeam', 'outcomeReason', 'invalidationReason']) {
+      if (result[key] !== undefined && result[key] !== null) {
+        throw new ApiError('VALIDATION_FAILED', `A ${status} match cannot carry ${key}.`, {
+          details: { table: 'matches', column: key, fields: [{ key, reason: 'must-be-null', got: result[key] }] },
+        });
+      }
+    }
+    if (result.terminationReason !== undefined && result.terminationReason !== null) {
+      throw new ApiError('VALIDATION_FAILED', `A ${status} match cannot carry terminationReason.`, {
+        details: { table: 'matches', column: 'terminationReason',
+          fields: [{ key: 'terminationReason', reason: 'must-be-null', got: result.terminationReason }] },
       });
     }
   }
+
   const winnerTeam = result.winnerTeam ?? null;
-  // NULL is not a draw (0004): a draw is the literal 'draw', NULL means no outcome at all.
-  if (winnerTeam !== null && !['alpha', 'bravo', 'draw'].includes(winnerTeam)) {
-    throw new ApiError('VALIDATION_FAILED', `Unknown winnerTeam: ${winnerTeam}`, {
-      details: { table: 'matches', column: 'winnerTeam' },
-    });
-  }
 
   const match = {
     matchId: result.matchId,
@@ -260,7 +515,7 @@ export function normaliseMatchResult(result) {
     rulesetVersion: result.rulesetVersion ?? null,
     statDefinitionVersion: result.statDefinitionVersion ?? null,
     serverBuild: result.serverBuild ?? null,
-    status: toStoredMatchStatus(result.status),
+    status,
     terminationReason: result.terminationReason ?? null,
     outcomeReason: result.outcomeReason ?? null,
     invalidationReason: result.invalidationReason ?? null,

@@ -19,6 +19,30 @@ function actorId(ctx) {
   return id;
 }
 
+/** The whole authenticated actor, for calls that authorise rather than merely identify. */
+function actor(ctx) {
+  actorId(ctx);
+  return ctx.actor;
+}
+
+/**
+ * §8: `Idempotency-Key` is REQUIRED on `PATCH /profile/me`.
+ *
+ * Enforced at the HTTP edge rather than in the service, because "required" is a statement
+ * about the request. A service call that arrives without one is an internal caller, not a
+ * client that skipped a header, and refusing those would only teach them to invent keys.
+ */
+function idempotencyKeyOf(ctx) {
+  const raw = ctx.headers?.['idempotency-key'];
+  const key = typeof raw === 'string' ? raw.trim() : '';
+  if (!key || key.length > 200) {
+    throw new ApiError('VALIDATION_FAILED', 'Idempotency-Key is required on this request.', {
+      details: { fields: [{ key: 'Idempotency-Key', reason: key ? 'too-long' : 'required' }] },
+    });
+  }
+  return key;
+}
+
 /**
  * `raw` bodies bypass the envelope wrapper in http.js, so the correlation id is attached here.
  * `headers` is carried on the result for the server wiring to apply — the ETag in §11.2 is a
@@ -38,8 +62,21 @@ export function createProfileModule({
   // The result-application transition emits `match.result_applied` through the shared outbox,
   // so a career change is traceable like every other state change.
   outbox = null,
+  /**
+   * The auth service (`auth.service`), for the one thing this module must not implement
+   * twice: a rename. It carries the name policy, the confusable fold, the cooldown, the
+   * `account.name_changed` event and the §10 audit row. Injected rather than imported so the
+   * profile module stays constructible without an auth module, exactly as its routes do with
+   * the auth middleware.
+   */
+  identity = null,
 }) {
-  const profiles = createProfileService({ store, clock, readPresence, readActiveSanctions });
+  const profiles = createProfileService({
+    store, clock, readPresence, readActiveSanctions,
+    changeDisplayName: identity?.changeDisplayName
+      ? (args) => identity.changeDisplayName(args)
+      : null,
+  });
   const settings = createSettingsService({ store, clock });
   const stats = createStatsService({ store, clock, outbox });
   const migration = createMigrationService({ store, clock });
@@ -50,7 +87,10 @@ export function createProfileModule({
     },
 
     async patchOwnProfile(ctx) {
-      return profiles.patchProfile(actorId(ctx), ctx.body);
+      return profiles.patchProfile(actor(ctx), ctx.body, {
+        idempotencyKey: idempotencyKeyOf(ctx),
+        correlationId: ctx.correlationId,
+      });
     },
 
     async getPublicProfile(ctx) {
@@ -81,8 +121,8 @@ export function createProfileModule({
       }
       // Privacy is the subject's, and a hidden career is null counters — not a 403, which would
       // confirm what it is refusing to show.
-      const view = await profiles.getPublicProfile(subjectId, viewerId);
-      if (!view.statsVisible) {
+      const visible = await profiles.visibilityFor(subjectId, viewerId);
+      if (!visible.stats) {
         return { accountId: subjectId, mode, statDefinitionVersion: STAT_DEFINITION_VERSION,
                  totals: null, weapons: null };
       }
@@ -92,9 +132,24 @@ export function createProfileModule({
     async getMatches(ctx) {
       const viewerId = actorId(ctx);
       const subjectId = ctx.params.accountId;
-      const view = await profiles.getPublicProfile(subjectId, viewerId);
-      if (!view.statsVisible) return { items: [], nextCursor: null };
-      const limit = Math.min(50, Math.max(1, Number(ctx.query.get('limit')) || 25));
+      const visible = await profiles.visibilityFor(subjectId, viewerId);
+      // `items: null`, not `[]`. An empty list is a real answer — a player who has never
+      // finished a match — and returning it for a hidden history made the two states
+      // indistinguishable, so a client could neither say "no matches yet" nor "this player
+      // keeps their history private", and every "why is my history empty" report was
+      // unanswerable. Null is the §11.8 convention for a hidden field: present, never omitted,
+      // never a 403.
+      if (!visible.stats) return { items: null, nextCursor: null };
+      // §10 requires an invalid limit to be REJECTED, not corrected. Clamping here silently
+      // undid the validation the service and both adapters now perform: a client sending
+      // ?limit=5000 got 100 rows and a 200, learned its request was fine, and would keep
+      // sending it. The raw value is passed down so the one validator decides.
+      // Query strings are strings; the validator wants an integer. Parse only a well-formed
+      // one — anything else is passed through verbatim so the single validator rejects it,
+      // rather than being coerced here into something that looks valid.
+      const rawLimit = ctx.query.get('limit');
+      const limit = rawLimit === null ? undefined
+        : (/^\d+$/.test(rawLimit) ? Number(rawLimit) : rawLimit);
       return stats.history(subjectId, { limit, cursor: ctx.query.get('cursor') });
     },
 

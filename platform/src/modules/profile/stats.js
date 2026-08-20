@@ -16,12 +16,19 @@
  * Store surface used (db-schema.md §3–§4), all optional-`tx` per store.js rule 4:
  *   stats.get / stats.applyDelta / stats.listForAccount
  *   weaponStats.applyDelta / weaponStats.listForAccount
- *   matches.record(result, tx)                       — the immutable result row + participants
+ *   matches.record(result, tx)                       — allocate the row, or finalise it (§4)
+ *   matches.markResultApplied(matchId, at, tx)       — stamp result_applied_at in the same tx
+ *   matches.byId(matchId, tx)                        — the §4.2 detail projection's source
  *   matches.listForAccount(accountId, opts, tx)      — history, newest first
  *   idempotency.get(key, actorId, tx) / idempotency.put(row, tx)   — §5.2/§5.4 replay
  */
 import { createHash } from 'node:crypto';
 import { ApiError } from '../../core/errors.js';
+import {
+  TERMINAL_MATCH_STATUSES, OUTCOME_REASONS, INVALIDATION_REASONS,
+  matchOutcomeProblems, terminalResultProblems, assertPageArgs,
+  PAGE_LIMIT_MAX, toHistoryMatchStatus,
+} from '../../core/store.js';
 
 /** Exactly the typed columns of `player_stats` minus the identity key. `score` is absent by
  * design: §3 says per-match score is a pacing device and does not aggregate. */
@@ -286,17 +293,15 @@ export function resultFor(winnerTeam, playerTeam) {
   return winnerTeam === playerTeam ? 'win' : 'loss';
 }
 
-/** §4.2: the three terminal statuses. `pending` is not one of them, and neither is anything
- * a caller invented — the union is closed or it is decoration. */
-export const TERMINAL_STATUSES = ['completed', 'aborted', 'invalidated'];
-
-/** The §4.0 matrix, executable. One row per status; every cell is checkable. */
-const OUTCOME_REASONS = {
-  completed: ['elimination', 'defuse', 'detonation', 'timer'],
-  aborted: ['forfeit', 'abandon', 'no-contest'],
-  invalidated: ['no-contest'],
-};
-const INVALIDATION_REASONS = ['cheat-detected', 'server-fault', 'roster-fault', 'admin-review'];
+/**
+ * §4.2: the three terminal statuses, and the §4.0 matrix that constrains them.
+ *
+ * Both come from `core/store.js` rather than being restated here. They were restated here, and a
+ * second copy of a matrix is how a result the store accepts becomes a result the career refuses
+ * — with the two disagreeing silently, because nothing compares them.
+ */
+export const TERMINAL_STATUSES = TERMINAL_MATCH_STATUSES;
+export { OUTCOME_REASONS, INVALIDATION_REASONS };
 
 /**
  * Validate one result against the §4.0 status matrix.
@@ -308,54 +313,28 @@ const INVALIDATION_REASONS = ['cheat-detected', 'server-fault', 'roster-fault', 
  * @returns {Array<object>} field-level problems, empty when the result is well-formed
  */
 export function outcomeProblems(result) {
-  const { status, winnerTeam = null, outcomeReason, invalidationReason, terminationReason } = result || {};
-  const problems = [];
-  if (!TERMINAL_STATUSES.includes(status)) {
-    return [{ key: 'status', reason: 'enum', allowed: TERMINAL_STATUSES, got: status ?? null }];
-  }
-  if (terminationReason !== undefined && terminationReason !== null && terminationReason !== status) {
-    problems.push({ key: 'terminationReason', reason: 'must-equal-status', expected: status, got: terminationReason });
-  }
-  if (outcomeReason !== undefined && !OUTCOME_REASONS[status].includes(outcomeReason)) {
-    problems.push({ key: 'outcomeReason', reason: 'enum', allowed: OUTCOME_REASONS[status], got: outcomeReason });
-  }
-
-  // winnerTeam, per row. `draw` exists only for a completed match; an abort is never a draw.
-  if (status === 'completed') {
-    if (!['alpha', 'bravo', 'draw'].includes(winnerTeam)) {
-      problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo', 'draw'], got: winnerTeam });
-    }
-  } else if (status === 'aborted') {
-    if (outcomeReason === 'no-contest') {
-      if (winnerTeam !== null) problems.push({ key: 'winnerTeam', reason: 'must-be-null', got: winnerTeam });
-    } else if (outcomeReason === 'forfeit' || outcomeReason === 'abandon') {
-      if (!['alpha', 'bravo'].includes(winnerTeam)) {
-        problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo'], got: winnerTeam });
-      }
-    } else if (![null, 'alpha', 'bravo'].includes(winnerTeam)) {
-      problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo', null], got: winnerTeam });
-    }
-  } else if (winnerTeam !== null) {
-    problems.push({ key: 'winnerTeam', reason: 'must-be-null', got: winnerTeam });
-  }
-
-  // invalidationReason is non-null from the enum for `invalidated`, and null for everything
-  // else. A completed match carrying "cheat-detected" is two truths in one row.
-  if (status === 'invalidated') {
-    if (invalidationReason !== undefined && !INVALIDATION_REASONS.includes(invalidationReason)) {
-      problems.push({ key: 'invalidationReason', reason: 'enum', allowed: INVALIDATION_REASONS, got: invalidationReason ?? null });
-    }
-  } else if (invalidationReason !== undefined && invalidationReason !== null) {
-    problems.push({ key: 'invalidationReason', reason: 'must-be-null', got: invalidationReason });
-  }
-  return problems;
+  return matchOutcomeProblems(result);
 }
 
-/** Throwing form, for the write path. §4.0 violations are malformed submissions, not variants. */
+/** Throwing form, for the aggregation path. §4.0 violations are malformed, not variants. */
 export function assertTerminalResult(result) {
   const problems = outcomeProblems(result);
   if (problems.length) {
     throw new ApiError('VALIDATION_FAILED', 'The match result does not satisfy the §4.0 status matrix.', {
+      details: { fields: problems },
+    });
+  }
+}
+
+/**
+ * The stricter form for the SUBMISSION path: the complete §4.2 required field set, then the
+ * matrix. A submission is a whole record; the aggregation path sees history rows that carry a
+ * subset by design, which is why these are two functions and not one.
+ */
+export function assertSubmittableResult(result) {
+  const problems = terminalResultProblems(result);
+  if (problems.length) {
+    throw new ApiError('VALIDATION_FAILED', 'The match result is not a valid §4.2 TerminalResult.', {
       details: { fields: problems },
     });
   }
@@ -406,6 +385,17 @@ export function addTotals(into, delta) {
   return into;
 }
 
+/**
+ * §4.0/§5.3: each terminal status has its own catalogued event. The catalogue distinguishes
+ * them (event-envelope.md §6) and so must the writer — "always match.completed" would tell every
+ * consumer that a forfeit and a cheat invalidation were the same thing.
+ */
+const TERMINAL_EVENT_TYPES = Object.assign(Object.create(null), {
+  completed: 'match.completed',
+  aborted: 'match.aborted',
+  invalidated: 'match.invalidated',
+});
+
 /** §5.2: "Idempotency key derived from matchId, so a retry is inherently the same key." */
 export const idempotencyKeyFor = (matchId) => `match-result:${matchId}`;
 
@@ -419,6 +409,9 @@ const RESULT_ACTOR = 'service:match-result';
 
 /** A result row is immutable forever; the replay window only has to outlive the retry queue. */
 const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** §4.2's pending variant: how long a client waits before asking for the result again. */
+const PENDING_RETRY_AFTER_MS = 2000;
 
 /** Key order must not change the hash, or a re-serialised retry looks like a different truth. */
 function stableStringify(value) {
@@ -457,7 +450,10 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
         details: { fields: [{ key: 'Idempotency-Key', reason: 'derived-key-mismatch', expected: key }] },
       });
     }
-    assertTerminalResult(result);
+    // The COMPLETE §4.2 check, not just the matrix: a submission missing `rulesSnapshot`,
+    // `endedAt` or `players` used to be stored as a finished match, and the row it left behind
+    // is one the detail endpoint cannot render and the recompute cannot interpret.
+    assertSubmittableResult(result);
     const sdv = result.statDefinitionVersion || STAT_DEFINITION_VERSION;
     const requestHash = resultHash(result);
 
@@ -496,6 +492,13 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
       }
 
       const resultAppliedAt = new Date(clock.now()).toISOString();
+      // db-schema.md §4 declares `result_applied_at` and nothing wrote it, so a match that had
+      // ended and a match whose career application committed were the same row — the exact
+      // distinction §4.2's pending-vs-terminal projection and §5's replay both rest on. Stamped
+      // in THIS transaction: a stamp that can commit without the application it records is a
+      // claim the recompute cannot check.
+      await store.matches.markResultApplied(result.matchId, resultAppliedAt, tx);
+
       // §5: the contract's response is `{ applied: bool }` — did this call apply, or was it a
       // replay. An array of account ids answered a different question and broke every typed
       // client, and it also leaked the roster to a caller that had not asked for it.
@@ -512,10 +515,32 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
       // transaction: a career applied with no event explaining it is the exact state the
       // outbox pattern exists to make impossible.
       if (outbox) {
-        await outbox.emitIn(tx, {
+        const ctx = {
           correlationId: correlationId || result.matchId,
           actor: { kind: 'service', id: RESULT_ACTOR, role: 'service' },
-        }, {
+        };
+        // §5.3 and §4.0: the terminal event follows the STATUS — `match.completed`,
+        // `match.aborted` or `match.invalidated`. Only `match.result_applied` was emitted, so
+        // three catalogued public/audit events (event-envelope.md §6) were produced by nothing
+        // at all, and every consumer of "a match finished" saw an empty stream. It goes first
+        // because the match ending is what causes the career application, not the reverse.
+        await outbox.emitIn(tx, ctx, {
+          type: TERMINAL_EVENT_TYPES[result.status],
+          subject: { kind: 'match', id: result.matchId },
+          payload: {
+            status: result.status,
+            mode: result.mode,
+            mapId: result.mapId,
+            terminationReason: result.terminationReason ?? result.status,
+            outcomeReason: result.outcomeReason ?? null,
+            winnerTeam: result.winnerTeam ?? null,
+            invalidationReason: result.invalidationReason ?? null,
+            teamScores: result.teamScores ?? null,
+            startedAt: result.startedAt ?? null,
+            endedAt: result.endedAt ?? null,
+          },
+        });
+        await outbox.emitIn(tx, ctx, {
           type: 'match.result_applied',
           subject: { kind: 'match', id: result.matchId },
           payload: {
@@ -601,7 +626,9 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
     const weapons = {};
     let cursor = null;
     do {
-      const page = await store.matches.listForAccount(accountId, { limit: 200, cursor });
+      // PAGE_LIMIT_MAX, not a larger number of its own: §10 fixes the maximum page, and a caller
+      // that exceeds it now gets VALIDATION_FAILED rather than a silently clamped page.
+      const page = await store.matches.listForAccount(accountId, { limit: PAGE_LIMIT_MAX, cursor });
       for (const item of page.items) {
         if (item.status === 'invalidated') continue;      // recorded, never aggregated
         if (item.status === 'pending') continue;          // not terminal, nothing to apply yet
@@ -622,8 +649,78 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
     return { accountId, mode, statDefinitionVersion: sdv, totals, weapons };
   }
 
-  /** §4.3 history union: a pending item carries null for every outcome field, never omits. */
-  async function history(accountId, { limit = 25, cursor = null } = {}) {
+  /**
+   * §4.2 `GET /v1/matches/:matchId` — the exact response union, built here rather than in a
+   * handler so one projection serves every caller.
+   *
+   * Four shapes discriminated by `status`, no more and no fewer keys than the union lists.
+   * `correlationId` is on every variant (§4.2), `endedAt` is null ONLY while the match is live —
+   * an ended match awaiting persistence is `pending` WITH a timestamp — and the terminal
+   * refinements carry the whole record including the roster derived from the participants.
+   */
+  async function getMatch(matchId, { correlationId = null } = {}) {
+    const row = typeof matchId === 'string' && matchId ? await store.matches.byId(matchId) : null;
+    if (!row) {
+      // §4.2: never-existed and not-a-participant are both 404. A 403 would confirm the match
+      // exists, which is the fact privacy is refusing to disclose.
+      throw new ApiError('NOT_FOUND', 'No such match.', { details: { matchId } });
+    }
+    const participants = row.participants || [];
+    if (toHistoryMatchStatus(row.status) === 'pending') {
+      return {
+        matchId: row.matchId,
+        status: 'pending',
+        mode: row.mode,
+        mapId: row.mapId,
+        mapVersion: row.mapVersion ?? null,
+        startedAt: row.startedAt ?? null,
+        // Null while LIVE; the real timestamp once ended and queued (§4.2). Not defaulted to
+        // "now" and not omitted: a missing key here is what made the two states unreadable.
+        endedAt: row.endedAt ?? null,
+        retryAfterMs: PENDING_RETRY_AFTER_MS,
+        correlationId,
+      };
+    }
+    return {
+      matchId: row.matchId,
+      status: row.status,
+      rulesetVersion: row.rulesetVersion,
+      statDefinitionVersion: row.statDefinitionVersion,
+      rulesSnapshot: row.rulesSnapshot,
+      serverBuild: row.serverBuild,
+      mapId: row.mapId,
+      mapVersion: row.mapVersion,
+      region: row.region,
+      mode: row.mode,
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
+      terminationReason: row.terminationReason,
+      outcomeReason: row.outcomeReason,
+      winnerTeam: row.winnerTeam ?? null,
+      invalidationReason: row.invalidationReason ?? null,
+      // The roster is derived from `match_participants` (db-schema.md §4) rather than stored a
+      // second time, so it cannot disagree with the players it would have duplicated.
+      roster: participants.map((p) => ({
+        accountId: p.accountId, team: p.team ?? null,
+        joinedAt: p.joinedAt ?? null, leftAt: p.leftAt ?? null,
+      })),
+      teamScores: row.teamScores,
+      rounds: row.rounds ?? [],
+      players: participants.map((p) => p.stats),
+      evidenceRef: row.evidenceRef,
+      correlationId,
+    };
+  }
+
+  /**
+   * §4.3 history union: a pending item carries null for every outcome field, never omits.
+   *
+   * The page arguments are VALIDATED (§10) rather than clamped — `limit=0` quietly becoming 25
+   * and a malformed cursor quietly becoming "from the top" both return a plausible page for a
+   * request that was wrong, which is how a paging bug survives.
+   */
+  async function history(accountId, pageArgs = {}) {
+    const { limit, cursor } = assertPageArgs(pageArgs);
     const page = await store.matches.listForAccount(accountId, { limit, cursor });
     const items = page.items.map((m) => {
       if (m.status === 'pending') {
@@ -650,5 +747,5 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
     return { items, nextCursor: page.nextCursor ?? null };
   }
 
-  return { applyMatchResult, getCareer, recomputeCareer, history };
+  return { applyMatchResult, getCareer, recomputeCareer, history, getMatch };
 }

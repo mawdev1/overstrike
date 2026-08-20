@@ -26,6 +26,7 @@ import { ulid as defaultUlid } from '../ids.js';
 import {
   STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
   MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
+  assertMatchTransition, assertPageArgs, TERMINAL_MATCH_STATUSES,
 } from '../store.js';
 
 const TX = Symbol('overstrike.pgtx');
@@ -587,29 +588,110 @@ export async function createPostgresStore(config = {}, deps = {}) {
 
   const matches = {
     /**
-     * The match row and its participants, in ONE transaction. Written once per match and
-     * immutable thereafter (match-result.md §4): a second record for the same id is CONFLICT,
-     * because §5.5 makes a second, different truth for a finalised match a bug or an attack,
-     * and an upsert would erase the first one either way.
+     * The match row and its participants, in ONE transaction — creating the row, or advancing an
+     * existing non-terminal one to its terminal result.
+     *
+     * Rows are created at ALLOCATION (db-schema.md §4), so "the row exists" is the normal state
+     * when a result arrives; refusing it as CONFLICT made finalising an allocated match
+     * impossible. The permitted edges are MATCH_STATUS_TRANSITIONS in store.js, shared with the
+     * memory adapter so a lifecycle legal on one is legal on the other.
+     *
+     * A second TERMINAL write is still CONFLICT (§5.5): terminal statuses have no outgoing edges.
      */
     async record(result, txh) {
       const { match, participants } = normaliseMatchResult(result);
       const run = async (t) => {
-        const { rowCount } = await q(t, 'select 1 from matches where match_id = $1', [match.matchId]);
-        if (rowCount) {
-          throw new ApiError('CONFLICT', 'That match already has a result.', {
-            details: { matchId: match.matchId },
+        // `for update` and not a bare select: two concurrent submissions for one match would
+        // otherwise both read "allocated", both pass the transition check, and both finalise.
+        const { rows } = await q(t,
+          'select status from matches where match_id = $1 for update', [match.matchId]);
+        const prior = rows[0] ?? null;
+        if (prior) {
+          assertMatchTransition(prior.status, match.status, match.matchId);
+          // result_applied_at is not in `match` — only markResultApplied writes it — and the
+          // allocation-time columns (allocated_at, room_id, server_id) are left alone unless the
+          // result actually carries a replacement.
+          const patch = { ...match };
+          delete patch.matchId;
+          for (const k of ['roomId', 'serverId', 'startedAt']) {
+            if (patch[k] === null || patch[k] === undefined) delete patch[k];
+          }
+          await updateRow(t, 'matches', patch, 'match_id = $1', [match.matchId], 'match_id');
+        } else {
+          // insertRow encodes the jsonb columns (JSONB_COLUMNS): `rounds` is an array, and an
+          // array reaches Postgres as an array literal unless it is stringified first.
+          await insertRow(t, 'matches', match, { returning: '' });
+        }
+        for (const p of participants) {
+          // The allocation may already hold this participant; the result updates it rather than
+          // colliding with the (match_id, account_id) primary key. joined_at is excluded from
+          // the update so the moment they joined is not restamped by the result.
+          await insertRow(t, 'match_participants', p, {
+            returning: '',
+            onConflict: 'on conflict (match_id, account_id) do update set '
+              + 'team = excluded.team, left_at = excluded.left_at, '
+              + 'disconnected = excluded.disconnected, abandoned = excluded.abandoned, '
+              + 'stats = excluded.stats',
           });
         }
-        // insertRow encodes the jsonb columns (JSONB_COLUMNS): `rounds` is an array, and an
-        // array reaches Postgres as an array literal unless it is stringified first.
-        await insertRow(t, 'matches', match, { returning: '' });
-        for (const p of participants) await insertRow(t, 'match_participants', p, { returning: '' });
-        return { matchId: match.matchId, participants: participants.length };
+        return {
+          matchId: match.matchId,
+          status: match.status,
+          transitioned: prior ? prior.status : null,
+          participants: participants.length,
+        };
       };
       // Already enrolled (the result submission path holds a transaction, §5.3); otherwise open
       // one, because the row and its participants must not land separately.
       return inTransaction(txh) ? run(txh) : tx((t) => run(t));
+    },
+
+    /**
+     * One match with its participants — the §4.2 `GET /v1/matches/:matchId` projection.
+     * `roster` is derived from `match_participants` rather than stored twice; db-schema.md §4
+     * has no roster column, and two copies of a roster is two rosters that can disagree.
+     */
+    async byId(matchId, txh) {
+      const { rows } = await q(txh, 'select * from matches where match_id = $1', [matchId]);
+      if (!rows.length) return null;
+      const m = mapRow(rows[0]);
+      const { rows: parts } = await q(txh,
+        `select account_id, team, joined_at, left_at, disconnected, abandoned, stats
+           from match_participants where match_id = $1 order by joined_at, account_id`,
+        [matchId]);
+      m.participants = parts.map((p) => ({ ...mapRow(p), matchId }));
+      return m;
+    },
+
+    /**
+     * Stamp `matches.result_applied_at` (db-schema.md §4) in the caller's transaction.
+     *
+     * The column was declared and never written, so nothing could distinguish a match that ended
+     * from one whose career application committed — which is exactly the question §4.2 and §5
+     * ask. The update is conditional on the row still being unapplied, so a second application
+     * loses the race rather than doubling a career.
+     */
+    async markResultApplied(matchId, at, txh) {
+      const stamp = at ?? new Date().toISOString();
+      const { rows } = await q(txh,
+        `update matches set result_applied_at = $2::timestamptz
+          where match_id = $1 and result_applied_at is null
+            and status in ('completed','aborted','invalidated')
+        returning *`, [matchId, stamp]);
+      if (rows.length) return mapRow(rows[0]);
+
+      const { rows: current } = await q(txh, 'select status, result_applied_at from matches where match_id = $1', [matchId]);
+      if (!current.length) {
+        throw new ApiError('NOT_FOUND', 'No such match.', { details: { matchId } });
+      }
+      if (current[0].result_applied_at) {
+        throw new ApiError('CONFLICT', 'That result has already been applied.', {
+          details: { matchId, reason: 'result-already-applied' },
+        });
+      }
+      throw new ApiError('CONFLICT', 'A match that has not finalised cannot have a result applied.', {
+        details: { matchId, status: current[0].status, reason: 'not-terminal' },
+      });
     },
 
     /**
@@ -620,9 +702,12 @@ export async function createPostgresStore(config = {}, deps = {}) {
      * match that never ended — ordering on ended_at would collapse every live match into one
      * null bucket and make the cursor ambiguous there. `match_participants_account_idx` serves
      * the account predicate; the sort is over one account's matches, not the table.
+     *
+     * `limit` and `cursor` are VALIDATED (http-api.md §10), not clamped — the same shared check
+     * the memory adapter runs, so a page argument refused on one adapter is refused on both.
      */
-    async listForAccount(accountId, { limit = 25, cursor = null } = {}, txh) {
-      const size = Math.max(1, Math.min(Number(limit) || 25, 200));
+    async listForAccount(accountId, pageArgs = {}, txh) {
+      const { limit: size, cursor } = assertPageArgs(pageArgs);
       const { rows } = await q(txh,
         `select ${MATCH_SELECT},
                 p.team as p_team, p.joined_at as p_joined_at, p.left_at as p_left_at,
@@ -633,7 +718,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
             and ($2::text is null or p.match_id < $2::text)
           order by p.match_id desc
           limit $3`,
-        [accountId, cursor ?? null, size + 1]);      // +1 answers "is there another page"
+        [accountId, cursor, size + 1]);              // +1 answers "is there another page"
 
       const page = rows.slice(0, size);
       const items = page.map((r) => {
@@ -659,6 +744,19 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
   };
 
+  /**
+   * The TTL clock is the store's INJECTED clock, not `now()` in the statement.
+   *
+   * Both adapters have to answer the same question at the same instant or a fake-clock test
+   * proves nothing about the adapter that ships. `deps.now` is that instant; falling back to
+   * the process clock when nothing is injected keeps production behaviour unchanged.
+   */
+  const consentNowIso = () => {
+    const t = deps.now ? deps.now() : Date.now();
+    if (t instanceof Date) return t.toISOString();
+    return typeof t === 'string' ? t : new Date(Number(t)).toISOString();
+  };
+
   const preAuthConsent = {
     /**
      * A new decision RESETS migrated_at. Leaving it set — which this adapter used to do — is a
@@ -682,7 +780,19 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return mapRow(rows[0]);
     },
 
+    /**
+     * Expiry is enforced on READ, and it DELETES. This adapter had no expiry check at all, so
+     * a decision older than the 30 days http-api.md §3a.3 grants it was still returned — and
+     * still stored. Both halves matter: the stale row was honoured as a live consent, and it
+     * outlived the retention the contract promises.
+     *
+     * Two statements rather than a data-modifying CTE: the main query of a `with … delete`
+     * runs against the same snapshot, so it would return the row the CTE just removed.
+     */
     async get(clientSessionId, txh) {
+      await q(txh,
+        'delete from pre_auth_consent where client_session_id = $1 and expires_at <= $2::timestamptz',
+        [clientSessionId, consentNowIso()]);
       const { rows } = await q(txh,
         'select * from pre_auth_consent where client_session_id = $1', [clientSessionId]);
       return mapRow(rows[0]);

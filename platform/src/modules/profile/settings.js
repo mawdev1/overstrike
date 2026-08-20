@@ -169,14 +169,34 @@ export function defaultRoamingValues(vocab = VOCABULARY) {
 
 export const etagFor = (version) => `"${version}"`;
 
-/** `If-Match: "7"` — quotes optional in practice, `*` means "whatever is there now". */
+/**
+ * `If-Match: "7"` — quotes and a `W/` prefix optional in practice.
+ *
+ * Returns one of four verdicts rather than a number-or-NaN, because the four cases get four
+ * different answers and a sentinel value is how two of them ended up sharing one:
+ *
+ *  - `absent`   — the §11.2 refusal: CONFLICT with `reason: "if-match-required"`.
+ *  - `wildcard` — REFUSED. `*` means "any existing representation", and settings always have
+ *    one (an account with no row reads as version 1 at the documented defaults), so `*` is a
+ *    compare-and-set that can never fail. That is last-write-wins spelled with an asterisk —
+ *    precisely the silently discarded rebind §11.2 exists to prevent. It is refused rather
+ *    than given invented semantics, because the client that sends it believes it is
+ *    protecting a write and is not.
+ *  - `malformed` — `If-Match: banana`. Also refused, and NOT as "absent": a header that was
+ *    sent and could not be understood is a client bug, and answering it with
+ *    `if-match-required` tells that client to add a header it already sent.
+ *  - `version`  — the revision to compare.
+ *
+ * Wildcard and malformed are VALIDATION_FAILED (400, §3a.4) rather than CONFLICT: nothing
+ * about the stored state is in conflict, the header itself is unusable.
+ */
 function parseIfMatch(header) {
-  if (header === undefined || header === null) return null;
+  if (header === undefined || header === null) return { kind: 'absent' };
   const raw = String(header).trim();
-  if (!raw) return null;
-  if (raw === '*') return '*';
+  if (!raw) return { kind: 'absent' };
+  if (raw === '*') return { kind: 'wildcard' };
   const m = raw.match(/^(?:W\/)?"?(\d+)"?$/);
-  return m ? Number(m[1]) : NaN;
+  return m ? { kind: 'version', version: Number(m[1]) } : { kind: 'malformed', got: raw };
 }
 
 export function createSettingsService({ store, clock = Date, vocab = VOCABULARY }) {
@@ -210,17 +230,22 @@ export function createSettingsService({ store, clock = Date, vocab = VOCABULARY 
     const current = await read(accountId, tx);
 
     const expected = parseIfMatch(ifMatchHeader);
-    if (expected === null) {
+    if (expected.kind === 'absent') {
       throw new ApiError('CONFLICT', 'If-Match is required on settings writes.', {
         details: { reason: 'if-match-required' },
       });
     }
-    if (Number.isNaN(expected)) {
-      throw new ApiError('CONFLICT', 'If-Match is not a settings version.', {
-        details: { reason: 'if-match-required' },
+    if (expected.kind === 'wildcard') {
+      throw new ApiError('VALIDATION_FAILED', 'If-Match must name a settings version.', {
+        details: { fields: [{ key: 'If-Match', reason: 'wildcard-not-supported', got: '*' }] },
       });
     }
-    if (expected !== '*' && expected !== current.version) {
+    if (expected.kind === 'malformed') {
+      throw new ApiError('VALIDATION_FAILED', 'If-Match is not a settings version.', {
+        details: { fields: [{ key: 'If-Match', reason: 'malformed', got: expected.got }] },
+      });
+    }
+    if (expected.version !== current.version) {
       // Return the current state so the UI can merge instead of re-fetching and racing again.
       throw new ApiError('CONFLICT', 'Settings changed on another device.', {
         details: { currentVersion: current.version, values: current.values },

@@ -30,6 +30,7 @@ import { ulid as defaultUlid } from '../ids.js';
 import {
   STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
   MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
+  assertMatchTransition, assertPageArgs, TERMINAL_MATCH_STATUSES,
 } from '../store.js';
 
 /** Handles are tagged so a handle from another store (or a stray object) fails loudly. */
@@ -757,32 +758,110 @@ export function createMemoryStore(config = {}, deps = {}) {
     decidedAt: null, expiresAt: undefined,
   });
 
+  /** The participants of one match, in insertion order, as plain rows. */
+  const participantsOf = (st, matchId) => [...st.matchParticipants.values()]
+    .filter((p) => p.matchId === matchId);
+
   const matches = {
     /**
-     * Written once per match, immutable thereafter (§4). A second record for the same match id
-     * is CONFLICT rather than an overwrite: §5.5 makes a second, different truth for a
-     * finalised match a bug or an attack, and overwriting would erase the first one either way.
+     * Create the row, or advance an existing non-terminal one to its terminal result.
+     *
+     * The row is created at ALLOCATION (§4, db-schema.md §4), so by the time a result arrives
+     * the row normally already exists. Treating that as CONFLICT meant no allocated match could
+     * ever finalise — allocate, play, finalise is the documented lifecycle and it was the one
+     * path this method refused. The transitions are MATCH_STATUS_TRANSITIONS in store.js so both
+     * adapters permit exactly the same ones.
+     *
+     * What stays refused is a SECOND terminal write (§5.5): terminal states have no outgoing
+     * edges, so a finalised match cannot be re-recorded with any result, identical or not.
      */
     record(result, txh) {
       assertCloneable(result, 'match result');
       const { match, participants } = normaliseMatchResult(result);
       return write(txh, (st) => {
-        if (st.matches.has(match.matchId)) {
-          throw new ApiError('CONFLICT', 'That match already has a result.', {
-            details: { matchId: match.matchId },
-          });
-        }
+        const prior = st.matches.get(match.matchId) ?? null;
+        if (prior) assertMatchTransition(prior.status, match.status, match.matchId);
+
         const rec = {};
         for (const c of MATCH_COLUMNS) rec[c] = match[c] ?? null;
         for (const c of ['startedAt', 'endedAt']) rec[c] = toIso(rec[c]);
-        rec.recordedAt = nowIso();
+        if (prior) {
+          // Allocation-time facts survive the finalise: `allocated_at` is when the id was
+          // issued, and a result that omits `startedAt` must not erase the one the row has.
+          rec.allocatedAt = prior.allocatedAt;
+          rec.recordedAt = prior.recordedAt;
+          rec.startedAt = rec.startedAt ?? prior.startedAt;
+          rec.roomId = rec.roomId ?? prior.roomId;
+          rec.serverId = rec.serverId ?? prior.serverId;
+          // Never carried over from a caller: only markResultApplied writes it.
+          rec.resultAppliedAt = prior.resultAppliedAt ?? null;
+        } else {
+          rec.allocatedAt = nowIso();
+          rec.recordedAt = nowIso();
+          rec.resultAppliedAt = null;
+        }
         st.matches.set(rec.matchId, rec);
         for (const p of participants) {
           requireAccount(st, p.accountId, 'match_participants');
+          const k = key(p.matchId, p.accountId);
+          const before = st.matchParticipants.get(k);
           const prec = { ...p, joinedAt: toIso(p.joinedAt), leftAt: toIso(p.leftAt) };
-          st.matchParticipants.set(key(p.matchId, p.accountId), prec);
+          // (match_id, account_id) is the primary key: a finalise updates the allocation row
+          // rather than inserting a second one, and joinedAt stays the moment they actually
+          // joined rather than being restamped by the result.
+          if (before) prec.joinedAt = before.joinedAt ?? prec.joinedAt;
+          st.matchParticipants.set(k, prec);
         }
-        return { matchId: rec.matchId, participants: participants.length };
+        return {
+          matchId: rec.matchId,
+          status: rec.status,
+          transitioned: prior ? prior.status : null,
+          participants: participants.length,
+        };
+      });
+    },
+
+    /**
+     * One match with its participants — what the §4.2 `GET /v1/matches/:matchId` projection
+     * needs. `roster` is not a column: it is derived from `match_participants`, which is where
+     * db-schema.md §4 puts it, so it cannot disagree with the participants it would duplicate.
+     */
+    byId(matchId, txh) {
+      return read(txh, (st) => {
+        const m = st.matches.get(matchId);
+        if (!m) return null;
+        return clone({ ...m, participants: participantsOf(st, matchId) });
+      });
+    },
+
+    /**
+     * Stamp `matches.result_applied_at` (db-schema.md §4).
+     *
+     * The column existed and nothing ever wrote it, so "ended, queued" and "ended, career
+     * applied" were the same row and §4.2 could not tell them apart. Written in the caller's
+     * transaction — the same one that applies the career — because a stamp that can commit
+     * without the application it records is a lie the recompute cannot detect.
+     */
+    markResultApplied(matchId, at, txh) {
+      return write(txh, (st) => {
+        const m = st.matches.get(matchId);
+        if (!m) {
+          throw new ApiError('NOT_FOUND', 'No such match.', { details: { matchId } });
+        }
+        if (!TERMINAL_MATCH_STATUSES.includes(m.status)) {
+          throw new ApiError('CONFLICT', 'A match that has not finalised cannot have a result applied.', {
+            details: { matchId, status: m.status, reason: 'not-terminal' },
+          });
+        }
+        if (m.resultAppliedAt) {
+          // Applying twice is what the §5 idempotency row exists to prevent; reaching here means
+          // it did not, and the second application would double a career.
+          throw new ApiError('CONFLICT', 'That result has already been applied.', {
+            details: { matchId, resultAppliedAt: m.resultAppliedAt, reason: 'result-already-applied' },
+          });
+        }
+        m.resultAppliedAt = toIso(at) ?? nowIso();
+        return clone(m);
       });
     },
 
@@ -796,14 +875,18 @@ export function createMemoryStore(config = {}, deps = {}) {
      *
      * The cursor is the last id of the previous page — an offset would skip or repeat rows as
      * matches are inserted between requests.
+     *
+     * `limit` and `cursor` are VALIDATED (http-api.md §10), not clamped: `limit=0` silently
+     * becoming 25 and a malformed cursor silently becoming "from the top" answered a question
+     * nobody asked and hid the paging bug that produced them.
      */
-    listForAccount(accountId, { limit = 25, cursor = null } = {}, txh) {
+    listForAccount(accountId, page = {}, txh) {
+      const { limit: size, cursor } = assertPageArgs(page);
       return read(txh, (st) => {
-        const size = Math.max(1, Math.min(Number(limit) || 25, 200));
         const rows = [];
         for (const p of st.matchParticipants.values()) {
           if (p.accountId !== accountId) continue;
-          if (cursor !== null && cursor !== undefined && !(p.matchId < cursor)) continue;
+          if (cursor !== null && !(p.matchId < cursor)) continue;
           const m = st.matches.get(p.matchId);
           if (!m) continue;
           rows.push({ m, p });
@@ -829,6 +912,21 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
   };
 
+  /**
+   * The TTL clock is the store's INJECTED clock, not `Date.now()`.
+   *
+   * A read filter that calls `Date.now()` directly is not the path a test with a fake clock
+   * exercises: the test advances its own clock past the 30 days, the adapter consults the wall
+   * clock, and the "expiry proof" proves nothing about expiry. `deps.now` is the same clock
+   * `nowIso` stamps rows with, so the row's `expires_at` and the instant it is compared
+   * against come from one source.
+   */
+  const consentNowMs = () => {
+    const t = deps.now ? deps.now() : Date.now();
+    if (t instanceof Date) return t.getTime();
+    return typeof t === 'string' ? Date.parse(t) : Number(t);
+  };
+
   const preAuthConsent = {
     /**
      * A new decision RESETS migrated_at on both adapters. Postgres used to leave it set, so a
@@ -849,16 +947,23 @@ export function createMemoryStore(config = {}, deps = {}) {
       });
     },
 
-    get(clientSessionId, txh) {
-      return read(txh, (st) => {
-        const row = st.preAuthConsent.get(clientSessionId);
-        if (!row) return null;
-        // A 30-day TTL that only a sweep enforces is not a TTL: it is a row that stops being
-        // valid at a time nothing checks. Expiry is decided on READ, so a decision cannot be
-        // honoured past its life just because no cleanup has run yet.
-        if (row.expiresAt && Date.parse(row.expiresAt) <= Date.now()) return null;
-        return clone(row);
-      });
+    /**
+     * A 30-day TTL that only a sweep enforces is not a TTL: it is a row that stops being valid
+     * at a time nothing checks. Expiry is decided on READ — and it DELETES.
+     *
+     * Filtering on read alone would answer correctly while leaving the record on disk past the
+     * life http-api.md §3a.3 gives it. For a consent decision that is a retention breach, not
+     * a stale read: the row is the evidence of a legally significant answer, and "we still
+     * hold it, we just decline to look at it" is not deletion.
+     */
+    async get(clientSessionId, txh) {
+      const row = await read(txh, (st) => st.preAuthConsent.get(clientSessionId) ?? null);
+      if (!row) return null;
+      if (row.expiresAt && Date.parse(row.expiresAt) <= consentNowMs()) {
+        await write(txh, (st) => { st.preAuthConsent.delete(clientSessionId); });
+        return null;
+      }
+      return clone(row);
     },
 
     markMigrated(clientSessionId, at, txh) {
