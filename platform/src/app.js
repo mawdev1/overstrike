@@ -72,6 +72,25 @@ export async function buildApp(config, overrides = {}) {
   // Assert the expected set rather than trusting the wiring. Without this, the stub check
   // below is unreachable precisely when the stub module fails to load — `deps.stubs` is
   // undefined, so `deps.stubs?.enabled` is falsy and the guard silently passes.
+  //
+  // EQUIVALENT MUTANTS, measured — this whole block, and each of its two assertions on its own.
+  // Both are backstops for a rule enforced ABOVE them, and neither can fire while that rule
+  // holds:
+  //
+  //   - `missing.length` cannot be non-empty. In production `mountModules` sets
+  //     `optional = false`, so a module that will not import RETHROWS (`if (!optional) throw
+  //     err`) and this line is never reached; a module that does import always pushes its name.
+  //     It fires only if that rethrow is removed — which is exactly what it is here for.
+  //   - `mounted.includes('stubs') || deps.stubs` cannot be true. Both are written in exactly
+  //     one place, inside `if (config.env !== 'production')`.
+  //
+  // Measured by deleting the block, and then each assertion separately, and re-running eight
+  // boots of the real assembly out of a copied tree — production/development/test intact,
+  // production and development with the telemetry module deleted from disk, production with
+  // auth deleted, and production and development with the stub module deleted — plus the
+  // stop() and stub-body probes: identical `booted`, `mounted` and error message in all 16
+  // observations, three times over. Kept because "assert the expected set rather than trust the
+  // wiring" is a claim this file must keep making even after someone edits the wiring.
   if (config.env === 'production') {
     const missing = REQUIRED_MODULES.filter((n) => !mounted.includes(n));
     if (missing.length) throw new Error(`modules failed to mount in production: ${missing.join(', ')}`);
@@ -117,6 +136,10 @@ export async function buildApp(config, overrides = {}) {
   /** Release every background timer this process started. Called on shutdown. */
   const stop = () => {
     stopJanitor();
+    // EQUIVALENT MUTANT, measured: `clearInterval(null)` is a documented no-op, so deleting the
+    // guard leaves `stop()` doing exactly what it did. Measured by building the app with the
+    // sweep interval on (50 ms) and off (0, so the timer is null), calling `stop()` twice in
+    // each and waiting past a tick: no throw and no further sweep, identical on both versions.
     if (idempotencyTimer) clearInterval(idempotencyTimer);
     // Auth sweeps expired ephemeral tokens on an interval. Unref'd, so it never holds the
     // process open — but a test that builds many apps would otherwise accumulate them.
@@ -154,6 +177,16 @@ function adaptAuthConsent(receipts, config) {
       const claims = receipts.readConsent(receipt);
       if (!claims) return { ok: false, reason: 'receipt_signature_invalid' };
       if (claims.telemetryPersonal !== true) return { ok: false, reason: 'consent_declined' };
+      // EQUIVALENT MUTANT, measured. This cannot fire: `receipts.readConsent`
+      // (modules/auth/receipts.js) already compares `claims.pv` against the SAME
+      // `config.consentPolicyVersion` and returns null on a mismatch, so a stale receipt is
+      // null by the line above and leaves as `receipt_signature_invalid`. Measured by driving a
+      // receipt minted by a policy-1 app at a policy-2 app — signed out, authenticated, and a
+      // policy-2 receipt as the control — with this line present and deleted: identical status,
+      // identical accepted/rejected counts and the same `receipt_signature_invalid` reason in
+      // all four comparisons, and `receipt_policy_stale` produced by neither. Kept as the
+      // backstop for an adapter that one day verifies without going through `readConsent`; the
+      // RULE it states is asserted end to end in apptest.mjs.
       if (claims.policyVersion !== config.consentPolicyVersion) {
         return { ok: false, reason: 'receipt_policy_stale' };
       }
@@ -385,6 +418,12 @@ async function readBodyForStub(req) {
     if (size > 256 * 1024) break;
     chunks.push(chunk);
   }
+  // EQUIVALENT MUTANT, measured: with no chunks, `Buffer.concat([]).toString('utf8')` is the
+  // empty string, `JSON.parse('')` throws, and the catch below returns the same `{}`. Measured
+  // over a stub `POST /v1/auth/signin` with no body, a zero-length body, a whitespace body and
+  // a non-JSON body, with this line present and deleted: byte-identical 400 envelopes on all
+  // four. Kept because reaching the answer through a thrown exception is not the same as
+  // stating it.
   if (!chunks.length) return {};
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return {}; }
 }

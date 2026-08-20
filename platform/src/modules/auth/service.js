@@ -351,6 +351,20 @@ export function createAuthService(deps) {
       // The store's unique constraints are the authority; the pre-checks above are only the
       // fast path. A CONFLICT here means "that email is registered", which is the one thing
       // signup may not say (§8).
+      //
+      // EQUIVALENT MUTANT, measured — this line and the `byEmailHash` pre-check below it are
+      // each other's backstop, so deleting EITHER ONE changes nothing observable. The suite
+      // runs the memory adapter, which serialises every transaction, so the only reachable way
+      // to make `accounts.create` raise CONFLICT from signup is a duplicate address — and the
+      // pre-check refuses that first with the identical `AUTH_INVALID_CREDENTIALS` / "We could
+      // not complete that sign-up." Measured by deleting each line on its own in a copied tree
+      // and driving a duplicate-address signup: byte-identical error code, message, details and
+      // outbox/audit row counts in all three runs.
+      //
+      // It is NOT redundant, and must not be removed with the pre-check: the case it exists for
+      // is the RACE — two signups on one address arriving together on Postgres, where the
+      // pre-check passes for both and the unique index refuses the loser. That case cannot be
+      // produced on the adapter the suite runs, which is why nothing here kills it.
       if (err instanceof ApiError && err.code === 'CONFLICT') {
         throw new ApiError('AUTH_INVALID_CREDENTIALS', 'We could not complete that sign-up.');
       }
@@ -401,6 +415,15 @@ export function createAuthService(deps) {
     // An existing address is reported as a name conflict would not be: signup cannot say
     // "that email is registered" without becoming the enumeration oracle §8 forbids, so it
     // returns the generic credential failure and the recovery flow is the way back in.
+    //
+    // EQUIVALENT MUTANT, measured — see the note on `createAccountRow`'s CONFLICT branch, which
+    // is this line's backstop and which this line is the backstop for. Deleting this check
+    // sends a duplicate address into `accounts.create`, whose CONFLICT that branch translates
+    // into the same `AUTH_INVALID_CREDENTIALS` with the same message; deleting that branch
+    // leaves this check to refuse first. Measured both ways on a copied tree: identical code,
+    // message, details and outbox/audit counts. Kept as the fast path — the refusal belongs
+    // to signup's own rules rather than to whichever adapter is mounted, and one of the two
+    // must survive or §8's oracle opens.
     if (await store.accounts.byEmailHash(lookup)) {
       throw new ApiError('AUTH_INVALID_CREDENTIALS', 'We could not complete that sign-up.');
     }

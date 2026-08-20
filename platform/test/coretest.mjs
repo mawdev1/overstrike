@@ -30,12 +30,21 @@
  * Run: `node platform/test/coretest.mjs`
  */
 import { readFileSync } from 'node:fs';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import net from 'node:net';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { Router, createApp, buildBelowFloor, isWellFormedBuild } from '../src/core/http.js';
+import {
+  Router, createApp, buildBelowFloor, isWellFormedBuild, raw, withHeaders,
+} from '../src/core/http.js';
 import { createRateLimiter, CLASSES } from '../src/core/ratelimit.js';
-import { ApiError } from '../src/core/errors.js';
+import { ApiError, CODES, toApiError } from '../src/core/errors.js';
+import {
+  loadMigrations, planMigrations, runMigrations, migrateCli,
+} from '../src/core/migrate.js';
 import { checkClientBuild } from '../src/modules/stubs/gates.js';
 import { loadConfig } from '../src/core/config.js';
 
@@ -59,9 +68,19 @@ const silent = () => { const noop = () => {}; return { debug: noop, info: noop, 
  * reached the handler and the handler happened to say no" are different facts and a status
  * code alone cannot tell them apart.
  */
-async function withServer(config, fn) {
+async function withServer(config, fn, opts = {}) {
   const handlerCalls = [];
   const router = new Router();
+
+  // Routes a section needs for its own claim, registered on the SAME real router. `opts.deps`
+  // adds to what handlers receive — a real `createRateLimiter()` for the sections about §9,
+  // never a fake, because a fake limiter proves the test can call one and nothing else.
+  for (const [method, path, handler, routeOpts] of opts.routes || []) {
+    router.add(method, path, async (ctx) => {
+      handlerCalls.push({ path: ctx.path, params: ctx.params });
+      return handler(ctx);
+    }, routeOpts);
+  }
 
   // Public echo: whatever the router decided the params were, spoken back verbatim. This is
   // the one route that can prove a smuggled separator never became a parameter value.
@@ -89,9 +108,10 @@ async function withServer(config, fn) {
   // §1's exemption, in core/http.js itself rather than in a fixture that says it copies it.
   router.get('/v1/health', async () => ({ ok: true }), { requireBuild: false });
 
-  const server = createApp({ router, deps: { logger: silent(), config } });
+  const server = createApp({ router, deps: { logger: opts.logger || silent(), config, ...opts.deps } });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const base = `http://127.0.0.1:${server.address().port}`;
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
 
   const call = async (method, path, { body, headers = {}, rawBody } = {}) => {
     let res;
@@ -116,11 +136,52 @@ async function withServer(config, fn) {
     const text = await res.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch { /* the test will say so */ }
-    return { status: res.status, body: json, text, transportFailed: false };
+    return { status: res.status, body: json, text, headers: res.headers, transportFailed: false };
   };
 
-  try { return await fn({ call, handlerCalls }); }
-  finally { await new Promise((r) => server.close(r)); }
+  try { return await fn({ call, handlerCalls, port, raw: (lines, o) => rawRequest(port, lines, o) }); }
+  finally { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); }
+}
+
+/**
+ * Speak HTTP on a socket, byte for byte.
+ *
+ * `fetch` is a client that obeys the specification: it normalises `//evil.com/v1/health` before
+ * it leaves, and it will not send a body on a GET. Both of those are exactly the request shapes
+ * `parseTarget` and `readJson` exist to survive, so a test written with `fetch` cannot reach
+ * them — the request under test is one a compliant client will not make.
+ *
+ * `body` is written verbatim and MAY be shorter than the declared Content-Length: that is how a
+ * request that never finishes arriving is expressed, and `timedOut` is then the answer.
+ */
+function rawRequest(port, lines, { body = '', timeoutMs = 2500 } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let text = '';
+    let socket = null;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      try { socket?.destroy(); } catch { /* already gone */ }
+      resolve(result);
+    };
+    const parse = (timedOut) => {
+      const status = text.match(/^HTTP\/1\.[01] (\d{3})/);
+      done({ timedOut, text, status: status ? Number(status[1]) : null });
+    };
+    const timer = setTimeout(() => parse(true), timeoutMs);
+    socket = net.connect(port, '127.0.0.1', () => {
+      socket.write(`${lines.join('\r\n')}\r\n\r\n${body}`);
+    });
+    socket.on('data', (chunk) => {
+      text += chunk.toString('utf8');
+      // Headers complete is enough: every assertion here is about the status line, and waiting
+      // for the socket to close would hang on a keep-alive response.
+      if (text.includes('\r\n\r\n')) { clearTimeout(timer); parse(false); }
+    });
+    socket.on('error', () => { clearTimeout(timer); parse(false); });
+    socket.on('close', () => { clearTimeout(timer); parse(false); });
+  });
 }
 
 const NO_FLOOR = { minClientBuild: null, trustedProxyHops: 0 };
@@ -552,6 +613,770 @@ section('core/ratelimit.js — sweep() and size');
   const stop = rl3.startJanitor(60_000);
   check(typeof stop === 'function', 'startJanitor returns its own stopper');
   stop();
+}
+
+/** Run `fn` and return whatever it threw, or null. Never returns a value on success. */
+const caught = (fn) => { try { fn(); return null; } catch (err) { return err; } };
+const caughtAsync = async (fn) => { try { await fn(); return null; } catch (err) { return err; } };
+
+// =============================================================================================
+section('core/config.js — the loader refuses what it cannot use');
+// =============================================================================================
+//
+// Six of this file's seven guards survived deletion. Nothing in 1780 checks noticed that
+// `PLATFORM_PORT=0x1F90` was accepted as 8080, that `PLATFORM_STORAGE=mysql` loaded, or that
+// the production secrets stopped being required in production — the file whose entire stated
+// purpose is "fails fast on anything missing or malformed rather than defaulting silently".
+//
+// `loadConfig` takes its source as an argument, so these drive the real loader with a literal
+// environment. That is not a substitution: the source object IS the parameter the function is
+// written to take, and `app.js` passes `process.env` into the same one.
+{
+  /** The environment a production process actually gets, minus whatever a case is removing. */
+  const PROD = {
+    NODE_ENV: 'production',
+    PLATFORM_TOKEN_SECRET: 'a-sufficiently-long-production-secret-value',
+    PLATFORM_SERVICE_TOKEN: 'a-sufficiently-long-production-service-token',
+  };
+
+  // ── :36 — the secrets are required in PRODUCTION, and only there ──
+  const noSecrets = caught(() => loadConfig({ NODE_ENV: 'production' }));
+  check(noSecrets instanceof Error && Array.isArray(noSecrets.problems)
+    && noSecrets.problems.includes('PLATFORM_TOKEN_SECRET is required in production')
+    && noSecrets.problems.includes('PLATFORM_SERVICE_TOKEN is required in production'),
+  'a production process with no signing secrets REFUSES to load config',
+  JSON.stringify(noSecrets?.problems ?? String(noSecrets)));
+
+  // The failure this prevents, spelled out: without the guard the loader hands back
+  // `tokenSecret: null` and the process boots — signing with a null key in production.
+  const half = caught(() => loadConfig({ ...PROD, PLATFORM_TOKEN_SECRET: undefined }));
+  check(half instanceof Error && half.problems?.length === 1
+    && half.problems[0] === 'PLATFORM_TOKEN_SECRET is required in production',
+  'and it names exactly the one that is missing, not both',
+  JSON.stringify(half?.problems ?? String(half)));
+
+  const empty = caught(() => loadConfig({ ...PROD, PLATFORM_SERVICE_TOKEN: '' }));
+  check(empty instanceof Error && empty.problems?.includes('PLATFORM_SERVICE_TOKEN is required in production'),
+    'an EMPTY secret is a missing secret, not a secret',
+    JSON.stringify(empty?.problems ?? String(empty)));
+
+  // CONTROL 1: with both present, production loads — the refusals above are the guard and not
+  // production being unloadable.
+  const prod = loadConfig(PROD);
+  check(prod.env === 'production' && prod.tokenSecret === PROD.PLATFORM_TOKEN_SECRET
+    && prod.serviceToken === PROD.PLATFORM_SERVICE_TOKEN,
+  'CONTROL: production with both secrets loads and carries them',
+  JSON.stringify({ env: prod.env, secret: typeof prod.tokenSecret }));
+
+  // CONTROL 2: outside production the same absence is fine, and is filled with a value nobody
+  // could mistake for a real one. Without this control the check above passes for a loader that
+  // demands the secrets everywhere, which would stop every developer.
+  const dev = loadConfig({ NODE_ENV: 'development' });
+  check(dev.tokenSecret === 'DEV-ONLY-INSECURE-TOKEN-SECRET-do-not-ship'
+    && dev.serviceToken === 'DEV-ONLY-INSECURE-SERVICE-TOKEN-do-not-ship',
+  'CONTROL: development fills the secrets with an obviously-fake value instead',
+  JSON.stringify(dev.tokenSecret));
+
+  // ── :46 — an integer is an integer, not whatever `Number()` will take ──
+  for (const [raw, why] of [
+    ['0x1F90', 'hex — `Number()` reads this as 8080 and the port silently moves'],
+    ['1e4', 'exponent notation'],
+    ['8090.5', 'a fraction is not a port'],
+    ['', 'the empty string, which `Number()` calls 0'],
+    ['  ', 'whitespace, which `Number()` also calls 0'],
+    ['eight', 'plain nonsense'],
+  ]) {
+    const err = caught(() => loadConfig({ PLATFORM_PORT: raw }));
+    // '' and '  ' take the absent branch / the regex branch respectively; both must refuse to
+    // produce a number out of a string that is not one. The empty string is the DEFAULT branch,
+    // so it is the one case here that legitimately loads — asserted as such below.
+    if (raw === '') {
+      check(err === null, 'an unset PLATFORM_PORT falls back to the default', String(err));
+      continue;
+    }
+    check(err instanceof Error && /PLATFORM_PORT must be an integer/.test(err.message),
+      `PLATFORM_PORT=${JSON.stringify(raw)} is refused (${why})`, String(err?.message).split('\n').join(' '));
+  }
+  // CONTROLS: the shapes an operator legitimately writes still load, including the surrounding
+  // whitespace a YAML file adds and the 0 that means "let the OS choose".
+  check(loadConfig({ PLATFORM_PORT: '8091' }).port === 8091, 'CONTROL: a plain integer loads');
+  check(loadConfig({ PLATFORM_PORT: ' 8091 ' }).port === 8091, 'CONTROL: whitespace is trimmed, not refused');
+  check(loadConfig({ PLATFORM_PORT: '0' }).port === 0, 'CONTROL: port 0 means "ask the OS" and is legal');
+
+  // ── :50 — a value past 2^53 is out of range, and SAYS so ──
+  //
+  // Every int in SPEC is bounded, so deleting this line does not let the value through: it
+  // falls to the min/max check one line down and is still refused. What it changes is the
+  // sentence the operator reads at 3am — `PLATFORM_PORT is out of range: "99999999999999999999"`
+  // becomes `PLATFORM_PORT must be <= 65535, got 100000000000000000000`, a number that is not
+  // the one they typed and cannot be found in their config. That message is the guard's whole
+  // observable effect, so it is what is asserted.
+  const huge = caught(() => loadConfig({ PLATFORM_PORT: '99999999999999999999' }));
+  check(huge instanceof Error
+    && huge.problems?.some((p) => p === 'PLATFORM_PORT is out of range: "99999999999999999999"'),
+  'a value past Number.MAX_SAFE_INTEGER is reported AS TYPED, not as the float it rounded to',
+  JSON.stringify(huge?.problems ?? String(huge)));
+  check(huge instanceof Error && !huge.problems.some((p) => /100000000000000000000/.test(p)),
+    'and the rounded value never appears in the message',
+    JSON.stringify(huge?.problems));
+
+  // CONTROL: an in-range value at the same boundary loads, so the refusal is about the size.
+  check(loadConfig({ PLATFORM_REFRESH_TTL: '86400' }).refreshTokenTtlSec === 86400,
+    'CONTROL: a large but safe integer loads');
+
+  // ── :55 — an enum takes its own values and nothing else ──
+  const storage = caught(() => loadConfig({ PLATFORM_STORAGE: 'mysql' }));
+  check(storage instanceof Error && /PLATFORM_STORAGE must be one of memory\|postgres/.test(storage.message),
+    'PLATFORM_STORAGE=mysql is refused at load, not at the first query',
+    String(storage?.message).split('\n').join(' '));
+  const level = caught(() => loadConfig({ PLATFORM_LOG_LEVEL: 'verbose' }));
+  check(level instanceof Error && /PLATFORM_LOG_LEVEL must be one of debug\|info\|warn\|error/.test(level.message),
+    'PLATFORM_LOG_LEVEL=verbose is refused', String(level?.message).split('\n').join(' '));
+  // Case matters: the values are literals, and `Memory` is not one of them.
+  check(caught(() => loadConfig({ PLATFORM_STORAGE: 'Memory' })) instanceof Error,
+    'the enum is compared literally — `Memory` is not `memory`');
+  check(loadConfig({ PLATFORM_STORAGE: 'memory' }).storage === 'memory',
+    'CONTROL: a listed value loads');
+
+  // ── :59 — postgres without a URL is a configuration that cannot work ──
+  const pgNoUrl = caught(() => loadConfig({ PLATFORM_STORAGE: 'postgres' }));
+  check(pgNoUrl instanceof Error
+    && pgNoUrl.problems?.includes('DATABASE_URL is required when PLATFORM_STORAGE=postgres'),
+  'PLATFORM_STORAGE=postgres with no DATABASE_URL is refused',
+  JSON.stringify(pgNoUrl?.problems ?? String(pgNoUrl)));
+  check(caught(() => loadConfig({ PLATFORM_STORAGE: 'postgres', DATABASE_URL: '' })) instanceof Error,
+    'an empty DATABASE_URL is a missing one');
+  const pgOk = loadConfig({ PLATFORM_STORAGE: 'postgres', DATABASE_URL: 'postgres://u@h/db' });
+  check(pgOk.storage === 'postgres' && pgOk.databaseUrl === 'postgres://u@h/db',
+    'CONTROL: postgres WITH a URL loads', JSON.stringify(pgOk.storage));
+  // CONTROL: the pairing is specific to postgres — memory does not need a URL.
+  check(loadConfig({ PLATFORM_STORAGE: 'memory' }).databaseUrl === null,
+    'CONTROL: memory storage needs no URL');
+
+  // ── :68 — problems are THROWN, not collected and returned ──
+  //
+  // Delete this and every case above returns a config object with the bad values in it: the
+  // whole file becomes a validator that reports to nobody. Each check above already fails in
+  // that world; this one names the mechanism.
+  const collected = caught(() => loadConfig({ PLATFORM_PORT: 'nope', PLATFORM_STORAGE: 'mysql' }));
+  check(collected instanceof Error && collected.problems?.length === 2,
+    'every problem is collected and reported at once, not one per boot attempt',
+    JSON.stringify(collected?.problems ?? String(collected)));
+  check(collected instanceof Error && /Invalid configuration:/.test(collected.message)
+    && collected.problems.every((p) => collected.message.includes(p)),
+  'and the message contains all of them', String(collected?.message).split('\n').join(' | '));
+
+  // A loaded config is FROZEN: a caller cannot patch a value the loader validated.
+  const frozen = loadConfig({});
+  const before = frozen.port;
+  try { frozen.port = 1; } catch { /* strict mode in a module: assignment throws */ }
+  check(frozen.port === before && Object.isFrozen(frozen),
+    'a loaded config is frozen, so a validated value cannot be replaced afterwards');
+}
+
+// =============================================================================================
+section('core/errors.js — the envelope');
+// =============================================================================================
+{
+  // :91 — a code that is not in the contract is a PROGRAMMING error and says so. Without the
+  // line the constructor still fails, but with `Cannot read properties of undefined (reading
+  // 'status')`, which sends the reader to the wrong file.
+  const unknown = caught(() => new ApiError('NOT_A_REAL_CODE', 'x'));
+  check(unknown instanceof Error && /ApiError: unknown code NOT_A_REAL_CODE/.test(unknown.message),
+    'an unknown error code names itself and the code', String(unknown?.message));
+
+  // CONTROL: every code the contract lists constructs, so the refusal above is about THIS code
+  // and not about the constructor being broken.
+  const unconstructable = Object.keys(CODES)
+    .filter((code) => caught(() => new ApiError(code, 'm')) instanceof Error);
+  check(unconstructable.length === 0, 'CONTROL: every code in contracts/errors.md constructs',
+    unconstructable.join(', '));
+
+  // :128 — an ApiError passes through `toApiError` unchanged. Wrapping it would turn every
+  // contracted 4xx in the platform into a 500 INTERNAL_ERROR.
+  const typed = new ApiError('NAME_TAKEN', 'taken');
+  check(toApiError(typed) === typed && toApiError(typed).status === 409,
+    'toApiError returns a contracted error unchanged, code and status intact',
+    `${toApiError(typed).code}/${toApiError(typed).status}`);
+  // CONTROL: something that is NOT one is wrapped, and the cause is kept off the envelope.
+  const wrapped = toApiError(new TypeError('x is not a function'));
+  check(wrapped.code === 'INTERNAL_ERROR' && wrapped.status === 500
+    && wrapped.cause instanceof TypeError
+    && !JSON.stringify(wrapped.toEnvelope('c')).includes('is not a function'),
+  'CONTROL: an unexpected throw becomes INTERNAL_ERROR and the cause never reaches the envelope',
+  JSON.stringify(wrapped.toEnvelope('c')));
+}
+
+// =============================================================================================
+section('core/migrate.js — the runner refuses what would diverge the schema');
+// =============================================================================================
+//
+// Six of twelve guards here survived deletion. `storetest.mjs` covers the Pool check and the
+// live apply; nothing covered the three rules the file header states as its reason to exist —
+// forward-only, checksum-verified, in order — and all three are pure functions that need no
+// database at all.
+{
+  const tmpDirs = [];
+  /** A migration directory on disk, because `loadMigrations` reads one. */
+  const migrationDir = async (files) => {
+    const dir = await mkdtemp(join(tmpdir(), 'overstrike-migrate-'));
+    tmpDirs.push(dir);
+    for (const [name, sql] of files) await writeFile(join(dir, name), sql);
+    return dir;
+  };
+  const applied = (files, over = {}) => files.map((f) => ({
+    version: f.version, name: f.name, checksum: f.checksum, ...over[f.version],
+  }));
+
+  // ── :43 — the filename IS the version, so a filename that does not state one is refused ──
+  for (const name of ['1_init.sql', '0001-init.sql', '0001_Init.sql', 'init_0001.sql', '001_init.sql']) {
+    const dir = await migrationDir([[name, 'select 1;']]);
+    const err = await caughtAsync(() => loadMigrations(dir));
+    check(err instanceof Error && /bad migration filename/.test(err.message),
+      `${name} is refused with a message that states the wanted shape`, String(err?.message));
+  }
+  // CONTROL: the shape the rule describes loads, and yields the version and name it encodes.
+  {
+    const dir = await migrationDir([['0007_add_index.sql', 'create index x on y (z);']]);
+    const files = await loadMigrations(dir);
+    check(files.length === 1 && files[0].version === 7 && files[0].name === 'add_index'
+      && /^[0-9a-f]{64}$/.test(files[0].checksum),
+    'CONTROL: a well-named migration loads with its version, name and checksum',
+    JSON.stringify(files[0] && { v: files[0].version, n: files[0].name }));
+  }
+
+  // ── :45 — two files claiming one version ──
+  //
+  // The merge of two branches that each added `0008_*.sql`. Without the guard both load, both
+  // apply, and the schema depends on which sorted first — the exact divergence the header
+  // describes, arriving silently.
+  {
+    const dir = await migrationDir([
+      ['0008_add_column.sql', 'alter table a add column b int;'],
+      ['0008_add_table.sql', 'create table c (d int);'],
+    ]);
+    const err = await caughtAsync(() => loadMigrations(dir));
+    check(err instanceof Error && /duplicate migration version 0008/.test(err.message),
+      'two migrations numbered 0008 are refused, naming the number', String(err?.message));
+  }
+  // CONTROL: distinct numbers in the same directory load, sorted by version and not by string.
+  {
+    const dir = await migrationDir([
+      ['0002_b.sql', 'select 2;'], ['0010_c.sql', 'select 10;'], ['0001_a.sql', 'select 1;'],
+    ]);
+    const files = await loadMigrations(dir);
+    check(files.map((f) => f.version).join(',') === '1,2,10',
+      'CONTROL: distinct versions load in numeric order (10 after 2, not before)',
+      files.map((f) => f.version).join(','));
+  }
+
+  // ── planMigrations: the three rules, on a real file set ──
+  const dir = await migrationDir([
+    ['0001_a.sql', 'select 1;'], ['0002_b.sql', 'select 2;'], ['0004_d.sql', 'select 4;'],
+  ]);
+  const files = await loadMigrations(dir);
+
+  // :93 — the database is AHEAD of the checkout. Rolling back a deploy past a migration is how
+  // a schema and the code that reads it stop matching, and the runner has to say which way.
+  const ahead = caught(() => planMigrations(files, [
+    ...applied(files), { version: 9, name: 'from_the_future', checksum: 'x' },
+  ]));
+  check(ahead instanceof Error && /migration 9 \(from_the_future\) which this checkout does not/.test(ahead.message)
+    && /roll forward, do not roll back/.test(ahead.message),
+  'a database holding a migration this checkout lacks refuses, and says roll forward',
+  String(ahead?.message));
+
+  // :98 — an APPLIED migration was edited afterwards.
+  const edited = caught(() => planMigrations(files, applied(files, { 2: { checksum: 'deadbeef' } })));
+  check(edited instanceof Error && /0002_b\.sql has changed since it was applied/.test(edited.message)
+    && /a correction is a new migration, never an edit/.test(edited.message),
+  'an edited migration is caught by checksum and names the file',
+  String(edited?.message));
+
+  // :106 — nothing pending is an empty plan, not a crash and not a re-apply.
+  let nothing = 'it threw';
+  try { nothing = planMigrations(files, applied(files)); } catch (err) { nothing = String(err.message); }
+  check(Array.isArray(nothing) && nothing.length === 0,
+    'a database that is fully up to date plans nothing',
+    JSON.stringify(nothing));
+
+  // :110 — a migration numbered BELOW the highest applied one.
+  const late = await migrationDir([
+    ['0001_a.sql', 'select 1;'], ['0002_b.sql', 'select 2;'],
+    ['0003_c.sql', 'select 3;'], ['0004_d.sql', 'select 4;'],
+  ]);
+  const withThree = await loadMigrations(late);
+  const outOfOrder = caught(() => planMigrations(withThree, applied(files)));
+  check(outOfOrder instanceof Error
+    && /0003_c\.sql is older than applied migration 4/.test(outOfOrder.message)
+    && /Renumber it above the highest applied version/.test(outOfOrder.message),
+  'a migration numbered below the highest applied one is refused, and says how to fix it',
+  String(outOfOrder?.message));
+
+  // CONTROL: the same file set one number higher IS the pending list, so the refusal above is
+  // the ordering rule and not a runner that plans nothing.
+  const next = await migrationDir([
+    ['0001_a.sql', 'select 1;'], ['0002_b.sql', 'select 2;'],
+    ['0004_d.sql', 'select 4;'], ['0005_e.sql', 'select 5;'],
+  ]);
+  const withFive = await loadMigrations(next);
+  const plan = planMigrations(withFive, applied(files));
+  check(Array.isArray(plan) && plan.length === 1 && plan[0].filename === '0005_e.sql',
+    'CONTROL: a migration above the highest applied one is planned',
+    JSON.stringify(plan instanceof Error ? String(plan) : plan.map((f) => f.filename)));
+
+  // ── :157 — a runner with no connection and no URL says so instead of dialling nothing ──
+  const noTarget = await caughtAsync(() => runMigrations({}));
+  check(noTarget instanceof Error && /need a client or a databaseUrl/.test(noTarget.message),
+    'runMigrations with neither a client nor a URL refuses before it opens anything',
+    String(noTarget?.message));
+
+  // ── :131 — something that is not a connection at all ──
+  //
+  // `storetest.mjs` covers the Pool case one line below this. Nothing covered the case where
+  // the argument cannot run a query at all: without the guard the runner reads `totalCount` off
+  // it and reports `Cannot read properties of undefined`, which names neither the parameter nor
+  // what it wanted.
+  for (const [client, what] of [[{}, 'an object with no query method'],
+    [{ query: 'select 1' }, 'an object whose `query` is not a function']]) {
+    const err = await caughtAsync(() => runMigrations({ client }));
+    check(err instanceof Error && /must be a connected pg Client \(it has no \.query\)/.test(err.message),
+      `${what} is refused by name`, String(err?.message));
+  }
+
+  // ── :214 — the deploy entry point without DATABASE_URL ──
+  //
+  // `out` is the sink the function takes as a parameter — console by default — not a stand-in
+  // for the thing under test. What is asserted is what `migrateCli` DID: it reported, it
+  // returned `ok: false`, and it never tried to connect.
+  const lines = [];
+  const out = { log: (m) => lines.push(`log:${m}`), error: (m) => lines.push(`error:${m}`) };
+  // The env var has to be genuinely absent, not passed as `undefined`: `migrateCli`'s default
+  // parameter reads `process.env.DATABASE_URL`, and a default fires on `undefined` — so
+  // `migrateCli({ databaseUrl: undefined })` MIGRATES THE REAL DATABASE under `pgtest`, which
+  // is what this test did on its first run. It passed on memory, where the variable happens to
+  // be unset. The deploy case is that the variable is not set at all, so that is what is built.
+  const saved = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  let cli;
+  try { cli = await migrateCli({}, out); }
+  finally { if (saved !== undefined) process.env.DATABASE_URL = saved; }
+  check(cli.ok === false && cli.applied.length === 0 && cli.alreadyApplied === 0,
+    'migrateCli with no DATABASE_URL returns ok:false rather than throwing at a connection',
+    JSON.stringify(cli));
+  check(lines.length === 1 && lines[0] === 'error:DATABASE_URL is not set',
+    'and it says exactly what is missing, on the error channel', JSON.stringify(lines));
+
+  // ── :229 — and the CLI turns that into a NON-ZERO EXIT ──
+  //
+  // A deploy step that prints an error and exits 0 is a deploy that continues onto an
+  // unmigrated database. Driven as the deploy drives it: a real process, its real exit code.
+  {
+    const env = { ...process.env };
+    delete env.DATABASE_URL;                       // pgtest sets one; the deploy case is that it does not
+    const r = spawnSync(process.execPath, [join(ROOT, 'platform/src/core/migrate.js')],
+      { encoding: 'utf8', env });
+    check(r.status === 2,
+      'node platform/src/core/migrate.js with no DATABASE_URL exits 2, not 0',
+      `exit ${r.status}: ${(r.stdout || '') + (r.stderr || '')}`);
+    check(/DATABASE_URL is not set/.test(`${r.stdout}${r.stderr}`),
+      'and the operator is told why', `${r.stdout}${r.stderr}`.slice(0, 200));
+  }
+
+  for (const d of tmpDirs) await rm(d, { recursive: true, force: true });
+}
+
+// =============================================================================================
+section('core/http.js — parseTarget refuses an authority-shaped target (core/http.js:91)');
+// =============================================================================================
+//
+// The header above this guard explains the two-argument `new URL(req.url, base)` trap, which
+// this file avoids by concatenating onto the origin. Measured, that concatenation alone does
+// NOT make the guard redundant, and the reason is one line further on: `Router.match` splits
+// the path and drops empty segments with `filter(Boolean)`. So `//v1/health` yields pathname
+// `//v1/health`, which splits to `['v1','health']` — and MATCHES `/v1/health`.
+//
+// A front proxy that routes, authorises or rate-limits on the literal request line sees a path
+// it does not recognise; this router serves the endpoint. Two components disagreeing about what
+// was requested is the whole of request smuggling, and the guard is what keeps them agreeing.
+//
+// `fetch` normalises the target before it leaves, so this can only be driven on a socket.
+await withServer(NO_FLOOR, async ({ raw, handlerCalls }) => {
+  const doubled = await raw(['GET //v1/health HTTP/1.1', 'Host: 127.0.0.1',
+    'X-Client-Build: 1.0.0', 'Connection: close']);
+  check(doubled.status === 404,
+    'GET //v1/health is 404 — an empty leading segment does not collapse into a match',
+    `${doubled.status} ${doubled.text.split('\r\n')[0]}`);
+  check(!/"ok":true/.test(doubled.text),
+    'and the health handler did not answer it', doubled.text.slice(0, 120));
+
+  const tripled = await raw(['GET ///v1/health HTTP/1.1', 'Host: 127.0.0.1',
+    'X-Client-Build: 1.0.0', 'Connection: close']);
+  check(tripled.status === 404, 'nor does a tripled one', `${tripled.status}`);
+
+  const authority = await raw(['GET //evil.com/v1/health HTTP/1.1', 'Host: 127.0.0.1',
+    'X-Client-Build: 1.0.0', 'Connection: close']);
+  check(authority.status === 404,
+    'GET //evil.com/v1/health is 404 — the authority form never reaches /v1/health',
+    `${authority.status} ${authority.text.split('\r\n')[0]}`);
+
+  const deeper = await raw(['GET //v1/probe/x HTTP/1.1', 'Host: 127.0.0.1',
+    'X-Client-Build: 1.0.0', 'Connection: close']);
+  check(deeper.status === 404 && !handlerCalls.some((c) => c.path?.startsWith('/v1/probe')),
+    'a doubled slash does not reach a parameterised route either — and no handler ran',
+    `${deeper.status} ${JSON.stringify(handlerCalls)}`);
+
+  // CONTROL: one slash, same path, same socket path through the code — served.
+  const single = await raw(['GET /v1/health HTTP/1.1', 'Host: 127.0.0.1', 'Connection: close']);
+  check(single.status === 200 && /"ok":true/.test(single.text),
+    'CONTROL: GET /v1/health on the same raw socket is 200',
+    `${single.status} ${single.text.split('\r\n\r\n')[1] || ''}`);
+});
+
+// =============================================================================================
+section('core/http.js — readJson: the empty body, the content type, and the shape');
+// =============================================================================================
+await withServer(NO_FLOOR, async ({ call, handlerCalls }) => {
+  // :116 — a POST with NO body at all is `{}`, not a parse failure. `POST /v1/auth/signout`
+  // and `POST /v1/onboarding/verify/resend` are exactly this request: their whole content is
+  // the URL and the token. Without the guard `JSON.parse('')` throws and both become 400.
+  const bodiless = await call('POST', '/v1/echo');
+  check(bodiless.status === 200 && bodiless.body?.keys === 0,
+    'a POST with no body at all is an empty object, not a parse error',
+    `${bodiless.status} ${JSON.stringify(bodiless.body)}`);
+  const emptyWithType = await call('POST', '/v1/echo',
+    { rawBody: '', headers: { 'content-type': 'application/json' } });
+  check(emptyWithType.status === 200 && emptyWithType.body?.keys === 0,
+    'and a zero-length body with a JSON content-type is too',
+    `${emptyWithType.status} ${JSON.stringify(emptyWithType.body)}`);
+
+  // :120 — §1 says JSON in, JSON out. A body that ANNOUNCES another type is refused even when
+  // its bytes happen to parse, because content-type confusion is how two parsers disagree.
+  const plain = await call('POST', '/v1/echo',
+    { rawBody: '{"a":1}', headers: { 'content-type': 'text/plain' } });
+  check(plain.status === 400 && plain.body?.error?.code === 'VALIDATION_FAILED'
+    && /application\/json/.test(plain.body?.error?.message ?? ''),
+  'a text/plain body is refused even though its bytes are valid JSON',
+  `${plain.status} ${plain.body?.error?.code}`);
+  check(!handlerCalls.some((c) => c.path === '/v1/echo' && c.bytes === 7),
+    'and it never reached the handler', JSON.stringify(handlerCalls));
+  const form = await call('POST', '/v1/echo',
+    { rawBody: '{"a":1}', headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+  check(form.status === 400 && form.body?.error?.code === 'VALIDATION_FAILED',
+    'a form content-type is refused too', `${form.status} ${form.body?.error?.code}`);
+
+  // CONTROLS: the declared type is honoured with its parameters, and an absent one is allowed —
+  // so the refusals above are about the type stated, not about POST bodies being broken.
+  const withCharset = await call('POST', '/v1/echo',
+    { rawBody: '{"a":1}', headers: { 'content-type': 'application/json; charset=utf-8' } });
+  check(withCharset.status === 200 && withCharset.body?.keys === 1,
+    'CONTROL: application/json with a charset parameter is accepted',
+    `${withCharset.status} ${JSON.stringify(withCharset.body)}`);
+  const upperType = await call('POST', '/v1/echo',
+    { rawBody: '{"a":1}', headers: { 'content-type': 'APPLICATION/JSON' } });
+  check(upperType.status === 200,
+    'CONTROL: the type is compared case-insensitively, as HTTP requires', `${upperType.status}`);
+
+  // :131 — `null`, `12`, `"s"`, `true` and arrays are all valid JSON and none is a request
+  // body. Letting one through means the first property access in a handler is a TypeError,
+  // which `toApiError` then reports as INTERNAL_ERROR — our fault, for their input.
+  for (const [rawBody, why] of [
+    ['null', 'null'], ['12345', 'a number'], ['"str"', 'a string'], ['true', 'a boolean'],
+    ['[{"a":1}]', 'an array of objects — the shape a client sends by mistake'],
+    ['[]', 'an empty array'],
+  ]) {
+    const res = await call('POST', '/v1/echo', { rawBody, headers: { 'content-type': 'application/json' } });
+    check(res.status === 400 && res.body?.error?.code === 'VALIDATION_FAILED',
+      `a body of ${why} is 400 VALIDATION_FAILED, never 500`,
+      `${res.status} ${res.body?.error?.code}`);
+  }
+  const malformed = await call('POST', '/v1/echo',
+    { rawBody: '{"a":', headers: { 'content-type': 'application/json' } });
+  check(malformed.status === 400 && /not valid JSON/.test(malformed.body?.error?.message ?? ''),
+    'CONTROL: truncated JSON is refused as unparseable, a different message from the shape check',
+    `${malformed.status} ${malformed.body?.error?.message}`);
+  const object = await call('POST', '/v1/echo',
+    { rawBody: '{"a":1,"b":2}', headers: { 'content-type': 'application/json' } });
+  check(object.status === 200 && object.body?.keys === 2,
+    'CONTROL: a JSON object is accepted and parsed', `${object.status} ${JSON.stringify(object.body)}`);
+});
+
+// =============================================================================================
+section('core/http.js — a GET body is never read (core/http.js:106)');
+// =============================================================================================
+//
+// Deleting the early return does not merely make a GET body readable: it makes the server WAIT
+// for it. `for await (const chunk of req)` on a request whose Content-Length has not arrived
+// suspends until the client sends the rest, so a GET that declares 100 bytes and sends 5 pins
+// the handler open — an unauthenticated slowloris on every read endpoint in the platform,
+// costing the sender one socket.
+//
+// The assertion is therefore not "the body was ignored" but "the request was ANSWERED".
+await withServer(NO_FLOOR, async ({ raw }) => {
+  const starved = await raw(
+    ['GET /v1/probe/x HTTP/1.1', 'Host: 127.0.0.1', 'X-Client-Build: 1.0.0',
+      'Content-Type: application/json', 'Content-Length: 100', 'Connection: close'],
+    { body: '{"a":1' });                            // 6 of the promised 100 bytes, then silence
+  check(starved.timedOut === false && starved.status === 200,
+    'a GET declaring a body it never sends is answered anyway, not held open',
+    `timedOut=${starved.timedOut} status=${starved.status}`);
+  check(/"accountId":"x"/.test(starved.text),
+    'and the handler ran with the routed parameter, not with the unsent body',
+    starved.text.split('\r\n\r\n')[1] || starved.text.slice(0, 120));
+
+  const deleteStarved = await raw(
+    ['DELETE /v1/probe/x HTTP/1.1', 'Host: 127.0.0.1', 'X-Client-Build: 1.0.0',
+      'Content-Length: 100', 'Connection: close'],
+    { body: '{' });
+  check(deleteStarved.timedOut === false && deleteStarved.status === 404,
+    'the same holds for DELETE — 404 because no DELETE route matches, but ANSWERED',
+    `timedOut=${deleteStarved.timedOut} status=${deleteStarved.status}`);
+
+  // CONTROL: a POST that starves its body IS held, because a POST body is content the handler
+  // needs and there is nothing else to answer with. Without this control the checks above pass
+  // for a server that never reads a body at all.
+  const post = await raw(
+    ['POST /v1/echo HTTP/1.1', 'Host: 127.0.0.1', 'X-Client-Build: 1.0.0',
+      'Content-Type: application/json', 'Content-Length: 100', 'Connection: close'],
+    { body: '{"a":1', timeoutMs: 1000 });
+  check(post.timedOut === true && post.status === null,
+    'CONTROL: a POST whose body never arrives is NOT answered — the GET exemption is specific',
+    `timedOut=${post.timedOut} status=${post.status}`);
+});
+
+// =============================================================================================
+section('core/http.js — a route\'s declared rate-limit class is the one applied (:178)');
+// =============================================================================================
+//
+// §9 assigns a class by METHOD, and a handful of routes are named in the table specifically.
+// `rateLimitClass` is how a route says which one it is. Delete the line that reads it and every
+// override silently becomes the method default: a `report` route capped at 5/hour starts
+// serving 120/min, and a route that opts out with `rateLimitClass: null` starts being capped.
+//
+// The limiter is the REAL `createRateLimiter()` and the counting is done by the server, over a
+// socket. Building the middleware here and calling it in a loop is the exact defect that let
+// the limiter go unconsulted for a dozen review rounds.
+{
+  const limiter = createRateLimiter();
+  await withServer(NO_FLOOR, async ({ call }) => {
+    // A route the §9 table names specifically: report, 5 per HOUR.
+    const reportCap = CLASSES.report.perMin;
+    let firstRefusal = 0;
+    for (let i = 1; i <= reportCap + 3; i++) {
+      const res = await call('GET', '/v1/reports');
+      if (res.status !== 200) { firstRefusal = i; break; }
+    }
+    check(firstRefusal === reportCap + 1,
+      `a route declaring rateLimitClass:'report' is refused at ${reportCap + 1}, not at 121`,
+      `first refusal at ${firstRefusal}`);
+
+    // The opt-out. `rateLimitClass: null` is a route saying the table exempts it; without the
+    // line that reads the option it is charged `read` like any other GET.
+    let served = 0;
+    for (let i = 1; i <= CLASSES.read.perMin + 5; i++) {
+      const res = await call('GET', '/v1/exempt');
+      if (res.status !== 200) break;
+      served++;
+    }
+    check(served === CLASSES.read.perMin + 5,
+      `a route declaring rateLimitClass:null serves all ${CLASSES.read.perMin + 5} calls`,
+      `served ${served}`);
+
+    // CONTROL: an ordinary GET on the same server, same limiter, no declaration — capped at the
+    // method default. Without this the two checks above pass for a limiter nobody consulted.
+    let readRefusal = 0;
+    for (let i = 1; i <= CLASSES.read.perMin + 2; i++) {
+      const res = await call('GET', '/v1/probe/rl');
+      if (res.status !== 200) { readRefusal = i; break; }
+    }
+    check(readRefusal === CLASSES.read.perMin + 1,
+      `CONTROL: an undeclared GET is charged the read class and refused at ${CLASSES.read.perMin + 1}`,
+      `first refusal at ${readRefusal}`);
+  }, {
+    deps: { rateLimiter: limiter },
+    routes: [
+      ['GET', '/v1/reports', async () => ({ items: [] }), { rateLimitClass: 'report' }],
+      ['GET', '/v1/exempt', async () => ({ ok: true }), { rateLimitClass: null }],
+    ],
+  });
+}
+
+// =============================================================================================
+section('core/http.js — X-Forwarded-For is ignored at zero trusted hops');
+// =============================================================================================
+//
+// EQUIVALENT MUTANT, measured: `clientIp`'s `if (hops <= 0) return socketIp` (core/http.js:211)
+// cannot change an answer. With `hops === 0` the code below it computes
+// `idx = chain.length - 0 = chain.length`, and `idx < chain.length` is then false for every
+// possible header, so the fall-through returns `socketIp` — the same value, on every input.
+// Measured by running both versions of the file over 1, 2 and 8-entry chains, an empty header,
+// a whitespace-only header, an absent header and a non-string header, at hops 0: identical IPs
+// in all 14 comparisons. The guard stays because reading a client-controlled header we have
+// decided not to trust is work with no purpose.
+//
+// The SECURITY property underneath it is not equivalent, and is asserted here: at the default
+// of zero hops a forged X-Forwarded-For must not move a caller into someone else's rate-limit
+// bucket, nor buy them a fresh one.
+{
+  const limiter = createRateLimiter();
+  await withServer(NO_FLOOR, async ({ call }) => {
+    let refusal = 0;
+    for (let i = 1; i <= CLASSES.read.perMin + 2; i++) {
+      // A different forged address on EVERY request. If the header were trusted, each one would
+      // be a fresh subject and the cap would never be reached.
+      const res = await call('GET', '/v1/probe/xff', { headers: { 'x-forwarded-for': `198.51.100.${i}` } });
+      if (res.status !== 200) { refusal = i; break; }
+    }
+    check(refusal === CLASSES.read.perMin + 1,
+      'a forged X-Forwarded-For does not buy a fresh rate-limit bucket at zero trusted hops',
+      `first refusal at ${refusal}`);
+
+    // And the caller cannot escape their own exhausted bucket by claiming to be someone else.
+    const escape = await call('GET', '/v1/probe/xff',
+      { headers: { 'x-forwarded-for': '203.0.113.9, 198.51.100.1' } });
+    check(escape.status === 429 && escape.body?.error?.code === 'RATE_LIMITED',
+      'nor escape an exhausted one with a longer chain', `${escape.status} ${escape.body?.error?.code}`);
+  }, { deps: { rateLimiter: limiter } });
+}
+
+// =============================================================================================
+section('core/http.js — a handler\'s response headers are actually written');
+// =============================================================================================
+//
+// `raw(status, body, headers)` and `withHeaders(body, headers)` are the only two ways a handler
+// can put a header on a response. Delete the one line in `finish` that reads them and both
+// become silent no-ops: the status and the body still look right, so every existing assertion
+// passes, while `Retry-After` stops arriving on a 429 and `ETag` stops arriving on a settings
+// read — and a conditional-request client then re-fetches forever without ever being told it
+// could stop.
+await withServer(NO_FLOOR, async ({ call }) => {
+  const rawRes = await call('GET', '/v1/hdr-raw');
+  check(rawRes.status === 503 && rawRes.headers?.get('retry-after') === '5',
+    'raw(status, body, headers) puts its headers on the wire',
+    `${rawRes.status} retry-after=${rawRes.headers?.get('retry-after')}`);
+  check(rawRes.body?.reason === 'draining',
+    'CONTROL: and the body it shaped arrives too', JSON.stringify(rawRes.body));
+
+  const tagged = await call('GET', '/v1/hdr-etag');
+  check(tagged.status === 200 && tagged.headers?.get('etag') === '"v7"',
+    'withHeaders(body, headers) puts its headers on the wire',
+    `${tagged.status} etag=${tagged.headers?.get('etag')}`);
+  check(tagged.body?.version === 7 && tagged.body?.__headers === undefined,
+    'CONTROL: the body is the handler\'s, with the header carrier stripped out of it',
+    JSON.stringify(tagged.body));
+
+  // CONTROL: a plain handler sets no stray headers, so the two above are the handlers speaking
+  // and not something the response writer adds to everything.
+  const plain = await call('GET', '/v1/probe/h');
+  check(plain.headers?.get('etag') === null && plain.headers?.get('retry-after') === null,
+    'CONTROL: an ordinary response carries neither header',
+    `${plain.headers?.get('etag')}/${plain.headers?.get('retry-after')}`);
+}, {
+  routes: [
+    ['GET', '/v1/hdr-raw', async () => raw(503, { reason: 'draining' }, { 'Retry-After': '5' }), {}],
+    ['GET', '/v1/hdr-etag', async () => withHeaders({ version: 7 }, { ETag: '"v7"' }), {}],
+  ],
+});
+
+// =============================================================================================
+section('core/http.js — the last-resort handler cannot take the process down');
+// =============================================================================================
+//
+// THE DEFECT THIS FOUND. `createApp`'s `handle(req, res).catch(...)` is the wrapper the file
+// header is about: "One request killed the platform. Nothing here may sit outside the guard."
+// Two statements do sit outside `finish`'s inner try — the request log line and the
+// `onRequestEnd` hook — and both run AFTER the response has been written and ended. A throw
+// there rejects `handle`, the catch runs, and its `res.end(...)` lands on an ended response.
+//
+// That does not throw on the catch's stack, so the `try` around it never sees it: Node emits
+// `error` on the ServerResponse asynchronously, and an unhandled 'error' event exits the
+// process. `ERR_STREAM_WRITE_AFTER_END`, uncaught, from one request — inside the handler whose
+// entire job is to make sure one request cannot do that.
+//
+// This section is written in-process deliberately. If the fault returns, this file does not
+// report a failure: it DIES, and `platformtest` reports the suite as failing, which is the
+// honest signal for a defect that kills processes.
+{
+  // A logger that throws exactly where the fault needs it: on the request log line at the end
+  // of `finish`, after the response has gone out. It is the LOGGER, not the code under test.
+  const explosive = () => {
+    const noop = () => {};
+    return {
+      debug: noop,
+      warn: noop,
+      error: noop,                      // the catch-all logs here; it must not throw as well
+      info: (event) => { if (event === 'request') throw new Error('logger exploded'); },
+    };
+  };
+
+  await withServer(NO_FLOOR, async ({ call }) => {
+    const first = await call('GET', '/v1/probe/x');
+    check(first.status === 200 && first.body?.accountId === 'x',
+      'a request whose tail logging throws is still answered normally',
+      `${first.status} ${first.text?.slice(0, 80)}`);
+
+    // The process is still here to answer this one. Reaching this line at all is the assertion.
+    const second = await call('GET', '/v1/probe/y');
+    check(second.status === 200 && second.body?.accountId === 'y',
+      'and the server survives it — the next request is served',
+      `${second.status} ${second.text?.slice(0, 80)}`);
+
+    // The error path too: a handler that throws AND a logger that throws on the way out.
+    const thrown = await call('GET', '/v1/boom');
+    check(thrown.status === 500 && thrown.body?.error?.code === 'INTERNAL_ERROR',
+      'a failing handler still produces the INTERNAL_ERROR envelope under the same logger',
+      `${thrown.status} ${thrown.body?.error?.code}`);
+    const third = await call('GET', '/v1/probe/z');
+    check(third.status === 200, 'and the server survives that too', `${third.status}`);
+  }, {
+    logger: explosive(),
+    routes: [['GET', '/v1/boom', async () => { throw new Error('handler exploded'); }, {}]],
+  });
+}
+
+// =============================================================================================
+section('core/health.js — the readiness timeout does not hold the process open');
+// =============================================================================================
+//
+// §7.1's probes are bounded at 2 s so a hung dependency cannot hang the check. The timer that
+// bounds them is unref'd, and deleting that line makes every readiness probe hold the event
+// loop open for its full 2 s even after the answer is known — so a CLI or a one-shot ops task
+// that asks for readiness pauses for two seconds per call before it can exit.
+//
+// A held event loop is only observable from outside the process, so this is measured as the
+// deploy would feel it: a real child, and the wall clock on its exit.
+{
+  const script = `
+    import { createHealth } from '${join(ROOT, 'platform/src/core/health.js')}';
+    const health = createHealth({ deps: { healthProbes: {
+      // A dependency that never answers — the case the timeout exists for.
+      db: () => new Promise(() => {}),
+    } } });
+    health.ready().then((r) => process.stdout.write('READY ' + JSON.stringify(r)));
+    process.stdout.write('CALLED\\n');
+  `;
+  const started = Date.now();
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  const elapsed = Date.now() - started;
+  check(/CALLED/.test(r.stdout ?? ''), 'control: the child really did call ready()',
+    `${r.stdout}${r.stderr}`.slice(0, 200));
+  check(elapsed < 1500,
+    'a process with nothing else to do exits without waiting out the 2 s probe timeout',
+    `it took ${elapsed} ms`);
+  // CONTROL: the timeout is still a timeout. With something else holding the loop open — a
+  // server, in a real process — it fires and reports the dependency down rather than hanging,
+  // so the exit above is not achieved by having no timer at all.
+  const waited = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { createHealth } from '${join(ROOT, 'platform/src/core/health.js')}';
+    const health = createHealth({ deps: { healthProbes: { db: () => new Promise(() => {}) } } });
+    const keepAlive = setTimeout(() => {}, 10_000);   // stands in for the server that is running
+    const r = await health.ready();
+    clearTimeout(keepAlive);
+    process.stdout.write(JSON.stringify(r));
+  `], { encoding: 'utf8' });
+  check(waited.stdout === '{"ok":false,"dependencies":{"db":"down"}}',
+    'CONTROL: awaited, a hung dependency is reported down — the bound is real',
+    `${waited.stdout}${waited.stderr}`.slice(0, 200));
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\ncore http and rate limiting run clean');

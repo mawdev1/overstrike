@@ -34,7 +34,8 @@ import { ulid } from '../src/core/ids.js';
 import { ApiError } from '../src/core/errors.js';
 import { createAuthModule } from '../src/modules/auth/index.js';
 import { fold, resolveScript } from '../src/modules/auth/names.js';
-import { RECOVERY_FLOOR_MS } from '../src/modules/auth/service.js';
+import { playerActor } from '../src/modules/auth/events.js';
+import { RECOVERY_FLOOR_MS, RECOVERY_TTL_MS, createAuthService } from '../src/modules/auth/service.js';
 import { sign, handleOf, hashPassword, verifyPassword } from '../src/modules/auth/crypto.js';
 import { classifyIp, classifyUserAgent } from '../src/modules/auth/sessions.js';
 import { createAuditLog } from '../src/modules/events/audit.js';
@@ -1718,6 +1719,268 @@ section('19. EXPIRED PRE-AUTH CONSENT IS SWEPT, NOT MERELY UNREAD (§3a.3)');
   ok('the janitor timer sweeps without anyone calling it',
     timed.store._debugCounts().preAuthConsent === 0);
   janitor.stop();
+}
+
+// ------------------------------- 19b. the refusals nothing was asserting on
+
+/**
+ * Guards that were unguarded.
+ *
+ * Each check below was written because deleting the line it covers left the whole suite green
+ * — measured with `node scripts/mutatetest.mjs --file=platform/src/modules/auth/service.js`.
+ * The pattern in every case was the same: some OTHER refusal downstream produced the same
+ * `code`, so a test that asserted only the code could not tell the guard from its absence.
+ * These therefore assert the thing that actually differs — the message, the `details.fields`
+ * path, the side effect, or the fact that no credential was minted.
+ */
+section('19b. REFUSALS THAT NOTHING WAS ASSERTING ON');
+{
+  const h = mk();
+
+  // ── the service will not exist without an outbox and an audit log ────────────────────
+  //
+  // §10 requires every privileged action to be audited and every state change to be emitted.
+  // Constructed without either, the service builds fine and then throws a TypeError on the
+  // FIRST mutation — after the request was accepted, from inside a transaction, with the
+  // caller told `INTERNAL_ERROR`. The wiring is refused at construction instead.
+  const parts = {
+    store: h.store, config: h.config, clock: h.clock, logger: silentLogger,
+    sessions: h.sessions, receipts: h.receipts, ephemeral: h.ephemeral, limiter: h.limiter,
+    outbox: h.outbox, audit: h.audit,
+  };
+  const build = (over) => {
+    try { createAuthService({ ...parts, ...over }); return null; }
+    catch (err) { return err.message; }
+  };
+  ok('a service built with no outbox is refused, and says which dependency is missing',
+    (build({ outbox: null }) ?? '').includes('an outbox and an audit log are required'),
+    String(build({ outbox: null })));
+  ok('a service built with no audit log is refused the same way',
+    (build({ audit: undefined }) ?? '').includes('an outbox and an audit log are required'),
+    String(build({ audit: undefined })));
+  ok('CONTROL: with both present the service constructs — the refusal is the dependency',
+    build({}) === null, String(build({})));
+
+  // ── a consent decision is a BOOLEAN ──────────────────────────────────────────────────
+  //
+  // `!!telemetryPersonal` was the alternative, and it is how `"false"` becomes a recorded YES.
+  // The refusal has to name the field, because the client's only repair is to send it again.
+  for (const value of ['true', 'false', 1, 0, null, undefined, {}]) {
+    const sid = ulid(h.clock.now());
+    let thrown = null;
+    const code = await codeOf(async () => {
+      try { return await h.service.putConsent({ telemetryPersonal: value, policyVersion: 1, clientSessionId: sid }); }
+      catch (err) { thrown = err; throw err; }
+    });
+    const path = thrown?.details?.fields?.[0]?.path;
+    ok(`telemetryPersonal: ${JSON.stringify(value)} is refused, naming the field`,
+      code === 'VALIDATION_FAILED' && path === 'telemetryPersonal', `code=${code} path=${path}`);
+    ok(`telemetryPersonal: ${JSON.stringify(value)} records no decision`,
+      (await h.store.preAuthConsent.get(sid)) === null,
+      JSON.stringify(await h.store.preAuthConsent.get(sid)));
+  }
+  // CONTROL: the two values that ARE decisions are recorded, so the refusals are the type.
+  for (const value of [true, false]) {
+    const sid = ulid(h.clock.now());
+    const put = await h.service.putConsent({ telemetryPersonal: value, policyVersion: 1, clientSessionId: sid });
+    ok(`CONTROL: telemetryPersonal: ${value} is recorded and receipted`,
+      put.telemetryPersonal === value && typeof put.receipt === 'string'
+      && (await h.store.preAuthConsent.get(sid))?.telemetryPersonal === value,
+      JSON.stringify(put));
+  }
+
+  // ── an authenticated read for an account that is not there ───────────────────────────
+  //
+  // `getConsent` reads the account and then reads a field off it. Without the guard the read
+  // is `null.consentTelemetry` — a TypeError, which leaves as `INTERNAL_ERROR` and tells a
+  // support investigation nothing. NOT_FOUND is the answer, and it is the answer BEFORE any
+  // consent state is invented for an account that does not exist.
+  const ghost = { id: 'account:GHOSTACCOUNT0000000000000', accountId: 'GHOSTACCOUNT0000000000000', roles: ['player'] };
+  ok('getConsent for an account that does not exist is NOT_FOUND',
+    await codeOf(() => h.service.getConsent({ actor: ghost })) === 'NOT_FOUND');
+  // CONTROL: the same call for a real account answers, so NOT_FOUND is about the account.
+  const consentAccount = await newAccount(h, { email: 'ghostctl@example.com', displayName: `Ghost${uniqueTag()}` });
+  const consentActor = await actorFor(h, consentAccount);
+  const realConsent = await h.service.getConsent({ actor: consentActor });
+  ok('CONTROL: getConsent for a real account returns that account\'s decision',
+    realConsent.subject === 'account' && realConsent.telemetryPersonal === true,
+    JSON.stringify(realConsent));
+
+  // ── undecided is undecided: no fragment of a decision leaks into the projection ──────
+  //
+  // §4 types consent as an exact union — a decision with its policy version and its time, or
+  // null. `null` means the question has not been answered, and answering "no decision, policy
+  // version 3" is a third member of a union that has two. Migration 0015 refuses a partial row
+  // on Postgres (asserted in §20); the memory adapter has no such constraint, so the projection
+  // is the guard here, and this is the state it is a guard against.
+  await h.store.accounts.update(consentActor.accountId, {
+    consentTelemetry: null, consentPolicyVer: 3, consentDecidedAt: new Date(h.clock.now()).toISOString(),
+  });
+  const undecided = await h.service.getConsent({ actor: consentActor });
+  ok('an account with no recorded decision reports NO policy version and NO decision time',
+    undecided.telemetryPersonal === null && undecided.policyVersion === null
+    && undecided.decidedAt === null && undecided.receipt === null && undecided.subject === 'account',
+    JSON.stringify(undecided));
+  // CONTROL: a real decision reports all three, so the nulls above are the undecided state and
+  // not a projection that has stopped reading the account at all.
+  await h.service.putConsent({ actor: consentActor, telemetryPersonal: true, policyVersion: 1 });
+  const decided = await h.service.getConsent({ actor: consentActor });
+  ok('CONTROL: a recorded decision reports its version, its time and a receipt',
+    decided.telemetryPersonal === true && decided.policyVersion === 1
+    && typeof decided.decidedAt === 'string' && typeof decided.receipt === 'string',
+    JSON.stringify(decided));
+
+  // ── a locked account cannot sign in, with the credential correct ─────────────────────
+  //
+  // The credential check above it passes, so nothing but this line stands between a banned
+  // player and a live session. Both statuses, because `banned` alone would let `restricted`
+  // be deleted from the condition without a red suite.
+  for (const status of ['banned', 'restricted']) {
+    const locked = await newAccount(h, { email: `${status}@example.com`, displayName: `Lock${uniqueTag()}` });
+    const lockedActor = await actorFor(h, locked);
+    await h.store.accounts.update(lockedActor.accountId, { status });
+    const code = await codeOf(() => h.service.signin({
+      email: `${status}@example.com`, password: PASSWORD, ip: '203.0.113.9',
+    }));
+    ok(`a ${status} account cannot sign in even with the right password`,
+      code === 'AUTH_ACCOUNT_LOCKED', `code=${code}`);
+    // The refusal must not be a bad-credential answer either: those two have different UI
+    // obligations, and telling a banned player "wrong password" sends them to recovery.
+    ok(`a ${status} account is not told its password is wrong`,
+      code !== 'AUTH_INVALID_CREDENTIALS', `code=${code}`);
+  }
+  // CONTROL: the same account, same password, active again — so the refusal is the status.
+  const reinstated = await newAccount(h, { email: 'active@example.com', displayName: `Live${uniqueTag()}` });
+  const reinstatedActor = await actorFor(h, reinstated);
+  await h.store.accounts.update(reinstatedActor.accountId, { status: 'restricted' });
+  ok('control: while restricted, signin is refused',
+    await codeOf(() => h.service.signin({ email: 'active@example.com', password: PASSWORD })) === 'AUTH_ACCOUNT_LOCKED');
+  await h.store.accounts.update(reinstatedActor.accountId, { status: 'active' });
+  const back = await h.service.signin({ email: 'active@example.com', password: PASSWORD });
+  ok('CONTROL: reinstated, the identical credential signs in',
+    typeof back.accessToken === 'string', JSON.stringify(Object.keys(back)));
+
+  // ── an EXPIRED reset link is not an invalid one ──────────────────────────────────────
+  //
+  // Two codes, two UI obligations: `_EXPIRED` says "that link timed out, request another",
+  // `_INVALID` says "that link was never real". Asserting that recovery refuses is satisfied
+  // by either, which is why the expiry branch could be deleted unnoticed.
+  const expiring = await newAccount(h, { email: 'expiry@example.com', displayName: `Exp${uniqueTag()}` });
+  ok('control: the account for the expiring link exists', typeof expiring.accessToken === 'string');
+  const started = await h.service.recoveryStart({ email: 'expiry@example.com' });
+  ok('control: recovery start issues a token for a real address', typeof started.recoveryToken === 'string');
+  h.clock.advance(RECOVERY_TTL_MS + 1);
+  const expiredCode = await codeOf(() => h.service.recoveryComplete({
+    token: started.recoveryToken, newPassword: 'another-correct-horse-battery',
+  }));
+  ok('an expired reset link is AUTH_RECOVERY_TOKEN_EXPIRED, not merely invalid',
+    expiredCode === 'AUTH_RECOVERY_TOKEN_EXPIRED', `code=${expiredCode}`);
+  const forgedCode = await codeOf(() => h.service.recoveryComplete({
+    token: 'not-a-token-anyone-issued', newPassword: 'another-correct-horse-battery',
+  }));
+  ok('CONTROL: a token nobody issued is _INVALID — the two answers are distinguishable',
+    forgedCode === 'AUTH_RECOVERY_TOKEN_INVALID', `code=${forgedCode}`);
+  // CONTROL: a live link still completes, so the expiry refusal is the clock.
+  const live = await h.service.recoveryStart({ email: 'expiry@example.com' });
+  ok('CONTROL: an unexpired reset link completes',
+    await codeOf(() => h.service.recoveryComplete({
+      token: live.recoveryToken, newPassword: 'a-third-correct-horse-battery',
+    })) === null);
+
+  // ── the throwaway recovery token minted for an address nobody owns ───────────────────
+  //
+  // §8 makes `recovery/start` do the same work for a real address and an absent one, which
+  // means it MINTS a token for the absent one, filed under `absent:<hash>`. That token is
+  // never delivered — but it exists, it is a valid single-use claim, and the line under test
+  // is the only thing standing between it and `null.accountId`. This is the state the service
+  // itself writes, reproduced through the same collaborator it writes it with.
+  const absentRaw = 'a-token-nobody-was-ever-sent';
+  h.ephemeral.issue('recovery', `absent:${handleOf('nobody@example.com')}`, absentRaw, RECOVERY_TTL_MS);
+  const absentCode = await codeOf(() => h.service.recoveryComplete({
+    token: absentRaw, newPassword: 'a-fourth-correct-horse-battery',
+  }));
+  ok('a recovery claim naming no real account is refused as an invalid link, not a crash',
+    absentCode === 'AUTH_RECOVERY_TOKEN_INVALID', `code=${absentCode}`);
+
+  // ── an authenticated caller whose account is not there ───────────────────────────────
+  //
+  // These are the "the row went away underneath us" backstops. Each one is followed, without
+  // it, by a member read on `null` — a TypeError, which reaches the client as INTERNAL_ERROR
+  // and reaches an investigation as nothing at all. The actor is the service's own shape; the
+  // account it names simply does not exist.
+  const GHOST_ID = 'GHOSTACCOUNT00000000000001';
+  const ghostActor = { ...playerActor(GHOST_ID), accountId: GHOST_ID, roles: ['player'] };
+  ok('control: the ghost account really is absent',
+    (await h.store.accounts.byId(GHOST_ID)) === null);
+  ok('resending verification for an account that is not there is NOT_FOUND',
+    await codeOf(() => h.service.verificationResend({ actor: ghostActor })) === 'NOT_FOUND',
+    String(await codeOf(() => h.service.verificationResend({ actor: ghostActor }))));
+  ok('renaming an account that is not there is NOT_FOUND',
+    await codeOf(() => h.service.changeDisplayName({ actor: ghostActor, displayName: `Ghost${uniqueTag()}` })) === 'NOT_FOUND',
+    String(await codeOf(() => h.service.changeDisplayName({ actor: ghostActor, displayName: `Ghost${uniqueTag()}` }))));
+  // The same absence on a WRITE path. Every self-service mutation reads the account first, and
+  // that read is what refuses — before a transaction is opened, before an event is staged.
+  // Without it the store refuses instead, from inside the transaction, with the same NOT_FOUND
+  // code and the same message: the only thing that differs is whose refusal it is, and the
+  // adapter's carries its own `details.accountId`. Measured on a copied tree: `details` is `{}`
+  // with the line present and `{accountId: …}` with it deleted, on both mutating callers.
+  let ghostWrite = null;
+  try { await h.service.termsAccept({ actor: ghostActor, version: h.config.termsVersion }); }
+  catch (err) { ghostWrite = err; }
+  ok('a mutation for an absent account is refused by auth, before any transaction is opened',
+    ghostWrite?.code === 'NOT_FOUND' && !Object.hasOwn(ghostWrite?.details ?? {}, 'accountId'),
+    `${ghostWrite?.code} ${JSON.stringify(ghostWrite?.details ?? null)}`);
+  let ghostConsent = null;
+  try { await h.service.putConsent({ actor: ghostActor, telemetryPersonal: true, policyVersion: 1 }); }
+  catch (err) { ghostConsent = err; }
+  ok('and the same on the consent write path',
+    ghostConsent?.code === 'NOT_FOUND' && !Object.hasOwn(ghostConsent?.details ?? {}, 'accountId'),
+    `${ghostConsent?.code} ${JSON.stringify(ghostConsent?.details ?? null)}`);
+
+  // CONTROL: the identical calls for an account that DOES exist succeed, so NOT_FOUND is the
+  // missing row and not the actor shape being unacceptable.
+  // The actor captured before the clock was advanced for the expiry check above: an actor is
+  // the decoded claim, and re-authenticating that access token now would fail on its 15-minute
+  // TTL (§1) — which is a different rule, tested there.
+  const presentActor = consentActor;
+  ok('CONTROL: the same resend for a real account is accepted',
+    (await h.service.verificationResend({ actor: presentActor })).accepted === true);
+  ok('CONTROL: the same rename for a real account is applied',
+    (await h.service.changeDisplayName({ actor: presentActor, displayName: `Renamed${uniqueTag()}` }))
+      .displayName.startsWith('Renamed'));
+
+  // ── the name history is not readable by nobody ───────────────────────────────────────
+  //
+  // Signed out there is no subject at all, and the answer to that is "sign in" — a different
+  // code, and a different thing for the client to do, from "you may not see this". Without the
+  // line the capability check answers instead, and an anonymous caller is told AUTH_FORBIDDEN.
+  const anonCode = await codeOf(() => h.service.nameHistory({ actor: null }));
+  ok('an unauthenticated name-history read is AUTH_REQUIRED, not AUTH_FORBIDDEN',
+    anonCode === 'AUTH_REQUIRED', `code=${anonCode}`);
+  // CONTROL: a signed-in player reading SOMEONE ELSE'S history is the forbidden case, so the
+  // two codes are genuinely distinguished rather than one of them being unreachable.
+  const otherCode = await codeOf(() => h.service.nameHistory({ actor: presentActor, accountId: GHOST_ID }));
+  ok('CONTROL: a player reading another account\'s history is AUTH_FORBIDDEN',
+    otherCode === 'AUTH_FORBIDDEN', `code=${otherCode}`);
+  ok('CONTROL: a player reading their OWN history is allowed',
+    Array.isArray(await h.service.nameHistory({ actor: presentActor })));
+
+  // ── signup refuses a taken name in its own words ─────────────────────────────────────
+  //
+  // The store's unique index refuses it too, with `That display name is taken.` and a
+  // `details.displayNameFolded` — the FOLDED form of somebody else's name, which errors.md §5
+  // keeps out of responses. Same code either way, which is why asserting the code alone left
+  // this line unguarded. The message and the absence of details are what differ.
+  const holder = `Holder${uniqueTag()}`;
+  await newAccount(h, { email: `holder-${uniqueTag()}@example.com`, displayName: holder });
+  let taken = null;
+  try { await newAccount(h, { email: `taker-${uniqueTag()}@example.com`, displayName: holder }); }
+  catch (err) { taken = err; }
+  ok('a taken display name is NAME_TAKEN', taken?.code === 'NAME_TAKEN', String(taken?.code));
+  ok('and it is refused in signup\'s words, leaking no folded form of the held name',
+    taken?.message === 'That name is taken.'
+    && !JSON.stringify(taken?.details ?? null).includes(fold(holder)),
+    `${taken?.message} ${JSON.stringify(taken?.details ?? null)}`);
 }
 
 // ---------------------------------------------------- 20. the same four, on real PostgreSQL

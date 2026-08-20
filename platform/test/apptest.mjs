@@ -16,8 +16,18 @@
  * substituted. If a seam is wrong, it fails here — which is the only place it can fail before
  * production.
  */
+import { cp, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import net from 'node:net';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
 import { loadConfig } from '../src/core/config.js';
 import { buildApp } from '../src/app.js';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let passed = 0;
 let failed = 0;
@@ -75,7 +85,14 @@ async function withApp(fn, envOverrides = {}) {
   };
 
   try { return await fn({ app, call, config, port }); }
-  finally { app.stop(); await new Promise((r) => app.server.close(r)); }
+  finally {
+    app.stop();
+    // `close()` waits for every open connection, and undici pools its sockets — so a section
+    // that stopped mid-upload (the body-cap cases) would otherwise hang here forever with the
+    // suite reporting nothing but an unsettled await.
+    app.server.closeAllConnections?.();
+    await new Promise((r) => app.server.close(r));
+  }
 }
 
 /**
@@ -1065,6 +1082,273 @@ await withApp(async ({ call, app }) => {
     'control: production still mounts every module it does require',
     JSON.stringify(prod.mounted));
   prod.stop();
+}
+
+// ── 9. a module that is genuinely ABSENT stops a production boot ──────────────────────
+//
+// §"Modules are optional in development and mandatory in production" is the one rule in this
+// file that cannot be checked by inspecting a successful boot, and §8 above checks it by
+// inspecting `prod.mounted` — which is the set produced when every module imported cleanly.
+// The rule is about the other case, and `load()`'s rethrow (`if (!optional) throw err`) was
+// therefore untested: delete it and a production process boots happily with `/v1/telemetry/*`
+// 404ing, which the file header calls worse than refusing to boot.
+//
+// Nothing is substituted or mocked to produce that. The module is genuinely not on disk: the
+// tree is copied, one module's directory is deleted, and the REAL `buildApp` is booted out of
+// the copy in a real process. Nothing else in the tree changes.
+{
+  section('a production boot with a module missing from disk');
+
+  const trees = [];
+  /** A copy of `platform/src` with one module directory removed, and a runner beside it. */
+  const treeWithout = async (moduleDir) => {
+    const dir = await mkdtemp(join(tmpdir(), 'overstrike-boot-'));
+    trees.push(dir);
+    await cp(join(ROOT, 'platform/src'), join(dir, 'src'), { recursive: true });
+    if (moduleDir) await rm(join(dir, 'src', moduleDir), { recursive: true, force: true });
+    // The copy resolves `pg` and anything else from the repository's own installed modules.
+    await symlink(join(ROOT, 'node_modules'), join(dir, 'node_modules'));
+    await writeFile(join(dir, 'boot.mjs'), `
+      import { loadConfig } from './src/core/config.js';
+      import { buildApp } from './src/app.js';
+      const say = (r) => process.stdout.write('__BOOT__' + JSON.stringify(r) + '\\n');
+      try {
+        const app = await buildApp(loadConfig(process.env), { logger: (() => {
+          const noop = () => {}; const l = { debug: noop, info: noop, warn: noop, error: noop };
+          l.child = () => l; return l;
+        })() });
+        say({ booted: true, mounted: app.mounted });
+        app.stop();
+      } catch (err) {
+        say({ booted: false, message: String(err && err.message || err) });
+      }
+      process.exit(0);
+    `);
+    return dir;
+  };
+
+  /** Boot that copy in its own process and read back what it decided. */
+  const boot = (dir, env) => {
+    const r = spawnSync(process.execPath, [join(dir, 'boot.mjs')], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PLATFORM_PORT: '0',
+        PLATFORM_TOKEN_SECRET: 'a-sufficiently-long-production-secret-value',
+        PLATFORM_SERVICE_TOKEN: 'a-sufficiently-long-production-service-token',
+        ...env,
+      },
+    });
+    const line = `${r.stdout}`.split('\n').find((l) => l.startsWith('__BOOT__'));
+    return line ? JSON.parse(line.slice('__BOOT__'.length))
+      : { booted: false, message: `no result line; stderr: ${r.stderr}`.slice(0, 300) };
+  };
+
+  // CONTROL FIRST: the untouched copy boots in production and mounts everything. Without this,
+  // the refusal below would be satisfied by a copy that is broken for some unrelated reason.
+  const intact = await treeWithout(null);
+  const whole = boot(intact, { NODE_ENV: 'production' });
+  check(whole.booted === true
+    && ['events', 'auth', 'profile', 'telemetry'].every((m) => whole.mounted?.includes(m)),
+  'CONTROL: an untouched copy of the tree boots in production with every module',
+  JSON.stringify(whole));
+
+  const gutted = await treeWithout('modules/telemetry');
+  const prod = boot(gutted, { NODE_ENV: 'production' });
+  check(prod.booted === false, 'a production boot with the telemetry module absent FAILS',
+    JSON.stringify(prod));
+  // Which failure matters. The import error names the file that is missing; the mounted-set
+  // assertion further down app.js names the module. Asserting the former is what distinguishes
+  // "the rethrow ran" from "the rethrow was deleted and the backstop caught it instead".
+  check(prod.booted === false && /Cannot find module|ERR_MODULE_NOT_FOUND|Failed to load/i.test(prod.message ?? '')
+    && /telemetry/.test(prod.message ?? ''),
+  'and it fails with the ABSENT MODULE, named — not with a generic assembly error',
+  JSON.stringify(prod.message));
+
+  // CONTROL: the identical tree in development boots and simply does without it. That is the
+  // documented asymmetry, and it is what makes the refusal above a production rule rather than
+  // the module being unimportable everywhere.
+  const dev = boot(gutted, { NODE_ENV: 'development' });
+  check(dev.booted === true && !dev.mounted?.includes('telemetry')
+    && dev.mounted?.includes('auth'),
+  'CONTROL: the same missing module in development boots WITHOUT it, and says so in `mounted`',
+  JSON.stringify(dev));
+
+  // And the rule covers every module the contract requires, not only the last one wired.
+  const noAuth = boot(await treeWithout('modules/auth'), { NODE_ENV: 'production' });
+  check(noAuth.booted === false && /auth/.test(noAuth.message ?? ''),
+    'the same holds for auth — the rule is per REQUIRED module, not per wiring order',
+    JSON.stringify(noAuth.message));
+
+  for (const dir of trees) await rm(dir, { recursive: true, force: true });
+}
+
+// ── 10. the outbox relay polls by itself outside a test process ───────────────────────
+//
+// §4 above proves the relay drains when a caller turns the handle. Nothing proved it turns its
+// OWN handle: `if (config.env !== 'test') deps.events.relay.start()` was untested in both
+// directions, and deleting it left the suite green because the suite runs as `development` and
+// the poll loop was already running everywhere it looked.
+//
+// Both halves matter. A relay that never auto-starts makes `events_outbox` write-only in
+// production — the defect this file was written for — and a relay that auto-starts under
+// `NODE_ENV=test` publishes rows out from under a test that is about to claim them, which is a
+// flaky suite manufactured by the wiring.
+await withApp(async ({ call, app }) => {
+  section('the relay auto-starts outside NODE_ENV=test');
+  await onboard(call, { sid: '01M0EFV571B7VBQCNXHAT5WTE1' });
+  const before = await app.deps.store.outbox.claimUnpublished(200);
+  check(before.length > 0, 'control: signup left unpublished rows in the outbox',
+    `${before.length} rows`);
+
+  // Four poll intervals (the relay ticks every 200 ms) with nobody calling runOnce.
+  await sleep(900);
+  const after = await app.deps.store.outbox.claimUnpublished(200);
+  check(after.length >= before.length,
+    'under NODE_ENV=test NOTHING drains the outbox on its own',
+    `${before.length} rows before, ${after.length} after`);
+}, { NODE_ENV: 'test' });
+
+await withApp(async ({ call, app }) => {
+  section('CONTROL: and it DOES start outside a test process');
+  await onboard(call, { sid: '01M0EFV571B7VBQCNXHAT5WTE2' });
+  // No runOnce, no drain: the only thing that can publish these is the loop app.js started.
+  let remaining = -1;
+  for (let i = 0; i < 40 && remaining !== 0; i++) {
+    await sleep(100);
+    remaining = (await app.deps.store.outbox.claimUnpublished(200)).length;
+  }
+  check(remaining === 0,
+    'CONTROL: under NODE_ENV=development the relay drains the outbox with nobody calling it',
+    `${remaining} rows left after 4 s`);
+}, { NODE_ENV: 'development' });
+
+// ── 11. the stub layer's body reader is bounded ───────────────────────────────────────
+//
+// `readBodyForStub` exists because the stub layer intercepts BEFORE `core/http.js` reads a
+// body, so it is the only body reader on that path — and therefore the only place the 256 KB
+// bound can be applied. Deleting the bound buffers whatever a caller sends, on an endpoint that
+// requires no credential.
+await withApp(async ({ call, port }) => {
+  section('the stub layer bounds the body it reads');
+
+  const signin = (padBytes) => call('POST', '/v1/auth/signin',
+    { email: 'a@b.invalid', password: 'p', pad: 'x'.repeat(padBytes) },
+    { 'x-stub-scenario': 'default', 'x-client-session-id': 'apptest-cap' });
+
+  // CONTROL FIRST: a body inside the bound is read, parsed, and answered from its fields.
+  const small = await signin(1024);
+  check(small.status === 200 && typeof small.body?.accessToken === 'string',
+    'CONTROL: a 1 KB signin body is read and answered', `${small.status} ${small.text?.slice(0, 80)}`);
+
+  // Over the bound the read stops, so the JSON is truncated and no fields survive — which the
+  // stub reports as the validation failure it is. What must never happen is a 200: that is the
+  // deleted-bound behaviour, and it means an unauthenticated caller chose how much memory to
+  // spend. A transport failure is also acceptable — the response is written without draining
+  // the rest of the upload, which is the bound doing its job.
+  let big;
+  try { big = await signin(400 * 1024); }
+  catch (err) { big = { status: null, transportFailed: String(err?.cause?.code || err?.message) }; }
+  check(big.status !== 200,
+    'a 400 KB stub body is NOT served a 200',
+    `${big.status} ${big.transportFailed ?? big.text?.slice(0, 80)}`);
+  check(big.status === 400 ? big.body?.error?.code === 'VALIDATION_FAILED' : big.status === null,
+    'it is refused as malformed input, or the socket is cut before it finishes arriving',
+    `${big.status} ${JSON.stringify(big.body?.error?.code ?? big.transportFailed)}`);
+
+  // ── the GET exemption in the same reader ──
+  //
+  // `if (req.method === 'GET' || req.method === 'DELETE') return {}` is not an optimisation.
+  // Without it the reader awaits the request stream on a GET, so a GET that declares a body and
+  // never sends it pins the stub layer open — an unauthenticated slowloris that costs the
+  // sender one socket. `fetch` will not send a body on a GET, so this is spoken on a socket.
+  const answered = await new Promise((resolve) => {
+    let text = '';
+    let settled = false;
+    const socket = net.connect(port, '127.0.0.1', () => socket.write(
+      ['GET /v1/rooms HTTP/1.1', 'Host: 127.0.0.1', 'X-Client-Build: 1.0.0',
+        'X-Stub-Scenario: default', 'X-Client-Session-Id: apptest-slow',
+        'Content-Type: application/json', 'Content-Length: 100', 'Connection: close',
+      ].join('\r\n') + '\r\n\r\n{"a":1'));           // 6 of the promised 100 bytes, then silence
+    const done = (r) => { if (settled) return; settled = true; try { socket.destroy(); } catch { /* gone */ } resolve(r); };
+    const timer = setTimeout(() => done({ timedOut: true, text }), 2500);
+    socket.on('data', (c) => {
+      text += c.toString('utf8');
+      if (text.includes('\r\n\r\n')) { clearTimeout(timer); done({ timedOut: false, text }); }
+    });
+    socket.on('error', () => { clearTimeout(timer); done({ timedOut: false, text }); });
+  });
+  check(answered.timedOut === false && /^HTTP\/1\.1 \d{3}/.test(answered.text),
+    'a GET that declares a body it never sends is ANSWERED by the stub layer, not held open',
+    `timedOut=${answered.timedOut} ${answered.text.split('\r\n')[0]}`);
+  // 401 specifically: `GET /v1/rooms` is an `A` row and this request carries no token, so the
+  // answer proves the request reached the stub's auth gate rather than dying in the reader.
+  check(/^HTTP\/1\.1 401/.test(answered.text),
+    'and the answer is the stub layer\'s own 401, so the request got all the way through',
+    answered.text.split('\r\n')[0]);
+});
+
+// ── 12. a consent receipt does not survive a consent POLICY BUMP ──────────────────────
+//
+// EQUIVALENT MUTANT, measured. `adaptAuthConsent`'s `claims.policyVersion !==
+// config.consentPolicyVersion` cannot fire: `receipts.readConsent` (modules/auth/receipts.js)
+// already returns null on exactly that comparison, against the same `config` object, before
+// this adapter sees any claims — so `claims` is null and the line above returns
+// `receipt_signature_invalid` first. Measured by driving the case below against the file with
+// the line present and with it deleted: identical status, identical `accepted`/`rejected`, and
+// the same `receipt_signature_invalid` reason in all six comparisons (stale receipt signed-out,
+// stale receipt authenticated, and a matching receipt as the control, on both versions).
+// `receipt_policy_stale` is unreachable and kept only as a backstop for a future adapter that
+// verifies without `readConsent`.
+//
+// The RULE underneath it is not equivalent and had no test at all: a decision recorded under
+// policy 1 must not authorise personal telemetry after the policy is bumped to 2. Two real
+// apps, one socket each, no substitution — they share the dev signing secret, which is what a
+// deployed pair on either side of a policy bump would also do.
+{
+  section('a consent receipt from the previous policy version is refused');
+  const sid = '01M0EFV571B7VBQCNXHAT5WTE3';
+  const ev = () => [{
+    name: 'flow.step', version: 1, occurredAt: new Date().toISOString(),
+    correlationId: CORR, payload: { step: 'signup', outcome: 'completed', errorCode: null },
+  }];
+
+  const oldReceipt = await withApp(async ({ call, config }) => {
+    check(config.consentPolicyVersion === 1, 'control: the first app runs policy version 1',
+      String(config.consentPolicyVersion));
+    const put = await call('PUT', '/v1/onboarding/consent',
+      { telemetryPersonal: true, policyVersion: 1, clientSessionId: sid });
+    check(put.status === 200 && typeof put.body?.receipt === 'string',
+      'control: it issues a consent receipt under policy version 1',
+      `${put.status} ${JSON.stringify(put.body?.error)}`);
+    // CONTROL: that receipt is accepted by the app that issued it. Without this the refusal
+    // below is satisfied by a receipt that was never valid anywhere.
+    const accepted = await call('POST', '/v1/telemetry/client',
+      { clientSessionId: sid, consentReceipt: put.body?.receipt, schemaVersion: 1, events: ev() });
+    check(accepted.body?.accepted === 1,
+      'CONTROL: the issuing app accepts it', JSON.stringify(accepted.body));
+    return put.body?.receipt;
+  });
+
+  await withApp(async ({ call, config }) => {
+    check(config.consentPolicyVersion === 2, 'control: the second app runs policy version 2',
+      String(config.consentPolicyVersion));
+    const stale = await call('POST', '/v1/telemetry/client',
+      { clientSessionId: sid, consentReceipt: oldReceipt, schemaVersion: 1, events: ev() });
+    check(stale.status === 202 && stale.body?.accepted === 0 && stale.body?.rejected === 1,
+      'a receipt minted under policy 1 does NOT authorise personal telemetry under policy 2',
+      JSON.stringify(stale.body));
+
+    // CONTROL: a receipt minted under the CURRENT policy, on the same app, is accepted — so the
+    // refusal above is the version and not a gate that refuses every receipt.
+    const fresh = await call('PUT', '/v1/onboarding/consent',
+      { telemetryPersonal: true, policyVersion: 2, clientSessionId: sid });
+    const allowed = await call('POST', '/v1/telemetry/client',
+      { clientSessionId: sid, consentReceipt: fresh.body?.receipt, schemaVersion: 1, events: ev() });
+    check(allowed.body?.accepted === 1 && allowed.body?.rejected === 0,
+      'CONTROL: a receipt minted under policy 2 is accepted by the policy-2 app',
+      JSON.stringify(allowed.body));
+  }, { PLATFORM_CONSENT_POLICY_VERSION: '2' });
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

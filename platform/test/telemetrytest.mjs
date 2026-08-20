@@ -208,9 +208,12 @@ console.log('\n§3.3/§3.4 consent gating — personal rejected, internal still 
     body: { ...mixed(), consentReceipt: someoneElse },
     actor: { accountId: 'A1' }, correlationId: ulid(),
   });
+  // The counts are asserted with the reason on purpose: `[].every(...)` is true, so a binding
+  // check that had stopped refusing altogether would have satisfied the reason clause alone.
   assert('a valid receipt belonging to another subject is rejected',
-    replayed.rejections.every((r) => r.reason === 'receipt_subject_mismatch'),
-    JSON.stringify(replayed.rejections));
+    replayed.accepted === 1 && replayed.rejected === 2
+    && replayed.rejections.every((r) => r.reason === 'receipt_subject_mismatch'),
+    JSON.stringify(replayed));
 
   const declined = consent.issue({ subject: 'account', subjectId: 'A1', telemetryPersonal: false, policyVersion: 1 });
   const declinedRes = await service.ingest({
@@ -801,6 +804,465 @@ console.log('\n§3.5.1 pre-consent is classified by (name, version), like everyt
       actor: null, correlationId: ulid(),
     }),
     'preconsent_batch_mixing');
+}
+
+// =============================================================================================
+console.log('\n§3.4 the receipt is bound to ONE subject and ONE subject class');
+// =============================================================================================
+//
+// WHERE THIS RUNS, AND WHERE IT DOES NOT. `app.js` replaces this module's verifier with
+// `adaptAuthConsent(deps.auth.receipts, config)` whenever the auth module is present — which in
+// production is always, since `REQUIRED_MODULES` includes auth and a process missing it refuses
+// to boot. `createConsentReceipts` is what a process composed WITHOUT auth deploys, and what the
+// service is built on when it is composed alone. The binding rules therefore have two
+// implementations and both need asserting; neither of these places is redundant:
+//
+//   - HERE, against this module's verifier, driven through the REAL `createTelemetryService`.
+//   - In apptest.mjs §3b and §3d, over a real socket against the assembled app, which is the
+//     ONLY place the deployed adapter's copy of these rules can be observed at all.
+//
+// That distinction is not pedantry. A decline test lived in this file for months while the
+// deployed gate — a different function, in app.js — accepted personal telemetry from players
+// who had said no, because nothing exercised the code the request actually reached.
+//
+// Every check below states the EXACT refusal reason. `rejections.every(...)` on its own is
+// vacuously true of an empty array, so a gate that stopped refusing entirely would satisfy it:
+// the accepted/rejected counts are asserted alongside for that reason.
+{
+  const clock = fakeClock();
+  const { service, consent } = harness({ clock });
+  // flow.step is personal-class: the class the receipt gates. Nothing else in the batch, so
+  // one refusal is one dropped event and the counts are unambiguous.
+  const personal = (extra = {}) => batch(
+    [ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock)], extra,
+  );
+  const grant = (subject, subjectId) =>
+    consent.issue({ subject, subjectId, telemetryPersonal: true, policyVersion: 1 });
+
+  const S1 = ulid();
+  const S2 = ulid();
+
+  // ── the authenticated branch: subject class `account`, id = the bearer's account ────────
+  const otherAccount = await service.ingest({
+    body: personal({ consentReceipt: grant('account', 'A2') }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert("another account's receipt does not authorise this account's personal event",
+    otherAccount.accepted === 0 && otherAccount.rejected === 1
+    && otherAccount.rejections[0].reason === 'receipt_subject_mismatch',
+    JSON.stringify(otherAccount.rejections));
+
+  // The CLASS check on its own. Same id on both sides — only `subject` differs — so the id
+  // comparison beside it cannot be what refuses this.
+  const sessionShaped = await service.ingest({
+    body: personal({ consentReceipt: grant('client-session', 'A1') }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('a CLIENT-SESSION receipt naming the account id does not authorise an authenticated batch',
+    sessionShaped.accepted === 0 && sessionShaped.rejected === 1
+    && sessionShaped.rejections[0].reason === 'receipt_subject_mismatch',
+    JSON.stringify(sessionShaped.rejections));
+
+  // ── the signed-out branch: subject class `client-session`, id = the batch's session ─────
+  const crossSession = await service.ingest({
+    body: personal({ clientSessionId: S1, consentReceipt: grant('client-session', S2) }),
+    actor: null, correlationId: ulid(),
+  });
+  assert("session B's receipt does not authorise session A — a receipt is not a bearer token",
+    crossSession.accepted === 0 && crossSession.rejected === 1
+    && crossSession.rejections[0].reason === 'receipt_subject_mismatch',
+    JSON.stringify(crossSession.rejections));
+
+  const accountShaped = await service.ingest({
+    body: personal({ clientSessionId: S1, consentReceipt: grant('account', S1) }),
+    actor: null, correlationId: ulid(),
+  });
+  assert('an ACCOUNT receipt naming that same id does not authorise a signed-out batch',
+    accountShaped.accepted === 0 && accountShaped.rejected === 1
+    && accountShaped.rejections[0].reason === 'receipt_subject_mismatch',
+    JSON.stringify(accountShaped.rejections));
+
+  // ── neither: there is nothing to bind to, so the receipt proves nothing about this sender ──
+  const unbound = await service.ingest({
+    body: personal({ consentReceipt: grant('client-session', S1) }),
+    actor: null, correlationId: ulid(),
+  });
+  assert('a personal batch with no account and no client session is refused as UNBOUND',
+    unbound.accepted === 0 && unbound.rejected === 1
+    && unbound.rejections[0].reason === 'receipt_unbound',
+    JSON.stringify(unbound.rejections));
+  assert('and the 202 names that specific fault so the client can act on it',
+    unbound.consentReceiptError?.code === 'CONSENT_RECEIPT_INVALID'
+    && unbound.consentReceiptError?.reason === 'receipt_unbound',
+    JSON.stringify(unbound.consentReceiptError));
+
+  // CONTROLS: each of those same receipts IS accepted by the subject it was issued to, so the
+  // five refusals above are the binding rule and not a gate that refuses everything.
+  const asAccount = await service.ingest({
+    body: personal({ consentReceipt: grant('account', 'A1') }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: the account receipt authorises the account it names',
+    asAccount.accepted === 1 && asAccount.rejected === 0 && asAccount.consentReceiptError === null,
+    JSON.stringify(asAccount.rejections));
+
+  const asSession = await service.ingest({
+    body: personal({ clientSessionId: S1, consentReceipt: grant('client-session', S1) }),
+    actor: null, correlationId: ulid(),
+  });
+  assert('CONTROL: the client-session receipt authorises the session it names',
+    asSession.accepted === 1 && asSession.rejected === 0,
+    JSON.stringify(asSession.rejections));
+}
+
+// =============================================================================================
+console.log('\n§3.4 a receipt that is not a receipt, and the key that signs one');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service } = harness({ clock });
+  const personal = (extra = {}) => batch(
+    [ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock)], extra,
+  );
+
+  // A receipt is `body.signature`. Without the separator there is no signature to check, and
+  // reporting it as a bad signature would send a client off to look for a key problem it does
+  // not have — `lastIndexOf('.')` on a string with no dot returns -1, which silently splits the
+  // token one character from its end and compares that to a MAC.
+  const noSeparator = await service.ingest({
+    body: personal({ consentReceipt: 'this-token-has-no-separator-at-all' }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('a receipt with no body/signature separator is MALFORMED, not badly signed',
+    noSeparator.accepted === 0 && noSeparator.rejected === 1
+    && noSeparator.rejections[0].reason === 'receipt_malformed'
+    && noSeparator.consentReceiptError?.reason === 'receipt_malformed',
+    JSON.stringify({ r: noSeparator.rejections, e: noSeparator.consentReceiptError }));
+
+  // CONTROL: the same rubbish WITH a separator is a different, more specific refusal — so the
+  // reason above distinguishes the two cases rather than being the module's only word for bad.
+  const separated = await service.ingest({
+    body: personal({ consentReceipt: 'this-token.has-a-separator' }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: a separated but unsigned token fails on the SIGNATURE instead',
+    separated.accepted === 0 && separated.rejections[0].reason === 'receipt_signature_invalid',
+    JSON.stringify(separated.rejections));
+
+  // The signing key. A receipt is worth exactly what its key is worth, so a key short enough to
+  // be guessed is refused at construction rather than at the first forged batch.
+  const build = (secret) => {
+    try { createConsentReceipts({ secret }); return null; }
+    catch (err) { return err.message; }
+  };
+  assert('a 15-character secret is refused, by name',
+    (build('x'.repeat(15)) ?? '').includes('at least 16 characters'), String(build('x'.repeat(15))));
+  assert('a missing secret is refused the same way',
+    (build(undefined) ?? '').includes('at least 16 characters'), String(build(undefined)));
+  assert('CONTROL: 16 characters is enough — the refusal is the length, not the call',
+    build('x'.repeat(16)) === null, String(build('x'.repeat(16))));
+}
+
+// =============================================================================================
+console.log('\n§3.5.1 the pre-consent correlation memory is bounded, and a replay cannot flush it');
+// =============================================================================================
+{
+  const ids = [ulid(), ulid(), ulid()];
+  const seen = createCorrelationSeen({ capacity: 3 });
+  for (const id of ids) seen.add(id);
+  assert('CONTROL: everything inside the capacity is remembered',
+    seen.size() === 3 && ids.every((i) => seen.has(i)), String(seen.size()));
+
+  const extra = ulid();
+  seen.add(extra);
+  assert('at capacity the OLDEST id is evicted and the newest kept — the set does not grow forever',
+    seen.size() === 3 && !seen.has(ids[0]) && seen.has(ids[1]) && seen.has(ids[2]) && seen.has(extra),
+    JSON.stringify({ size: seen.size(), oldest: seen.has(ids[0]), newest: seen.has(extra) }));
+
+  // A repeat must not be QUEUED twice. If it is, the second copy of the id in the eviction
+  // queue evicts the id itself — and "never reused" (§3.5.1) stops holding for precisely the
+  // correlation id that was replayed, which is the one an attacker replays.
+  const replayed = createCorrelationSeen({ capacity: 3 });
+  const [a, b, c] = [ulid(), ulid(), ulid()];
+  replayed.add(a);
+  replayed.add(a);
+  replayed.add(b);
+  replayed.add(c);
+  assert('re-adding a known id does not queue it again, so it cannot evict itself',
+    replayed.size() === 3 && replayed.has(a) && replayed.has(b) && replayed.has(c),
+    JSON.stringify({ size: replayed.size(), a: replayed.has(a), b: replayed.has(b), c: replayed.has(c) }));
+}
+
+// =============================================================================================
+console.log('\n§3.3 a client that supplies a server-owned field is discarded AND reported');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service, logger } = harness({ clock });
+  await service.ingest({
+    body: batch([ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock)],
+      { accountId: 'A-FORGED', geo: 'NZ' }),
+    actor: null, correlationId: 'CORR-FORGED-1',
+  });
+  const warned = logger.lines.filter((l) => l.event === 'telemetry.client_supplied_server_field');
+  assert('one warning, naming every forbidden field the body carried and the request it came on',
+    warned.length === 1 && warned[0].level === 'warn'
+    && warned[0].fields.join(',') === 'accountId,geo'
+    && warned[0].correlationId === 'CORR-FORGED-1',
+    JSON.stringify(warned));
+
+  // CONTROL: a batch claiming nothing produces no such line, so the assertion above is about
+  // the forgery and not about the handler logging on every request.
+  const clean = harness({ clock });
+  await clean.service.ingest({
+    body: batch([ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock)]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('CONTROL: a batch that claims nothing is not reported',
+    clean.logger.lines.every((l) => l.event !== 'telemetry.client_supplied_server_field'),
+    JSON.stringify(clean.logger.lines.map((l) => l.event)));
+}
+
+// =============================================================================================
+console.log('\n§3.3 an event that is not an object, and a payload that is not a payload');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service, sink } = harness({ clock });
+
+  const res = await service.ingest({
+    body: batch([
+      null,
+      ['client.fps', 60],
+      'client.fps',
+      ev('client.asset_build', { ms: 1200 }, clock),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('each non-object event is rejected as such, by index, and the real event still lands',
+    res.accepted === 1 && res.rejected === 3
+    && res.rejections.map((r) => `${r.index}:${r.name}:${r.reason}`).join(' ')
+       === '0:null:event_not_object 1:null:event_not_object 2:null:event_not_object',
+    JSON.stringify(res.rejections));
+  assert('CONTROL: the one well-formed event in that batch reached the warehouse',
+    sink.records.length === 1 && sink.records[0].name === 'client.asset_build',
+    JSON.stringify(sink.records.map((r) => r.name)));
+
+  // A well-formed EVENT whose payload is not an object. Rejected on the payload's shape —
+  // reporting it as a missing field would name a field the sender never had a chance to send.
+  const shapes = await service.ingest({
+    body: batch([
+      ev('client.fps', ['p50', 60], clock),
+      ev('client.heap', 'usedMb=12', clock),
+      ev('client.asset_build', { ms: 1200 }, clock),
+    ]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('an array and a string payload are both rejected on SHAPE, not as missing fields',
+    shapes.accepted === 1 && shapes.rejected === 2
+    && shapes.rejections.every((r) => r.reason === 'payload_not_object'),
+    JSON.stringify(shapes.rejections));
+}
+
+// =============================================================================================
+console.log('\nthe 202 reports a receipt fault only when a receipt actually cost an event');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service, consent } = harness({ clock });
+  const personalEvent = () => ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock);
+  const internalEvent = () => ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock);
+
+  // An internal-only batch legitimately carries no receipt (§3.3). Nothing was dropped for the
+  // absent receipt, so telling this sender its receipt is invalid would route a pre-consent
+  // visitor to a consent screen it is already looking at.
+  const internalOnly = await service.ingest({
+    body: batch([internalEvent()]), actor: null, correlationId: ulid(),
+  });
+  assert('an internal-only batch with no receipt reports NO receipt fault',
+    internalOnly.accepted === 1 && internalOnly.consentReceiptError === null,
+    JSON.stringify(internalOnly.consentReceiptError));
+
+  // CONTROL: the same absent receipt, on a batch where it DID cost an event, is reported.
+  const personalNoReceipt = await service.ingest({
+    body: batch([personalEvent()]), actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: an absent receipt that dropped a personal event IS reported, typed',
+    personalNoReceipt.accepted === 0
+    && personalNoReceipt.consentReceiptError?.code === 'CONSENT_RECEIPT_INVALID'
+    && personalNoReceipt.consentReceiptError?.reason === 'receipt_absent',
+    JSON.stringify(personalNoReceipt.consentReceiptError));
+
+  // A valid receipt recording a DECLINE is the system working, not a broken receipt. Reporting
+  // it as one asks the player the question they already answered.
+  const declined = await service.ingest({
+    body: batch([personalEvent()], {
+      consentReceipt: consent.issue({
+        subject: 'account', subjectId: 'A1', telemetryPersonal: false, policyVersion: 1,
+      }),
+    }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('a DECLINE drops the personal event and reports NO receipt fault',
+    declined.accepted === 0 && declined.rejected === 1
+    && declined.rejections[0].reason === 'consent_declined'
+    && declined.consentReceiptError === null,
+    JSON.stringify({ r: declined.rejections, e: declined.consentReceiptError }));
+
+  // CONTROL: a working receipt reports null too, so `null` is not simply what this field always
+  // says — the three cases above and this one are told apart by it.
+  const accepted = await service.ingest({
+    body: batch([personalEvent()], {
+      consentReceipt: consent.issue({
+        subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 1,
+      }),
+    }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: an accepted personal event reports no fault either',
+    accepted.accepted === 1 && accepted.consentReceiptError === null,
+    JSON.stringify(accepted.consentReceiptError));
+}
+
+// =============================================================================================
+console.log('\n§3.3 batch shape — each refusal names its own problem');
+// =============================================================================================
+//
+// Every check here asserts the SPECIFIC refusal, never merely "it was refused". These rules sit
+// in one function and throw the same `VALIDATION_FAILED` code, so a test that only counted
+// refusals would be satisfied by whichever guard happened to survive a refactor — and would say
+// nothing at all about the other five.
+{
+  const clock = fakeClock();
+  const { service } = harness({ clock });
+  const good = () => [ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock)];
+
+  for (const body of [[], 'schemaVersion=1', 42]) {
+    await refuses(`a body that is ${JSON.stringify(body)} is refused as a body, not as a version`,
+      () => service.ingest({ body, actor: null, correlationId: ulid() }),
+      'Body must be an object');
+  }
+
+  await refuses('a batch declaring a schema version this server does not speak is refused by version',
+    () => service.ingest({
+      body: { schemaVersion: 2, events: good() }, actor: null, correlationId: ulid(),
+    }),
+    'Unsupported telemetry schema version');
+  await refuses('and the refusal states the version the server DOES speak',
+    () => service.ingest({
+      body: { schemaVersion: 2, events: good() }, actor: null, correlationId: ulid(),
+    }),
+    '"expected":1');
+  await refuses('a batch with no schemaVersion at all is refused the same way',
+    () => service.ingest({ body: { events: good() }, actor: null, correlationId: ulid() }),
+    'Unsupported telemetry schema version');
+  await refuses('the version is a number — the string "1" is not version 1',
+    () => service.ingest({
+      body: { schemaVersion: '1', events: good() }, actor: null, correlationId: ulid(),
+    }),
+    'Unsupported telemetry schema version');
+
+  // §3.5: clientSessionId is a ULID. A free-form string here is a client inventing its own
+  // identifier scheme, and an identifier nobody minted is one nothing can expire.
+  await refuses('a clientSessionId that is not a ULID is refused, by that name',
+    () => service.ingest({
+      body: batch([ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock)],
+        { clientSessionId: 'session-7' }),
+      actor: null, correlationId: ulid(),
+    }),
+    'clientSessionId must be a ULID');
+
+  // CONTROL: the same batch with a real ULID gets past the shape check — the refusal above is
+  // about the shape of the id and not about the field being present.
+  const sid = ulid();
+  const shaped = await service.ingest({
+    body: batch([ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock)],
+      { clientSessionId: sid }),
+    actor: null, correlationId: ulid(),
+  });
+  assert('CONTROL: a ULID clientSessionId passes the shape check and reaches the consent gate',
+    shaped.rejected === 1 && shaped.rejections[0].reason === 'receipt_absent',
+    JSON.stringify(shaped.rejections));
+
+  // §3.5: an internal-only batch carries no receipt. A receipt is an identifier, and one with
+  // no purpose on this batch is linkage the class exists to prevent.
+  await refuses('an internal-only batch carrying a consent receipt is refused by that rule',
+    () => service.ingest({
+      body: batch(good(), {
+        consentReceipt: harness({ clock }).consent.issue({
+          subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 1,
+        }),
+      }),
+      actor: null, correlationId: ulid(),
+    }),
+    'internal_only_receipt');
+
+  // CONTROL: the SAME receipt on a batch that contains a personal event is not refused — the
+  // rule is about the receipt having nothing to authorise, not about receipts.
+  const withPersonal = harness({ clock });
+  const okReceipt = withPersonal.consent.issue({
+    subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 1,
+  });
+  const mixed = await withPersonal.service.ingest({
+    body: batch([
+      ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock),
+      ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock),
+    ], { consentReceipt: okReceipt }),
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: a receipt beside a personal event is accepted, not refused as purposeless',
+    mixed.accepted === 2 && mixed.rejected === 0, JSON.stringify(mixed.rejections));
+}
+
+// =============================================================================================
+console.log('\n§3.5.1 a pre-consent correlation id is a FRESH ULID, and rubbish in the batch cannot hide one');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service, sink } = harness({ clock });
+
+  for (const correlationId of ['corr-1', '', undefined, 12345]) {
+    await refuses(`a funnel.preconsent correlationId of ${JSON.stringify(correlationId)} is refused on SHAPE`,
+      () => service.ingest({
+        body: batch([ev('funnel.preconsent', { step: 'landing', outcome: 'viewed' }, clock, { correlationId })]),
+        actor: null, correlationId: ulid(),
+      }),
+      'preconsent_correlation_shape');
+  }
+
+  // CONTROL: a fresh ULID on the same event is accepted and stored with no join key, so the
+  // refusals above are about the id's shape and not about the event.
+  const fresh = ulid();
+  const accepted = await service.ingest({
+    body: batch([ev('funnel.preconsent', { step: 'landing', outcome: 'viewed' }, clock, { correlationId: fresh })]),
+    actor: null, correlationId: ulid(),
+  });
+  const stored = sink.records.find((r) => r.name === 'funnel.preconsent');
+  assert('CONTROL: a fresh ULID correlationId is accepted and stored unlinked',
+    accepted.accepted === 1 && stored?.correlationId === fresh
+    && stored?.accountId === null && stored?.clientSessionId === null && stored?.unlinked === true,
+    JSON.stringify(stored));
+
+  // The §3.5.1 classification pass walks the raw events. A non-object among them is skipped
+  // there and rejected later by the service — it must not derail the classification, and it
+  // must not let a real funnel.preconsent slip past the rules by travelling next to it.
+  await refuses('a null event beside a funnel.preconsent does not exempt the batch from §3.5.1',
+    () => service.ingest({
+      body: batch([null, ev('funnel.preconsent', { step: 'consent', outcome: 'viewed' }, clock,
+        { correlationId: ulid() })], { clientSessionId: ulid() }),
+      actor: null, correlationId: ulid(),
+    }),
+    'preconsent_client_session');
+
+  const withJunk = await service.ingest({
+    body: batch([null, ev('funnel.preconsent', { step: 'consent', outcome: 'viewed' }, clock,
+      { correlationId: ulid() })]),
+    actor: null, correlationId: ulid(),
+  });
+  assert('and a clean pre-consent event beside that null is still accepted, unlinked',
+    withJunk.accepted === 1 && withJunk.rejected === 1
+    && withJunk.rejections[0].reason === 'event_not_object',
+    JSON.stringify(withJunk.rejections));
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nclient telemetry runs clean');

@@ -86,6 +86,12 @@ export class Router {
  * routes as `/v1/health` — a front proxy matching the literal request line and this router
  * would disagree about what was requested. Concatenating onto the origin instead makes the
  * authority unreachable, and anything not starting with a single `/` is refused outright.
+ *
+ * The concatenation alone is NOT enough, which is why the check below is a check and not a
+ * comment: `Router.match` drops empty segments (`split('/').filter(Boolean)`), so the pathname
+ * `//v1/health` splits to `['v1','health']` and matches `/v1/health` anyway. Measured — with
+ * this guard deleted, `GET //v1/health` is served 200. The same disagreement, reached by a
+ * different road.
  */
 function parseTarget(rawUrl) {
   if (typeof rawUrl !== 'string' || !rawUrl.startsWith('/') || rawUrl.startsWith('//')) {
@@ -208,6 +214,17 @@ export function buildBelowFloor(build, floor) {
 function clientIp(req, config) {
   const socketIp = req.socket.remoteAddress || '';
   const hops = config.trustedProxyHops || 0;
+  // EQUIVALENT MUTANT, measured. Deleting this early return cannot change an answer: at
+  // `hops === 0` the code below computes `idx = chain.length - 0`, and `idx < chain.length` is
+  // then false for every possible header, so the fall-through returns `socketIp` anyway.
+  // Measured by running both versions of this file over eight header shapes at zero hops —
+  // absent, empty, whitespace-only, one entry, two entries, eight entries, commas only, and the
+  // header sent twice — and the same eight at one hop as a control that the probe can see a
+  // difference at all: identical in all 16 comparisons, and the hops-1 column differs from the
+  // hops-0 column on five of eight, so the probe was not blind. Kept because reading and
+  // splitting a client-controlled header we have decided not to trust is work with no purpose.
+  // The security property underneath it — a forged XFF buys no rate-limit bucket at the default
+  // zero hops — is NOT equivalent and is asserted in coretest.mjs.
   if (hops <= 0) return socketIp;
 
   const header = req.headers['x-forwarded-for'];
@@ -236,6 +253,24 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
     handle(req, res).catch((err) => {
       try {
         logger.error('request.unhandled', { cause: String(err && err.stack || err) });
+        // The last-resort handler could take the process down, which is the one thing it exists
+        // to prevent. `handle` can only reject from the two statements after `finish`'s inner
+        // try — the request log line and the `onRequestEnd` hook — and by then the response has
+        // been written and ENDED. `res.end()` on an ended response does not throw here: it
+        // emits `error` asynchronously on the ServerResponse, and an unhandled 'error' event
+        // exits the process. Measured on Node 25 with a logger whose `info` throws:
+        // `ERR_STREAM_WRITE_AFTER_END`, uncaught, process dead, one request. The `try` around
+        // this cannot catch it because the throw does not happen on this stack.
+        if (res.writableEnded || res.destroyed) return;
+        // EQUIVALENT MUTANT, measured: deleting this line changes nothing observable, because
+        // reaching it with headers ALREADY sent is not a state `finish` can produce. It writes
+        // the head and ends in one sequence, and the only thing that can throw between them —
+        // `JSON.stringify(payload)` — throws inside `finish`'s own try, which destroys the
+        // socket, and the line above then returns. Measured by running both versions over a
+        // logger that throws after the response, a handler that throws, and a handler returning
+        // an unserialisable body: identical status, body and next-request behaviour in all 8
+        // comparisons. Kept because "write a head if none was written" is the correct thing for
+        // a last-resort handler to check, and a future edit could reach it.
         if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'application/json' }); }
         res.end('{"error":{"code":"INTERNAL_ERROR","message":"Something went wrong on our end."}}');
       } catch { /* the socket is already gone; there is nothing left to say */ }
