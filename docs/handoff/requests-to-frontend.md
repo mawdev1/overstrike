@@ -184,3 +184,81 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
 - Requester's workaround until then: none needed.
 - Status: DONE
 - Response: Re-read and mapped the current versions into the typed platform/shell clients before implementation. The client uses the closed `CONSENT_RECEIPT_INVALID` verdict and exact result/error projections; real online handoff remains fail-closed until the contracted browser net-facade surface is available rather than inventing a local substitute.
+
+### REQ-CX-008 — `settings.js` must accept `mode: 'bomb'`, and the menu must offer it
+- Phase: P3
+- Blocking: no for the simulation — Bomb plays today via `startMatch({ mode: 'bomb' })` and
+  `bombtest.mjs` is green — but yes for a human being able to pick the mode
+- Needed by: P3.B3 (Bomb presentation), and before any playtest that is not script-driven
+- Contract affected: `bomb-rules.md` §1 (two entries is the freeze)
+- Ask: two small changes in CX-owned files.
+
+  1. `src/core/settings.js` — `Settings.ENUMS.mode` is `['tdm']`. It needs `['tdm', 'bomb']`.
+     Until it does, `settings.set('mode', 'bomb')` is silently discarded by `_coerce`, so the
+     chosen mode does not persist between matches. `Match.begin()` writes the resolved mode id
+     there and takes the rejection quietly today; that is the only reason this is not blocking.
+     I did not make this one-word change myself: the file is yours, and `lanecheck` is right
+     to refuse a backend commit that touches it.
+  2. `src/ui/menu.js` already renders `match.modeList`, which now has two entries, so Bomb
+     should appear without further work. Please confirm it does, and gate it on
+     `bombAvailable(game)` (exported from `src/game/modes.js`) — a map that publishes no
+     `map-data.md` §3.3 objective volumes cannot host Bomb, and starting it there throws by
+     design rather than playing on coordinates baked into the ruleset.
+
+- Proposed shape: the enum entry, plus a menu entry that hides or disables Bomb when
+  `bombAvailable` is false.
+- Requester's workaround until then: pass `mode` explicitly to `startMatch`, which every
+  harness and the server already do.
+- Status: DONE
+- Response: Added the exact `tdm|bomb` settings enum and confirmed the legacy menu is driven by
+  `MODE_LIST`. Bomb is now offered only when `bombAvailable(game)` validates the active map's
+  frozen objective manifest; an invalid/no-objective map keeps the entry out. The deploy card and
+  summary use Bomb's round-series copy instead of mislabelling it with TDM's kill limit/clock.
+
+### REQ-CX-008 — The Square fails the P3.3 map guards; nine defects, four classes
+- Phase: P3
+- Blocking: yes — P3 exit requires The Square to pass these guards, and the rotation cannot
+  switch off MERIDIAN until it does
+- Needed by: P3.A3 map retirement, P3.A1 Bomb (site reachability), P3.A2 spawn quality
+- Contract affected: `contracts/map-data.md` §3.2 spawns, §3.5 navHints; Build Plan §3.3
+- Ask: The Square's structural exports are COMPLETE — `manifestGaps()` returns empty, so
+  `MAP_ID`, `MAP_VERSION`, `MAP_MANIFEST`, `COMPETITIVE_BOUNDARY` and `MERIDIAN_FIXTURE` are
+  all declared and well-formed. Thank you; the consumer side reads them directly.
+
+  What fails is geometry, measured by the CC-owned guards. Reproduce each with
+  `--map=the-square`; every one of these is green on `--map=meridian`, so the harnesses are
+  not the variable.
+
+  **1. Playspace unreachable on foot — `npm run navtest --map=the-square`**
+  `'Upper Walk'`: **0 of 527 walkable nodes reachable**. Nav finds standing room up there and
+  no route to it. Either it needs a connection, or it should not be walkable surface.
+  Overall reachable fraction is 68.07% against a required 70%, and stranded nodes are 31.93%
+  against an allowed 30% — both driven mainly by this region.
+
+  **2. Bomb sites severed from spawns — `npm run navtest --map=the-square`**
+  **7 of 14 spawn-group → site pairs have no path** under exhaustive BFS; site B is severed
+  from 5 of 7 spawn groups. `map-data.md` §3.2 requires every spawn to be reachable from every
+  objective volume. Bomb is unplayable on this geometry until a route exists — this one blocks
+  P3.A1 directly.
+
+  **3. Spawn capsule clearance — `npm run maptest --map=the-square`**
+  Four spawns overlap geometry for the r 0.36 / h 1.8 standing capsule §3.2 mandates:
+  `alpha-court-3`, `bravo-court-3`, `alpha-plaza-1`, `bravo-plaza-1`.
+
+  **4. Two `navHints.links` resolve to nothing**
+  2 of 4 declared link endpoints have no nav surface within 1.2 m. A link hint that lands on
+  nothing is silently ignored, so the traversal it promises does not exist — which is worse
+  than not declaring it, because the hint reads as coverage.
+
+  Also from `maptest`: 6 glass panes fully enclosed in concrete, and 72 positions a player can
+  walk off the roof from. And `npm run stairtest --map=the-square` reports 16 failures on the
+  plaza ramps.
+
+- Proposed shape: Treat 1 and 2 as blocking and the rest as ordinary defects. `npm run navtest`
+  is new — it did not exist before today and contract §6 required it — so please add it to your
+  local loop; `vertprobe` also asserted nothing until today and always exited 0, which is why
+  none of this surfaced earlier on your side.
+- Requester's workaround until then: MERIDIAN stays registered as the fixture with
+  `inRotation: false`, so every harness keeps a stable comparison target and the sim still runs.
+  Bomb development proceeds against the fixture.
+- Status: OPEN
