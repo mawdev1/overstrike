@@ -67,31 +67,60 @@
  * Of the review's two named defects, ONE still reproduces and one does not, which is the whole
  * argument for running this rather than citing it:
  *
- *   - STILL OPEN. `auth/service.js:46`, the `^\d{4}-\d{2}-\d{2}$` check behind the age gate,
- *     survives — and so does the line below it that rejects an impossible calendar date. Those
- *     two lines are the whole of what stands between `"banana"` and a signed eligibility
- *     receipt, and nothing in 1368 checks notices either of them going away.
+ *   - WAS OPEN, NOW CLOSED. `auth/service.js:46`, the `^\d{4}-\d{2}-\d{2}$` check behind the
+ *     age gate, survived — as did the line below it rejecting an impossible calendar date.
+ *     Those two lines were the whole of what stood between `"banana"` and a signed eligibility
+ *     receipt, and nothing in 1368 checks noticed either going away. Both are killed as of
+ *     2026-08-20, by nine malformed inputs each asserted twice — for the code AND for minting
+ *     no receipt — chosen so each guard is individually load-bearing (`1994-3-2` only the
+ *     format check catches; `1994-02-31` and `1900-02-29` only the calendar check).
  *   - CLOSED. `telemetry/service.js:108`, the §3.4 personal-class consent gate, is now KILLED.
  *     A test landed for it between the review and this file. The neighbouring subject-binding
- *     checks in `telemetry/consent.js` (lines 86-91) still survive, so the receipt-is-a-bearer-
- *     token hole the module header warns about is untested even though the gate above it is not.
+ *     checks in `telemetry/consent.js` (lines 86-91) survived at that point — the
+ *     receipt-is-a-bearer-token hole the module header warns about — and are killed as of
+ *     2026-08-20. Not over a socket, though, and the reason is worth keeping: `app.js` replaces
+ *     that verifier with `adaptAuthConsent` in every real composition, so the module's own
+ *     `verify` is UNREACHABLE through the composition root. A socket test would have exercised
+ *     app.js's copy while appearing to cover this one.
  *
  * Worst three files, all in the store layer:
  *
  *   core/store/postgres.js  37/41    core/store.js  34/81    core/store/memory.js  33/61
  *
  * `postgres.js` deserves an asterisk and it is the same asterisk `pgtest.mjs` is about: the
- * suite runs the MEMORY adapter unless `DATABASE_URL` is set, so 37 of those 41 guards are not
- * so much untested as unreached. Sweep them honestly with
+ * suite runs the MEMORY adapter unless `DATABASE_URL` is set, so most of those guards are not
+ * so much untested as UNREACHED. Swept against a real database the file scores 7 survivors of
+ * 43, not 35 — reporting the 35 would describe this harness's configuration and call it
+ * coverage.
  *
- *   DATABASE_URL=... PLATFORM_STORAGE=postgres node scripts/mutatetest.mjs --file=platform/src/core/store
+ * ── The obvious way to sweep it does NOT work, and this is why ───────────────────────────
+ * This header used to say:
+ *
+ *   DATABASE_URL=... PLATFORM_STORAGE=postgres node scripts/mutatetest.mjs --file=.../store
+ *
+ * That recipe was written from intention and never run. It cannot work: `apptest.mjs` and
+ * `matchtest.mjs` onboard with FIXED display names, so a second run against a database that
+ * persists gets NAME_TAKEN. The harness fails its own baseline on run two and never reaches a
+ * single mutant. `pgtest.mjs` never noticed because it raises a fresh container per run — the
+ * suite is green and simply not re-runnable, which is a different property from passing.
+ *
+ * To sweep a Postgres-only file today, give each mutant its own database: migrate a template
+ * once, then `create database ... template ...` per mutant. A scratch driver doing exactly
+ * that, reusing this file's own operator, is what produced the 7/43 figure above.
+ *
+ * The durable fix is to make the suite re-runnable — unique identities per onboarding, as
+ * `apptest.mjs`'s `onboard()` already does and `matchtest.mjs` does not. Until then, a
+ * DB-backed sweep needs the per-mutant database.
  *
  * ── Thresholds ───────────────────────────────────────────────────────────────────────────
  * `--max-survivors=N` exits non-zero above N, so this can gate CI later. It is deliberately
  * NOT wired into `npm run ci` or the GitHub workflow today: at 365 survivors the gate would be
  * permanently red, and a permanently red gate is a gate everyone learns to ignore.
  *
- *   current:  365 survivors of 679 mutants across platform/src/** (54% survival, fcd7341)
+ *   current:  365/679 (54%) at fcd7341; 308/685 (45%) at 6d6237b. After the 2026-08-20
+ *             sweep-and-cover round: events 42/69 -> 1, stubs 40 -> 1, telemetry 18 -> 0,
+ *             profile 40/103 -> 7, store cluster 69 -> 12, core+app 32 -> 8. Re-measure
+ *             rather than quoting these: a mutation score belongs to a tree at a moment.
  *   target:   0 survivors in platform/src/modules/events/** and the telemetry consent path
  *             first (those are the ones with a user-visible privacy failure behind them),
  *             then a whole-tree ceiling ratcheted DOWNWARD as tests are added — set
