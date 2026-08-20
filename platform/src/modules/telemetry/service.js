@@ -166,7 +166,7 @@ export function createTelemetryService({
  * Route registration. Kept separate from `ingest` so tests exercise the rules directly rather
  * than through a socket, and so the endpoint's wire shape is visible in one place.
  */
-export function registerTelemetryRoutes(router, { service }) {
+export function registerTelemetryRoutes(router, { service, optionalAuth = null }) {
   router.post('/v1/telemetry/client', async (ctx) => {
     const result = await service.ingest({
       body: ctx.body,
@@ -178,7 +178,12 @@ export function registerTelemetryRoutes(router, { service }) {
     return raw(202, {
       accepted: result.accepted, rejected: result.rejected, correlationId: ctx.correlationId,
     });
-  }, { auth: 'optional' });
+    // `{ auth: 'optional' }` was not an option core/http.js reads — it honours `middleware`
+    // and `requireBuild` only. So no middleware ran, ctx.actor was permanently undefined, and
+    // an authenticated player's telemetry could never be attributed or bound to an
+    // account-scoped receipt. An option a router ignores is worse than no option: it reads
+    // like a guarantee.
+  }, optionalAuth ? { middleware: [optionalAuth] } : {});
   return router;
 }
 

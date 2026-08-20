@@ -22,7 +22,9 @@ import { createRateLimiter } from './core/ratelimit.js';
 import { ApiError } from './core/errors.js';
 import { timingSafeEqual, createHash } from 'node:crypto';
 
-const MODULE_NAMES = ['events', 'auth', 'profile', 'telemetry', 'stubs'];
+// The modules a production process MUST have. `stubs` is deliberately absent: in production
+// it is not mounted at all, which is a stronger guarantee than mounting it disabled.
+const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
@@ -34,11 +36,24 @@ export async function buildApp(config, overrides = {}) {
   const deps = {
     config, logger, store, rateLimiter,
     clock: overrides.clock || (() => Date.now()),
-    healthProbes: { store: () => store.health() },
+    // §7.1 names this dependency `db`. The shape is contract, not a label we choose.
+    healthProbes: { db: () => store.health() },
   };
 
   const router = new Router();
   const health = createHealth({ deps });
+
+  // §9's read/write/room/report classes had no call site: the limiter was constructed,
+  // janitored, and never consulted, so /v1/profile/me was unlimited. Applied as route
+  // middleware so a new endpoint inherits it by declaring a class rather than remembering to.
+  deps.rateLimit = (className) => async (ctx) => {
+    const subject = ctx.actor?.accountId || ctx.ip || 'anonymous';
+    const verdict = ctx.deps.rateLimiter.check(className, subject);
+    if (!verdict.allowed) {
+      throw new ApiError('RATE_LIMITED', 'Too many requests. Try again shortly.',
+        { retryAfterMs: verdict.retryAfterMs });
+    }
+  };
 
   router.get('/v1/health', async () => health.live(), { requireBuild: false });
   router.get('/v1/health/ready', async (ctx) => {
@@ -57,12 +72,15 @@ export async function buildApp(config, overrides = {}) {
   // below is unreachable precisely when the stub module fails to load — `deps.stubs` is
   // undefined, so `deps.stubs?.enabled` is falsy and the guard silently passes.
   if (config.env === 'production') {
-    const missing = MODULE_NAMES.filter((n) => !mounted.includes(n));
+    const missing = REQUIRED_MODULES.filter((n) => !mounted.includes(n));
     if (missing.length) throw new Error(`modules failed to mount in production: ${missing.join(', ')}`);
-    // contracts/feature-flags.md §12: the stub layer must be impossible to enable in
-    // production. Asserted at boot so a misconfigured deploy fails immediately and loudly
-    // rather than quietly serving fixtures to real players.
-    if (deps.stubs?.enabled) throw new Error('stub layer is enabled in production configuration');
+    // contracts/feature-flags.md §12. The previous form — mount it, then assert it is not
+    // enabled — could never fire, because `enabled` was already derived from the same env
+    // check. Code that cannot be reached is not a guard. Production does not load the module,
+    // so there is nothing to enable, and this assertion is the backstop rather than the rule.
+    if (mounted.includes('stubs') || deps.stubs) {
+      throw new Error('stub layer is present in a production process');
+    }
   }
 
   const server = createApp({ router, deps });
@@ -73,9 +91,39 @@ export async function buildApp(config, overrides = {}) {
     // Auth sweeps expired ephemeral tokens on an interval. Unref'd, so it never holds the
     // process open — but a test that builds many apps would otherwise accumulate them.
     try { deps.auth?.stop?.(); } catch { /* nothing useful to do while shutting down */ }
+    try { deps.events?.relay?.stop?.(); } catch { /* same */ }
   };
 
   return { server, router, deps, mounted, stopJanitor, stop };
+}
+
+/**
+ * Present auth's consent receipts through the interface telemetry verifies against.
+ *
+ * Auth owns issuing (it holds the account and the policy version); telemetry owns the gate.
+ * Rather than duplicate a signer — two ways to mint, one way to verify — this translates
+ * auth's `readConsent` result into telemetry's `{ ok, reason, subject, subjectId }` verdict.
+ */
+function adaptAuthConsent(receipts, config, clock) {
+  return {
+    verify(receipt, expect = {}) {
+      const claims = receipts.readConsent(receipt);
+      if (!claims) return { ok: false, reason: 'receipt_signature_invalid' };
+      if (claims.telemetryPersonal !== true) return { ok: false, reason: 'consent_declined' };
+      if (claims.policyVersion !== config.consentPolicyVersion) {
+        return { ok: false, reason: 'receipt_policy_stale' };
+      }
+      // A receipt is only evidence about the subject it was issued for. Accepting one bound to
+      // another subject would make it a bearer token for someone else's consent.
+      const subject = claims.subject;
+      const subjectId = claims.subjectId ?? null;
+      if (expect.subject && expect.subject !== subject) return { ok: false, reason: 'receipt_unbound' };
+      if (expect.subjectId && expect.subjectId !== subjectId) {
+        return { ok: false, reason: 'receipt_subject_mismatch' };
+      }
+      return { ok: true, subject, subjectId, policyVersion: claims.policyVersion };
+    },
+  };
 }
 
 /** Order matters: events first, because auth and profile emit through its outbox. */
@@ -113,6 +161,23 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
       buildEvent: events.buildEvent,
       rbac: { check: events.check, can: events.can, requireCapability: events.requireCapability },
     };
+    // Without a relay the outbox is a write-only table: rows accumulate, `published_at` stays
+    // null forever, and migration 0011's index serves a poll that never runs. At-least-once
+    // delivery is only a guarantee if something delivers.
+    deps.events.relay = events.createRelay({
+      store: deps.store,
+      logger,
+      // ONE event per call, not a batch — the relay awaits publish per row so it can order
+      // within a subject and retry a single failure. Handing it a batch-shaped function made
+      // every publish throw, which the retry budget then dressed up as a transient fault.
+      publish: async (event) => {
+        logger.info('event.published', {
+          eventId: event.eventId, type: event.type, subjectKind: event.subject?.kind,
+          subjectId: event.subject?.id, correlationId: event.correlationId,
+        });
+      },
+    });
+    if (config.env !== 'test') deps.events.relay.start();
     mounted.push('events');
   }
 
@@ -146,15 +211,17 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
   // ── telemetry: the client ingest endpoint ────────────────────────────────────────────
   const telemetry = await load('telemetry', './modules/telemetry/index.js');
   if (telemetry) {
-    // ONE signer for consent receipts, shared with auth. Two implementations of the same
-    // signature is two ways to mint a receipt and only one way to verify it — the telemetry
-    // module ships its own so it can be tested alone, and here the auth one wins.
-    const consent = deps.auth?.receipts?.consent
-      || telemetry.createConsentReceipts({
+    // ONE consent verifier, and it must understand the receipts AUTH ACTUALLY ISSUES.
+    //
+    // The previous `deps.auth?.receipts?.consent` was always undefined, so this silently fell
+    // through to telemetry's own signer — which shares the secret but not the claim schema
+    // (auth writes {k,s,sid,tp,pv,dat,exp}, telemetry expected {subject,telemetryPersonal,…}).
+    // The HMAC verified, the claims did not, and EVERY personal-class event from every
+    // consenting player was discarded as `consent_declined`. The whole client funnel.
+    const consent = deps.auth
+      ? adaptAuthConsent(deps.auth.receipts, config, deps.clock)
+      : telemetry.createConsentReceipts({
         secret: config.tokenSecret,
-        // Passed explicitly, not defaulted. A receipt is only meaningful against the policy
-        // version it was issued under, and a verifier that hardcodes 1 keeps accepting stale
-        // receipts the moment the policy moves — which is the whole reason it is versioned.
         policyVersion: config.consentPolicyVersion,
       });
     // The service REQUIRES a sink and destructures it; building without one made every
@@ -162,17 +229,24 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     // which is why wiring needs its own boot check, not just module tests.
     const sink = overrides.telemetrySink || createLogSink(logger);
     const service = telemetry.createTelemetryService({ store: deps.store, logger, consent, config, sink });
-    telemetry.registerTelemetryRoutes(router, { service });
+    // `{ auth: 'optional' }` is not an option core/http.js understands — it only reads
+    // `middleware`. So no middleware ran, ctx.actor was always undefined, and an
+    // authenticated player's telemetry could never be attributed or bound to an account
+    // receipt. Pass the real middleware, as the profile module does.
+    telemetry.registerTelemetryRoutes(router, { service, optionalAuth: deps.auth?.routes?.optionalAuth });
     deps.telemetry = { service, consent };
     mounted.push('telemetry');
   }
 
   // ── stubs: the fixture layer that unblocks the frontend lane ─────────────────────────
-  const stubs = await load('stubs', './modules/stubs/index.js');
-  if (stubs) {
-    const enabled = config.env !== 'production';
-    deps.stubs = { enabled, api: enabled ? stubs.createStubApi({ config }) : null };
-    mounted.push('stubs');
+  // Not loaded in production at all. Serving fixtures to real players is the failure this
+  // prevents, and the surest way to not serve them is to not have the code.
+  if (config.env !== 'production') {
+    const stubs = await load('stubs', './modules/stubs/index.js');
+    if (stubs) {
+      deps.stubs = { enabled: true, api: stubs.createStubApi({ config }) };
+      mounted.push('stubs');
+    }
   }
 
   return mounted;

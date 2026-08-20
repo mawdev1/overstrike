@@ -132,7 +132,11 @@ export function createAuthService(deps) {
       spec,
       (tx) => store.accounts.update(actor.accountId, patch, tx),
     ));
-    return result;
+    // `recordWithEvent` -> `outbox.commit` returns { result: { row, event, result }, events }.
+    // Destructuring one level yielded the wrapper, so callers got { row, event, result } where
+    // they expected the updated account — which left `sid` off the consent receipt entirely,
+    // producing an UNBOUND receipt: a bearer token for someone else's consent.
+    return result.result;
   }
 
   /** The common case: a field on the account changed, which is `profile.updated` (§6). */
