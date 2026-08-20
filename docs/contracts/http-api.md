@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -68,9 +68,22 @@ gated personal events on a consent state that lived nowhere. The chain, in order
 POST /v1/onboarding/eligibility      P
 { "dateOfBirth": "1994-03-02", "jurisdiction": "CA-ON" }
 
-200 → { "eligible": true, "minimumAge": 13, "correlationId": "…" }
+200 → { "eligible": true,
+        "receipt": "opaque-signed-token",     // carries the verdict, policy version, expiry
+        "expiresAt": "…",                     // 30 minutes
+        "policyVersion": 1,
+        "correlationId": "…" }
 403 → AUTH_ELIGIBILITY_DENIED, details: { "category": "under-minimum-age" }
 ```
+
+**`minimumAge` is not returned (REQ-CC-022).** The gate is neutral — it must not reveal the
+number it is testing against, or the next attempt simply clears it. The earlier success
+response published `13`, which defeated the neutrality the gate exists for. `policyVersion`
+identifies which rule ran without saying what the rule is.
+
+The **receipt** is opaque and signed, binds the verdict to a policy version, and expires in
+30 minutes. Signup consumes it; a client cannot mint one, and one obtained for a different
+jurisdiction or policy version is rejected.
 
 The birthdate is evaluated and **discarded**; only the derived boolean and the policy version
 are persisted, at signup. This is why the preflight is separate from signup: `auth.md` §11
@@ -86,12 +99,19 @@ Signup therefore takes `{ email, password, displayName }` — **no `dateOfBirth`
 ```http
 POST /v1/onboarding/verify/resend     A   → 202
 POST /v1/onboarding/verify/complete   A   { "token" } → 204
-   errors: AUTH_RECOVERY_TOKEN_INVALID · AUTH_RECOVERY_TOKEN_EXPIRED
+   errors: AUTH_VERIFICATION_TOKEN_INVALID · AUTH_VERIFICATION_TOKEN_EXPIRED
 
 GET  /v1/onboarding/terms             P   → { "version", "url", "publishedAt", "correlationId" }
 POST /v1/onboarding/terms/accept      A   { "version" } → 204
-   errors: CONFLICT (a newer version now applies; body carries it)
+   errors: CONFLICT — details: { "currentVersion", "url", "publishedAt" }
 ```
+
+**Verification has its own error codes (REQ-CC-022).** It previously reused the recovery
+codes, whose documented UI obligation is "restart recovery" — so a failed email verification
+would have sent the player into a password-reset flow.
+
+**Every 204 in this contract returns `X-Correlation-Id`.** A body-less success is still an
+event someone will need to trace, and it is the only place the id can travel.
 
 ### 3a.3 Consent — a distinct record
 
@@ -100,16 +120,33 @@ error: `telemetry.md` pointed at "auth §11 / HTTP §4", which define age and wh
 profile — neither is a decision about analytics.
 
 ```http
-GET /v1/onboarding/consent    auth OPTIONAL
+GET /v1/onboarding/consent    auth OPTIONAL   ?clientSessionId=01J…
 PUT /v1/onboarding/consent    auth OPTIONAL
-{ "telemetryPersonal": true, "policyVersion": 1 }
-→ { "telemetryPersonal": true, "policyVersion": 1,
-    "decidedAt": "…", "subject": "account|client-session", "correlationId": "…" }
+{ "telemetryPersonal": true, "policyVersion": 1, "clientSessionId": "01J…" }
+
+→ { "telemetryPersonal": true, "policyVersion": 1, "decidedAt": "…",
+    "subject": "account|client-session",
+    "receipt": "opaque-signed-token",      // replayed on every telemetry batch
+    "correlationId": "…" }
 ```
 
+`clientSessionId` is **required when signed out** and ignored when authenticated — the account
+is the stronger subject. The response carries a signed `receipt`; `telemetry.md` §3.3 requires
+it on every batch, and without it the server cannot tell a consented pre-auth batch from an
+unconsented one.
+
 Auth-optional because the funnel starts before an account exists. Signed out, the decision is
-keyed to `clientSessionId` and returned as a **consent receipt** the client replays on its
-telemetry batches; at signup the receipt is migrated to the account.
+keyed to `clientSessionId`; at signup the decision migrates to the account and a new
+account-scoped receipt is issued.
+
+**Consent is captured at the landing step, before signup (REQ-CC-022, REQ-CC-026).** Two
+problems forced this. Signup returns a profile whose `privacy.consent` had to be non-null
+before any consent endpoint had been called; and dropping personal events until after signup
+made the first four funnel steps — landing, eligibility, signup, verification — permanently
+unmeasurable, while §3.1 promised to measure exactly those. Asking at landing fixes both.
+
+`consent: null` in a profile means **undecided**, which is a legal state: an account created
+before this policy version existed has no decision recorded, and is treated as no consent.
 
 **Until a decision exists, personal-class events are dropped, not queued.** Queuing them
 against a later "yes" would mean collecting first and asking afterwards. `internal`-class
@@ -144,7 +181,7 @@ schematises:
 | PATCH | `/v1/profile/me` | A | Display name, roaming settings. Idempotency key required |
 | GET | `/v1/profile/:accountId` | A | Public projection, filtered by the subject's privacy settings |
 | GET | `/v1/profile/:accountId/stats` | A | `?mode=tdm\|bomb\|all`. Canonical definitions in `match-result.md` |
-| GET | `/v1/profile/:accountId/matches` | A | Paginated history, newest first |
+| GET | `/v1/profile/:accountId/matches` | A | Paginated history, newest first. Includes `aborted` entries |
 | GET | `/v1/profile/me/settings` | A | Roaming settings only |
 | PUT | `/v1/profile/me/settings` | A | Full replace; `If-Match` on the settings version |
 
@@ -207,22 +244,10 @@ were impossible.
 Requires an authenticated account that still **holds a seat** in the room. It does not create
 membership, so it cannot be used to jump a queue or re-enter a room the player has left.
 
-Room summary in `GET /v1/rooms`:
-
-```json
-{
-  "roomId": "01J…", "name": "…", "region": "yyz",
-  "map": "the-square", "mode": "tdm|bomb",
-  "players": 6, "capacity": 12,
-  "status": "open|countdown|in-progress|closing",
-  "joinable": true, "joinBlockedReason": null,
-  "estimatedRttMs": 24, "hasPassword": false, "build": "…"
-}
-```
-
-`estimatedRttMs` is **measured**, from the client's most recent region probe — not guessed
-from geography. If it has not been measured, it is `null` and the UI shows it as unknown.
-A ping number the browser invented is worse than no ping number.
+`GET /v1/rooms` returns **`RoomCore[]`** exactly as defined in §11.3 — no roster, no separate
+field list here. An earlier duplicate example in this section still used `map` and `players`
+where §11.3 says `mapId`/`mapVersion` and `playerCount`; it is deleted rather than corrected,
+because a second copy of a schema is the thing that drifts (REQ-CC-021).
 
 `POST /v1/rooms/:id/join` returns a reservation, not a seat:
 
@@ -249,8 +274,11 @@ without a way to mint another, a client that dropped could never rejoin its own 
 `net.reconnecting` was a state with no exit.
 
 ```json
-200 → { "serverUrl": "wss://…", "sessionTicket": "…", "expiresAt": "…",
-        "graceEndsAt": "…", "correlationId": "…" }
+200 → { "handoff": { /* the complete MatchHandoff from realtime-lobby.md §6.1,
+                       so a reloaded client recovers map, rules, sites and policy */ },
+        "graceEndsAt": "…",      // ISO-8601 wall clock
+        "serverNow": "…",        // ISO-8601 — the client converts against this, never its own clock
+        "correlationId": "…" }
 409 → RECONNECT_GRACE_EXPIRED     // entity released; the match continues without you
 404 → NOT_FOUND                   // no such match, or you were never in it
 ```
@@ -376,14 +404,17 @@ So the **components** are canonical and shared; the **responses** that embed the
   "estimatedRttMs": 24,             // null when unmeasured (§11.6)
   "settings": { /* RoomSettings */ } }
 
-// ── RoomSettings ───────────────────────────────────────────────────────────
-{ "killLimit": 75,                  // TDM only, null in bomb
-  "roundsToWin": 7,                 // bomb only, null in tdm
-  "maxRounds": 12,                  // bomb only, null in tdm
-  "roundLengthSec": 105,            // bomb only, null in tdm
-  "backfill": true,
-  "requiredReady": 8,
-  "minPlayers": 2 }
+// ── RoomSettings — discriminated by RoomCore.mode ──────────────────────────
+// mode: "tdm"
+{ "killLimit": 75,
+  "roundsToWin": null, "maxRounds": null, "roundLengthSec": null,
+  "backfill": true, "requiredReady": 8, "minPlayers": 2 }
+
+// mode: "bomb"
+{ "killLimit": null,
+  "roundsToWin": 7, "maxRounds": 12, "roundLengthSec": 105,
+  "backfill": false,                // Bomb never backfills mid-round (bomb-rules.md §9)
+  "requiredReady": 8, "minPlayers": 2 }
 
 // ── RosterMember ───────────────────────────────────────────────────────────
 { "accountId": "…", "displayName": "…",
@@ -398,8 +429,10 @@ So the **components** are canonical and shared; the **responses** that embed the
 { "endsAt": "…", "requiredReady": 8, "currentReady": 6 }
 ```
 
-Mode-specific `RoomSettings` keys are **present and null** in the other mode rather than
-omitted, so one parser handles both without key-existence checks.
+Mode-specific keys are **present and null** in the other mode rather than omitted, so one
+parser handles both without key-existence checks. The single earlier example combined a TDM
+`killLimit` with live Bomb fields while claiming the opposite, so both are now written out
+(REQ-CC-021).
 
 Two responses embed those components:
 
@@ -412,14 +445,18 @@ Two responses embed those components:
 need four hundred roster entries, and sending them makes the list slow at exactly the moment
 it should feel instant.
 
-**`room.updated` is `Partial<RoomCore>`** restricted to these keys: `name`, `status`,
-`capacity`, `playerCount`, `joinable`, `joinBlockedReason`, `settings`, `ownerAccountId`.
+**`room.updated` is `Partial<RoomCore>`** restricted to exactly this closed set — the
+**mutable** keys, and no others:
+
+```
+name · status · capacity · playerCount · joinable · joinBlockedReason · settings · ownerAccountId
+```
 `settings` is replaced **wholesale** when any part of it changes — a partial settings patch
 would need per-key null semantics that collide with the present-and-null rule above. `roomId`,
 `mapId`, `mapVersion`, `mode`, `rulesetVersion`, and `build` never change for a live room; a
 room needing different ones is a different room.
 
-### 11.3a Room create response
+### 11.3a `CreateRoomResponse`
 
 `POST /v1/rooms` returned "RoomState + reservation", which is not a shape. It is:
 
@@ -472,9 +509,10 @@ eventually disagree, and only one is right.
 
 ```json
 // GET /v1/profile/:id/matches?limit=25&cursor=…
-{ "items": [ { "matchId": "…", "mode": "bomb", "map": "the-square",
+{ "items": [ { "matchId": "…", "mode": "bomb",
+               "mapId": "the-square", "mapVersion": "1.0.0",
                "endedAt": "…", "status": "completed|aborted|invalidated|pending",
-               "result": "win|loss|draw|null",
+               "result": "win|loss|draw|null",   // null only when the match had no winner
                "teamScores": { "alpha": 7, "bravo": 5 },
                "playerSummary": { "kills": 0, "deaths": 0, "assists": 0, "score": 0 } } ],
   "nextCursor": "…" | null, "correlationId": "…" }
@@ -541,14 +579,14 @@ left to inference.
                      "joinable": bool, "roomId": string|null } ],
         "nextCursor", "correlationId" }
 
-// POST /v1/rooms   { "name", "region", "map", "mode", "capacity", "password"?, "settings"? }
-201 → RoomState + reservation (as §11.4)
+// POST /v1/rooms   { "name", "region", "mapId", "mode", "capacity", "password"?, "settings"? }
+201 → CreateRoomResponse (§11.3a)
 
 // POST /v1/rooms/:id/leave    {} → 204   (idempotent; 204 even if not a member)
-// POST /v1/rooms/:id/team     { "team": "alpha"|"bravo"|"auto" } → 200 RoomState
+// POST /v1/rooms/:id/team     { "team": "alpha"|"bravo"|"auto" } → 200 RoomDetailResponse
 //   errors: TEAM_FULL · TEAM_SWITCH_FORBIDDEN · NOT_IN_ROOM
-// POST /v1/rooms/:id/ready    { "ready": bool } → 200 RoomState
-// POST /v1/rooms/:id/loadout  { "primaryIdx", "secondaryIdx" } → 200 RoomState
+// POST /v1/rooms/:id/ready    { "ready": bool } → 200 RoomDetailResponse
+// POST /v1/rooms/:id/loadout  { "primaryIdx", "secondaryIdx" } → 200 RoomDetailResponse
 //   errors: VALIDATION_FAILED (index out of range for the ruleset)
 // POST /v1/rooms/:id/launch   {} → 202 { "correlationId" }
 //   errors: AUTH_FORBIDDEN (not owner) · CONFLICT (not all ready) · ROOM_IN_PROGRESS
@@ -603,9 +641,15 @@ speakers to a laptop is a setting arriving wrong on a machine that had it right.
 (`Crouch/slide` ships `Left Ctrl` + `C`). A single action→code map cannot express that:
 
 ```jsonc
-"keybinds": { "crouchSlide": { "primary": "ControlLeft", "secondary": "KeyC" },
-              "jump":        { "primary": "Space",       "secondary": null } }
+"keybinds": { "<actionId>": { "primary": "ControlLeft", "secondary": "KeyC" },
+              "<actionId>": { "primary": "Space",       "secondary": null } }
 ```
+
+**`<actionId>` is pending CX (REQ-CC-026).** The inventory's binding table carries labels
+(`Move forward`, `Crouch/slide`) but no stable IDs, so a validator cannot yet be generated from
+it. The earlier example here invented `crouchSlide` and `jump` — inventing them a second time
+would recreate the drift REQ-CC-016 was raised about. Filed as `REQ-CX-005`; the validator
+binds to that vocabulary when it lands, and restates none of it.
 
 **Validation** is generated from the inventory rather than hand-maintained here, so a change to
 a range in the design doc cannot silently disagree with the server. A key outside the ROAM set,

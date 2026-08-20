@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -40,10 +40,42 @@ loss it lies in the player's favour, which is the exact shape of a cheat.
 ## 3. Connection lifecycle
 
 ```js
-await net.connect({ url, roomId, sessionTicket })   // name matches realtime-lobby.md and auth.md §6
+await net.connect(handoff)   // handoff is the MatchHandoff from realtime-lobby.md §6.1,
+                            // passed through UNMODIFIED — see §3.1
 net.disconnect(reason)
 net.state   // 'idle' | 'connecting' | 'live' | 'reconnecting' | 'closed' | 'version-mismatch' | 'rejected'
 ```
+
+### 3.1 `MatchHandoff` — the descriptor the facade needs (REQ-CC-023)
+
+`connect()` previously took `{ url, roomId, sessionTicket }`, which meant the static fields
+§5.1 promises — map, ruleset, region, build, series, spectator policy, sites — had **no way
+into the facade at all**. They arrive in `match.ready`; nothing carried them across.
+
+`connect()` now takes that message whole:
+
+```js
+MatchHandoff = {
+  matchId, serverUrl, sessionTicket, expiresAt, reconnectGraceMs,
+  mapId, mapVersion, mode, rulesetVersion,
+  region, serverBuild, protocolVersion,
+  series, spectatorPolicy, sites,
+}
+```
+
+Pass `match.ready`'s payload through unmodified. The facade stores it as the **immutable
+descriptor** for the match and merges it into `matchState`; nothing in it changes for the
+life of the match.
+
+**`matchState.matchId` comes from here**, and is required — without it the facade cannot even
+form the reconnect URL, which is the endpoint that keeps a dropped player in the match.
+
+**Reload safety.** The descriptor is what a reconnect must restore, so
+`POST /v1/matches/:matchId/reconnect-ticket` returns the identical `MatchHandoff` alongside
+the fresh ticket. A player who reloads the page has lost the original `match.ready` and would
+otherwise reconnect into a match whose map and rules it cannot name.
+
+### 3.2 Connection states
 
 `connect()` rejects with a typed error from `errors.md`. The states Codex must design screens
 for, and what each means:
@@ -62,11 +94,16 @@ for, and what each means:
 
 ```js
 net.sendLoadout({ primaryIdx, secondaryIdx })   // fire-and-forget, server may refuse
-net.requestInteraction(kind)                    // 'plant' | 'defuse' | 'pickup' | 'interact'
+net.requestInteraction(kind)                    // 'plant' | 'defuse'  — Alpha scope
 ```
 
 Input itself does **not** go through the facade. `src/core/input.js` (Codex) feeds the
 existing command pipeline; the facade does not re-wrap 120 Hz input.
+
+**`pickup` and `interact` are not in the Alpha facade (REQ-CC-024).** They were listed here
+while `MSG_MATCHSTATE` progress and the refusal enum covered only plant and defuse, so a UI
+calling them had no defined response. Bomb pickup is contact-range with no cast time
+(`bomb-rules.md` §5) and needs no request at all. They return when something needs them.
 
 `requestInteraction` returns nothing. Progress and completion arrive in `matchState` and as
 snapshot events. There is deliberately no promise to await — awaiting an interaction is how
@@ -135,7 +172,9 @@ frames; entity objects are pooled and their contents change under you.
     entityId: number, team: 'alpha'|'bravo'|'unassigned',
     role: 'attacker'|'defender'|null,
     alive: boolean, isSpectating: boolean, spectatingId: number|null,
-    spectatorPolicy: { canSpectateEnemies: false, canFreeCam: boolean, canUseTeamChat: boolean },
+    spectatorPolicy: { canSpectateEnemies: false,
+                       canFreeCam: boolean,        // phase-derived, see below
+                       canUseTeamChat: boolean },  // phase-derived, see below
   },
 }
 ```
@@ -159,6 +198,22 @@ remainingMs = (phaseEndsAt - serverNow) - (performance.now() - sampledAt);
 Both terms of the first subtraction come from the same clock; `sampledAt` only ages the sample
 locally. The facade reconstructs `serverNow` from the u32 `serverTimeMs` on the wire, handling
 the 49.7-day wrap — full rules in `wire-protocol.md` §8.10.
+
+#### 5.1.0a Spectator policy is derived per phase, not frozen at handoff
+
+`match.ready` carries the policy's **static** part (`canSpectateEnemies: false` for all of
+Alpha). The other two are phase-dependent and the facade recomputes them on every
+`matchState` (REQ-CC-024) — freezing them at handoff would have kept a dead player locked out
+of free camera for the whole match, which `bomb-rules.md` §8 explicitly allows at round end:
+
+| Phase | `canFreeCam` | `canUseTeamChat` |
+|---|---|---|
+| `live`, `planted` | `false` | `false` while dead — the relay rule |
+| `roundEnd`, `matchEnd` | `true` | `true` |
+| `warmup`, `freeze` | `true` | `true` |
+
+The server enforces all three regardless; the facade exposes them so the UI does not offer a
+control the server will refuse.
 
 #### 5.1.1 `bomb.carrierId` may be `null` and that is not an error
 
@@ -200,16 +255,23 @@ client cannot have, and REQ-CC-012 correctly caught three of them.
 | `welcome` | `{ clientId, entityId, matchSeed, killLimit, mode, isReconnect, isSpectator, protocolVersion, serverTickRateHz }` | `MSG_WELCOME` v2 (§8.4) |
 | `matchState` | the §5.1 object | `MSG_MATCHSTATE` (§8.6) for live state; **`match.ready` (`realtime-lobby.md` §6.1) for every static field** — map, ruleset, region, build, series, spectator policy, sites |
 | `stateChange` | `{ from, to, reason }` | Facade-local; `reason` from `MSG_REJECT` or socket close |
-| `disconnected` | `{ reason, code, retryable, graceEndsAt }` | Socket close + `MSG_REJECT` (§8.3) |
+| `disconnected` | `{ reason, code, retryable, graceEndsAt: null }` | Socket close + `MSG_REJECT` (§8.3). **`graceEndsAt` is always `null` here** — a closed socket cannot deliver it; the value arrives later on `reconnectUpdate` |
+| `reconnectUpdate` | `{ graceEndsAt, attempt, maxAttempts, canCancel }` | The `reconnect-ticket` HTTP response — the only authority for the deadline |
 | `versionMismatch` | `{ clientVersion, serverVersion }` | `MSG_REJECT` (§8.3) |
 | `interactionRefused` | `{ kind, reason }` | **`interactRefused` event (§8.7 kind 20)** — its own kind, because a refusal is not a cancellation |
 | `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
 | `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` for aborted/invalidated — distinct from `'draw'` |
 | `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
 
-`interactionRefused.reason` maps from the cancel-reason enum on the wire: `0` released →
-`released`, `1` left volume → `outside-volume`, `2` died → `not-eligible`, `3` round ended →
-`wrong-phase`.
+**`interactionRefused` maps from `interactRefused` (kind 20) and from nothing else.** An
+earlier paragraph here mapped it from the *cancellation* enum, which was wrong twice over: a
+cancellation is not a refusal, and the cancel enum has no value for `not-carrier` or
+`already-planted`. `kind` comes from flags bits 1–5, `reason` from `amount` (`wire-protocol.md`
+§8.7).
+
+Cancellations surface separately as `bombStateChanged` and the `plantCancel`/`defuseCancel`
+wire events — a plant that was interrupted is a different thing to report than one that was
+never allowed to start.
 
 `requestInteraction` still returns nothing (§4). Refusal arrives as `interactionRefused`, which
 is what lets the UI distinguish "the server said no" from "the packet is still in flight" —
@@ -218,8 +280,32 @@ a promise would collapse those two into one silent case.
 ### 5.4 `net.reconnect`
 
 ```js
-{ graceEndsAt: number, attempt: number, maxAttempts: 5, canCancel: true } | null
+{ graceEndsAt: number,      // CLIENT monotonic ms, converted — see below
+  attempt: number, maxAttempts: number, canCancel: boolean } | null
 ```
+
+**Clock conversion (REQ-CC-023).** HTTP returns `graceEndsAt` as **ISO-8601 wall clock**;
+every other facade time is a number. The facade converts once, on receipt:
+
+```js
+graceEndsAt = performance.now() + (Date.parse(httpGraceEndsAt) - Date.parse(httpServerNow));
+```
+
+The response carries `serverNow` for exactly this subtraction, so the result never depends on
+the client's clock being correct — only on it running at the right rate.
+
+**Retry policy** is not hardcoded in the facade. `maxAttempts` and `canCancel` come from the
+policy block below, defaulting to the same values as the lobby (`realtime-lobby.md` §8):
+
+| Parameter | Value |
+|---|---|
+| `maxAttempts` | 5 |
+| Backoff | Exponential from 1 s, ×2, jittered, cap 15 s |
+| `canCancel` | `true` — the player may abandon the match rather than wait |
+| Ticket | Fresh per attempt; never replay a consumed one |
+
+Until the first `reconnectUpdate` arrives, `net.reconnect` is `null` and the UI shows an
+indeterminate reconnecting state — not a countdown against a number it guessed.
 
 `graceEndsAt` is the server's authoritative deadline, so the countdown a player sees is the
 real one rather than an optimistic guess.

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — host resolved; awaiting REQ-CX-001 |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |
 | **Scope** | P1–P5. Economy, ownership, creator, and agent tables are later contracts |
@@ -58,7 +58,17 @@ accounts(
   email_hash        text unique,          -- lookup only; the address itself lives with the auth provider
   display_name      text not null,
   display_name_folded text not null unique,  -- NFKC + case + confusable folding (auth.md §9)
-  eligibility       jsonb not null default '{}',
+  -- Onboarding state, typed rather than free JSON (REQ-CC-022). These gate access and
+  -- carry legal weight; a jsonb blob cannot be constrained, indexed, or migrated safely.
+  eligibility_verdict     boolean,
+  eligibility_policy_ver  int,
+  eligibility_decided_at  timestamptz,
+  email_verified_at       timestamptz,
+  terms_version_accepted  int,
+  terms_accepted_at       timestamptz,
+  consent_telemetry       boolean,          -- null = undecided
+  consent_policy_ver      int,
+  consent_decided_at      timestamptz,
   privacy           jsonb not null default '{}',
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now(),
@@ -75,6 +85,15 @@ sessions(
   refresh_family_id text not null      -- rotation family; reuse revokes the whole family
 )
 ```
+
+**No birthdate column, deliberately.** The eligibility preflight (`http-api.md` §3a.1)
+evaluates a date of birth and discards it; only the verdict, its policy version, and the
+decision time are stored. The most sensitive field in the funnel is never persisted, which is
+also the cheapest possible answer to a deletion request about it.
+
+`consent_telemetry` is nullable because **null means undecided**, which is distinct from a
+recorded "no". An account predating the policy has no decision, and is treated as no consent
+until it makes one.
 
 `display_name_folded` carries the uniqueness constraint, not `display_name`. Enforcing on the
 raw name lets `Ada` and `Аdа` (Cyrillic А) coexist, which is the cheapest impersonation attack
@@ -138,7 +157,10 @@ matches(
   match_id primary key, room_id, region, server_id,
   map_id, map_version, mode, ruleset_version, stat_definition_version, server_build,
   status,               -- allocated|in-progress|completed|aborted|invalidated
-  termination_reason text, invalidation_reason text,
+  termination_reason text, outcome_reason text, invalidation_reason text,
+  winner_team text,     -- 'alpha'|'bravo'|'draw'|null — null is NOT draw (match-result.md §4.0)
+  rules_snapshot jsonb not null,   -- immutable ruleset copy; a result without it is
+                                   -- uninterpretable once the ruleset is retuned
   team_scores jsonb, rounds jsonb, evidence_ref text,
   allocated_at, started_at, ended_at, result_applied_at
 )

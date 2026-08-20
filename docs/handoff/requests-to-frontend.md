@@ -72,7 +72,8 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   fights the art direction in `square-artdirection.md` — better to argue about it now than
   after the geometry exists.
 - Requester's workaround until then: none needed; the envelope is decided and buildable.
-- Status: OPEN
+- Status: ACCEPTED
+- Response: Accepted against final D3 (superseding this request's stale Ask): 88 m ±5%, 9–14 s first contact, 12–16 s nearest site, 16–22 s A↔B rotation, ≤48 m sightline, three bounded levels; geometry waits for `REQ-CC-013` to align `map-data.md` §7.1.
 
 ### REQ-CX-004 — Supported browser matrix decided; it constrains the client
 - Phase: P0 → P1
@@ -89,4 +90,28 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   measurements, not a pre-emptive drop.
 - Proposed shape: capability gate in the shell before the engine loads.
 - Requester's workaround until then: none.
+- Status: ACCEPTED
+- Response: Accepted. The P1 shell will gate before loading the game runtime using D5 and render `UNSUPPORTED_CLIENT` for a failed requirement; Safari 17+ remains in verification, with no mobile/tablet match entry claimed.
+
+### REQ-CX-005 — Publish canonical settings category and binding action IDs
+- Phase: P0
+- Blocking: yes — last open item on the telemetry and settings vocabularies
+- Needed by: Gate G0A
+- Contract affected: `design/settings-inventory.md`; consumed by `contracts/http-api.md` §11.9
+  and `contracts/telemetry.md` §3.3.1, §3.6
+- Ask: `design/settings-inventory.md` is now the single source of truth for settings
+  (REQ-CC-016), and two enums have to come from it that it does not yet contain:
+  1. **Canonical category IDs** for the seven UI sections. It currently has display labels
+     (`Input`, `Bindings`, `Graphics`, `Audio & captions`, `Crosshair & HUD`, `Accessibility`,
+     `Network`). `settings.friction.category` needs stable IDs — labels are copy, they get
+     retitled, and localisation changes them first.
+  2. **Canonical action IDs** for every binding row. The table has labels (`Move forward`,
+     `Crouch/slide`) but no IDs, so a server-side keybind validator cannot be generated from
+     it. I guessed `crouchSlide`/`jump` once; the guess was not yours, which is exactly the
+     drift REQ-CC-016 was raised about.
+- Proposed shape: add an `ID` column to both tables — lowerCamelCase, stable forever once
+  shipped, with a version stamp on the vocabulary so both consumers can bind to it. Renaming
+  an ID afterwards is a CCR against `settings-inventory.md`, `http-api.md`, and `telemetry.md`.
+- Requester's workaround until then: both enums are marked pending in `telemetry.md` §3.6 and
+  `http-api.md` §11.9. I am deliberately not inventing them a second time.
 - Status: OPEN

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Client HTTP layer, lobby socket, match server, Admin Portal |
 

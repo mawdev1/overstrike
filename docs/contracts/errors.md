@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform endpoint, the lobby socket, the client HTTP layer |
 
@@ -62,6 +62,9 @@ a code is an additive amendment, changing what one *means* is breaking.
 | `AUTH_ELIGIBILITY_DENIED` | 403 | Failed eligibility for this action | Terminal. `details.category` only — **never the stored birthdate** |
 | `AUTH_TERMS_ACCEPTANCE_REQUIRED` | 403 | Updated terms unaccepted | Route to acceptance; `details.version` |
 | `AUTH_RECOVERY_TOKEN_INVALID` | 400 | Recovery token bad, used, or superseded | Restart recovery |
+| `AUTH_VERIFICATION_TOKEN_INVALID` | 400 | Verification token bad, used, or superseded | **Resend verification** — not recovery |
+| `AUTH_VERIFICATION_TOKEN_EXPIRED` | 400 | Verification token past TTL | Resend verification |
+| `ELIGIBILITY_RECEIPT_INVALID` | 400 | Signup receipt bad, expired, or for another policy version | Restart the age gate |
 | `AUTH_RECOVERY_TOKEN_EXPIRED` | 400 | Past its 30-minute TTL | Restart recovery |
 
 ### Validation and request
@@ -74,7 +77,7 @@ a code is an additive amendment, changing what one *means* is breaking.
 | `IDEMPOTENCY_KEY_REUSED` | 409 | Same key, different payload. See `http-api.md` §8 |
 | `PAYLOAD_TOO_LARGE` | 413 | Over the endpoint limit |
 | `RATE_LIMITED` | 429 | General rate limit; honour `retryAfterMs` |
-| `UNSUPPORTED_CLIENT` | 426 | Client build below the supported floor. Upgrade message, never retry |
+| `UNSUPPORTED_CLIENT` | 426 | Client build **or capability** outside the D5 matrix. `details.reason` is the closed set shared with `client.unsupported` telemetry: `build`, `browser-version`, `os-version`, `webgl2`, `pointer-lock`, `websocket-binary`, `memory`, `vram`, `cpu-cores`, `mobile-or-tablet`. Upgrade/unsupported message, never retry |
 
 ### Profile and identity
 

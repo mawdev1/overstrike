@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -78,16 +78,20 @@ binding additions:
 {
   "matchId": "01J…",              // assigned at ALLOCATION, not completion
   "rulesetVersion": "bomb-1.0.0",
-  "rulesSnapshot": {                  // REQ-CC-019 — immutable copy of the series config
+  // Immutable copy of the ruleset, discriminated by mode (REQ-CC-019, REQ-CC-025)
+  "rulesSnapshot": {
+    // mode "bomb":
     "roundsToWin": 7, "maxRounds": 12, "sideSwitchAfter": 6,
     "roundLengthSec": 105, "bombTimerSec": 40, "defuseSec": 7, "plantSec": 3,
-    "overtime": false
+    "freezeSec": 8, "overtime": false, "killLimit": null
+    // mode "tdm":  { "killLimit": 75, everything above null }
   },
   "statDefinitionVersion": "1.0.0",  // which definitions in §3 produced these numbers
   "serverBuild": "…", "mapId": "the-square", "mapVersion": "1.0.0", "region": "yyz",
   "mode": "tdm|bomb",
   "startedAt": "…", "endedAt": "…",
   "terminationReason": "completed|aborted|invalidated",
+  "outcomeReason": "elimination|defuse|detonation|timer|forfeit|abandon|no-contest",
   "invalidationReason": null,
   "roster": [ { "accountId": "…", "team": "alpha|bravo", "joinedAt": "…", "leftAt": null } ],
   "teamScores": { "alpha": 0, "bravo": 0 },
@@ -172,6 +176,31 @@ as "your match vanished" and invites a client to try to supply its own stats.
 A `pending` response never invites the browser to submit anything. Result submission is
 service-only (§5), and no field in this response hints otherwise.
 
+### 4.0 The outcome matrix (REQ-CC-025)
+
+One matrix, applied identically by the wire, the facade, this record, the HTTP surface, the
+database, career aggregation, and the event stream. Previously the wire allowed
+`forfeit`/`abandon` with a decided winner and `terminationReason: aborted`, while this contract
+required every aborted match to have a null winner — so a team that won because the other side
+walked would have been recorded as having won nothing.
+
+| Situation | `winner` (wire) | `winnerTeam` | `terminationReason` | `outcomeReason` | Career | Event |
+|---|---|---|---|---|---|---|
+| Normal finish | 1\|2 | `alpha`\|`bravo` | `completed` | elimination / defuse / detonation / timer | W/L | `match.completed` |
+| 6-6 after 12 | 3 | `draw` | `completed` | `timer` | **Draw** | `match.completed` |
+| Opponent forfeits | 1\|2 | `alpha`\|`bravo` | `aborted` | `forfeit` | **W/L** | `match.aborted` |
+| Opponent all disconnect | 1\|2 | `alpha`\|`bravo` | `aborted` | `abandon` | **W/L** | `match.aborted` |
+| Both teams gone | 0 | `null` | `aborted` | `no-contest` | Not counted | `match.aborted` |
+| Server crash, evidence intact | 0 | `null` | `aborted` | `no-contest` | Not counted | `match.aborted` |
+| Invalidated by review | 0 | `null` | `invalidated` | `no-contest` | Not counted | `match.invalidated` |
+
+**An aborted match can have a winner.** That is the row that was missing, and it matters: a
+forfeit is the most common abnormal ending and the winning team earns the win.
+
+`outcomeReason` is a **top-level, closed** field. The per-round `reason` describes the last
+round; it cannot describe why the *match* ended, and reading round-level reasons to infer a
+match-level one is how a forfeit becomes a "timer" win.
+
 **`mapId` and `mapVersion` are separate fields, everywhere (REQ-CC-019).** This record
 previously combined them as `"the-square@…"` while `map-data.md`, `db-schema.md`, the room
 schema, and the facade all kept them apart — so the one place that had to join against the
@@ -199,8 +228,9 @@ Idempotency-Key: match-result:<matchId>
 1. Service-authenticated. **Never browser-reachable** — a client that can post results owns
    the leaderboard.
 2. Idempotency key derived from `matchId`, so a retry is inherently the same key.
-3. Result write, career stat application, and the `match.completed` outbox event are **one
-   transaction**. Partial application is the failure mode that produces stats nobody can
+3. Result write, career stat application, and the outbox event are **one transaction**. The
+   event type follows §4.0 — `match.completed`, `match.aborted`, or `match.invalidated`. It is
+   not always `match.completed`; the catalogue distinguishes them and so must the writer. Partial application is the failure mode that produces stats nobody can
    reconcile.
 4. Replay with the same payload returns the stored response without re-applying.
 5. Replay with a *different* payload for a finalised match → `CONFLICT`. A match finalises

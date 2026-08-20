@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
 
@@ -225,6 +225,10 @@ Score awards extend the existing `SCORE` table with `plant`, `defuse`, `roundWin
 
 Per `wire-protocol.md` §7 G3, all appended, never inserted:
 
+**This list is the wire contract's §8, restated. If they disagree, §8 wins.**
+
+- **Bomb position** `bombX/Y/Z` in `MSG_MATCHSTATE`, per-recipient filtered (§8.6, §8.8).
+- **`interactRefused`** event kind 20, carrying requested kind and refusal reason (§8.7).
 - **No new entity flag bit.** Planting and defusing ride in the appended `interact` u8 field
   (`wire-protocol.md` §8.5): bits 0–1 kind (0 none, 1 plant, 2 defuse), bits 2–7 progress 0–63.
   Two states plus progress in one byte, and flags bit 7 stays spare.

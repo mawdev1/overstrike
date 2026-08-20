@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -61,7 +61,7 @@ registry rows describing one thing.
 
 ### 3.1.1 Supported browser and device matrix — **DECIDED** (D5)
 
-`unsupported_client` is measured against this. Reasoning in
+`client.unsupported` is measured against this. Reasoning in
 [`../decisions/P0-decisions.md`](../decisions/P0-decisions.md) §D5.
 
 | Tier | Support |
@@ -100,6 +100,7 @@ POST /v1/telemetry/client        auth OPTIONAL
 Content-Type: application/json
 
 { "clientSessionId": "01J…",     // client-generated ULID, non-authoritative
+  "consentReceipt": "…",         // from http-api.md §3a.3; REQUIRED for personal-class events
   "schemaVersion": 1,
   "events": [ {
     "name": "flow.step",
@@ -132,6 +133,7 @@ authorization, rate-limit identity, or anything that matters.
 | Retry | Once, after 30 s. Then drop. Telemetry never retries into an outage |
 | Failure | Silent. A telemetry failure is never visible to the player and never blocks a frame |
 | Unknown `name` | Rejected server-side and counted; the batch still succeeds |
+| Missing/invalid `consentReceipt` | Personal-class events in the batch are **rejected**; internal-class still accepted. The batch does not fail as a whole |
 | Payload | Per-name **allowlist**. Keys outside it are dropped server-side, not stored-and-filtered |
 
 **Never persisted in the queue:** access tokens, refresh cookies, raw error strings, chat
@@ -156,7 +158,7 @@ Every payload below is closed: unlisted keys are dropped server-side, not stored
 | `match.handoff_failure` | 1 | personal | `{ stage, code }` — stage `allocating`\|`ticket`\|`connect`\|`welcome` |
 | `match.return_outcome` | 1 | personal | `{ outcome, returnedToLobby: bool }` — outcome `completed`\|`disconnected`\|`kicked`\|`aborted`\|`grace-expired` |
 | `connection.failure` | 1 | personal | `{ stage, code }` — stage `platform`\|`lobby`\|`match`; code from `errors.md` |
-| `settings.friction` | 1 | personal | `{ category, duringFirstSession: bool }` — category is the **UI section** from `design/settings-inventory.md` (`controls`\|`bindings`\|`video`\|`audio`\|`interface`\|`accessibility`\|`diagnostics`\|`practice`), not a settings key |
+| `settings.friction` | 1 | personal | `{ category, duringFirstSession: bool }` — category is a **canonical category ID** from `design/settings-inventory.md` — see §3.6. Not a settings key, and not a display label |
 | `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — reason covers every D5 check: `webgl2`\|`browser-version`\|`os-version`\|`pointer-lock`\|`websocket-binary`\|`memory`\|`vram`\|`cpu-cores`\|`mobile-or-tablet` |
 | `client.fps` | 1 | internal | `{ p50: 0–1000, p01: 0–1000, windowSec: 1–600 }` |
 | `client.frame_time` | 1 | internal | `{ p50Ms, p95Ms, p99Ms }` each 0–10000 |
@@ -180,6 +182,24 @@ display names and chat.
 
 Adding an event is additive — a new row plus a version. Changing an existing payload's meaning
 is a CCR, because the warehouse already has rows under the old interpretation.
+
+### 3.6 Bound vocabularies — pending CX (REQ-CC-026)
+
+Two enums in this contract are **owned by `design/settings-inventory.md`**, not by me:
+
+| Enum | Used by | Status |
+|---|---|---|
+| Settings **category IDs** | `settings.friction.category` | **Blocked on CX** — the inventory has display labels (`Input`, `Bindings`, `Graphics`, `Audio & captions`, `Crosshair & HUD`, `Accessibility`, `Network`) but no stable IDs |
+| Binding **action IDs** | `http-api.md` §11.9 keybind validation | **Blocked on CX** — same reason |
+
+I guessed both once (`controls|bindings|video|audio|…`, and `crouchSlide`/`jump`) and the
+guesses did not match the inventory. Guessing again would reproduce exactly the drift that
+`REQ-CC-016` was raised about, so these stay open until Codex publishes canonical IDs —
+filed as `REQ-CX-005`.
+
+Display labels cannot serve as IDs: they are copy, they get retitled, and they are the first
+thing localisation changes. When the IDs land, both this enum and the §11.9 validator bind to
+that versioned vocabulary and neither restates it.
 
 ### 3.4 Consent and eligibility gating
 

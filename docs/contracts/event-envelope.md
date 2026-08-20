@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` |
-| **Version** | 1.0.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform service, the worker, audit, analytics, Admin Portal |
 
@@ -111,6 +111,7 @@ representing, it is `agent.action.requested` — a request that was made, which 
 | `match.allocated` | service | match | internal | standard |
 | `match.started` | service | match | public | standard |
 | `match.completed` | service | match | public | audit |
+| `match.aborted` | service | match | public | audit |
 | `match.invalidated` | service/admin | match | internal | audit |
 | `match.result_applied` | service | match | internal | audit |
 | `player.killed` | service | match | public | standard |

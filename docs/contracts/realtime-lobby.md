@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] shell UI, presence service, room service |
 
@@ -90,7 +90,7 @@ Failures close the socket with a code and an `errors.md` payload: bad ticket
 | `lobby.welcome` | full state | Once, at open |
 | `roster.delta` | `{ added: RosterMember[], updated: RosterMember[], removed: accountId[] }` — full members on add/update, **ids only** on remove | Never a full roster after welcome, except after `state.resync` |
 | `presence.delta` | `{ accountId, state: 'online'\|'in-lobby'\|'in-match'\|'offline', joinable: bool, roomId: string\|null }` | Out-of-room presence for the online list |
-| `room.updated` | a **partial** `RoomState` — only changed top-level keys, `settings` replaced wholesale when any part changes | Name, capacity, mode, map, status, joinable |
+| `room.updated` | `Partial<RoomCore>` over the closed mutable set in `http-api.md` §11.3 — `settings` replaced wholesale | Never carries `roomId`, `mapId`, `mapVersion`, `mode`, `rulesetVersion` or `build`: those are immutable for a live room |
 | `team.changed` | `{ accountId, team, byServer }` | `byServer: true` when balancing moved them, so the UI can explain it |
 | `ready.changed` | `{ accountId, ready, clearedReason? }` | `clearedReason` ∈ `roster-change`, `team-change`, `loadout-change`, `room-change` |
 | `countdown.started` | `{ endsAt, requiredReady, currentReady }` | |

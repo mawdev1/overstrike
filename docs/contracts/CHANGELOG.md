@@ -32,6 +32,51 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — Fourth-pass graph audit, `REQ-CC-021`…`026` (additive)
+
+Codex re-walked the six chains amended by `REQ-CC-015`…`020` and found residual breaks in all
+six. Affected contracts go to **1.4.0**.
+
+**These were the loose ends of my own fixes.** Each amendment closed the middle of a chain and
+left an end dangling: components defined but old duplicates left in place, a receipt required
+by one endpoint and returned by none, a descriptor produced by the lobby with no facade
+parameter to receive it.
+
+| Request | Residual break |
+|---|---|
+| `REQ-CC-021` | Room components defined, but the list example, mutation returns, and `room.updated` still described the removed `RoomState` |
+| `REQ-CC-022` | Signup required an `eligibilityReceipt` that eligibility never returned; consent promised a receipt nothing carried |
+| `REQ-CC-023` | `match.ready` carried the descriptor; `net.connect` had no parameter for it, and `matchState` had no `matchId` to build the reconnect URL |
+| `REQ-CC-024` | Refusal event carried a reason but not the kind, so it could not produce `{ kind, reason }` |
+| `REQ-CC-025` | Wire allowed a forfeit winner; the result required every aborted match to have none |
+| `REQ-CC-026` | Two enums bound to a CX vocabulary that does not yet exist |
+
+### Three worth naming
+
+1. **A forfeit is an aborted match with a winner.** The wire allowed it, `match-result.md`
+   forbade it, so the team that won because the other side walked would have been recorded as
+   winning nothing. §4.0 is now one outcome matrix — completed, draw, forfeit, abandon,
+   no-contest, invalidated — applied identically by wire, facade, result, HTTP, database,
+   career aggregation, and event type.
+2. **The neutral age gate published the number it was testing against.** Returning
+   `minimumAge: 13` on success tells a rejected visitor exactly what to enter next. Eligibility
+   now returns an opaque signed receipt and a policy version, and nothing else.
+3. **Consent moved before signup.** Capturing it after meant the first four funnel steps were
+   permanently unmeasurable while §3.1 promised to measure them, *and* signup returned a
+   profile whose consent object had to be non-null before any consent call existed. Asking at
+   landing fixes both.
+
+### Two enums I am deliberately not writing
+
+Settings category IDs and binding action IDs belong to `design/settings-inventory.md`, which
+has display labels and no stable IDs. I guessed both once and neither guess matched. Guessing
+again would reproduce exactly the drift `REQ-CC-016` was raised about, so they are marked
+pending and filed as `REQ-CX-005`.
+
+**Lesson recorded:** an amendment is not done when the change is written — it is done when
+both ends of every chain it touches have been re-read. Four rounds, same failure mode, each
+narrower than the last.
+
 ## 2026-08-20 — Cross-reference audit, `REQ-CC-015`…`020` (additive)
 
 Codex audited **producer→consumer chains across files** rather than each file alone. Every

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -239,7 +239,7 @@ failure. The socket closes immediately after; the client must not retry a reject
 | 1 | u32 | `clientId` | yes |
 | 5 | u32 | `entityId` | yes |
 | 9 | u32 | `matchSeed` | yes |
-| 13 | u16 | `killLimit` | yes |
+| 13 | u16 | `killLimit` — **`0` in Bomb** | yes |
 | 15 | u16 | `protocolVersion` | **new** |
 | 17 | u8 | `mode` (0 tdm, 1 bomb) | **new** |
 | 18 | u8 | `flags` — bit 0 `isReconnect`, bit 1 `isSpectator` | **new** |
@@ -247,6 +247,11 @@ failure. The socket closes immediately after; the client must not retry a reject
 
 Still re-sent on match restart. `isReconnect` tells the client it rebound to an existing entity
 rather than spawning, so it restores rather than resets its local view.
+
+**`killLimit` is `0` in Bomb, and `0` means "not applicable" (REQ-CC-021).** `RoomSettings`
+represents the same absence as `null`, which a u16 cannot express. Decoders map `0` → `null`
+when `mode` is bomb. A kill limit of zero is not otherwise reachable — `normalizeKillLimit`
+clamps to `MIN_KILL_LIMIT = 1` — so the sentinel is unambiguous.
 
 ### 8.5 The flag-bit problem — resolved
 
@@ -301,6 +306,12 @@ thousands of times a match.
 | 32 | f32 | `bombY` |
 | 36 | f32 | `bombZ` |
 
+**Visibility filtering (REQ-CC-024).** `bombX/Y/Z` is filtered per recipient by the same rule
+as `bombCarrierId` (§8.8): attackers always receive it; defenders receive it only when the
+bomb is **planted** (its position is then public — they must find it to defuse) or when a
+dropped bomb is in their line of sight. Otherwise zero. Sending true coordinates to everyone
+and hiding them in the UI would be a wallhack shipped in the protocol.
+
 **Bomb position is state, not an event (REQ-CC-018).** `bombDropped` (§8.7) fires once; a
 client that reconnects or resyncs after it has fired would never learn where the bomb is. It
 lives in the state message so every snapshot of the world is complete on its own. Meaningful
@@ -326,8 +337,14 @@ Appended to `EV_KINDS` **in this order** — the wire code is the index:
 **`interactRefused` is separate from the cancel kinds (REQ-CC-018).** A cancellation ends
 something that had started; a refusal means it never started — wrong phase, not the carrier,
 already planted. The facade previously sourced `interactionRefused` from `plantCancel`, which
-cannot express a precondition that was never met. `amount` carries the refusal reason: `0`
-not-eligible, `1` wrong-phase, `2` outside-volume, `3` not-carrier, `4` already-planted.
+cannot express a precondition that was never met. It carries **both** the requested kind and the reason, because the facade needs
+`{ kind, reason }` and `amount` alone cannot produce it:
+
+| Field | Carries |
+|---|---|
+| flags bits 1–5 | requested kind — `1` plant, `2` defuse (the same encoding as `interact`) |
+| `amount` | reason — `0` not-eligible, `1` wrong-phase, `2` outside-volume, `3` not-carrier, `4` already-planted |
+
 Sent only to the refused player.
 
 All reuse the existing 12-byte event header. `entityId` is the actor; `amount` carries the
