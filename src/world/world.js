@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { buildLevel } from './level.js';
+import * as MERIDIAN from './level.js';
 
 /**
  * World — static collision + level geometry.  See ARCHITECTURE.md §5.
@@ -70,6 +70,361 @@ let _probeSurface = 'concrete';
 // and only when debugDraw(true) is first called.
 let _debugMat = null;
 
+// ══ the map data contract ═════════════════════════════════════════════════════════════
+//
+// `docs/contracts/map-data.md` §3. A level module is [CX]-owned art authoring; this lane
+// consumes it through a manifest and NEVER by reaching into its internals. Everything
+// below is the consumer half of that seam.
+//
+// Two states, and the difference is recorded rather than smoothed over:
+//
+//   DECLARED — the level module exports MAP_MANIFEST, so the manifest is read from it.
+//   DERIVED  — it does not (MERIDIAN today), so the manifest is reconstructed from what
+//              the level actually produced: real bounds, real spawn markers, real box
+//              count. Nothing is invented. Fields the contract requires but the producer
+//              has not supplied are EMPTY with a `provenance` of 'missing', so a consumer
+//              that needs them (the Bomb ruleset needs objectives) fails loudly against a
+//              missing key instead of quietly running on a plausible-looking fabrication.
+//
+// `manifest.provenance` is the machine-readable list of what Codex still owes. Harnesses
+// read it; `scripts/maptest.mjs` prints it.
+
+/** Draw/tri/material/light/collider allocation from map-data.md §3.6 (REQ-CC-007). */
+const CONTRACT_DEFAULT_BUDGETS = Object.freeze({
+  profileId: 'ref-integrated-1080p',
+  drawCalls: 140,
+  triangles: 300_000,
+  materials: 48,
+  lights: 6,
+  colliders: 1200,
+});
+
+/** Present-and-own-property. `x !== null` would accept a key that is not there at all. */
+function present(obj, key) {
+  return obj !== null && typeof obj === 'object' && Object.hasOwn(obj, key);
+}
+
+function isVec3Like(v) {
+  return v !== null && typeof v === 'object'
+    && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+}
+
+function toVec3(v) { return new THREE.Vector3(v.x, v.y, v.z); }
+
+/** A §3.3/§3.4 volume, normalised so min <= max on every axis. Returns null if malformed. */
+function normalizeBox(b) {
+  if (!present(b, 'min') || !present(b, 'max')) return null;
+  if (!isVec3Like(b.min) || !isVec3Like(b.max)) return null;
+  return {
+    min: new THREE.Vector3(Math.min(b.min.x, b.max.x), Math.min(b.min.y, b.max.y), Math.min(b.min.z, b.max.z)),
+    max: new THREE.Vector3(Math.max(b.min.x, b.max.x), Math.max(b.min.y, b.max.y), Math.max(b.min.z, b.max.z)),
+    // Whether the AUTHORED box was inverted. §3.1 says the guard rejects min > max rather
+    // than letting the spatial hash silently drop it, so the fact is carried, not erased.
+    inverted: b.min.x > b.max.x || b.min.y > b.max.y || b.min.z > b.max.z,
+  };
+}
+
+function pointInBox(box, x, y, z) {
+  return x >= box.min.x && x <= box.max.x
+    && y >= box.min.y && y <= box.max.y
+    && z >= box.min.z && z <= box.max.z;
+}
+
+// ── registry ─────────────────────────────────────────────────────────────────────────
+//
+// Map selection is by MANIFEST ENTRY, not by an import at the top of World.init(). That
+// is the whole point: retiring MERIDIAN in favour of The Square must be a change to a
+// rotation list, not an edit to the simulation.
+
+const MAP_REGISTRY = new Map();
+let _rotation = [];
+let _activeMapId = null;
+
+/**
+ * Register a level module as a selectable map.
+ *
+ * `mod` is the module namespace of a [CX]-owned level file. `fallbackId`/`fallbackVersion`
+ * are used ONLY while that module has not yet exported MAP_ID / MAP_VERSION; once it does,
+ * its own values win and the fallbacks are dead weight.
+ */
+export function registerMap(mod, { fallbackId, fallbackVersion = '0.0.0-underived', inRotation = true } = {}) {
+  if (typeof mod?.buildLevel !== 'function') {
+    throw new Error(`registerMap: level module for '${fallbackId}' exports no buildLevel()`);
+  }
+  const declaresId = present(mod, 'MAP_ID') && typeof mod.MAP_ID === 'string' && mod.MAP_ID.length > 0;
+  const declaresVersion = present(mod, 'MAP_VERSION') && typeof mod.MAP_VERSION === 'string';
+  const declaresManifest = present(mod, 'MAP_MANIFEST') && mod.MAP_MANIFEST !== null
+    && typeof mod.MAP_MANIFEST === 'object';
+  const declaresBoundary = present(mod, 'COMPETITIVE_BOUNDARY') && Array.isArray(mod.COMPETITIVE_BOUNDARY);
+
+  const entry = {
+    id: declaresId ? mod.MAP_ID : fallbackId,
+    version: declaresVersion ? mod.MAP_VERSION : fallbackVersion,
+    module: mod,
+    declares: {
+      MAP_ID: declaresId,
+      MAP_VERSION: declaresVersion,
+      MAP_MANIFEST: declaresManifest,
+      COMPETITIVE_BOUNDARY: declaresBoundary,
+    },
+    build(game, world) { mod.buildLevel(game, world); },
+  };
+  if (!entry.id) throw new Error('registerMap: no MAP_ID export and no fallbackId');
+  MAP_REGISTRY.set(entry.id, entry);
+  if (inRotation && !_rotation.includes(entry.id)) _rotation.push(entry.id);
+  if (_activeMapId === null) _activeMapId = entry.id;
+  return entry;
+}
+
+export function getMapEntry(id) { return MAP_REGISTRY.get(id) ?? null; }
+export function listMaps() { return [...MAP_REGISTRY.values()]; }
+/** Ids eligible for match rotation, in order. */
+export function mapRotation() { return [..._rotation]; }
+export function activeMapId() { return _activeMapId; }
+
+/**
+ * Replace the rotation. This is the retirement lever: dropping MERIDIAN is
+ * `setMapRotation(['the-square'])`, and the map stays registered as a test fixture
+ * (map-data.md §9) because registration and rotation are separate lists.
+ */
+export function setMapRotation(ids) {
+  for (const id of ids) {
+    if (!MAP_REGISTRY.has(id)) throw new Error(`setMapRotation: '${id}' is not a registered map`);
+  }
+  _rotation = [...ids];
+  if (!_rotation.includes(_activeMapId) && _rotation.length) _activeMapId = _rotation[0];
+  return mapRotation();
+}
+
+export function selectMap(id) {
+  if (!MAP_REGISTRY.has(id)) throw new Error(`selectMap: '${id}' is not a registered map`);
+  _activeMapId = id;
+  return id;
+}
+
+// The Square is the level module's own map. It declares MAP_ID/MAP_VERSION/MAP_MANIFEST,
+// so both are read from it and the fallbacks below are never used.
+registerMap(MERIDIAN, { fallbackId: 'the-square', fallbackVersion: '0.0.0-underived' });
+
+// map-data.md §9: MERIDIAN is RETAINED as a test fixture and is NOT in rotation. Every
+// performance and collision baseline in this repository was measured against it, and a
+// comparison against a map you have deleted is not a comparison. `inRotation: false` is
+// the whole retirement: registered, selectable by name from a harness, never matched on.
+if (Object.hasOwn(MERIDIAN, 'MERIDIAN_FIXTURE')) {
+  registerMap(MERIDIAN.MERIDIAN_FIXTURE, { fallbackId: 'meridian', inRotation: false });
+}
+
+// ── manifest construction ────────────────────────────────────────────────────────────
+
+/**
+ * §3.2 spawn record, normalised.
+ *
+ * A DERIVED spawn keeps the level's own `{position, yaw, team}` object identity — the
+ * spawner and `_faceSpawnsIntoTheOpen` hold references to it — and gains the contract
+ * fields. `id` is derived from team and authoring order, which is stable as long as
+ * `placeSpawns` is, and is marked derived so nothing treats it as the forever-stable id
+ * §3.2 demands.
+ */
+function deriveSpawns(world, mapId) {
+  const out = [];
+  const perTeam = new Map();
+  for (let i = 0; i < world.spawnPoints.length; i++) {
+    const sp = world.spawnPoints[i];
+    const team = Number.isFinite(sp.team) ? sp.team : -1;
+    const n = (perTeam.get(team) ?? 0) + 1;
+    perTeam.set(team, n);
+    const label = team === 0 ? 'alpha' : team === 1 ? 'bravo' : 'neutral';
+    if (!present(sp, 'id')) sp.id = `${mapId}-${label}-${n}`;
+    if (!present(sp, 'group')) sp.group = `${mapId}-${label}`;
+    if (!present(sp, 'protectionRadius')) sp.protectionRadius = 4.0;
+    if (!present(sp, 'modes')) sp.modes = ['tdm'];
+    out.push(sp);
+  }
+  return out;
+}
+
+function readDeclaredSpawns(list, world) {
+  const out = [];
+  world.spawnPoints.length = 0;
+  for (const s of list) {
+    if (!present(s, 'position') || !isVec3Like(s.position)) continue;
+    const rec = {
+      id: present(s, 'id') ? String(s.id) : null,
+      position: toVec3(s.position),
+      yaw: Number.isFinite(s.yaw) ? s.yaw : 0,
+      team: Number.isFinite(s.team) ? s.team : -1,
+      group: present(s, 'group') ? String(s.group) : null,
+      protectionRadius: Number.isFinite(s.protectionRadius) ? s.protectionRadius : 4.0,
+      modes: Array.isArray(s.modes) ? [...s.modes] : ['tdm'],
+    };
+    world.spawnPoints.push(rec);
+    out.push(rec);
+  }
+  return out;
+}
+
+function readVolumes(list, extra) {
+  const out = [];
+  if (!Array.isArray(list)) return out;
+  for (const v of list) {
+    if (!present(v, 'id') || !present(v, 'box')) continue;
+    const box = normalizeBox(v.box);
+    if (box === null) continue;
+    out.push({ id: String(v.id), box, ...extra(v) });
+  }
+  return out;
+}
+
+function readNavHints(src) {
+  const boxes = (list) => {
+    const out = [];
+    if (!Array.isArray(list)) return out;
+    for (const b of list) { const nb = normalizeBox(b); if (nb !== null) out.push(nb); }
+    return out;
+  };
+  const links = [];
+  if (Array.isArray(src?.links)) {
+    for (const l of src.links) {
+      if (!present(l, 'from') || !present(l, 'to')) continue;
+      if (!isVec3Like(l.from) || !isVec3Like(l.to)) continue;
+      const kind = present(l, 'kind') ? String(l.kind) : 'mantle';
+      links.push({ from: toVec3(l.from), to: toVec3(l.to), kind });
+    }
+  }
+  const cover = [];
+  if (Array.isArray(src?.cover)) {
+    for (const c of src.cover) {
+      if (!present(c, 'position') || !isVec3Like(c.position)) continue;
+      cover.push({ position: toVec3(c.position), facing: Number.isFinite(c.facing) ? c.facing : 0 });
+    }
+  }
+  return {
+    walkable: boxes(src?.walkable),
+    blocked: boxes(src?.blocked),
+    links,
+    cover,
+  };
+}
+
+/**
+ * Build the §3 manifest for a built world.
+ *
+ * Called once, after `build()`, from `World.init()`. Reads the producer's MAP_MANIFEST
+ * where it exists and derives the rest from measured geometry.
+ */
+export function buildManifest(entry, world) {
+  const src = entry.declares.MAP_MANIFEST ? entry.module.MAP_MANIFEST : null;
+  const provenance = {};
+
+  // -- bounds
+  let bounds;
+  if (src !== null && present(src, 'bounds') && present(src.bounds, 'min') && present(src.bounds, 'max')
+    && isVec3Like(src.bounds.min) && isVec3Like(src.bounds.max)) {
+    bounds = { min: toVec3(src.bounds.min), max: toVec3(src.bounds.max) };
+    provenance.bounds = 'declared';
+  } else {
+    bounds = { min: world.bounds.min.clone(), max: world.bounds.max.clone() };
+    provenance.bounds = 'derived';
+  }
+
+  // -- spawns
+  let spawns;
+  if (src !== null && Array.isArray(src.spawns) && src.spawns.length > 0) {
+    spawns = readDeclaredSpawns(src.spawns, world);
+    provenance.spawns = 'declared';
+  } else {
+    spawns = deriveSpawns(world, entry.id);
+    provenance.spawns = 'derived';
+  }
+
+  // -- objectives (§3.3). Bomb needs these; nothing plausible is invented for them.
+  let objectives = [];
+  if (src !== null && Array.isArray(src.objectives)) {
+    objectives = readVolumes(src.objectives, (v) => ({
+      kind: present(v, 'kind') ? String(v.kind) : 'zone',
+      site: present(v, 'site') ? String(v.site) : null,
+      requiresGround: present(v, 'requiresGround') ? !!v.requiresGround : true,
+    }));
+    provenance.objectives = 'declared';
+  } else {
+    provenance.objectives = 'missing';
+  }
+
+  // -- callouts (§3.4)
+  let callouts = [];
+  if (src !== null && Array.isArray(src.callouts)) {
+    callouts = readVolumes(src.callouts, (v) => ({
+      name: present(v, 'name') ? String(v.name) : String(v.id),
+      priority: Number.isFinite(v.priority) ? v.priority : 0,
+    }));
+    provenance.callouts = 'declared';
+  } else {
+    provenance.callouts = 'missing';
+  }
+
+  // -- nav hints (§3.5)
+  let navHints;
+  if (src !== null && present(src, 'navHints')) {
+    navHints = readNavHints(src.navHints);
+    provenance.navHints = 'declared';
+  } else {
+    navHints = readNavHints(null);
+    provenance.navHints = 'missing';
+  }
+
+  // -- budgets (§3.6)
+  let budgets;
+  if (src !== null && present(src, 'budgets')) {
+    budgets = { ...CONTRACT_DEFAULT_BUDGETS, ...src.budgets };
+    provenance.budgets = 'declared';
+  } else {
+    budgets = { ...CONTRACT_DEFAULT_BUDGETS };
+    provenance.budgets = 'contract-default';
+  }
+
+  // -- §5 removable competitive boundary
+  let boundary = [];
+  if (entry.declares.COMPETITIVE_BOUNDARY) {
+    for (const b of entry.module.COMPETITIVE_BOUNDARY) {
+      const nb = normalizeBox(b);
+      if (nb !== null) boundary.push(nb);
+    }
+    provenance.boundary = 'declared';
+  } else {
+    provenance.boundary = 'missing';
+  }
+
+  return {
+    mapId: entry.id,
+    mapVersion: entry.version,
+    source: entry.declares.MAP_MANIFEST ? 'declared' : 'derived',
+    declares: { ...entry.declares },
+    provenance,
+    bounds,
+    spawns,
+    objectives,
+    callouts,
+    navHints,
+    budgets,
+    boundary,
+    /** Measured, never declared — the manifest must not be able to lie about this. */
+    measured: { colliders: world.boxes.length },
+  };
+}
+
+/** Everything §3 requires that this manifest's producer has not supplied yet. */
+export function manifestGaps(manifest) {
+  const gaps = [];
+  if (!manifest.declares.MAP_ID) gaps.push('MAP_ID');
+  if (!manifest.declares.MAP_VERSION) gaps.push('MAP_VERSION');
+  if (!manifest.declares.MAP_MANIFEST) gaps.push('MAP_MANIFEST');
+  if (!manifest.declares.COMPETITIVE_BOUNDARY) gaps.push('COMPETITIVE_BOUNDARY');
+  for (const [k, v] of Object.entries(manifest.provenance)) {
+    if (v === 'missing') gaps.push(`MAP_MANIFEST.${k}`);
+  }
+  return gaps;
+}
+
 export class World {
   constructor(game) {
     this.game = game;
@@ -78,6 +433,16 @@ export class World {
     this.boxes = [];
     /** @type {Array<{position:THREE.Vector3, yaw:number, team:number}>} */
     this.spawnPoints = [];
+
+    /**
+     * The map-data.md §3 manifest for whatever map is loaded. Null until init() runs —
+     * deliberately null rather than an empty object, so a consumer that reads it too
+     * early throws instead of silently seeing "a map with no objectives".
+     */
+    this.manifest = null;
+    this.mapId = null;
+    this.mapVersion = null;
+
     this.bounds = {
       min: new THREE.Vector3(-1, -1, -1),
       max: new THREE.Vector3(1, 1, 1),
@@ -108,13 +473,91 @@ export class World {
 
   // ────────────────────────────────────────────────────────────────── lifecycle
 
-  async init() {
+  /**
+   * Build a map by manifest.
+   *
+   * `mapId` selects from the registry; omitted, the active rotation entry is used. There
+   * is no import of a specific level here on purpose — swapping MERIDIAN for The Square
+   * is a registry/rotation change, not a code change in the simulation.
+   */
+  async init({ mapId = null } = {}) {
     const t0 = (typeof performance !== 'undefined' ? performance.now() : 0);
-    buildLevel(this.game, this);
+    const id = mapId ?? activeMapId();
+    const entry = getMapEntry(id);
+    if (entry === null) throw new Error(`World.init: no registered map '${id}'`);
+
+    this.mapId = entry.id;
+    this.mapVersion = entry.version;
+    entry.build(this.game, this);
     this.build();
+    // The manifest is read AFTER build() so derived bounds and collider counts are the
+    // measured ones, and BEFORE the spawn re-aim so a declared spawn set is what gets
+    // re-aimed rather than whatever placeSpawns happened to leave behind.
+    this.manifest = buildManifest(entry, this);
+    if (this.manifest.provenance.bounds === 'declared') {
+      this.setBounds(this.manifest.bounds.min, this.manifest.bounds.max);
+    }
     this._faceSpawnsIntoTheOpen();
     this.buildStats.buildMs = (typeof performance !== 'undefined' ? performance.now() : 0) - t0;
     this.buildStats.colliders = this.boxes.length;
+  }
+
+  // ─────────────────────────────────────────────────────────── manifest queries
+
+  /** Spawns filtered by §3.2 `modes` and team. `team` -1 (or omitted) accepts any. */
+  spawnsFor(mode = null, team = -1) {
+    const list = this.manifest === null ? this.spawnPoints : this.manifest.spawns;
+    const out = [];
+    for (const sp of list) {
+      if (team !== -1 && sp.team !== -1 && sp.team !== team) continue;
+      if (mode !== null && Array.isArray(sp.modes) && !sp.modes.includes(mode)) continue;
+      out.push(sp);
+    }
+    return out;
+  }
+
+  /** Distinct §3.2 spawn groups for a team — what the TDM spawn scorer selects between. */
+  spawnGroups(team = -1) {
+    const groups = new Map();
+    for (const sp of this.spawnsFor(null, team)) {
+      const key = present(sp, 'group') && sp.group !== null ? sp.group : '(ungrouped)';
+      const g = groups.get(key) ?? [];
+      g.push(sp);
+      groups.set(key, g);
+    }
+    return groups;
+  }
+
+  /** §3.3 objective volume by its never-changing id, or null. */
+  objective(id) {
+    if (this.manifest === null) return null;
+    for (const o of this.manifest.objectives) if (o.id === id) return o;
+    return null;
+  }
+
+  /** §3.3 volumes for a site, e.g. `objectivesAt('A')`. */
+  objectivesAt(site) {
+    if (this.manifest === null) return [];
+    return this.manifest.objectives.filter((o) => o.site === site);
+  }
+
+  /**
+   * §3.4: the one callout region a point resolves to, or null when the producer has
+   * supplied no callouts. Highest `priority` wins where regions overlap.
+   */
+  calloutAt(x, y, z) {
+    if (this.manifest === null) return null;
+    let best = null;
+    for (const c of this.manifest.callouts) {
+      if (!pointInBox(c.box, x, y, z)) continue;
+      if (best === null || c.priority > best.priority) best = c;
+    }
+    return best;
+  }
+
+  /** §5: the removable competitive boundary layer, or an empty list if untagged. */
+  boundaryBoxes() {
+    return this.manifest === null ? [] : this.manifest.boundary;
   }
 
   /**
@@ -1050,6 +1493,7 @@ export class World {
     });
     if (this.group.parent) this.group.parent.remove(this.group);
     this.group.clear();
+    this.manifest = null;
     // Materials are owned by assets.js — only the debug-only line material is ours.
     if (_debugMat) { _debugMat.dispose(); _debugMat = null; }
     this._debugMesh = null;

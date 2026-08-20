@@ -1,0 +1,1086 @@
+/**
+ * Bomb ruleset verification — `docs/contracts/bomb-rules.md` §12.
+ *
+ * Every case here names the contract rule it holds down, and every case that could pass
+ * for the wrong reason carries its failing CONTROL: the same setup shifted by one tick, or
+ * one precondition removed, asserted to produce the OTHER outcome. A test that cannot tell
+ * which rule fired leaves every neighbouring rule untested, and the §4 precedence list is
+ * exactly a set of neighbouring rules that resolve the same inputs differently.
+ *
+ * ── How the simulation is driven ─────────────────────────────────────────────────────────
+ * `match.fixedUpdate(FIXED_DT)` directly, not `game._fixedUpdate`. Both are the real code
+ * under test; the difference is that the referee's step alone leaves bots standing where
+ * the harness put them, so a boundary case is a boundary case and not a race with an AI
+ * that wandered out of the volume. The determinism case at the end runs the FULL game loop
+ * with live bots, twice, precisely because the scripted driver would not prove that.
+ *
+ * ── Where the bomb sites come from ───────────────────────────────────────────────────────
+ * The map manifest (`map-data.md` §3.3), never constants in the ruleset. This harness reads
+ * the live map's own compiled manifest — The Square declares `site-A` and `site-B` — so
+ * every volume test below is played on real authored geometry. The only synthetic manifests
+ * here are the malformed ones, which exist to prove each rejection by name, and the
+ * objective-less one, which proves a map that publishes no sites cannot host Bomb.
+ */
+import { Game } from '../src/core/game.js';
+import { NullPresenter } from '../src/core/presenter.js';
+import { MODE_LIST, MODES, DEFAULT_MODE, getMode, BOMB, TDM, bombAvailable } from '../src/game/modes.js';
+import {
+  BOMB_PARAMS, BOMB_TICKS as T, REFUSE, compileObjectives, resolveMapManifest,
+} from '../src/game/bomb.js';
+import { SCORE } from '../src/game/match.js';
+import { FIXED_DT } from '../src/core/mathUtils.js';
+
+let failures = 0;
+let checks = 0;
+let section = '';
+const ok = (name) => { checks++; console.log(`  ok   ${name}`); };
+const bad = (name, detail) => {
+  failures++; checks++;
+  console.log(`  FAIL ${name}\n       ${detail}`);
+};
+const expect = (cond, name, detail = '') => (cond ? ok(name) : bad(name, `[${section}] ${detail}`));
+/** Value equality against a SPECIFIC expected value — never a truthiness or a length. */
+const eq = (actual, expected, name) => expect(
+  Object.is(actual, expected), name, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+);
+const eqJson = (actual, expected, name) => expect(
+  JSON.stringify(actual) === JSON.stringify(expected), name,
+  `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+);
+const head = (title) => { section = title; console.log(`\n── ${title}`); };
+
+// ─────────────────────────────────────────────────────────────────────────────── fixtures
+
+async function newGame({ seed = 20260819, botCount = 7, mode = 'bomb' } = {}) {
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode, botCount, seed });
+  // Skip the presentation countdown; the ruleset's own freeze is the phase under test.
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  return game;
+}
+
+const step = (game, n = 1) => { for (let i = 0; i < n; i++) game.match.fixedUpdate(FIXED_DT); };
+
+/** Advance to the live round, asserting the freeze lasted exactly the configured time. */
+function toLive(game, label) {
+  const bomb = game.match.bomb;
+  let n = 0;
+  while (bomb.phase !== 'live' && n < T.freeze * 4) { step(game); n++; }
+  eq(n, T.freeze + 1, `${label}: freeze lasts ${BOMB_PARAMS.freezeSeconds}s then the round goes live`);
+  return bomb;
+}
+
+const roster = (game) => game.entities.filter((e) => e.team === 0 || e.team === 1);
+const teamOf = (game, team) => roster(game).filter((e) => e.team === team).sort((a, b) => a.id - b.id);
+const attackers = (game) => teamOf(game, game.match.bomb.attackingTeam);
+const defenders = (game) => teamOf(game, game.match.bomb.defendingTeam);
+
+function kill(game, victim, attacker = null) {
+  game.bus.emit('kill', { victim, attacker, weaponId: 'ar_vector', headshot: false, distance: 12 });
+}
+
+/** Eliminate a whole team except the listed survivors. */
+function wipe(game, team, keep = []) {
+  const keepIds = new Set(keep.map((e) => e.id));
+  for (const e of teamOf(game, team)) {
+    if (keepIds.has(e.id)) continue;
+    if (game.match.bomb.isAlive(e)) kill(game, e, null);
+  }
+}
+
+function centre(box) {
+  return {
+    x: (box.min.x + box.max.x) / 2,
+    y: box.min.y + 0.5,
+    z: (box.min.z + box.max.z) / 2,
+  };
+}
+
+function place(entity, p) {
+  entity.position.set(p.x, p.y, p.z);
+  entity.grounded = true;
+}
+
+/** Put the round's bomb carrier inside a site's plant volume, ready to plant. */
+function carrierIntoSite(game, siteId = 'A') {
+  const bomb = game.match.bomb;
+  const carrier = game.entityById(bomb.bomb.carrierId);
+  place(carrier, centre(bomb.sites.get(siteId).plant));
+  return carrier;
+}
+
+/** Plant the bomb outright, and assert it took exactly the configured plant time. */
+function plant(game, siteId = 'A', label = 'plant') {
+  const bomb = game.match.bomb;
+  const carrier = carrierIntoSite(game, siteId);
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  eq(bomb.phase, 'live', `${label}: still live one tick before the plant completes`);
+  step(game, 1);
+  eq(bomb.phase, 'planted', `${label}: the bomb is planted after exactly ${BOMB_PARAMS.plantSeconds}s`);
+  return carrier;
+}
+
+/** The most recent event of a kind, or a stand-in that fails every field comparison. */
+function lastEvent(bomb, kind) {
+  for (let i = bomb.events.length - 1; i >= 0; i--) if (bomb.events[i].kind === kind) return bomb.events[i];
+  return { kind: `<no ${kind} event>` };
+}
+
+/** Put a defender in the defuse volume and hold the key. */
+function beginDefuse(game, defender) {
+  const bomb = game.match.bomb;
+  place(defender, centre(bomb.sites.get(bomb.bomb.siteId).defuse));
+  return bomb.requestInteract(defender, 'defuse');
+}
+
+// ════════════════════════════════════════════════════════ §1 the mode table is the freeze
+
+console.log('\nBomb ruleset — docs/contracts/bomb-rules.md §12');
+head('§1 mode table');
+
+eqJson(MODE_LIST.map((m) => m.id), ['tdm', 'bomb'], 'the mode table has exactly two entries, tdm and bomb');
+eqJson(Object.keys(MODES), ['tdm', 'bomb'], 'MODES is keyed by exactly those two ids');
+eq(DEFAULT_MODE, 'tdm', 'TDM remains the default ruleset');
+eq(getMode('bomb'), BOMB, 'getMode resolves the bomb id to the Bomb ruleset');
+eq(getMode('capture-the-flag'), TDM, 'an unknown mode id resolves to TDM');
+eq(getMode('constructor'), TDM, 'a prototype key is not a mode');
+eq(BOMB_PARAMS.roundsToWin, 7, '§2 rounds to win is 7');
+eq(BOMB_PARAMS.maxRounds, 12, '§2.1a regulation is MR12');
+eq(BOMB_PARAMS.sideSwitchAfterRound, 6, '§2 sides switch after round 6');
+eq(BOMB_PARAMS.overtime, false, '§2.2 there is no overtime in Alpha');
+eq(BOMB_PARAMS.defuseKit, false, '§2 there is no defuse kit in Alpha');
+eq(T.bomb, 4800, '§2.1 the bomb timer is 40 s of fixed steps');
+eq(T.plant, 360, '§2 the plant takes 3.0 s of fixed steps');
+eq(T.defuse, 840, '§2 the defuse takes 7.0 s of fixed steps');
+
+// ═══════════════════════════════════════════════ map-data §3.3 — sites come from the map
+
+head('map-data.md §3.3 objective volumes');
+{
+  const boxA = { min: { x: 0, y: 0, z: 0 }, max: { x: 4, y: 3, z: 4 } };
+  const good = compileObjectives({
+    objectives: [
+      { id: 'p', kind: 'plant', site: 'A', box: boxA },
+      { id: 'z', kind: 'zone', box: boxA },
+    ],
+  });
+  eq(good.get('A').defuseId, 'p', 'an omitted defuse volume defaults to the plant volume');
+  eq(good.get('A').requiresGround, true, 'requiresGround defaults to true');
+
+  const rejects = [
+    [{ objectives: 'nope' }, 'publishes no objectives array'],
+    [{ objectives: [] }, 'declares no bomb site'],
+    [{ objectives: [{ kind: 'plant', site: 'A', box: boxA }] }, 'has no id'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A', box: boxA }, { id: 'p', kind: 'plant', site: 'B', box: boxA }] }, 'duplicate objective id'],
+    [{ objectives: [{ id: 'p', kind: 'landmine', site: 'A', box: boxA }] }, 'unknown kind'],
+    [{ objectives: [{ id: 'p', kind: 'plant', box: boxA }] }, 'names no site'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A' }] }, 'has no box'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A', box: { min: { x: 4, y: 0, z: 0 }, max: { x: 0, y: 3, z: 4 } } }] }, 'min > max'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A', box: { ...boxA, inverted: true } }] }, 'min > max'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A', box: { min: { x: 0, y: 0, z: 0 }, max: { x: NaN, y: 3, z: 4 } } }] }, 'not a finite point'],
+    [{ objectives: [{ id: 'd', kind: 'defuse', site: 'A', box: boxA }] }, 'no plant volume'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A', box: boxA }, { id: 'p2', kind: 'plant', site: 'A', box: boxA }] }, 'two plant volumes'],
+    [{ objectives: [{ id: 'p', kind: 'plant', site: 'A', box: boxA }, { id: 'd', kind: 'defuse', site: 'A', box: boxA }, { id: 'd2', kind: 'defuse', site: 'A', box: boxA }] }, 'two defuse volumes'],
+  ];
+  for (const [manifest, fragment] of rejects) {
+    let message = '<no throw>';
+    try { compileObjectives(manifest); } catch (err) { message = err.message; }
+    expect(message.includes(fragment), `a manifest whose objective ${fragment} is rejected by name`, `message was "${message}"`);
+  }
+}
+
+{
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  eq(resolveMapManifest(game), game.world.manifest, 'with no override the ruleset reads the map\'s own compiled manifest');
+  eq(bombAvailable(game), true, 'Bomb is available on the live map, which declares its sites');
+  eqJson(game.world.manifest.objectives.map((o) => o.id), ['site-A', 'site-B'],
+    'and those sites are the map\'s, not the ruleset\'s');
+  // A map with no objective volumes cannot host Bomb, and says so at match start rather
+  // than quietly playing on coordinates baked into the ruleset.
+  game.mapManifest = { ...game.world.manifest, objectives: [] };
+  eq(bombAvailable(game), false, 'Bomb reports unavailable on a map with no objective volumes');
+  let message = '<no throw>';
+  try { game.startMatch({ mode: 'bomb', botCount: 1, seed: 1 }); } catch (err) { message = err.message; }
+  expect(message.includes('declares no bomb site'), 'starting Bomb on such a map fails loudly, naming the missing data', message);
+  game.dispose();
+}
+
+{
+  const game = await newGame();
+  const bomb = game.match.bomb;
+  eqJson([...bomb.sites.keys()], ['A', 'B'], 'the ruleset reads its site ids from the manifest');
+  eq(bomb.sites.get('A').plantId, 'site-A', 'site A plants inside the map\'s own site-A volume');
+  eq(bomb.sites.get('B').defuseId, 'site-B', 'site B, declaring no defuse volume, defuses inside its plant volume');
+  const a = bomb.sites.get('A');
+  eq(bomb.siteAt(centre(a.plant)), a, 'a point inside a plant volume resolves to its site');
+  eq(bomb.siteAt({ x: a.plant.max.x + 0.01, y: centre(a.plant).y, z: centre(a.plant).z }), null,
+    'a point one centimetre outside the plant volume resolves to no site');
+  game.dispose();
+}
+
+// ═══════════════════════════════════════════════════════════════ §3 the round state machine
+
+head('§3 round state machine');
+{
+  const game = await newGame();
+  const bomb = game.match.bomb;
+  eq(bomb.phase, 'warmup', 'a Bomb match starts in warmup');
+  eq(bomb.allowRespawn(), true, '§3 respawns are on during warmup');
+  step(game, 1);
+  eq(bomb.phase, 'freeze', 'the first step of the match opens round 1 with a freeze');
+  eq(bomb.roundNumber, 1, 'the first round is round 1');
+  eq(bomb.attackingTeam, 0, 'team 0 attacks first');
+  eq(bomb.allowRespawn(), false, '§8 respawns are off from freeze onward');
+  eq(game.match.canFire(attackers(game)[0]), false, '§3 weapons are locked during the freeze');
+  eq(bomb.bomb.state, 'carried', '§5 the bomb is carried from the freeze');
+  const carrier = game.entityById(bomb.bomb.carrierId);
+  eq(carrier.team, bomb.attackingTeam, '§5 the carrier is an attacker');
+  step(game, T.freeze - 1);
+  eq(bomb.phase, 'freeze', 'one tick before the freeze ends the round is not live');
+  step(game, 1);
+  eq(bomb.phase, 'live', 'the round goes live on the exact tick the freeze ends');
+  eq(game.match.canFire(attackers(game)[0]), true, 'weapons unlock when the round goes live');
+  eq(bomb.roundTicks, 0, 'the round timer starts at zero, not part-way through the freeze');
+  game.dispose();
+}
+
+// ═════════════════════════════════════════════════ §4 win conditions, each in isolation
+
+head('§4.pre-plant win conditions');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'pre-plant elimination');
+  wipe(game, bomb.attackingTeam);
+  step(game, 1);
+  eq(bomb.rounds.length, 1, 'wiping the attackers pre-plant ends the round');
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, '§4.2 all attackers eliminated → DEFENDERS win');
+  eq(bomb.rounds[0].reason, 'elimination', 'the round is recorded as an elimination');
+  eq(bomb.rounds[0].planted, false, 'the round record says the bomb was never planted');
+  eq(bomb.phase, 'roundEnd', 'the round enters its end delay');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'pre-plant defender wipe');
+  wipe(game, bomb.defendingTeam);
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, '§4.3 all defenders eliminated → ATTACKERS win');
+  eq(bomb.rounds[0].reason, 'elimination', 'that round is an elimination too');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'round timer');
+  step(game, T.round - 1);
+  eq(bomb.rounds.length, 0, 'one tick before the round timer expires nothing has been decided');
+  eq(bomb.roundTimeRemaining, FIXED_DT, 'the round clock reports one step remaining');
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, '§4.4 the round timer expiring → DEFENDERS win');
+  eq(bomb.rounds[0].reason, 'timer', 'the round is recorded as a timer expiry');
+  game.dispose();
+}
+{
+  // Mutual wipe on one tick: §4 lists "all attackers eliminated" BEFORE "all defenders
+  // eliminated", so the defenders take it. Evaluation order must not decide this.
+  const game = await newGame();
+  const bomb = toLive(game, 'mutual wipe');
+  wipe(game, 0);
+  wipe(game, 1);
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, '§4 a mutual wipe pre-plant resolves to the DEFENDERS, by precedence');
+  eqJson(bomb.aliveCounts(), [0, 0], 'both teams really were empty when it resolved');
+  game.dispose();
+}
+
+head('§4.post-plant win conditions');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'detonation');
+  plant(game, 'A', 'detonation');
+  eq(bomb.bomb.siteId, 'A', 'the round records which site the bomb went down on');
+  eq(bomb.bombTimeRemaining, BOMB_PARAMS.bombTimerSeconds, '§3 the bomb timer replaces the round timer at plant');
+  eq(bomb.displayTime, BOMB_PARAMS.bombTimerSeconds, 'the HUD clock switches to the bomb timer');
+  step(game, T.bomb - 1);
+  eq(bomb.rounds.length, 0, 'one tick before the bomb timer expires the round is undecided');
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, '§4 post-plant 2: the bomb timer expiring → ATTACKERS win');
+  eq(bomb.rounds[0].reason, 'detonation', 'the round is recorded as a detonation');
+  eq(bomb.bomb.state, 'detonated', 'the bomb object ends detonated');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse');
+  const planter = plant(game, 'A', 'defuse');
+  const defender = defenders(game)[0];
+  eq(beginDefuse(game, defender), true, 'a defender inside the defuse volume may start a defuse');
+  step(game, T.defuse - 1);
+  eq(bomb.rounds.length, 0, 'one tick before the defuse completes the round is undecided');
+  eq(bomb.progressOf(defender.id), 62, 'the wire progress byte is short of full one tick out');
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, '§4 post-plant 1: the bomb defused → DEFENDERS win');
+  eq(bomb.rounds[0].reason, 'defuse', 'the round is recorded as a defuse');
+  eq(bomb.bomb.state, 'defused', 'the bomb object ends defused, not detonated');
+  eq(bomb.objectiveStats.get(defender.id).defuses, 1, '§10 the defuser is credited exactly one defuse');
+  eq(bomb.objectiveStats.get(planter.id).plants, 1, '§10 the planter keeps their plant');
+  eq(game.match.statsFor(defender).defuses, 1, 'the stat book records the defuse');
+  eq(game.match.statsFor(planter).plants, 1, 'the stat book records the plant');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'post-plant defender wipe');
+  plant(game, 'A', 'post-plant defender wipe');
+  wipe(game, bomb.defendingTeam);
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, '§4 post-plant 3: all defenders eliminated → ATTACKERS win');
+  eq(bomb.rounds[0].reason, 'elimination', 'that round is an elimination, not a detonation');
+  eq(bomb.bomb.state, 'detonated', '§4 the bomb still detonates for presentation once the round is decided');
+  game.dispose();
+}
+
+// ══════════════════════ §4 post-plant rule 4 — THE load-bearing rule, and its control
+
+head('§4 post-plant 4: eliminating the attackers after the plant wins NOTHING');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'attackers wiped post-plant');
+  plant(game, 'A', 'attackers wiped post-plant');
+  const winsBefore = [...bomb.roundWins];
+  wipe(game, bomb.attackingTeam);
+  step(game, 120);
+  eqJson(bomb.aliveCounts()[bomb.attackingTeam], 0, 'every attacker really is eliminated');
+  eq(bomb.phase, 'planted', 'the round is still running with no attacker alive');
+  eq(bomb.rounds.length, 0, 'no round has been awarded');
+  eqJson(bomb.roundWins, winsBefore, 'the defenders were awarded nothing for the wipe');
+  step(game, T.bomb - 120 - 1);
+  eq(bomb.rounds.length, 0, 'still nothing one tick before the bomb timer expires');
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'the bomb detonates and the ATTACKERS win with nobody alive');
+  eq(bomb.rounds[0].reason, 'detonation', 'the reason is detonation');
+  eq(bomb.rounds[0].aliveAttackers, 0, 'the round record shows the winning team had nobody left');
+  game.dispose();
+}
+{
+  // The control: the same wipe BEFORE the plant is a defender win. If the two cases
+  // produced the same result, the rule above would be untested.
+  const game = await newGame();
+  const bomb = toLive(game, 'attackers wiped pre-plant control');
+  wipe(game, bomb.attackingTeam);
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'control: the identical wipe BEFORE the plant wins for the defenders');
+  game.dispose();
+}
+
+// ═══════════════════════════════════════════ §4 simultaneity, and no double award
+
+head('§4 simultaneity: plant vs elimination on one tick');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'plant vs attacker wipe');
+  const carrier = carrierIntoSite(game, 'A');
+  wipe(game, bomb.attackingTeam, [carrier]);
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  eq(bomb.aliveCounts()[bomb.attackingTeam], 1, 'the planter is the last attacker alive');
+  // The completing tick. In the engine a kill from this step reaches the referee AFTER
+  // match.fixedUpdate — so the plant is resolved first, exactly as §4 orders it.
+  step(game, 1);
+  eq(bomb.phase, 'planted', '§4 pre-plant 1: the plant is a PHASE CHANGE and it comes first');
+  const scoreBefore = defenders(game).map((e) => game.match.statsFor(e).score);
+  const killer = defenders(game)[0];
+  kill(game, carrier, killer);
+  eq(bomb.phase, 'planted', 'the last attacker dying in that same step does not end the round');
+  eq(bomb.rounds.length, 0, 'no round outcome was awarded for the simultaneous elimination');
+  // The killer is paid for the KILL and nothing more; nobody is paid a round win.
+  eqJson(
+    defenders(game).map((e, i) => game.match.statsFor(e).score - scoreBefore[i]),
+    defenders(game).map((e) => (e === killer ? SCORE.kill : 0)),
+    'the killer is paid for the kill and nobody is paid a round win — there is no double award',
+  );
+  eqJson(defenders(game).map((e) => game.match.statsFor(e).roundWins), defenders(game).map(() => 0),
+    'and no defender is credited a round win');
+  eq(game.match.statsFor(carrier).plants, 1, 'the planter is credited exactly one plant');
+  game.dispose();
+}
+{
+  // Control: the same death ONE TICK EARLIER is an ordinary pre-plant elimination.
+  const game = await newGame();
+  const bomb = toLive(game, 'plant vs attacker wipe control');
+  const carrier = carrierIntoSite(game, 'A');
+  wipe(game, bomb.attackingTeam, [carrier]);
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  kill(game, carrier, defenders(game)[0]);
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'control: the planter dying one tick earlier wins for the defenders');
+  eq(bomb.rounds[0].reason, 'elimination', 'control: by elimination');
+  eq(bomb.rounds[0].planted, false, 'control: and the bomb was never planted');
+  eq(game.match.statsFor(carrier).plants, 0, 'control: an interrupted plant credits nothing');
+  game.dispose();
+}
+{
+  // Plant completing on the tick the last DEFENDER dies: the plant lands first (phase
+  // change), then post-plant rule 3 awards the attackers an elimination.
+  const game = await newGame();
+  const bomb = toLive(game, 'plant vs defender wipe');
+  const carrier = carrierIntoSite(game, 'A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  wipe(game, bomb.defendingTeam);
+  step(game, 1);
+  eq(bomb.rounds[0].reason, 'elimination', 'a plant and the last defender on one tick resolves as an elimination');
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'and the attackers win it');
+  eq(bomb.rounds[0].planted, true, 'the round record shows the bomb DID go down');
+  eq(bomb.rounds[0].site, 'A', 'on site A');
+  eq(game.match.statsFor(carrier).plants, 1, 'the plant still counts — it completed');
+  eq(bomb.roundWins[bomb.rounds[0].winnerTeam], 1, 'exactly one round was awarded, not two');
+  game.dispose();
+}
+
+head('§4 simultaneity: defuse vs the bomb timer');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse on the detonation tick');
+  plant(game, 'A', 'defuse on the detonation tick');
+  const defender = defenders(game)[0];
+  // Start the defuse so that its LAST tick is the tick the bomb timer expires.
+  step(game, T.bomb - T.defuse);
+  eq(bomb.bombTicks, T.bomb - T.defuse, 'the bomb timer is exactly one defuse from expiry');
+  beginDefuse(game, defender);
+  step(game, T.defuse - 1);
+  eq(bomb.rounds.length, 0, 'nothing has resolved one tick out');
+  step(game, 1);
+  eq(bomb.bombTicks, T.bomb, 'the bomb timer expired on that very tick');
+  eq(bomb.rounds[0].reason, 'defuse', '§4 simultaneity: the DEFUSE wins the tie');
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'so the defenders win');
+  eq(bomb.bomb.state, 'defused', 'and the bomb is defused, not detonated');
+  game.dispose();
+}
+{
+  // Control: one tick later and the bomb wins. Same setup, one tick of difference.
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse one tick too late');
+  plant(game, 'A', 'defuse one tick too late');
+  const defender = defenders(game)[0];
+  step(game, T.bomb - T.defuse + 1);
+  beginDefuse(game, defender);
+  step(game, T.defuse - 1);
+  eq(bomb.rounds[0].reason, 'detonation', 'control: a defuse starting one tick later loses to the timer');
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'control: the attackers win it');
+  eq(bomb.bomb.state, 'detonated', 'control: the bomb detonated');
+  game.dispose();
+}
+
+head('§4 simultaneity: defuse vs the last defender dying');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse as the last defender dies');
+  plant(game, 'A', 'defuse as the last defender dies');
+  const defender = defenders(game)[0];
+  beginDefuse(game, defender);
+  wipe(game, bomb.defendingTeam, [defender]);
+  step(game, T.defuse - 1);
+  eq(bomb.aliveCounts()[bomb.defendingTeam], 1, 'the defuser is the last defender alive');
+  eq(bomb.rounds.length, 0, 'the round has not resolved yet');
+  step(game, 1);
+  // The kill lands in the same step, after the referee — which is the ordering the engine
+  // produces, since Match runs before weapons and bots in `game.systems`.
+  kill(game, defender, attackers(game)[0]);
+  eq(bomb.rounds.length, 1, 'exactly one round outcome exists');
+  eq(bomb.rounds[0].reason, 'defuse', '§4: the defuse completed, so the defuse wins');
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'the defenders win it despite having nobody left');
+  eq(bomb.aliveCounts()[bomb.defendingTeam], 0, 'and they really do have nobody left');
+  game.dispose();
+}
+{
+  // Control: the same death one tick EARLIER interrupts the defuse and hands the round to
+  // the attackers by elimination.
+  const game = await newGame();
+  const bomb = toLive(game, 'last defender dies one tick early');
+  plant(game, 'A', 'last defender dies one tick early');
+  const defender = defenders(game)[0];
+  beginDefuse(game, defender);
+  wipe(game, bomb.defendingTeam, [defender]);
+  step(game, T.defuse - 1);
+  kill(game, defender, attackers(game)[0]);
+  step(game, 1);
+  eq(bomb.rounds[0].reason, 'elimination', 'control: dying one tick before completion loses the defuse');
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'control: the attackers win by elimination');
+  eq(bomb.bomb.state, 'detonated', 'control: the bomb was never defused');
+  game.dispose();
+}
+
+// ══════════════════════════════════════════════ §6 plant — preconditions and interruption
+
+head('§6 plant preconditions, all server-side');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'plant preconditions');
+  const carrier = game.entityById(bomb.bomb.carrierId);
+  const otherAttacker = attackers(game).find((e) => e.id !== carrier.id);
+  const defender = defenders(game)[0];
+  const site = bomb.sites.get('A');
+
+  place(carrier, { x: site.plant.max.x + 5, y: centre(site.plant).y, z: centre(site.plant).z });
+  eq(bomb.requestInteract(carrier, 'plant'), false, 'the carrier outside the volume is refused');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.outsideVolume, 'the refusal names the volume');
+  eq(bomb.events[bomb.events.length - 1].kind, 'interactRefused', '§11 refusals are their own event kind');
+  eq(bomb.events[bomb.events.length - 1].requested, 'plant', 'and carry the requested interaction');
+
+  place(carrier, centre(site.plant));
+  carrier.grounded = false;
+  eq(bomb.requestInteract(carrier, 'plant'), false, 'a carrier off the ground is refused where requiresGround');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.notGrounded, 'the refusal names the ground rule');
+  carrier.grounded = true;
+
+  place(otherAttacker, centre(site.plant));
+  eq(bomb.requestInteract(otherAttacker, 'plant'), false, 'an attacker who is not carrying the bomb is refused');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.notCarrying, 'the refusal says they are not carrying it');
+
+  place(defender, centre(site.plant));
+  eq(bomb.requestInteract(defender, 'plant'), false, 'a defender standing on the site cannot plant');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.wrongTeam, 'the refusal names the team rule');
+
+  eq(bomb.requestInteract(carrier, 'plant'), true, 'the carrier, alive, grounded, inside the volume, may plant');
+  step(game, 5);
+  eq(bomb._progress.get(carrier.id).ticks, 5, 'progress accumulates on the SERVER, one tick at a time');
+  kill(game, carrier, defender);
+  eq(bomb._progress.has(carrier.id), false, 'death resets the progress to zero');
+  eq(bomb.progressOf(carrier.id), 0, 'and the wire progress reads zero');
+  game.dispose();
+}
+
+head('§6/§7 interruption at every boundary — no partial credit, no resume');
+for (const at of ['first tick', 'one tick before completion', 'the completing tick']) {
+  const game = await newGame();
+  const bomb = toLive(game, `plant interrupted at ${at}`);
+  const carrier = carrierIntoSite(game, 'A');
+  const before = at === 'first tick' ? 1 : T.plant - 1;
+  bomb.requestInteract(carrier, 'plant');
+  step(game, before);
+  eq(bomb._progress.get(carrier.id).ticks, before, `${at}: the server holds exactly ${before} tick(s) of progress`);
+  if (at === 'the completing tick') {
+    // Interrupt in the step that would have completed it, before the referee runs.
+    kill(game, carrier, defenders(game)[0]);
+    step(game, 1);
+    eq(bomb.phase, 'live', `${at}: the plant did not complete`);
+  } else {
+    bomb.releaseInteract(carrier);
+    eq(bomb._progress.has(carrier.id), false, `${at}: releasing the key resets progress to zero`);
+    eq(lastEvent(bomb, 'plantCancel').reason, REFUSE.released, `${at}: the cancel is reported, with the reason`);
+    // No resume: the interrupted progress buys nothing.
+    bomb.requestInteract(carrier, 'plant');
+    step(game, T.plant - 1);
+    eq(bomb.phase, 'live', `${at}: after re-starting, ${T.plant - 1} ticks is still not a plant`);
+    step(game, 1);
+    eq(bomb.phase, 'planted', `${at}: it takes the FULL plant time again`);
+  }
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'plant interrupted by leaving the volume');
+  const carrier = carrierIntoSite(game, 'A');
+  const site = bomb.sites.get('A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  place(carrier, { x: site.plant.max.x + 5, y: centre(site.plant).y, z: centre(site.plant).z });
+  step(game, 1);
+  eq(bomb.phase, 'live', 'stepping out of the volume on the last tick cancels the plant');
+  eq(lastEvent(bomb, 'plantCancel').reason, REFUSE.outsideVolume, 'the cancel names the volume');
+  eq(bomb.progressOf(carrier.id), 0, 'progress is zero, not held');
+  place(carrier, centre(site.plant));
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  eq(bomb.phase, 'live', 'and the plant restarts from zero rather than resuming');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse interrupted');
+  plant(game, 'A', 'defuse interrupted');
+  const defender = defenders(game)[0];
+  const site = bomb.sites.get('A');
+  beginDefuse(game, defender);
+  step(game, T.defuse - 1);
+  place(defender, { x: site.defuse.max.x + 5, y: centre(site.defuse).y, z: centre(site.defuse).z });
+  step(game, 1);
+  eq(bomb.phase, 'planted', 'leaving the defuse volume one tick from the end cancels the defuse');
+  eq(lastEvent(bomb, 'defuseCancel').reason, REFUSE.outsideVolume, 'the cancel is reported as a defuse cancel, naming the volume');
+  eq(bomb.progressOf(defender.id), 0, 'defuse progress resets to zero');
+  beginDefuse(game, defender);
+  step(game, T.defuse - 1);
+  eq(bomb.phase, 'planted', 'the restarted defuse gets no credit for the interrupted one');
+  step(game, 1);
+  eq(bomb.rounds[0].reason, 'defuse', 'it completes only after the full defuse time again');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'plant phase preconditions');
+  const carrier = carrierIntoSite(game, 'A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant);
+  eq(bomb.phase, 'planted', 'the bomb is planted');
+  eq(bomb.requestInteract(carrier, 'plant'), false, '§6.3 a second plant is refused once the bomb is down');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.alreadyPlanted, 'the refusal says it is already planted');
+  const attacker = attackers(game)[0];
+  place(attacker, centre(bomb.sites.get('A').defuse));
+  eq(bomb.requestInteract(attacker, 'defuse'), false, '§7 an attacker cannot defuse');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.wrongTeam, 'the refusal names the team rule');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse before the plant');
+  const defender = defenders(game)[0];
+  place(defender, centre(bomb.sites.get('A').plant));
+  eq(bomb.requestInteract(defender, 'defuse'), false, '§7 there is nothing to defuse before the plant');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.notPlanted, 'the refusal says the bomb is not planted');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'defuse at the wrong site');
+  plant(game, 'B', 'defuse at the wrong site');
+  const defender = defenders(game)[0];
+  place(defender, centre(bomb.sites.get('A').defuse));
+  eq(bomb.requestInteract(defender, 'defuse'), false, 'a defender at the OTHER site cannot defuse');
+  eq(bomb.events[bomb.events.length - 1].reason, REFUSE.outsideVolume, 'the refusal names the volume');
+  place(defender, centre(bomb.sites.get('B').plant));
+  eq(bomb.requestInteract(defender, 'defuse'), true, 'site B defuses inside its plant volume, per §3.3');
+  game.dispose();
+}
+
+head('§7 two defenders do not defuse faster than one');
+{
+  const one = await newGame({ seed: 5150 });
+  const bombOne = toLive(one, 'one defuser');
+  plant(one, 'A', 'one defuser');
+  const d1 = defenders(one)[0];
+  beginDefuse(one, d1);
+  let ticksOne = 0;
+  while (bombOne.rounds.length === 0 && ticksOne < T.defuse * 2) { step(one); ticksOne++; }
+
+  const two = await newGame({ seed: 5150 });
+  const bombTwo = toLive(two, 'two defusers');
+  plant(two, 'A', 'two defusers');
+  const [e1, e2] = defenders(two);
+  beginDefuse(two, e1);
+  beginDefuse(two, e2);
+  let ticksTwo = 0;
+  while (bombTwo.rounds.length === 0 && ticksTwo < T.defuse * 2) { step(two); ticksTwo++; }
+
+  eq(ticksOne, T.defuse, 'one defender takes exactly the configured defuse time');
+  eq(ticksTwo, T.defuse, 'two defenders take exactly the same time — progress does not stack');
+  eq(bombTwo.rounds[0].reason, 'defuse', 'the two-defender round still ends in a defuse');
+  eq(bombTwo.objectiveStats.get(e1.id).defuses, 1, 'the lower entity id is credited with the completion');
+  eq(bombTwo.objectiveStats.has(e2.id), false, 'the second defender is credited nothing — completions only');
+  one.dispose(); two.dispose();
+}
+
+// ════════════════════════════════════════════════════════════════════ §5 the bomb object
+
+head('§5 the bomb object');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'carrier death and pickup');
+  const carrier = game.entityById(bomb.bomb.carrierId);
+  const site = bomb.sites.get('A');
+  const spot = centre(site.plant);
+  place(carrier, spot);
+  step(game, 1);
+  eqJson([bomb.bomb.position.x, bomb.bomb.position.z], [spot.x, spot.z], 'the bomb tracks its carrier');
+
+  // Keep everyone else well clear so a pickup is deliberate, not incidental.
+  for (const e of roster(game)) if (e !== carrier) place(e, { x: site.plant.min.x - 40, y: spot.y, z: spot.z });
+  kill(game, carrier, defenders(game)[0]);
+  step(game, 1);
+  eq(bomb.bomb.state, 'dropped', '§5 the carrier dying drops the bomb');
+  eq(bomb.bomb.carrierId, -1, 'and it has no carrier');
+  eqJson([bomb.bomb.position.x, bomb.bomb.position.z], [spot.x, spot.z], 'it drops at the death position');
+  eq(bomb.events[bomb.events.length - 1].kind, 'bombDropped', 'the drop is reported');
+  eq(bomb.events[bomb.events.length - 1].reason, 'carrierDeath', 'with the reason');
+
+  const defender = defenders(game)[0];
+  place(defender, { x: spot.x + 0.2, y: spot.y, z: spot.z });
+  step(game, 1);
+  eq(bomb.bomb.state, 'dropped', '§5 a defender standing on it cannot pick it up');
+  eq(bomb.bomb.carrierId, -1, 'and does not become the carrier');
+  place(defender, { x: site.plant.min.x - 40, y: spot.y, z: spot.z });
+
+  const nextAttacker = attackers(game).find((e) => bomb.isAlive(e));
+  place(nextAttacker, { x: spot.x + 0.4, y: spot.y, z: spot.z });
+  step(game, 1);
+  eq(bomb.bomb.state, 'carried', '§5 any attacker in contact range picks it up, with no cast time');
+  eq(bomb.bomb.carrierId, nextAttacker.id, 'and becomes the carrier');
+  eq(bomb.events[bomb.events.length - 1].reason, 'pickup', 'the pickup is reported as a pickup');
+
+  // Out of bounds: it can never be lost.
+  kill(game, nextAttacker, defender);
+  step(game, 1);
+  eq(bomb.bomb.state, 'dropped', 'the bomb drops again');
+  const valid = { ...bomb.bomb.lastValid };
+  const out = game.world.bounds.max.x + 500;
+  bomb.bomb.position.x = out;
+  for (const e of roster(game)) place(e, { x: site.plant.min.x - 40, y: spot.y, z: spot.z });
+  step(game, 1);
+  eqJson([bomb.bomb.position.x, bomb.bomb.position.y, bomb.bomb.position.z], [valid.x, valid.y, valid.z],
+    '§5 a bomb out of bounds returns to its last valid position');
+  eq(bomb.events[bomb.events.length - 1].kind, 'bombRecovered', 'the recovery is reported');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'carrier disconnect');
+  const carrier = game.entityById(bomb.bomb.carrierId);
+  const spot = centre(bomb.sites.get('A').plant);
+  place(carrier, spot);
+  step(game, 1);
+  bomb.noteDisconnect(carrier);
+  eq(bomb.bomb.state, 'dropped', '§9 a carrier disconnecting drops the bomb');
+  eqJson([bomb.bomb.position.x, bomb.bomb.position.z], [spot.x, spot.z], 'at their last position');
+  eq(bomb.isAlive(carrier), false, 'a disconnected player does not count as alive');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'disconnect mid-plant');
+  const carrier = carrierIntoSite(game, 'A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  bomb.noteDisconnect(carrier);
+  eq(bomb.progressOf(carrier.id), 0, '§9 disconnecting mid-plant resets the progress to zero');
+  step(game, 1);
+  eq(bomb.phase, 'live', 'and the plant does not complete on the tick it would have');
+  game.dispose();
+}
+
+// ═════════════════════════════════════════════════════════ §8 no-respawn and spectating
+
+head('§8 no respawns, and spectator information limits');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'no respawns');
+  const victim = attackers(game)[1];
+  kill(game, victim, defenders(game)[0]);
+  eq(bomb.eliminated.has(victim.id), true, '§8 a death in a live round is an elimination');
+  eq(game.match._respawns.length, 0, 'no respawn is queued');
+  step(game, 1200);
+  eq(victim.alive, false, 'ten seconds later they are still out');
+  eq(game.match.canFire(victim), false, 'and they cannot fire');
+
+  const mate = attackers(game).find((e) => e.id !== victim.id && bomb.isAlive(e));
+  const enemy = defenders(game).find((e) => bomb.isAlive(e));
+  eq(bomb.canSpectate(victim, mate), true, '§8 a dead player may spectate their own living team-mates');
+  eq(bomb.canSpectate(victim, enemy), false, '§8 a dead player may NOT spectate an enemy during a live round');
+  eq(bomb.canSpectate(mate, enemy), false, 'a LIVING player spectates nobody');
+  eq(bomb.canFreeCam(victim), false, '§8 there is no free camera during a live round');
+  eq(bomb.canPing(victim), false, '§8 the eliminated cannot ping');
+
+  const chat = [];
+  game.bus.on('chat', (p) => chat.push(p));
+  const held = bomb.submitChat(victim, 'they rotated B');
+  eq(held.delivered, false, '§8 dead-player chat is not delivered live');
+  eq(held.deferredUntil, 'freeze', 'it is held until the next freeze');
+  eq(chat.length, 0, 'nothing reached the bus');
+  const livingSaid = bomb.submitChat(mate, 'pushing A');
+  eq(livingSaid.delivered, true, 'a living player is heard immediately');
+  eq(chat.length, 1, 'exactly one message reached the bus');
+
+  wipe(game, bomb.defendingTeam);
+  step(game, 1);
+  eq(bomb.phase, 'roundEnd', 'the round is decided');
+  eq(bomb.canFreeCam(victim), true, '§8 free camera opens at roundEnd, when there is nothing to leak');
+  eq(bomb.canSpectate(victim, enemy), true, 'and any camera is permitted then');
+  step(game, T.roundEnd);
+  eq(bomb.phase, 'freeze', 'the next round opens with a freeze');
+  eq(chat.length, 2, 'the held message is delivered at the freeze');
+  eq(chat[1].text, 'they rotated B', 'and it is the message that was held');
+  eq(bomb.eliminated.size, 0, '§8 elimination lasts only until the next freeze');
+  eq(victim.alive, true, 'the eliminated are back in the world for the new round');
+  game.dispose();
+}
+
+// ═════════════════════════════════════════════════════ §9 backfill, disconnect, reconnect
+
+head('§9 backfill and disconnects');
+{
+  const game = await newGame();
+  const bomb = game.match.bomb;
+  eqJson(bomb.canJoin(), { allowed: true, reason: null }, 'joining during warmup is allowed');
+  toLive(game, 'backfill');
+  eqJson(bomb.canJoin(), { allowed: false, reason: 'ROOM_IN_PROGRESS' },
+    '§9 a join request mid-match is refused with ROOM_IN_PROGRESS');
+  wipe(game, bomb.defendingTeam);
+  step(game, 1);
+  eqJson(bomb.canJoin(), { allowed: false, reason: 'ROOM_IN_PROGRESS' }, 'and still refused between rounds');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'reconnect');
+  const alive = attackers(game)[1];
+  const dead = attackers(game)[2];
+  kill(game, dead, defenders(game)[0]);
+  bomb.noteDisconnect(alive);
+  bomb.noteDisconnect(dead);
+  step(game, 60);
+  eqJson(bomb.canReconnect(alive.id), { allowed: true, asSpectator: false, reason: null },
+    '§9 reconnect inside grace rebinds to the existing entity');
+  eqJson(bomb.canReconnect(dead.id), { allowed: true, asSpectator: true, reason: null },
+    '§9 a player who was eliminated returns as a spectator');
+  const graceTicks = Math.round(BOMB_PARAMS.reconnectGraceSeconds / FIXED_DT);
+  step(game, graceTicks - 60);
+  eq(bomb.canReconnect(alive.id).allowed, true, 'still allowed on the last tick of grace');
+  step(game, 1);
+  eqJson(bomb.canReconnect(alive.id), { allowed: false, asSpectator: false, reason: 'GRACE_EXPIRED' },
+    '§9 reconnect after grace is refused');
+  eqJson(bomb.noteReconnect(dead.id === alive.id ? alive : dead), { allowed: false, asSpectator: false, reason: 'GRACE_EXPIRED' },
+    'and the refusal is what noteReconnect returns');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'forfeit');
+  for (const e of teamOf(game, 1)) bomb.noteDisconnect(e);
+  eq(bomb.phase, 'matchEnd', '§9 a team dropping to zero connected ends the match');
+  eq(bomb.series.winnerTeam, 0, 'the remaining team wins');
+  eq(bomb.series.outcomeReason, 'forfeit', 'the outcome reason is forfeit, not abandon');
+  eq(bomb.series.terminationReason, 'aborted', 'and the termination reason is aborted');
+  eq(bomb.series.aggregate, true, '§9 forfeit stats are recorded AND aggregated');
+  step(game, 1);
+  eq(game.match.phase, 'ended', 'the referee ends the match');
+  eq(game.match.result.outcomeReason, 'forfeit', 'and the result record carries the reason');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'no-contest');
+  for (const e of roster(game)) bomb.noteDisconnect(e);
+  eq(bomb.phase, 'matchEnd', '§9 both teams dropping to zero ends the match');
+  eq(bomb.series.winnerTeam, -1, 'with no winner');
+  eq(bomb.series.reason, 'no-contest', 'a forfeit is upgraded to a no-contest when the other team goes too');
+  eq(bomb.series.outcomeReason, 'no-contest', 'the outcome reason is no-contest, not invalidated');
+  eq(bomb.series.aggregate, false, 'no-contest stats are recorded but NOT aggregated');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'abandon');
+  const gone = attackers(game)[1];
+  bomb.noteDisconnect(gone);
+  eq(bomb.abandoned(gone.id), false, 'one round absent is not an abandon');
+  wipe(game, bomb.defendingTeam);
+  step(game, 1 + T.roundEnd);
+  eq(bomb.abandoned(gone.id), false, 'still not, after one full round');
+  eq(gone.alive, false, 'a disconnected player is not put back in the world at the freeze');
+  wipe(game, bomb.defendingTeam);
+  step(game, 1 + T.freeze + T.roundEnd);
+  eq(bomb.abandoned(gone.id), true, `§2 ${BOMB_PARAMS.abandonRounds} consecutive rounds absent is an abandon`);
+  game.dispose();
+}
+
+// ═══════════════════════════════════════════════ §2.1a series: transitions and side switch
+
+head('§2.1a round transitions, side switch and the series');
+{
+  const game = await newGame({ seed: 777 });
+  const bomb = toLive(game, 'series');
+  const firstAttackers = bomb.attackingTeam;
+  eq(firstAttackers, 0, 'team 0 attacks the first half');
+  const seen = [];
+  // Team 0 wins every round by wiping team 1 — which is an elimination win whichever
+  // side team 0 happens to be on, so the same script survives the side switch.
+  for (let round = 1; round <= 7; round++) {
+    if (bomb.phase !== 'live') {
+      let guard = 0;
+      while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
+    }
+    seen.push({ round: bomb.roundNumber, attacking: bomb.attackingTeam });
+    wipe(game, 1);
+    step(game, 1);
+    if (round === 7) {
+      eq(bomb.phase, 'roundEnd', 'the seventh round plays out its end delay like any other');
+      eq(bomb.series, null, 'and the series is not resolved before that delay is served');
+    }
+    step(game, T.roundEnd);
+  }
+  eqJson(seen.map((s) => s.round), [1, 2, 3, 4, 5, 6, 7], 'the rounds run 1 through 7 in order');
+  eqJson(seen.map((s) => s.attacking), [0, 0, 0, 0, 0, 0, 1],
+    '§2 sides switch after round 6 and not before');
+  eqJson(bomb.roundWins, [7, 0], 'team 0 has 7 round wins');
+  eq(bomb.phase, 'matchEnd', '§2.1a reaching 7 ends the match immediately');
+  eq(bomb.rounds.length, 7, 'the remaining rounds are not played');
+  eq(bomb.series.reason, 'roundsToWin', 'the series record says why');
+  eq(bomb.series.winnerTeam, 0, 'and who won');
+  step(game, 1);
+  eq(game.match.phase, 'ended', 'the referee ends the match on the next step');
+  eq(game.match.result.reason, 'roundsToWin', 'the match result carries the series reason');
+  eq(game.match.result.winnerTeam, 0, 'and the winning team');
+  eqJson(game.match.result.roundWins, [7, 0], 'and the round score');
+  eq(game.match.result.rounds.length, 7, 'and a record per round');
+  eq(game.match.result.maxRounds, 12, 'and the MR12 format it was played under');
+  game.dispose();
+}
+{
+  const game = await newGame({ seed: 778 });
+  const bomb = toLive(game, 'draw');
+  for (let round = 1; round <= 12; round++) {
+    let guard = 0;
+    while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
+    wipe(game, round % 2 === 0 ? 0 : 1);   // alternate, so neither side reaches 7
+    step(game, 1);
+    step(game, T.roundEnd);
+  }
+  eqJson(bomb.roundWins, [6, 6], 'twelve alternating rounds end 6-6');
+  eq(bomb.phase, 'matchEnd', 'the match ends after the twelfth round');
+  eq(bomb.rounds.length, 12, 'exactly twelve rounds were played');
+  eq(bomb.series.winnerTeam, -1, '§2.1a 6-6 after 12 has no winner');
+  eq(bomb.series.winnerLabel, 'draw', 'the series record says "draw"');
+  eq(bomb.series.reason, 'draw', 'and the reason is a draw, not a timer');
+  step(game, 1);
+  eq(game.match.result.outcome, 'draw', 'the match result is a draw');
+  game.dispose();
+}
+
+// ═════════════════════════════════════════════════════════════════════════ §10 scoring
+
+head('§10 objective scoring');
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'scoring');
+  const carrier = carrierIntoSite(game, 'A');
+  const before = game.match.statsFor(carrier).score;
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant);
+  eq(game.match.statsFor(carrier).score - before, SCORE.plant, '§10 a completed plant pays the plant award');
+  const defender = defenders(game)[0];
+  const dBefore = game.match.statsFor(defender).score;
+  beginDefuse(game, defender);
+  step(game, T.defuse);
+  eq(game.match.statsFor(defender).score - dBefore, SCORE.defuse + SCORE.roundWin,
+    '§10 a completed defuse pays the defuse award and the round win');
+  eq(game.match.statsFor(defender).roundWins, 1, 'the round win is booked once');
+  eq(game.match.statsFor(carrier).roundWins, 0, 'and not to the losing side');
+  let threw = '<no throw>';
+  try { game.match.awardObjective(carrier, 'nonsense'); } catch (err) { threw = err.message; }
+  expect(threw.includes('unknown objective award'), 'an unknown award id throws rather than paying nothing quietly', threw);
+  game.dispose();
+}
+{
+  const game = await newGame({ seed: 4242 });
+  const bomb = toLive(game, 'clutch');
+  const hero = defenders(game)[0];
+  wipe(game, bomb.defendingTeam, [hero]);
+  step(game, 1);
+  eq(bomb.aliveCounts()[bomb.defendingTeam], 1, 'one defender is left against the whole attacking side');
+  const before = game.match.statsFor(hero).score;
+  wipe(game, bomb.attackingTeam);
+  step(game, 1);
+  eq(bomb.rounds[0].clutchBy, hero.id, '§10 the last player standing is recorded as the clutch');
+  eq(game.match.statsFor(hero).score - before, SCORE.roundWin + SCORE.clutch, 'and is paid the clutch on top of the round win');
+  eq(game.match.statsFor(hero).clutches, 1, 'the clutch is booked once');
+  game.dispose();
+}
+
+// ═════════════════════════════════════════════════════════════════ TDM is unaffected
+
+head('TDM still plays by its own rules');
+{
+  const game = await newGame({ mode: 'tdm', botCount: 7 });
+  eq(game.match.modeId, 'tdm', 'a TDM match resolves to the TDM ruleset');
+  eq(game.match.bomb, null, 'and carries no bomb state');
+  const attacker = game.player;
+  const victim = game.bots.bots.find((b) => b.team !== attacker.team);
+  kill(game, victim, attacker);
+  eq(game.match._respawns.length, 1, 'a TDM death still queues a respawn');
+  eq(game.match.canFire(attacker), true, 'and TDM has no round freeze');
+  game.dispose();
+}
+
+// ═══════════════════════════════════════════════════════════════════ §12.12 determinism
+
+head('§12.12 determinism');
+
+/** A scripted round, identical every time it is run, exercising every subsystem. */
+async function scriptedRun(seed) {
+  const game = await newGame({ seed, botCount: 7 });
+  const bomb = game.match.bomb;
+  while (bomb.phase !== 'live') step(game);
+  const carrier = carrierIntoSite(game, 'A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, 40);
+  bomb.releaseInteract(carrier);          // an interrupted plant
+  kill(game, attackers(game).find((e) => e.id !== carrier.id), defenders(game)[0]);
+  step(game, 30);
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant);
+  const defender = defenders(game)[0];
+  beginDefuse(game, defender);
+  step(game, 200);
+  kill(game, defender, carrier);           // interrupted defuse
+  step(game, 60);
+  const second = defenders(game).find((e) => bomb.isAlive(e));
+  beginDefuse(game, second);
+  step(game, T.defuse);                    // defused, round over
+  step(game, T.roundEnd + T.freeze + 10);  // into the next round
+  const snapshot = {
+    bomb: bomb.state(),
+    scores: [...game.match.scores],
+    rows: game.match.getScoreboardRows().map((r) => ({ ...r, entity: undefined })),
+  };
+  game.dispose();
+  return snapshot;
+}
+
+{
+  const a = await scriptedRun(31337);
+  const b = await scriptedRun(31337);
+  // The runs must be non-trivial, or "identical" would mean "both empty".
+  eq(a.bomb.rounds.length, 1, 'the scripted run completes exactly one round');
+  eq(a.bomb.rounds[0].reason, 'defuse', 'which ends in a defuse');
+  eq(a.bomb.roundNumber, 2, 'and leaves the match in round 2');
+  eq(a.bomb.events.filter((e) => e.kind === 'plantCancel').length, 1, 'with one cancelled plant');
+  eq(a.bomb.events.filter((e) => e.kind === 'defuseCancel').length, 1, 'and one cancelled defuse');
+  eq(JSON.stringify(a) === JSON.stringify(b), true, 'two identical scripted runs produce byte-identical state');
+  const c = await scriptedRun(31338);
+  expect(JSON.stringify(c.bomb.bomb) !== JSON.stringify(a.bomb.bomb) || c.bomb.events.length !== a.bomb.events.length
+    || JSON.stringify(c.rows) !== JSON.stringify(a.rows),
+  'a different seed produces a different match — the comparison is not vacuous',
+  'seed 31338 produced identical state to 31337');
+}
+
+/** The full engine loop, bots included: nothing in the round machine reads a clock. */
+async function liveRun(seed, ticks) {
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+
+  game.startMatch({ mode: 'bomb', botCount: 7, seed });
+  for (let i = 0; i < ticks; i++) game._fixedUpdate(FIXED_DT);
+  const out = {
+    bomb: game.match.bomb ? game.match.bomb.state() : null,
+    rows: game.match.getScoreboardRows().map((r) => ({ ...r, entity: undefined })),
+  };
+  game.dispose();
+  return out;
+}
+
+{
+  const ticks = 2400;
+  const a = await liveRun(9091, ticks);
+  const b = await liveRun(9091, ticks);
+  eq(a.bomb.phase, 'live', 'the live run reaches a live round');
+  eq(JSON.stringify(a) === JSON.stringify(b), true,
+    'two identical FULL-ENGINE runs from one seed produce byte-identical bomb state and stats');
+}
+
+console.log(failures
+  ? `\n${failures} of ${checks} Bomb check(s) failed`
+  : `\nBomb ruleset is clean — ${checks} checks`);
+process.exit(failures ? 1 : 0);

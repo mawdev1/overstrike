@@ -97,6 +97,28 @@ const NODE_BUDGET = 1800;      // hard cap on expansions; best partial path is r
 const NODE_BUDGET_MULTI = 10000;
 const REV_CAP = 4096;
 
+/** What `bake()` sees when the map supplies no §3.5 hints. Frozen so nothing writes it. */
+const EMPTY_HINTS = Object.freeze({
+  walkable: Object.freeze([]),
+  blocked: Object.freeze([]),
+  links: Object.freeze([]),
+  cover: Object.freeze([]),
+});
+
+/**
+ * The map-data.md §3 manifest, or null.
+ *
+ * `world.manifest` is null before `World.init()` and an object after, and its `navHints`
+ * key is always present once it exists — so this checks for the KEY rather than for
+ * truthiness, which would happily accept a world whose manifest is an unrelated object.
+ */
+function readManifest(world) {
+  const m = world.manifest;
+  if (m === null || typeof m !== 'object') return null;
+  if (!Object.hasOwn(m, 'navHints') || !Object.hasOwn(m, 'provenance')) return null;
+  return m;
+}
+
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
@@ -169,6 +191,26 @@ export class NavGrid {
     this._decayCursor = 0;
     this._debug = null;
     this._debugOn = false;
+
+    /**
+     * map-data.md §3.5 links that the 8-neighbour grid cannot express — a mantle across a
+     * gap, a stair between non-adjacent cells. Map of node -> [{to, cost, kind, oneWay}].
+     * Empty when the producer supplies no hints, which is the current MERIDIAN case.
+     */
+    this.hintLinks = new Map();
+
+    /**
+     * What the manifest actually changed, so a harness can assert on it with numbers
+     * instead of trusting that the hints were read. Every field is a count of nodes or
+     * links the hints MOVED, not of hints supplied — a hint that resolves to nothing is
+     * the failure mode worth catching.
+     */
+    this.hintStats = {
+      source: 'none',
+      walkableBoxes: 0, blockedBoxes: 0, coverHints: 0, linkHints: 0,
+      forcedWalkable: 0, reaffirmedWalkable: 0, forcedBlocked: 0, coverApplied: 0, linksResolved: 0,
+      unresolvedWalkable: 0, unresolvedBlocked: 0, unresolvedCover: 0, unresolvedLinks: 0,
+    };
 
     this.stats = { bakeMs: 0, searches: 0, expansions: 0, partials: 0 };
   }
@@ -247,6 +289,17 @@ export class NavGrid {
     const world = this.world;
     if (!world || !world.bounds) { console.warn('[nav] no world bounds; nav disabled'); return; }
 
+    // map-data.md §3: bounds come from the manifest when the producer declares them, and
+    // from the built world otherwise. `world.bounds` is already the manifest's bounds in
+    // the declared case (World.init applies them), so this reads one source either way.
+    const manifest = readManifest(world);
+    const hints = manifest === null ? EMPTY_HINTS : manifest.navHints;
+    this.hintStats.source = manifest === null ? 'none' : manifest.provenance.navHints;
+    this.hintStats.walkableBoxes = hints.walkable.length;
+    this.hintStats.blockedBoxes = hints.blocked.length;
+    this.hintStats.coverHints = hints.cover.length;
+    this.hintStats.linkHints = hints.links.length;
+
     const bmin = world.bounds.min;
     const bmax = world.bounds.max;
     this.originX = bmin.x;
@@ -278,10 +331,28 @@ export class NavGrid {
     this._stamp = new Uint32Array(n);
     this._state = new Uint8Array(n);
 
+    this.hintLinks = new Map();
+    this.hintStats.forcedWalkable = 0;
+    this.hintStats.reaffirmedWalkable = 0;
+    this.hintStats.forcedBlocked = 0;
+    this.hintStats.coverApplied = 0;
+    this.hintStats.linksResolved = 0;
+    this.hintStats.unresolvedWalkable = 0;
+    this.hintStats.unresolvedBlocked = 0;
+    this.hintStats.unresolvedCover = 0;
+    this.hintStats.unresolvedLinks = 0;
+
     const boxes = world.boxes || [];
     const { start, list } = this._rasterizeBoxes(boxes);
     this._bakeColumns(boxes, start, list);
+    // §3.5 order matters: force-walkable first so a hinted ledge can then be linked, then
+    // force-blocked so a sill the raster wrongly liked is gone BEFORE links are cut — a
+    // blocked node that keeps its links is exactly the phantom this repository shipped.
+    this._applyWalkableHints(boxes, start, list, hints.walkable);
+    this._applyBlockedHints(hints.blocked);
     this._bakeLinks(boxes, start, list);
+    this._applyLinkHints(hints.links);
+    this._applyCoverHints(hints.cover);
     // Before _bakeReachability, which seeds itself through `nodeAt` — and `nodeAt`
     // refuses to answer until the grid says it is ready.
     this.ready = true;
@@ -291,9 +362,268 @@ export class NavGrid {
     let walkable = 0;
     for (let i = 0; i < n; i++) if (this.flags[i] & F_WALKABLE) walkable++;
     this.walkableCount = walkable;
+    const hs = this.hintStats;
+    const hintNote = hs.source === 'declared'
+      ? ` — hints: +${hs.forcedWalkable} walkable, -${hs.forcedBlocked} blocked, `
+        + `${hs.linksResolved}/${hs.linkHints} links, ${hs.coverApplied}/${hs.coverHints} cover`
+      : ` — no manifest nav hints (${hs.source})`;
     console.info(
-      `[nav] baked ${this.cols}x${this.rows} @ ${CELL}m — ${walkable} walkable nodes in ${this.stats.bakeMs.toFixed(1)} ms`,
+      `[nav] baked ${this.cols}x${this.rows} @ ${CELL}m — ${walkable} walkable nodes in ${this.stats.bakeMs.toFixed(1)} ms${hintNote}`,
     );
+  }
+
+  // ------------------------------------------------------- §3.5 nav hint application
+
+  /**
+   * Insert a walkable node at `y` in a column, keeping layers sorted by height.
+   *
+   * Sorted because everything downstream relies on it: `_groundNodeAt` takes the FIRST
+   * walkable layer as "the ground here", and `samplePoints` pass 2 skips the first as
+   * pass 1's business. An out-of-order insert would put a hinted roof ledge in the ground
+   * lattice. Returns the node id, or -1 if the column is full.
+   */
+  _insertNode(col, y, clearance) {
+    const base = col * MAX_LAYERS;
+    let count = this.layerCount[col];
+    for (let l = 0; l < count; l++) {
+      if (Math.abs(this.floorY[base + l] - y) < 0.05) return base + l;   // already there
+    }
+    if (count >= MAX_LAYERS) return -1;
+    let at = count;
+    while (at > 0 && this.floorY[base + at - 1] > y) at--;
+    for (let l = count; l > at; l--) {
+      const dst = base + l, srcN = base + l - 1;
+      this.floorY[dst] = this.floorY[srcN];
+      this.clearance[dst] = this.clearance[srcN];
+      this.flags[dst] = this.flags[srcN];
+      this.coverX[dst] = this.coverX[srcN];
+      this.coverZ[dst] = this.coverZ[srcN];
+    }
+    const node = base + at;
+    this.floorY[node] = y;
+    this.clearance[node] = clearance;
+    // Created UNFLAGGED. The caller decides walkability, which is what lets it tell a
+    // node it just created apart from one the raster had already found — and a counter
+    // that cannot tell those apart is a counter that reports success for a hint that
+    // changed nothing.
+    this.flags[node] = 0;
+    this.coverX[node] = 0;
+    this.coverZ[node] = 0;
+    this.layerCount[col] = count + 1;
+    return node;
+  }
+
+  /**
+   * §3.5 `walkable`: force-walkable volumes for surfaces the raster misses.
+   *
+   * The hint is a VOLUME, and which surface inside it is meant matters:
+   *
+   *   - if a real collider top lies inside the volume, THAT is the surface. The hint is
+   *     saying "the thing in here is walkable", and the node goes on the geometry.
+   *   - only when the volume contains no collider top does the volume's own top face
+   *     become the surface — the thin-ledge case the contract describes.
+   *
+   * Reading it the other way round — always using the volume's top face — is not a
+   * theoretical distinction. The Square hints its whole ground plane as the volume
+   * y ∈ [-0.1, 0.35] over a slab whose top is y = 0; taking the top face put a second
+   * walkable layer 0.35 m above every square metre of the district, 10,909 extra nodes
+   * standing on nothing, and the bake read 47% phantom — the exact defect this
+   * repository has already shipped once.
+   *
+   * Clearance is measured from real geometry either way: a hint cannot conjure headroom,
+   * or bots path into a ceiling.
+   */
+  _applyWalkableHints(boxes, start, list, hintBoxes) {
+    for (const hb of hintBoxes) {
+      const cx0 = clamp(Math.floor((hb.min.x - this.originX) / CELL), 0, this.cols - 1);
+      const cx1 = clamp(Math.floor((hb.max.x - this.originX) / CELL), 0, this.cols - 1);
+      const cz0 = clamp(Math.floor((hb.min.z - this.originZ) / CELL), 0, this.rows - 1);
+      const cz1 = clamp(Math.floor((hb.max.z - this.originZ) / CELL), 0, this.rows - 1);
+      let applied = 0, reaffirmed = 0;
+      for (let cz = cz0; cz <= cz1; cz++) {
+        const wz = this.originZ + (cz + 0.5) * CELL;
+        if (wz < hb.min.z || wz > hb.max.z) continue;
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const wx = this.originX + (cx + 0.5) * CELL;
+          if (wx < hb.min.x || wx > hb.max.x) continue;
+          const col = cz * this.cols + cx;
+          const y = this._surfaceInBand(boxes, start, list, wx, wz, hb.min.y, hb.max.y);
+          const clear = this._clearanceAt(boxes, start, list, wx, wz, y);
+          if (clear < STAND_CLEARANCE) continue;   // no headroom: the hint is simply wrong
+          const node = this._insertNode(col, y, clear);
+          if (node < 0) continue;
+          // Counted separately on purpose. A hint over ground the raster already liked
+          // changes nothing, and folding the two together would let a hint that does
+          // nothing at all report a healthy number.
+          if (this.flags[node] & F_WALKABLE) { reaffirmed++; continue; }
+          this.flags[node] |= F_WALKABLE;
+          applied++;
+        }
+      }
+      this.hintStats.forcedWalkable += applied;
+      this.hintStats.reaffirmedWalkable += reaffirmed;
+      if (applied === 0 && reaffirmed === 0) this.hintStats.unresolvedWalkable++;
+    }
+  }
+
+  /**
+   * The highest collider top at (x, z) inside [`lo`, `hi`], or `hi` when the band holds
+   * no geometry — i.e. "the surface this force-walkable volume is talking about".
+   */
+  _surfaceInBand(boxes, start, list, x, z, lo, hi) {
+    const col = this.colOf(x, z);
+    if (col < 0) return hi;
+    let best = -Infinity;
+    for (let k = start[col]; k < start[col + 1]; k++) {
+      const bx = boxes[list[k]];
+      if (x < bx.min.x || x > bx.max.x || z < bx.min.z || z > bx.max.z) continue;
+      const t = bx.max.y;
+      if (t < lo - 1e-4 || t > hi + 1e-4) continue;
+      if (t > best) best = t;
+    }
+    return best === -Infinity ? hi : best;
+  }
+
+  /** Headroom above `y` at (x, z) from the real box set. */
+  _clearanceAt(boxes, start, list, x, z, y) {
+    const col = this.colOf(x, z);
+    if (col < 0) return 0;
+    let clear = this.maxY - y;
+    for (let k = start[col]; k < start[col + 1]; k++) {
+      const bx = boxes[list[k]];
+      if (x < bx.min.x - INFLATE || x > bx.max.x + INFLATE) continue;
+      if (z < bx.min.z - INFLATE || z > bx.max.z + INFLATE) continue;
+      if (bx.max.y > y + FOOT_EPS && bx.min.y < y + FOOT_EPS) return 0;   // solid at foot level
+      if (bx.min.y >= y + FOOT_EPS) {
+        const c = bx.min.y - y;
+        if (c < clear) clear = c;
+      }
+    }
+    return clear;
+  }
+
+  /**
+   * §3.5 `blocked`: force-unwalkable. Window sills, parapet caps, decorative ledges — the
+   * surfaces the baker cheerfully calls walkable and bots then stand on. A hint that
+   * matches no node is counted, not ignored: it means the geometry moved out from under
+   * the hint, which is the same class of drift as a stale nav bake.
+   */
+  _applyBlockedHints(hintBoxes) {
+    for (const hb of hintBoxes) {
+      const cx0 = clamp(Math.floor((hb.min.x - this.originX) / CELL), 0, this.cols - 1);
+      const cx1 = clamp(Math.floor((hb.max.x - this.originX) / CELL), 0, this.cols - 1);
+      const cz0 = clamp(Math.floor((hb.min.z - this.originZ) / CELL), 0, this.rows - 1);
+      const cz1 = clamp(Math.floor((hb.max.z - this.originZ) / CELL), 0, this.rows - 1);
+      let applied = 0;
+      for (let cz = cz0; cz <= cz1; cz++) {
+        const wz = this.originZ + (cz + 0.5) * CELL;
+        if (wz < hb.min.z || wz > hb.max.z) continue;
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const wx = this.originX + (cx + 0.5) * CELL;
+          if (wx < hb.min.x || wx > hb.max.x) continue;
+          const col = cz * this.cols + cx;
+          const nl = this.layerCount[col];
+          for (let l = 0; l < nl; l++) {
+            const node = col * MAX_LAYERS + l;
+            if (!(this.flags[node] & F_WALKABLE)) continue;
+            const y = this.floorY[node];
+            // A foot standing at `y` is inside the volume if the volume covers the band
+            // from the surface up to knee height; matching only the exact top face would
+            // miss a sill hinted as a whole solid.
+            if (y < hb.min.y - 0.05 || y > hb.max.y + 0.05) continue;
+            this.flags[node] &= ~F_WALKABLE;
+            this.linkMask[node] = 0;
+            this.dropMask[node] = 0;
+            applied++;
+          }
+        }
+      }
+      this.hintStats.forcedBlocked += applied;
+      if (applied === 0) this.hintStats.unresolvedBlocked++;
+    }
+  }
+
+  /**
+   * §3.5 `links`: affordances the 8-neighbour raster cannot express — a mantle over a
+   * gap, a stair between cells that are not neighbours. Stored as an explicit adjacency
+   * consulted by reachability and A*, so a hinted route is a route bots really take
+   * rather than a comment in the manifest.
+   *
+   * `drop` is one-way, matching the baked drop semantics: you may fall down it, not climb
+   * it. `stair` and `mantle` are two-way.
+   */
+  _applyLinkHints(links) {
+    for (const l of links) {
+      const a = this._hintNode(l.from);
+      const b = this._hintNode(l.to);
+      if (a < 0 || b < 0 || a === b) { this.hintStats.unresolvedLinks++; continue; }
+      const ax = this.cellCenterX((a / MAX_LAYERS) | 0), az = this.cellCenterZ((a / MAX_LAYERS) | 0);
+      const bx = this.cellCenterX((b / MAX_LAYERS) | 0), bz = this.cellCenterZ((b / MAX_LAYERS) | 0);
+      const dist = Math.hypot(bx - ax, bz - az) + Math.abs(this.floorY[b] - this.floorY[a]) * 0.9;
+      const penalty = l.kind === 'mantle' ? 1.2 : l.kind === 'drop' ? 1.6 : 0.2;
+      this._addHintLink(a, b, dist + penalty, l.kind);
+      if (l.kind !== 'drop') this._addHintLink(b, a, dist + penalty, l.kind);
+      this.hintStats.linksResolved++;
+    }
+  }
+
+  _addHintLink(from, to, cost, kind) {
+    const arr = this.hintLinks.get(from);
+    if (arr === undefined) this.hintLinks.set(from, [{ to, cost, kind }]);
+    else arr.push({ to, cost, kind });
+  }
+
+  /**
+   * The walkable node a hint point refers to, or -1.
+   *
+   * The hint's own column first, then its eight neighbours — a hint is authored at a
+   * position, not on a 0.75 m lattice, and the foot of a stair lands a few centimetres
+   * either side of a cell boundary depending on where the stair was drawn. One cell of
+   * tolerance, no more.
+   *
+   * VERTICAL tolerance is the strict one: 1.2 m, so a hint authored at head height or at
+   * the foot of a step resolves, and a hint a whole storey off does NOT. Snapping that
+   * one to the nearest floor is how a link ends up on the wrong level, and a link on the
+   * wrong level is worse than no link — it is a route the bake swears exists.
+   */
+  _hintNode(p) {
+    let best = -1, bestErr = Infinity, bestDist = Infinity;
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const col = this.colOf(p.x + dx * CELL, p.z + dz * CELL);
+        if (col < 0) continue;
+        const lateral = Math.hypot(this.cellCenterX(col) - p.x, this.cellCenterZ(col) - p.z);
+        const nl = this.layerCount[col];
+        for (let l = 0; l < nl; l++) {
+          const node = col * MAX_LAYERS + l;
+          if (!(this.flags[node] & F_WALKABLE)) continue;
+          const err = Math.abs(this.floorY[node] - p.y);
+          if (err > 1.2) continue;
+          // Height agreement dominates: a node on the right floor one cell away beats a
+          // node in the exact column on the floor below.
+          if (err < bestErr - 0.05 || (err < bestErr + 0.05 && lateral < bestDist)) {
+            bestErr = err; bestDist = lateral; best = node;
+          }
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * §3.5 `cover`: an authored cover node with a facing. Overrides the derived cover
+   * direction, which is a centroid of nearby geometry and cannot know that a designer
+   * means "this corner, looking down that lane".
+   */
+  _applyCoverHints(cover) {
+    for (const c of cover) {
+      const node = this._hintNode(c.position);
+      if (node < 0) { this.hintStats.unresolvedCover++; continue; }
+      this.flags[node] |= F_NEARCOVER;
+      this.coverX[node] = -Math.sin(c.facing);
+      this.coverZ[node] = -Math.cos(c.facing);
+      this.hintStats.coverApplied++;
+    }
   }
 
   /**
@@ -387,7 +717,15 @@ export class NavGrid {
         for (let i = 0; i < ns; i++) {
           if (spanClass[i] === 2 && spanMin[i] > this.minY) { roofed = true; break; }
         }
-        if (!roofed) cand[nc++] = this.minY;
+        // A column with no box UNDER ITS CENTRE has no floor, and `minY` is a bound, not a
+        // surface. Seeding it manufactured playspace out of the void: on The Square, 235
+        // walkable nodes 4 m below the district in the half-cell the grid overhangs its
+        // bounds by, and in the skirt around the boundary wall where the only geometry
+        // near the cell centre is beside it rather than beneath it. Every real floor —
+        // including the ground slab — arrives below as the top of a class-2 span.
+        let hasFloor = false;
+        for (let i = 0; i < ns; i++) if (spanClass[i] === 2) { hasFloor = true; break; }
+        if (!roofed && hasFloor) cand[nc++] = this.minY;
         for (let i = 0; i < ns; i++) {
           if (spanClass[i] !== 2) continue;
           const y = spanMax[i];
@@ -621,6 +959,17 @@ export class NavGrid {
       const cur = queue[--top];
       const col = (cur / MAX_LAYERS) | 0;
       const cx = col % cols, cz = (col / cols) | 0;
+      // §3.5 hinted links are traversable, so they carry reachability. A hinted mantle
+      // that the flood ignored would leave its destination marked unreachable, and every
+      // destination picker filters by `reachable` — the hint would exist and do nothing.
+      const extra = this.hintLinks.get(cur);
+      if (extra !== undefined) {
+        for (const e of extra) {
+          if (!(flags[e.to] & F_WALKABLE) || reach[e.to]) continue;
+          reach[e.to] = 1;
+          queue[top++] = e.to;
+        }
+      }
       const mask = linkMask[cur];
       if (mask === 0) continue;
       for (let d = 0; d < 8; d++) {
@@ -648,6 +997,16 @@ export class NavGrid {
   cellCenterZ(col) { return this.originZ + (((col / this.cols) | 0) + 0.5) * CELL; }
 
   isWalkable(node) { return node >= 0 && (this.flags[node] & F_WALKABLE) !== 0; }
+
+  /**
+   * Does this node connect to anything at all?
+   *
+   * Grid links OR a §3.5 hinted link. Every "is this an island" test has to ask both:
+   * a ledge whose only way off is an authored mantle has `linkMask === 0`, and the four
+   * destination pickers that used to test the mask alone would have refused to send a
+   * bot anywhere the manifest had just made reachable.
+   */
+  _linked(node) { return this.linkMask[node] !== 0 || this.hintLinks.has(node); }
   isNearCover(node) { return node >= 0 && (this.flags[node] & F_NEARCOVER) !== 0; }
 
   /** Node whose floor best matches a world position, or -1. */
@@ -749,7 +1108,7 @@ export class NavGrid {
       for (let l = 0; l < n; l++) {
         const node = col * MAX_LAYERS + l;
         if (!(this.flags[node] & F_WALKABLE)) continue;
-        if (this.linkMask[node] === 0) continue;
+        if (!this._linked(node)) continue;
         const err = Math.abs(this.floorY[node] - pos.y);
         if (err < bestErr) { bestErr = err; best = node; }
       }
@@ -799,7 +1158,7 @@ export class NavGrid {
         for (let l = 0; l < n; l++) {
           const node = col * MAX_LAYERS + l;
           if (!(this.flags[node] & F_WALKABLE)) continue;
-          if (this.linkMask[node] === 0 || !this.reachable[node]) continue;
+          if (!this._linked(node) || !this.reachable[node]) continue;
           const rise = this.floorY[node] - pos.y;
           if (rise < minRise) continue;
           const wx = this.cellCenterX(col), wz = this.cellCenterZ(col);
@@ -984,7 +1343,7 @@ export class NavGrid {
         let seenGround = false;
         for (let l = 0; l < lc && n < maxOut; l++) {
           const node = col * MAX_LAYERS + l;
-          if (!(this.flags[node] & F_WALKABLE) || this.linkMask[node] === 0) continue;
+          if (!(this.flags[node] & F_WALKABLE) || !this._linked(node)) continue;
           // The lowest linked layer is pass 1's business, and a column whose lowest
           // surface is already a roof (solid building underneath) got it from there.
           if (!seenGround) { seenGround = true; continue; }
@@ -1005,7 +1364,7 @@ export class NavGrid {
     for (let l = 0; l < lc; l++) {
       const node = col * MAX_LAYERS + l;
       if (!(this.flags[node] & F_WALKABLE)) continue;
-      if (this.linkMask[node] === 0) continue;
+      if (!this._linked(node)) continue;
       // A column filled solid by a skyline block has exactly one walkable layer — its
       // 15 m roof — and nothing links it to the map. Emitting it as "the ground here"
       // put a point of interest on top of a building with no way up.
@@ -1204,9 +1563,29 @@ export class NavGrid {
 
       const col = (cur / MAX_LAYERS) | 0;
       const cx = col % cols, cz = (col / cols) | 0;
+      const cy = floorY[cur];
+
+      // §3.5 hinted links, expanded exactly like grid neighbours so a mantle or an
+      // out-of-band stair is a route the search can actually take.
+      const extra = this.hintLinks.get(cur);
+      if (extra !== undefined) {
+        for (const e of extra) {
+          const nnode = e.to;
+          if (!(flags[nnode] & F_WALKABLE)) continue;
+          if (stamp[nnode] === gen && state[nnode] === 2) continue;
+          const tentative = g[cur] + e.cost + danger[nnode] * 1.35;
+          if (stamp[nnode] !== gen) { stamp[nnode] = gen; state[nnode] = 0; g[nnode] = Infinity; }
+          if (tentative >= g[nnode]) continue;
+          g[nnode] = tentative;
+          came[nnode] = cur;
+          f[nnode] = tentative + this._heuristic(nnode, gx, gz, gy);
+          state[nnode] = 1;
+          this._heapPush(nnode);
+        }
+      }
+
       const mask = linkMask[cur];
       if (mask === 0) continue;
-      const cy = floorY[cur];
 
       for (let d = 0; d < 8; d++) {
         if (!(mask & (1 << d))) continue;

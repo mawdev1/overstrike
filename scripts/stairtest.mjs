@@ -23,6 +23,21 @@ import * as THREE from 'three';
 import { Builder } from '../src/world/props.js';
 import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
+import { selectMap, getMapEntry, listMaps } from '../src/world/world.js';
+
+// `--map` selects any registered map, in or out of rotation, so the retained MERIDIAN
+// fixture (map-data.md §9) keeps its traversal baseline after it leaves the live rotation.
+{
+  const hit = process.argv.slice(2).find((a) => a.startsWith('--map='));
+  if (hit) {
+    const id = hit.slice('--map='.length);
+    if (getMapEntry(id) === null) {
+      console.error(`stairtest: no registered map '${id}'. Registered: ${listMaps().map((m) => m.id).join(', ')}`);
+      process.exit(2);
+    }
+    selectMap(id);
+  }
+}
 
 const VERBOSE = process.argv.includes('--verbose');
 

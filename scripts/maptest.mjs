@@ -10,17 +10,32 @@
  *   - the player escaping the level or seeing over the perimeter
  *   - accidental slits between wall segments that were meant to touch
  *
- *   node scripts/maptest.mjs [--rays=40000]
+ *   node scripts/maptest.mjs [--rays=40000] [--map=<id>]
+ *
+ * `--map` selects any registered map, in or out of rotation — the retained MERIDIAN
+ * fixture (map-data.md §9) included, so its collision baseline stays checkable after it
+ * leaves the live rotation.
  */
 import * as THREE from 'three';
 import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
+import { selectMap, getMapEntry, listMaps } from '../src/world/world.js';
 
 const arg = (k, d) => {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${k}=`));
   return hit ? Number(hit.split('=')[1]) : d;
 };
 const RAYS = arg('rays', 40000);
+
+const MAP_ARG = process.argv.slice(2).find((a) => a.startsWith('--map='));
+if (MAP_ARG) {
+  const id = MAP_ARG.slice('--map='.length);
+  if (getMapEntry(id) === null) {
+    console.error(`maptest: no registered map '${id}'. Registered: ${listMaps().map((m) => m.id).join(', ')}`);
+    process.exit(2);
+  }
+  selectMap(id);
+}
 
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
@@ -469,6 +484,111 @@ let reachable = new Set();
   }
   if (holes.length === 0) ok(`solid ground under all ${sampled} sampled columns`);
   else bad('there is ground everywhere', `${holes.length}+ columns with no floor: ${holes.join(' ')}`);
+}
+
+// ── the map-data.md §3 manifest ──────────────────────────────────────────────────────
+//
+// Contract §6 assigns to this harness: "Manifest conforms; every objective/callout/spawn
+// id resolves; no malformed boxes." The simulation reads the map through the manifest and
+// never through the level module's internals, so these are the properties that make the
+// CC/CX geometry seam safe (Build Plan §3.3).
+//
+// A map registered only as a FIXTURE (map-data.md §9 retains MERIDIAN as one) is held to
+// the box and spawn-geometry rules but not to the Bomb-era §3.2–§3.4 minimums: it is a
+// frozen comparison target, not a competitive map, and failing the suite on it forever
+// would only teach everyone to ignore the suite.
+{
+  const { manifestGaps, mapRotation } = await import('../src/world/world.js');
+  const m = w.manifest;
+  const inRotation = mapRotation().includes(m.mapId);
+  console.log(`\nmap-data §3 manifest — '${m.mapId}' v${m.mapVersion}, ${m.source}`
+    + `${inRotation ? '' : ' (fixture, not in rotation)'}`);
+
+  const gaps = manifestGaps(m);
+  if (gaps.length === 0) ok('the producer declares every §3 export');
+  else if (inRotation) bad('the producer declares every §3 export', `still owed: ${gaps.join(', ')}`);
+  else console.log(`  note   fixture does not declare: ${gaps.join(', ')}`);
+
+  // §3.1 / §3.3 / §3.4: a volume authored min > max is silently dropped by the spatial
+  // hash, and a zero-extent one is a volume nothing can ever be inside.
+  const volumes = [
+    ...m.objectives.map((o) => [`objective ${o.id}`, o.box]),
+    ...m.callouts.map((c) => [`callout ${c.id}`, c.box]),
+    ...m.boundary.map((b, i) => [`boundary ${i}`, b]),
+  ];
+  const malformed = [];
+  for (const [name, box] of volumes) {
+    if (box.inverted) malformed.push(`${name} authored min > max`);
+    else if (box.max.x - box.min.x <= 0 || box.max.y - box.min.y <= 0 || box.max.z - box.min.z <= 0) {
+      malformed.push(`${name} has zero extent on an axis`);
+    }
+  }
+  if (malformed.length === 0) ok(`all ${volumes.length} manifest volumes are well formed`);
+  else bad('every manifest volume is well formed', `${malformed.length}:\n       ${malformed.slice(0, 6).join('\n       ')}`);
+
+  // Ids are referenced by the ruleset, the HUD, evidence and analytics (§3.2–§3.4).
+  const seen = new Map();
+  const idProblems = [];
+  for (const [kind, list] of [['spawn', m.spawns], ['objective', m.objectives], ['callout', m.callouts]]) {
+    for (const rec of list) {
+      if (typeof rec.id !== 'string' || rec.id.length === 0) { idProblems.push(`a ${kind} has no id`); continue; }
+      if (seen.has(rec.id)) idProblems.push(`id '${rec.id}' used by both a ${seen.get(rec.id)} and a ${kind}`);
+      seen.set(rec.id, kind);
+    }
+  }
+  // Resolution, not just presence: the lookups the ruleset and HUD will actually call.
+  for (const o of m.objectives) {
+    if (w.objective(o.id) === null) idProblems.push(`objective '${o.id}' does not resolve through world.objective()`);
+    if (o.site !== null && w.objectivesAt(o.site).length === 0) {
+      idProblems.push(`site '${o.site}' resolves to no volume`);
+    }
+  }
+  if (idProblems.length === 0) ok(`all ${seen.size} manifest ids are unique and resolve`);
+  else bad('every manifest id is unique and resolves', `${idProblems.length}:\n       ${idProblems.slice(0, 6).join('\n       ')}`);
+
+  // §3.2: "Standing clearance for the player capsule (r 0.36, h 1.8), on walkable ground."
+  // Asked of the real collider set with the real capsule, because a spawn that clips a
+  // pane or has no floor is a life that starts stuck or falling.
+  {
+    const { PLAYER_TUNE } = await import('../src/player/player.js');
+    const R = PLAYER_TUNE.RADIUS ?? 0.36;
+    const H = PLAYER_TUNE.HEIGHT ?? 1.8;
+    const bad3 = [];
+    for (const sp of m.spawns) {
+      const p = sp.position;
+      const ground = w.sampleGroundHeight(p.x, p.z, p.y + 1.0);
+      if (ground === null || !Number.isFinite(ground)) {
+        bad3.push(`${sp.id}: no ground under it`);
+        continue;
+      }
+      if (Math.abs(ground - p.y) > 0.6) {
+        bad3.push(`${sp.id}: ground is ${(ground - p.y).toFixed(2)} m off the spawn height`);
+        continue;
+      }
+      if (w._overlapAny(p.x, ground + 0.02, p.z, R, H)) {
+        bad3.push(`${sp.id} at (${p.x}, ${p.y}, ${p.z}): the r=${R} h=${H} capsule overlaps geometry`);
+      }
+    }
+    if (bad3.length === 0) ok(`all ${m.spawns.length} spawns have standing clearance on walkable ground`);
+    else bad('every spawn has standing clearance on walkable ground',
+      `${bad3.length} of ${m.spawns.length}:\n       ${bad3.slice(0, 8).join('\n       ')}`);
+  }
+
+  // §3.6: colliders are bounded because every move/raycast/losClear query scales with them.
+  if (m.measured.colliders <= m.budgets.colliders) {
+    ok(`collider count within the §3.6 budget (${m.measured.colliders} <= ${m.budgets.colliders})`);
+  } else {
+    bad('the collider count is within the §3.6 budget',
+      `${m.measured.colliders} colliders against a budget of ${m.budgets.colliders}`);
+  }
+
+  // §5: the competitive boundary must be a removable tagged layer, not baked into the
+  // district — otherwise P6 re-authors the whole map to open it up.
+  if (inRotation) {
+    if (m.boundary.length > 0) ok(`the competitive boundary is a removable layer (${m.boundary.length} volumes)`);
+    else bad('the competitive boundary is a removable layer',
+      'COMPETITIVE_BOUNDARY is not exported, so the boundary is baked into the district geometry');
+  }
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nthe map holds up');
