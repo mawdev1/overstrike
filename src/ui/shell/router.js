@@ -88,14 +88,23 @@ export function matchShellRoute(input) {
       id: route.id,
       pattern: route.pattern,
       title: route.title,
+      // Carried through explicitly. This object is BUILT, not spread from the route, so a new
+      // field on SHELL_ROUTES does not reach a caller unless it is listed here — which is how
+      // `signedOut` was added, deployed, and had no effect at all: the guard read
+      // `route.signedOut` on an object that never had the key.
+      signedOut: route.signedOut === true,
       pathname,
       params: Object.freeze(params),
     });
   }
+  // An unmatched path is the `system` not-found notice, and a signed-out visitor must be able
+  // to SEE it. Without this flag a bad link bounced them to sign-in instead of telling them the
+  // page does not exist.
   return Object.freeze({
     id: 'system',
     pattern: '/system/:condition',
     title: 'Page not found',
+    signedOut: true,
     pathname,
     params: Object.freeze({ condition: 'not-found' }),
   });
