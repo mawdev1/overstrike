@@ -1,0 +1,18 @@
+{
+  "name": "overstrike-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OVERSTRIKE platform control plane — accounts, profiles, presence, lobby, results",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "migrate": "node src/core/migrate.js",
+    "test": "node ../scripts/platformtest.mjs"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "pg": "^8.13.1"
+  },
+  "engines": { "node": ">=20" }
+}
