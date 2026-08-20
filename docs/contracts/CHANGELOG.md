@@ -32,6 +32,42 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — Second Codex review, `REQ-CC-010`…`014` (additive)
+
+Codex re-reviewed the 1.1.0 amendments and found five further gaps. All resolved; affected
+contracts go to **1.2.0**. Additive throughout — no shipped shape changed meaning.
+
+| Request | Contract | Amendment |
+|---|---|---|
+| `REQ-CC-010` | `http-api.md` §11.8–11.10, `auth.md` §3 | Remaining endpoint schemas, settings allowlist, 17 stub scenarios; socket-token contradiction fixed |
+| `REQ-CC-011` | `realtime-lobby.md` §3–5, §6 | One canonical `RoomState`/`RosterMember`; typed deltas; real countdown abort policy |
+| `REQ-CC-012` | `wire-protocol.md` §8.9–8.10, `net-facade.md` §5–6 | `MSG_OUTCOME`; wire source per facade field; clock domains and u32 wrap |
+| `REQ-CC-013` | `bomb-rules.md`, `map-data.md`, `net-facade.md`, `P0-decisions.md` | One series rule; stale wire prose and timing numbers corrected |
+| `REQ-CC-014` | `telemetry.md` §3.3.1 | Published event registry with classes, bounds, closed enums |
+
+### What the second pass caught that the first did not
+
+Three were **contradictions I introduced while fixing the first round** — the cost of amending
+in place rather than re-reading the whole document afterwards:
+
+1. **The series was impossible.** "First to 7, max 13" and "MR12, no overtime, 6-6 draw" sat in
+   adjacent rows describing different formats. Max 13 permits a 7–6 thirteenth round; MR12 ends
+   at 12. Settled as `maxRounds: 12`, `roundsToWin: 7` (early win), draw at 6-6.
+2. **Stale numbers survived the amendment.** `map-data.md` §7.0 got the new 88 m envelope while
+   §7.1 kept the old 8–12 / 11–15 / 14–20 thresholds, and `P0-decisions.md` D4 still showed the
+   20/27/13 arithmetic the envelope change had invalidated. Two tables in one file disagreeing
+   is worse than one wrong table, because each looks authoritative.
+3. **`bomb-rules.md` §11 still described the flag-bit encoding** that §8.5 of the wire contract
+   had already replaced with `interact`.
+
+The other two were originals: the facade promised `matchId`, winner, and reason on
+`matchEnded` with **no wire source anywhere** — a field the client could not have obtained —
+and `auth.md` claimed the access token is sent on lobby-socket connect, when sockets take
+single-use tickets precisely so a bearer token never lands in a URL.
+
+**Lesson recorded:** amending a contract in place needs a full re-read of the file, not just
+the edited section. Both review rounds found the same failure mode.
+
 ## 2026-08-19 — Codex review amendments, `REQ-CC-001`…`009` (additive)
 
 Codex's P0 sufficiency review returned **10 of 13 contracts insufficient** and identified five

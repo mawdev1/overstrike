@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
 
@@ -28,7 +28,8 @@ Every rule in this contract holds for any values here; these are the numbers. Re
 
 | Parameter | Value | Note |
 |---|---|---|
-| Rounds to win | **7** (first to 7, max 13) | MR12 |
+| Rounds to win | **7** | Early win. A team reaching 7 ends the match immediately |
+| Regulation rounds | **12** (`maxRounds: 12`) | MR12. 6-6 after 12 is a draw |
 | Side switch | **After round 6** | Both teams attack and defend equally |
 | Round length | **1:45** | Pre-plant |
 | Freeze time | **8 s** | Positioning. There is no buy economy |
@@ -62,9 +63,34 @@ assumed — so the REQ-CX-002 measurement is now load-bearing rather than confir
 envelope gone to Codex's full 104 m, the minimum would have been 35 s and 40 s would not have
 survived.
 
-**If measured rotation on real geometry exceeds 20 s, the timer moves — not the map.** That is
+**If measured rotation on real geometry exceeds 22 s, the timer moves — not the map.** That is
 by far the cheaper correction. `REQ-CX-002` is the request that produces the measurement from
 `mapbalance.mjs` once graybox geometry exists.
+
+### 2.1a Series semantics — one internally consistent rule (REQ-CC-013)
+
+The earlier wording said both "first to 7, **max 13**" and "MR12, no overtime, 6-6 draw".
+Those cannot both hold: max 13 permits a 7–6 thirteenth round, while MR12 ends after 12. The
+contract was describing two different formats in adjacent rows.
+
+**The Alpha series, stated once:**
+
+```
+maxRounds:   12        regulation, always
+roundsToWin:  7        early win — reaching 7 ends the match immediately
+6-6 after 12:          DRAW
+```
+
+| Situation | Outcome |
+|---|---|
+| A team reaches 7 at any point | Match ends immediately, that team wins. Remaining rounds are not played |
+| After 12 rounds, 7–5 or wider | Winner already decided at round 7 by the rule above |
+| After 12 rounds, 6–6 | **Draw.** `winnerTeam: "draw"` |
+| Side switch | After round 6, so each side plays 6 attacking and 6 defending |
+
+7 is reachable by round 12 at the latest (7–5), so the early-win rule and the 12-round cap
+never conflict. `maxRounds: 12` is the value that appears in `net-facade.md` §5.1 `series`,
+in the room `settings` block (`http-api.md` §11.3), and in the result record.
 
 ### 2.2 Why no overtime in Alpha
 
@@ -199,10 +225,11 @@ Score awards extend the existing `SCORE` table with `plant`, `defuse`, `roundWin
 
 Per `wire-protocol.md` §7 G3, all appended, never inserted:
 
-- Entity flag bit: `F_PLANTING` / `F_DEFUSING` (one spare bit remains in the flags byte —
-  if both are needed, the byte is full and this becomes a new field, not a squeeze).
+- **No new entity flag bit.** Planting and defusing ride in the appended `interact` u8 field
+  (`wire-protocol.md` §8.5): bits 0–1 kind (0 none, 1 plant, 2 defuse), bits 2–7 progress 0–63.
+  Two states plus progress in one byte, and flags bit 7 stays spare.
 - Match state: round index, round phase, alive counts, bomb state, carrier id, site id,
-  objective progress (0–255) and progress actor.
+  objective progress (0–63, from `interact`) and progress actor.
 - Event kinds appended to `EV_KINDS`: `plantStart`, `plantComplete`, `plantCancel`,
   `defuseStart`, `defuseComplete`, `defuseCancel`, `bombDropped`, `bombPickedUp`,
   `bombDetonated`, `roundStart`.

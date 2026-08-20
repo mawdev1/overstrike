@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -79,7 +79,7 @@ net.localEntity      // predicted local state; the ONLY predicted value on this 
 net.remoteEntities   // Map<id, interpolated entity> — interpolated INTERP_DELAY_MS behind
 net.matchState       // authoritative; see §5.1
 net.netStats         // measured; see §5.2
-net.reconnect        // { graceMs, remainingMs, attempt } | null
+net.reconnect        // see §5.4 — { graceEndsAt, attempt, maxAttempts, canCancel } | null
 ```
 
 All are live views, re-read per frame. Nothing here is a snapshot Codex should cache across
@@ -109,7 +109,7 @@ frames; entity objects are pooled and their contents change under you.
   killLimit: number | null,     // TDM
 
   series: {                                            // ¹
-    roundsToWin: 7, maxRounds: 13,
+    roundsToWin: 7, maxRounds: 12,
     sideSwitchAfter: 6, sideSwitched: boolean,
     overtime: false,                                   // always false in Alpha (bomb-rules.md §2.2)
   } | null,
@@ -145,6 +145,19 @@ already cancelled the plant.
 **Timers are derived from `phaseEndsAt` against the server clock, not counted down locally.**
 A local countdown drifts through a stall and then disagrees with the round it is describing.
 
+#### 5.1.0 Clock domains — do not mix them
+
+`serverNow` and `phaseEndsAt` are **server** monotonic time; `sampledAt` is **client**
+`performance.now()`. Subtracting one from the other is meaningless. The correct derivation:
+
+```js
+remainingMs = (phaseEndsAt - serverNow) - (performance.now() - sampledAt);
+```
+
+Both terms of the first subtraction come from the same clock; `sampledAt` only ages the sample
+locally. The facade reconstructs `serverNow` from the u32 `serverTimeMs` on the wire, handling
+the 49.7-day wrap — full rules in `wire-protocol.md` §8.10.
+
 #### 5.1.1 `bomb.carrierId` may be `null` and that is not an error
 
 The server filters the carrier per recipient (`wire-protocol.md` §8.8): teammates always see
@@ -177,17 +190,24 @@ contract; the facade reports them as measured and does not smooth them into look
 
 Event names alone were not buildable. Each carries:
 
-| Event | Payload |
-|---|---|
-| `welcome` | `{ clientId, entityId, matchSeed, killLimit, mode, isReconnect, isSpectator, protocolVersion, serverTickRateHz }` |
-| `matchState` | the §5.1 object |
-| `stateChange` | `{ from, to, reason }` |
-| `disconnected` | `{ reason, code, retryable, graceEndsAt }` — `code` from `errors.md` |
-| `versionMismatch` | `{ clientVersion, serverVersion }` |
-| `interactionRefused` | `{ kind, reason }` — `not-eligible`, `wrong-phase`, `outside-volume`, `not-carrier`, `already-planted` |
-| `roundEnded` | `{ roundIndex, winner, reason }` — `elimination`, `defuse`, `detonation`, `timer` |
-| `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw', reason, terminationReason }` |
-| `bombStateChanged` | `{ from, to, actorId, siteId }` |
+**Every field below has a named wire source.** A facade field with no source is a field the
+client cannot have, and REQ-CC-012 correctly caught three of them.
+
+| Event | Payload | Wire source |
+|---|---|---|
+| `welcome` | `{ clientId, entityId, matchSeed, killLimit, mode, isReconnect, isSpectator, protocolVersion, serverTickRateHz }` | `MSG_WELCOME` v2 (§8.4) |
+| `matchState` | the §5.1 object | `MSG_MATCHSTATE` (§8.6) + `MSG_WELCOME` for the static fields |
+| `stateChange` | `{ from, to, reason }` | Facade-local; `reason` from `MSG_REJECT` or socket close |
+| `disconnected` | `{ reason, code, retryable, graceEndsAt }` | Socket close + `MSG_REJECT` (§8.3) |
+| `versionMismatch` | `{ clientVersion, serverVersion }` | `MSG_REJECT` (§8.3) |
+| `interactionRefused` | `{ kind, reason }` | `plantCancel`/`defuseCancel` event `amount` (§8.7) |
+| `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
+| `matchEnded` | `{ matchId, winner, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9) |
+| `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
+
+`interactionRefused.reason` maps from the cancel-reason enum on the wire: `0` released →
+`released`, `1` left volume → `outside-volume`, `2` died → `not-eligible`, `3` round ended →
+`wrong-phase`.
 
 `requestInteraction` still returns nothing (§4). Refusal arrives as `interactionRefused`, which
 is what lets the UI distinguish "the server said no" from "the packet is still in flight" —
@@ -202,21 +222,23 @@ a promise would collapse those two into one silent case.
 `graceEndsAt` is the server's authoritative deadline, so the countdown a player sees is the
 real one rather than an optimistic guess (`realtime-lobby.md` §8).
 
-## 6. Events
+## 6. Subscribing
 
 ```js
-net.on(type, fn)   // returns an unsubscribe function
+const off = net.on(type, fn)   // returns an unsubscribe function
 ```
+
+**§5.3 is the canonical event table.** This section previously carried a second, older table
+that had drifted out of step with it — a stale `welcome` payload, and `disconnected` missing
+`graceEndsAt`. REQ-CC-012 was right that two tables means one of them is wrong; there is now
+one, in §5.3.
+
+Two additional low-level events not in §5.3, because they carry no domain payload:
 
 | Type | Payload | Fires |
 |---|---|---|
-| `welcome` | `{ clientId, entityId, matchSeed, killLimit }` | Join, and **again on every match restart** — treat as assignment, not handshake |
 | `snapshot` | `{ tick, keyframe }` | Each accepted snapshot |
-| `event` | decoded event (`hitmarker`, `kill`, `fire`, `damaged`, `death`, `respawn`, `explosion`, `blood`, `flash`, `roundEnd`) | As they arrive |
-| `matchState` | the object in §5.1 | On change only, not per tick |
-| `stateChange` | `{ from, to, reason }` | On any §3 transition |
-| `disconnected` | `{ reason, code, retryable }` | On loss |
-| `versionMismatch` | `{ clientVersion, serverVersion }` | At handshake |
+| `event` | one decoded wire event (`EV_KINDS`, `wire-protocol.md` §5.2 and §8.7) | As they arrive |
 
 Handlers must not throw. A throwing handler is caught, logged with the correlation ID, and
 unsubscribed — the netcode does not stop because a HUD widget has a bug.

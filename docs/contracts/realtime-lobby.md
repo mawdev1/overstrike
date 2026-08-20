@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] shell UI, presence service, room service |
 
@@ -45,7 +45,9 @@ Opening the socket is what converts a reservation into a seat.
 client that has the welcome can render the whole lobby. Every later message is a delta
 against it.
 
-**Exact shape (REQ-CC-003).** `state.snapshot` returns this identical payload.
+**Exact shape (REQ-CC-003).** `state.snapshot` carries the identical `d` payload with
+`"t": "state.snapshot"` — the envelope type differs, so a reducer can tell a resync from a
+first connect rather than inferring it from `seq`.
 
 ```jsonc
 { "t": "lobby.welcome", "seq": 0, "ts": "…", "correlationId": "…",
@@ -67,8 +69,10 @@ against it.
       "status": "open|countdown|in-progress|closing",
       "capacity": 12, "playerCount": 6,
       "hasPassword": false, "ownerAccountId": "…",
-      "rules": { "killLimit": 75, "roundsToWin": 7, "roundLengthSec": 105,
-                 "backfill": true, "requiredReady": 8, "minPlayers": 2 }
+      "joinable": true, "joinBlockedReason": null,
+      "settings": { "killLimit": 75, "roundsToWin": 7, "maxRounds": 12,
+                    "roundLengthSec": 105, "backfill": true,
+                    "requiredReady": 8, "minPlayers": 2 }
     },
     "roster": [ {
       "accountId": "…", "displayName": "…",
@@ -85,7 +89,22 @@ against it.
 ```
 
 Every field is required. `null` means present-and-empty; an omitted key is a contract
-violation. The room block matches `http-api.md` §11.3 exactly, so one renderer serves both.
+violation.
+
+**One shared schema, not two similar ones (REQ-CC-011).** This block previously claimed to
+match `http-api.md` §11.3 "exactly" while renaming `settings` to `rules` and dropping
+`joinable` and `joinBlockedReason` — so a client building one renderer for both would have
+broken on the first field it reached for. The canonical definitions now live in one place:
+
+| Schema | Defined in | Used by |
+|---|---|---|
+| `RoomState` | `http-api.md` §11.3 | `GET /v1/rooms/:id`, `lobby.welcome.d.room`, `state.snapshot`, `room.updated` |
+| `RosterMember` | `http-api.md` §11.3 | the same, plus `roster.delta` |
+
+The lobby `room` block **is** `RoomState`, field for field, including `joinable` and
+`joinBlockedReason`. The key is `settings` in both — `rules` above was the rename and is gone.
+`correlationId` stays on the envelope (§2) rather than inside `d`, because in the socket it
+belongs to the frame, not the room.
 
 Failures close the socket with a code and an `errors.md` payload: bad ticket
 (`SESSION_TOKEN_INVALID`), expired reservation (`SLOT_RESERVATION_EXPIRED`), room gone
@@ -96,9 +115,9 @@ Failures close the socket with a code and an `errors.md` payload: bad ticket
 | `t` | Payload | Notes |
 |---|---|---|
 | `lobby.welcome` | full state | Once, at open |
-| `roster.delta` | `{ added[], removed[], updated[] }` | Never a full roster after welcome, except after `state.resync` |
-| `presence.delta` | `{ accountId, state, joinable }` | Out-of-room presence for the online list |
-| `room.updated` | changed room fields | Name, capacity, mode, map, status |
+| `roster.delta` | `{ added: RosterMember[], updated: RosterMember[], removed: accountId[] }` — full members on add/update, **ids only** on remove | Never a full roster after welcome, except after `state.resync` |
+| `presence.delta` | `{ accountId, state: 'online'\|'in-lobby'\|'in-match'\|'offline', joinable: bool, roomId: string\|null }` | Out-of-room presence for the online list |
+| `room.updated` | a **partial** `RoomState` — only changed top-level keys, `settings` replaced wholesale when any part changes | Name, capacity, mode, map, status, joinable |
 | `team.changed` | `{ accountId, team, byServer }` | `byServer: true` when balancing moved them, so the UI can explain it |
 | `ready.changed` | `{ accountId, ready, clearedReason? }` | `clearedReason` ∈ `roster-change`, `team-change`, `loadout-change`, `room-change` |
 | `countdown.started` | `{ endsAt, requiredReady, currentReady }` | |
@@ -107,7 +126,7 @@ Failures close the socket with a code and an `errors.md` payload: bad ticket
 | `match.allocating` | `{ }` | Allocation started — may take seconds |
 | `match.ready` | `{ matchId, serverUrl, sessionTicket, expiresAt }` | **The handoff.** See §6 |
 | `match.failed` | `errors.md` payload | `MATCH_ALLOCATION_FAILED`, `MATCH_SERVER_UNREACHABLE` |
-| `chat.message` | `{ id, accountId, displayName, text, ts }` | Already policy-filtered |
+| `chat.message` | `{ id, accountId, displayName, text (≤200 chars), ts, filtered: bool }` | Already policy-filtered; `filtered` marks server-redacted text |
 | `chat.removed` | `{ id, reason }` | Moderation retraction |
 | `ping.placed` | `{ accountId, kind, target? }` | Canned callouts |
 | `state.snapshot` | full state | Only in reply to `state.resync` |
@@ -155,8 +174,18 @@ Binding rules:
 
 1. **The roster freezes at `countdown.started`**, not at `match.ready`. Otherwise a player who
    joins during the countdown reaches a match server that was sized without them.
-2. A player leaving during countdown → `countdown.aborted` with `player-left`, or the
-   countdown re-arms — **per an explicit configured rule, never silently**.
+2. **Countdown abort policy (REQ-CC-011).** "Per an explicit configured rule" was not a rule,
+   it was a placeholder in two places. The rule:
+
+   | Trigger during countdown | Outcome |
+   |---|---|
+   | Ready count drops below `requiredReady` | `countdown.aborted`, reason `player-unready` or `player-left`. Readiness is **not** cleared — the remaining players stay green so a re-launch is one click |
+   | Player leaves but ready count still meets `requiredReady` | Countdown **continues**. The roster is already frozen; a departure that does not break the threshold does not punish everyone |
+   | Team balance becomes illegal | `countdown.aborted`, reason `team-imbalance`, readiness cleared |
+   | Owner cancels | `countdown.aborted`, reason `owner-cancelled`, readiness preserved |
+   | Allocation fails | `countdown.aborted`, reason `allocation-failed`, readiness cleared (§6 rule 4) |
+
+   The countdown never silently re-arms. An abort is always announced with its reason.
 3. `sessionTicket` is per-account, single-use, 60 s (`auth.md` §6). One player's ticket cannot
    admit another.
 4. If allocation fails, everyone gets `match.failed` and the room returns to `open` with

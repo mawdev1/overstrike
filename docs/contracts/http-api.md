@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -332,6 +332,132 @@ fabricated latency number is worse than an absent one, because the player trusts
 ### 11.7 Flags
 
 See `feature-flags.md` §3.1 for the exact `GET /v1/config/flags` response.
+
+### 11.8 Remaining endpoint schemas (REQ-CC-010)
+
+§11.1–11.7 covered the endpoints with unusual semantics. These are the rest, so no endpoint is
+left to inference.
+
+```jsonc
+// POST /v1/auth/signup   { "email", "password", "displayName", "dateOfBirth" }
+// POST /v1/auth/signin   { "email", "password" }
+201/200 → { "accessToken", "expiresAt", "session": { "sessionId", "deviceLabel", "createdAt" },
+            "profile": { /* §4 GET /profile/me */ }, "correlationId" }
+  errors: VALIDATION_FAILED · AUTH_INVALID_CREDENTIALS · AUTH_RATE_LIMITED ·
+          NAME_TAKEN · NAME_POLICY_VIOLATION · AUTH_ELIGIBILITY_DENIED
+
+// POST /v1/auth/signout        {} → 204
+// POST /v1/auth/signout-all    {} → 204          (both clear the refresh cookie)
+
+// GET /v1/auth/sessions
+200 → { "sessions": [ { "sessionId", "deviceLabel", "userAgentClass", "ipClass",
+                        "createdAt", "lastSeenAt", "isCurrent" } ], "correlationId" }
+// DELETE /v1/auth/sessions/:id → 204 · NOT_FOUND · AUTH_FORBIDDEN
+
+// POST /v1/auth/recovery/start     { "email" } → 202 { "correlationId" }   (always 202)
+// POST /v1/auth/recovery/complete  { "token", "newPassword" } → 204
+  errors: AUTH_RECOVERY_TOKEN_INVALID · AUTH_RECOVERY_TOKEN_EXPIRED · VALIDATION_FAILED
+
+// PATCH /v1/profile/me   { "displayName"?, "privacy"? }   Idempotency-Key required
+200 → the §4 profile object
+  errors: NAME_TAKEN · NAME_POLICY_VIOLATION · NAME_CHANGE_COOLDOWN · VALIDATION_FAILED
+
+// GET /v1/profile/:accountId          public projection
+200 → { "accountId", "displayName", "createdAt",
+        "stats": { … } | null,        // null when statsVisibility forbids it
+        "presence": { … } | null,     // null when presenceVisibility forbids it
+        "correlationId" }
+  A privacy-hidden field is null. It is never omitted, and never a 403 — both would
+  disclose that the setting exists and is set.
+
+// GET /v1/presence/online?limit=&cursor=
+200 → { "items": [ { "accountId", "displayName",
+                     "state": "online|in-lobby|in-match",
+                     "joinable": bool, "roomId": string|null } ],
+        "nextCursor", "correlationId" }
+
+// POST /v1/rooms   { "name", "region", "map", "mode", "capacity", "password"?, "settings"? }
+201 → RoomState + reservation (as §11.4)
+
+// POST /v1/rooms/:id/leave    {} → 204   (idempotent; 204 even if not a member)
+// POST /v1/rooms/:id/team     { "team": "alpha"|"bravo"|"auto" } → 200 RoomState
+//   errors: TEAM_FULL · TEAM_SWITCH_FORBIDDEN · NOT_IN_ROOM
+// POST /v1/rooms/:id/ready    { "ready": bool } → 200 RoomState
+// POST /v1/rooms/:id/loadout  { "primaryIdx", "secondaryIdx" } → 200 RoomState
+//   errors: VALIDATION_FAILED (index out of range for the ruleset)
+// POST /v1/rooms/:id/launch   {} → 202 { "correlationId" }
+//   errors: AUTH_FORBIDDEN (not owner) · CONFLICT (not all ready) · ROOM_IN_PROGRESS
+
+// POST /v1/reports  { "subjectAccountId", "category", "matchId"?, "description"? }
+201 → { "reportId", "correlationId" }
+  category ∈ cheating | harassment | offensive-name | griefing | other
+  errors: REPORT_DUPLICATE · RATE_LIMITED · VALIDATION_FAILED
+
+// GET /v1/health        → 200 { "ok": true }              (no dependency detail, ever)
+// GET /v1/health/ready  → 200 { "ok", "dependencies": { "db": "up|down", … } }   [S]
+
+// POST /v1/matches/:matchId/result   [S]  Idempotency-Key: match-result:<matchId>
+  body: the full match-result.md §4 record
+  200 → { "applied": bool, "correlationId" }     // applied:false = idempotent replay
+  errors: CONFLICT (finalised with a different payload) · VALIDATION_FAILED
+```
+
+**`?mode=all` on stats** returns `{ "modes": { "tdm": {…}, "bomb": {…} }, "correlationId" }`,
+each value being the §11.5 body. It does **not** sum across modes — a combined K/D over two
+rulesets with different death semantics is a number that means nothing.
+
+### 11.9 Roaming settings — the allowlist
+
+`values` in §11.2 is a closed object, not free-form. It mirrors `docs/design/settings-inventory.md`;
+anything outside it is rejected with `VALIDATION_FAILED` rather than stored.
+
+| Key | Type | Range | Roams? |
+|---|---|---|---|
+| `sensitivity` | number | 0.05–10.0 | yes |
+| `adsSensitivityScale` | number | 0.1–2.0 | yes |
+| `fov` | integer | 70–110 | yes |
+| `invertY` | boolean | — | yes |
+| `crosshair` | object | `{ style, size 1–10, thickness 1–5, gap 0–10, colorHex, dot }` | yes |
+| `hud` | object | `{ scale 0.75–1.5, showKillfeed, showMinimap, showDamageNumbers }` | yes |
+| `audio` | object | `{ master, sfx, music, voice }` each 0–1 | yes |
+| `accessibility` | object | `{ reduceShake, reduceMotion, subtitles, colorblindMode, textScale 1.0–1.5 }` | yes |
+| `keybinds` | object | action → code, from a closed action list | yes |
+| `network.showDiagnostics` | boolean | — | yes |
+| resolution, graphics quality, audio device, display | — | — | **no — local only** |
+
+The bottom row is the reason the allowlist exists: roaming a monitor resolution or a GPU
+quality preset to a different machine is a bug that looks like a feature until someone signs in
+on a laptop.
+
+### 11.10 Stub scenarios (REQ-CC-010)
+
+§12's single populated fixture cannot express an empty server browser, a pending result, or a
+privacy-filtered profile — and reusing a populated fixture as an "empty" state is how a UI ships
+with an empty state nobody ever saw. Deterministic named scenarios, selected by the
+`X-Stub-Scenario` request header (ignored in production):
+
+| Scenario | Produces |
+|---|---|
+| `default` | Signed-in account, 3 rooms across 2 regions, 20 matches of history |
+| `first-run` | No account; signup/signin succeed; empty history |
+| `browser-empty` | `GET /v1/rooms` → `{ items: [], nextCursor: null }` |
+| `browser-unreachable` | `SERVICE_UNAVAILABLE` on room endpoints only; auth still works |
+| `room-full` | Join returns `ROOM_FULL` |
+| `room-in-progress` | Join returns `ROOM_IN_PROGRESS` |
+| `room-password` | Join returns `ROOM_PASSWORD_REQUIRED`, then succeeds with any non-empty password |
+| `result-pending` | `GET /v1/matches/:id` → `status: "pending"` for 3 calls, then completed |
+| `result-invalidated` | `status: "invalidated"` |
+| `history-empty` | Career totals all zero, no matches |
+| `privacy-filtered` | `GET /v1/profile/:id` with `stats: null, presence: null` |
+| `sanctioned` | `SANCTIONED` on room join and chat; profile still readable |
+| `name-taken` | Signup and name change return `NAME_TAKEN` |
+| `session-revoked` | Third authenticated call returns `AUTH_SESSION_REVOKED` |
+| `token-expiry` | Access token expires after 30 s so refresh can be exercised |
+| `slow` | Every response delayed 2 s, for loading states |
+| `offline` | Every request fails at the transport layer |
+
+Each is deterministic: the same scenario returns the same data every run, so a screenshot test
+is stable. `?__stub=error:CODE` remains available for one-off error injection.
 
 ## 12. Stub mode
 

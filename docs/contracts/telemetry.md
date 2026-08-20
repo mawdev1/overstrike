@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -126,6 +126,43 @@ authorization, rate-limit identity, or anything that matters.
 **Never persisted in the queue:** access tokens, refresh cookies, raw error strings, chat
 text, other players' display names, or anything from §3.4's prohibitions. The queue survives a
 reload in `sessionStorage`, so anything in it is anything an XSS can read.
+
+### 3.3.1 Event registry (REQ-CC-014)
+
+The allowlist was referenced but never published, which left "allowlisted" meaning nothing.
+This is it. **Privacy class is derived server-side from `(name, version)` using this table** —
+the client does not send it. A client-supplied class would be a client deciding its own privacy
+handling, and a compromised or modified one would simply declare everything `internal`.
+
+Every payload below is closed: unlisted keys are dropped server-side, not stored and filtered.
+
+| `name` | v | Class | Payload |
+|---|---:|---|---|
+| `signin.step` | 1 | personal | `{ step }` — `landing`\|`signup`\|`signin`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results` |
+| `session.first_match_completed` | 1 | personal | `{ completed: bool, mode, timeToFirstMatchSec: 0–86400 }` |
+| `lobby.abandoned` | 1 | personal | `{ lastState }` — `browsing`\|`joining`\|`in-lobby`\|`countdown`; `dwellSec: 0–86400` |
+| `connection.failure` | 1 | personal | `{ stage, code }` — stage `platform`\|`lobby`\|`match`; code from `errors.md` |
+| `settings.friction` | 1 | personal | `{ panel, duringFirstSession: bool }` — panel from §11.9's key set |
+| `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — reason `webgl2`\|`browser-version`\|`os`\|`memory`\|`pointer-lock` |
+| `client.fps` | 1 | internal | `{ p50: 0–1000, p01: 0–1000, windowSec: 1–600 }` |
+| `client.frame_time` | 1 | internal | `{ p50Ms, p95Ms, p99Ms }` each 0–10000 |
+| `client.webgl_context_lost` | 1 | internal | `{ recovered: bool, uptimeSec }` |
+| `client.error` | 1 | internal | `{ errorClass, fatal: bool }` — **class only, never the raw message** |
+| `client.asset_build` | 1 | internal | `{ ms: 0–600000 }` |
+| `client.heap` | 1 | internal | `{ usedMb: 0–65536, sampledAtSec }` |
+| `client.net_health` | 1 | internal | `{ rttMs, jitterMs, lossPct: 0–100, correctionRatePerSec, snapshotAgeMs }` |
+
+Units are in the key names. Every numeric field has stated bounds, and a value outside them is
+rejected rather than clamped — a 900 000 ms frame time is a bug in the sender, and silently
+clamping it to the ceiling hides that bug in the dashboard.
+
+`client.error.errorClass` is a closed set maintained alongside the client error handler
+(`webgl-init`, `asset-decode`, `net-decode`, `unhandled-rejection`, `render-loop`, `other`).
+Raw error strings are never sent: they routinely contain player-authored content such as
+display names and chat.
+
+Adding an event is additive — a new row plus a version. Changing an existing payload's meaning
+is a CCR, because the warehouse already has rows under the old interpretation.
 
 ### 3.4 Consent and eligibility gating
 

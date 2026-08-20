@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code (contract) |
 | **Producer** | [CX] Codex — `src/world/level.js`, `src/world/props.js` |
 | **Consumers** | `world.js`, `navGrid.js`, `spawner.js`, `match.js`, Bomb ruleset, minimap, evidence |
@@ -259,15 +259,15 @@ the map, and anything longer is an angle that decides rounds by itself.
 it was at 80 m, which makes REQ-CX-002's measurement matter more, not less.
 
 **The rotation figure feeds the Bomb timer** (`bomb-rules.md` §2.1). If measured rotation
-exceeds 20 s, the timer moves rather than the geometry — see `REQ-CX-002`.
+exceeds **22 s**, the timer moves rather than the geometry — see `REQ-CX-002`.
 
 ### 7.1 Thresholds
 
 | Signal | Threshold |
 |---|---|
-| Spawn-to-first-contact, per group | 8–12 s (§7.0) |
-| Spawn-to-site, both sites | 11–15 s, within 15% of each other |
-| Rotation time A↔B, both teams | 14–20 s, within 15% |
+| Spawn-to-first-contact, per group | 9–14 s (§7.0) |
+| Spawn-to-site, both sites | 12–16 s, within 15% of each other |
+| Rotation time A↔B, both teams | 16–22 s, within 15% |
 | Immediate repeat-death rate (TDM) | < 5% of deaths within 10 s of the spawn point |
 | Spawn-flip-into-enemy rate | < 2% of spawns with an enemy inside 15 m and line of sight |
 | Sightline length distribution | Long/medium/close all represented; no single uncontested angle covering both sites |

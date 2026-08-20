@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Client HTTP layer, lobby socket, match server, Admin Portal |
 
@@ -48,9 +48,16 @@ Two tokens. Not one.
 |---|---|---|
 | Lifetime | 15 minutes | 30 days, sliding |
 | Carries | `accountId`, `sessionId`, roles, issued/expiry | Opaque handle only |
-| Sent on | Every API request, lobby socket connect | Only `/v1/auth/refresh` |
+| Sent on | Every API request. **Never on a socket** — see below | Only `/v1/auth/refresh` |
 | Stored | Memory. **Never** `localStorage` | httpOnly, Secure, SameSite=Lax cookie |
 | Revocable | Denylist by `sessionId` until expiry | Immediately, at the row |
+
+**Sockets take tickets, not tokens (REQ-CC-010).** This table previously said the access token
+was sent on lobby-socket connect. It is not, and must not be: the lobby socket accepts only a
+single-use lobby ticket (`realtime-lobby.md` §1), and the match socket only a single-use session
+ticket (§6). The access token is used to *obtain* those tickets over HTTPS and never travels on
+a WebSocket URL, where it would land in proxy logs, browser history, and referrer headers — and
+a bearer token in a URL is a bearer token you have published.
 
 **The access token is never written to `localStorage`.** Any XSS in a page that renders
 player-authored display names or chat becomes total account takeover, and this game renders
@@ -180,7 +187,10 @@ change. Open questions are listed in [`../decisions/P0-decisions.md`](../decisio
 
 What this contract fixes regardless of where the policy lands:
 
-- Age/eligibility is captured **before** any sensitive profile data is collected, not after.
+- Age/eligibility is captured **before** any sensitive profile data is collected, not after —
+  which means it may be read and written during account creation. The restriction in D6 is on
+  the *separate prize-eligibility flag*, which stays isolated to P8/P11; the account-eligibility
+  record itself is a normal part of signup and the profile.
 - The eligibility record is a first-class field, not an inference from a birthdate left in a
   form.
 - Cash-equivalent XO prize eligibility is a **separate, stricter** flag than account age

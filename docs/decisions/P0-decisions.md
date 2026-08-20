@@ -117,11 +117,12 @@ player walks **4.6 m/s**, sprints **7.2 m/s**.
 | Longest sightline | **≤ 48 m** | Hard ceiling |
 | Vertical playspace | 3 usable levels; rooftops bounded | — |
 
-**Why slightly smaller than MERIDIAN.** MERIDIAN is a general-purpose FPS map. The Square is a
-competitive map for two modes, and compactness is what makes route knowledge valuable and
-rotations tense. 80 m is comparable to the classics this map is meant to sit beside.
+**Why 88 m rather than larger.** MERIDIAN is a general-purpose FPS map at 86 m; The Square is a
+competitive map for two modes, where compactness is what makes route knowledge valuable and
+rotations tense. 88 m keeps it in the same class as the classics it sits beside, and keeps the
+existing performance and collision baselines a meaningful comparison.
 
-**Why 45 m caps sightlines.** At 80 m playspace, a 45 m lane already spans more than half the
+**Why 48 m caps sightlines.** At 88 m playspace, a 48 m lane already spans more than half the
 map. Anything longer becomes an angle that decides rounds on its own, which §7 of
 `map-data.md` explicitly tests against.
 
@@ -146,9 +147,8 @@ Weighing the substance rather than just the arithmetic:
 - **I have the stronger claim on the upper bound.** At 104 m with a 28 s rotation, the bomb
   timer must rise to ~45–50 s (28 + 7 = 35 s minimum), rounds slow down, and a compact
   competitive map quietly becomes a mid-size one. The whole argument for tightness weakens.
-- 88 m also sits just under MERIDIAN's 86 m… marginally over it, in fact, which means the
-  existing performance and collision baselines remain a meaningful comparison rather than a
-  different class of map.
+- 88 m sits marginally above MERIDIAN's 86 m, so the existing performance and collision
+  baselines remain a meaningful comparison rather than a different class of map.
 
 **Consequence for the bomb timer:** worst-case rotation rises from 20 s to 22 s, so the
 minimum viable timer becomes 22 + 7 = **29 s**. At 40 s that leaves **11 s** of fighting
@@ -169,7 +169,8 @@ decisions had to be made together.
 
 | Parameter | Value | Reasoning |
 |---|---|---|
-| Rounds to win | **7** (first to 7, max 13) | MR12. Long enough to reward adaptation, short enough for a browser session |
+| Rounds to win | **7** | Early win — reaching 7 ends the match immediately |
+| Regulation rounds | **12** (`maxRounds: 12`) | MR12. Long enough to reward adaptation, short enough for a browser session |
 | Side switch | **After round 6** | Both sides attack and defend equally |
 | Round length | **1:45** pre-plant | |
 | Freeze time | **8 s** | Positioning, not buying — there is no buy economy |
@@ -187,15 +188,15 @@ rotation plus a defuse, or defenders can never retake and the mode collapses int
 race:
 
 ```
-worst-case rotation (D3)     20 s
+worst-case rotation (D3)     22 s
 defuse                        7 s
                              ────
-minimum viable timer         27 s
-chosen                       40 s   →  13 s of margin to win the site fight
+minimum viable timer         29 s
+chosen                       40 s   →  11 s of margin to win the site fight
 ```
 
-13 s is enough to contest a site and not enough to walk in unopposed. If D3's rotation
-measures longer than 20 s on real geometry, **the timer moves, not the map** — that is the
+11 s is enough to contest a site and not enough to walk in unopposed. If D3's rotation
+measures longer than 22 s on real geometry, **the timer moves, not the map** — that is the
 cheaper correction, and REQ-CX-002 is the request that will produce the measurement.
 
 **No overtime in Alpha, and a 6-6 draw.** Overtime needs a rule set of its own — round count,

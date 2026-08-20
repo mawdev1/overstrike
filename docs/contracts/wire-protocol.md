@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -60,6 +60,9 @@ exactly is an enum or is passed through `quantiseCommand`.
 | `MSG_SNAPSHOT` | 2 | s→c | variable |
 | `MSG_WELCOME` | 3 | s→c | 15 |
 | `MSG_LOADOUT` | 4 | c→s | 3 |
+
+Protocol v2 adds `MSG_HELLO` (5), `MSG_REJECT` (6), `MSG_MATCHSTATE` (7), and `MSG_OUTCOME` (8)
+— see §8.
 
 ## 4. Commands (c→s)
 
@@ -192,6 +195,7 @@ intentions. This is the byte layout. `PROTOCOL_VERSION` becomes **2** only when 
 | `MSG_HELLO` | 5 | c→s | 4 + `n` (ticket) |
 | `MSG_REJECT` | 6 | s→c | 4 + `n` (reason) |
 | `MSG_MATCHSTATE` | 7 | s→c | 28 |
+| `MSG_OUTCOME` | 8 | s→c | 32 |
 
 ### 8.2 `MSG_HELLO` — authenticated handshake (closes G1 + G2)
 
@@ -327,7 +331,71 @@ Sending the true carrier to everyone and hiding it in the UI would be a wallhack
 protocol — the exact class of mistake §2 of `errors.md` and the anti-cheat model exist to
 prevent. If it is not on the wire, the client cannot cheat with it.
 
-### 8.9 Malformed and unknown handling
+### 8.9 `MSG_OUTCOME` — round and match results (REQ-CC-012)
+
+`net-facade.md` promised `roundEnded` and `matchEnded` payloads carrying identifiers and
+reasons that **existed nowhere on the wire**: `MSG_MATCHSTATE` has no `matchId`, no winner, and
+no reason field, so the facade was documenting data the client could not have. Phase alone
+cannot substitute — it says a round ended, not who won or why.
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | u8 | `MSG_OUTCOME` |
+| 1 | u8 | `scope` — 1 round, 2 match |
+| 2 | u8 | `roundIndex` (255 = not applicable) |
+| 3 | u8 | `winner` — 0 draw, 1 alpha, 2 bravo |
+| 4 | u8 | `reason` — see below |
+| 5 | u8 | `terminationReason` — 0 completed, 1 aborted, 2 invalidated (match scope only) |
+| 6 | u16 | `scoreAlpha` |
+| 8 | u16 | `scoreBravo` |
+| 10 | u16 | `roundsPlayed` |
+| 12 | u32 | `actorId` — planter, defuser, or 0 |
+| 16 | bytes[16] | `matchId`, the ULID's 16 raw bytes |
+
+`reason`: `0` elimination, `1` defuse, `2` detonation, `3` timer, `4` forfeit, `5` abandon.
+
+`matchId` travels as 16 raw bytes rather than its 26-character text form — a ULID is a 128-bit
+value, and sending it as text would cost 10 extra bytes on a message that already carries
+everything the results screen needs.
+
+Sent once per round end and once per match end, immediately before the corresponding
+`MSG_MATCHSTATE` phase change, so a client that renders on outcome always has the state to go
+with it.
+
+### 8.10 Clock domains (REQ-CC-012)
+
+Three different clocks appear across these contracts and conflating them produces timers that
+drift or jump:
+
+| Value | Domain | Epoch | Wraps? |
+|---|---|---|---|
+| `serverTimeMs` (`MSG_MATCHSTATE`) | Server monotonic | Server process start | **Yes — u32, every 49.7 days** |
+| `serverNow` (`net-facade.md` §5.1) | Server monotonic, reconstructed to 53-bit | Same | No |
+| `sampledAt` (facade) | **Client** `performance.now()` | Client page load | No |
+| `phaseEndsAt`, `endsAt` (facade, lobby) | Server monotonic, reconstructed | Same as `serverNow` | No |
+| `occurredAt`, `ts` (HTTP, lobby JSON) | Wall clock, ISO-8601 UTC | Unix epoch | No |
+
+**Never compare across domains.** `phaseEndsAt - sampledAt` is meaningless: one is server time,
+the other client time. The UI computes remaining time as `phaseEndsAt - serverNow`, where both
+sides come from the same server clock, and uses `sampledAt` only to age the sample locally:
+
+```
+remainingMs = (phaseEndsAt - serverNow) - (performance.now() - sampledAt)
+```
+
+**u32 wrap reconstruction.** `serverTimeMs` is the low 32 bits of a monotonic millisecond
+counter. The facade reconstructs a continuous 53-bit value:
+
+```js
+if (raw < (prevRaw - 0x8000_0000)) epoch += 0x1_0000_0000;   // forward wrap
+serverNow = epoch + raw;
+```
+
+The half-range comparison distinguishes a wrap from an out-of-order packet: a genuine wrap
+appears as a drop of nearly 2³² ms, while reordering moves the value by milliseconds. A match
+lasting 49.7 days is not the case this handles — a *server* running that long is.
+
+### 8.11 Malformed and unknown handling
 
 | Case | Behaviour |
 |---|---|
