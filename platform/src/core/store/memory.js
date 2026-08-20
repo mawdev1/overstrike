@@ -943,8 +943,11 @@ export function createMemoryStore(config = {}, deps = {}) {
    * clock, and the "expiry proof" proves nothing about expiry. `deps.now` is the same clock
    * `nowIso` stamps rows with, so the row's `expires_at` and the instant it is compared
    * against come from one source.
+   *
+   * Used by every TTL in this adapter — pre-auth consent and idempotency keys — not consent
+   * alone, which is what it was named for when consent was the only one.
    */
-  const consentNowMs = () => {
+  const storeNowMs = () => {
     const t = deps.now ? deps.now() : Date.now();
     if (t instanceof Date) return t.getTime();
     return typeof t === 'string' ? Date.parse(t) : Number(t);
@@ -952,10 +955,10 @@ export function createMemoryStore(config = {}, deps = {}) {
 
   const preAuthConsent = {
     /**
-     * A new decision RESETS migrated_at on both adapters. Postgres used to leave it set, so a
-     * client that changed its mind after signup kept a receipt claiming the new decision had
-     * already been carried onto an account — which is a consent record that is not true.
-     * `migratedAt` is therefore not a column a caller may write; only markMigrated sets it.
+     * `migratedAt` is not a column a caller may write, and nothing writes it any more: signup
+     * DELETES the row rather than stamping it (`deleteFor`, §3a.3). Both adapters still force
+     * it to null on write, so a row that arrives from a backfill or a hand-written statement
+     * carrying a stamp cannot make a live decision read as already-carried and be ignored.
      */
     put(row, txh) {
       assertCloneable(row, 'pre_auth_consent row');
@@ -982,7 +985,7 @@ export function createMemoryStore(config = {}, deps = {}) {
     async get(clientSessionId, txh) {
       const row = await read(txh, (st) => st.preAuthConsent.get(clientSessionId) ?? null);
       if (!row) return null;
-      if (!row.expiresAt || Date.parse(row.expiresAt) > consentNowMs()) return clone(row);
+      if (!row.expiresAt || Date.parse(row.expiresAt) > storeNowMs()) return clone(row);
 
       // Re-check INSIDE the write, against the row as it is now.
       //
@@ -993,18 +996,26 @@ export function createMemoryStore(config = {}, deps = {}) {
       await write(txh, (st) => {
         const cur = st.preAuthConsent.get(clientSessionId);
         if (!cur) return;
-        if (!cur.expiresAt || Date.parse(cur.expiresAt) > consentNowMs()) return;   // refreshed
+        if (!cur.expiresAt || Date.parse(cur.expiresAt) > storeNowMs()) return;   // refreshed
         st.preAuthConsent.delete(clientSessionId);
       });
       return null;
     },
 
-    markMigrated(clientSessionId, at, txh) {
-      return write(txh, (st) => {
-        const r = st.preAuthConsent.get(clientSessionId);
-        if (!r) throw new ApiError('NOT_FOUND', 'No pre-auth consent for that client session.');
-        r.migratedAt = toIso(at) ?? nowIso();
-      });
+    /**
+     * The migration half of the §3a.3 lifecycle: "deleted on migration at signup, or on expiry".
+     *
+     * This used to be `markMigrated`, which stamped `migratedAt` and KEPT the row. Reads then
+     * treated a stamped row as absent, so the decision was correctly ignored — and retained,
+     * for the whole remainder of its 30-day TTL, as a standalone consent record keyed by a
+     * client session, sitting beside the account it had already been copied onto. A record we
+     * have decided to stop reading is not a record we have deleted, and §3a.3, db-schema.md §2
+     * and migration 0001 all say signup deletes it.
+     *
+     * @returns {Promise<boolean>} whether a row was removed.
+     */
+    deleteFor(clientSessionId, txh) {
+      return write(txh, (st) => st.preAuthConsent.delete(clientSessionId));
     },
 
     /**
@@ -1020,7 +1031,7 @@ export function createMemoryStore(config = {}, deps = {}) {
      * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
      */
     sweepExpired(at = null, txh) {
-      const cutoff = at === null || at === undefined ? consentNowMs() : Date.parse(toIso(at));
+      const cutoff = at === null || at === undefined ? storeNowMs() : Date.parse(toIso(at));
       if (!Number.isFinite(cutoff)) {
         throw new ApiError('VALIDATION_FAILED', 'The sweep instant must be a timestamp.');
       }
@@ -1213,6 +1224,36 @@ export function createMemoryStore(config = {}, deps = {}) {
         }
         st.idempotency.set(k, rec);
         return clone(rec);
+      });
+    },
+
+    /**
+     * §8 retention: "24 h for gameplay, permanent for value-bearing operations."
+     *
+     * Every writer stamped `expiresAt` and nothing ever deleted on it, so the retention the
+     * contract declares was a field rather than a policy. A NULL `expiresAt` is the permanent
+     * class and is never swept.
+     *
+     * Deliberately not paired with an expiry check in `get`, for the same reason the Postgres
+     * adapter gives: honouring a row slightly past its window costs nothing, while refusing it
+     * re-executes a write the client already believes happened.
+     *
+     * @param at ISO string, Date or epoch ms; defaults to the store's injected clock.
+     * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
+     */
+    sweepExpired(at = null, txh) {
+      const cutoff = at === null || at === undefined ? storeNowMs() : Date.parse(toIso(at));
+      if (!Number.isFinite(cutoff)) {
+        throw new ApiError('VALIDATION_FAILED', 'The sweep instant must be a timestamp.');
+      }
+      return write(txh, (st) => {
+        let removed = 0;
+        for (const [k, row] of st.idempotency) {
+          if (!row.expiresAt || Date.parse(row.expiresAt) > cutoff) continue;
+          st.idempotency.delete(k);
+          removed += 1;
+        }
+        return removed;
       });
     },
   };

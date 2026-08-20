@@ -32,6 +32,145 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — `match-result.md` 1.8.0, `http-api.md` 1.10.0, `telemetry.md` 1.10.0, `errors.md` 1.6.0, `net-facade.md` 1.9.0, `bomb-rules.md` 1.7.0, `db-schema.md` 1.7.0 (additive) — REQ-CC-043 and REQ-CC-044 closed, REQ-CC-042 finished
+
+Seven contracts, one amendment, because the findings were one defect wearing seven hats: a rule
+written in one place and *referenced* in six, where the reference had drifted or the referent had
+never been written at all.
+
+**The section four contracts cited did not exist.** `wire-protocol.md` §8.9, `net-facade.md`
+§5.3 and §8, `bomb-rules.md` §9 and `platform/src/core/store.js` all cite "the
+`match-result.md` §4.0 outcome matrix" as the authority for which `(status, outcomeReason,
+winnerTeam)` tuples are legal. There was no §4.0. The rule lived in §4.2's invariant table under
+another name, so five citations pointed at a section number and the sixth — the code — had
+copied the rule out. §4.0 now publishes the six-row matrix once, and §4.2 refines it.
+
+**`draw` implies `timer`, everywhere now.** The §4.2 table permitted `winnerTeam: "draw"` beside
+elimination, defuse and detonation. `wire-protocol.md` §8.9 has forbidden that since v2 landed,
+and commit `60f059e` put the rule in the store validator and in a database `CHECK` — but not in
+this contract, so the document a client generates types from still said a drawn elimination was
+representable. Written down here at last.
+
+**`ResultSubmission` (§5.1).** `http-api.md` §11.8 asked producers for "the full
+`match-result.md` §4 record" — a section containing the pending variant, the response-only
+correlation envelope and three response tables. It is now a named type: the §4.2 field set,
+terminal status only, without `correlationId`/`retryAfterMs`, plus optional `roomId`/`serverId`,
+with the path/body/idempotency-key binding stated. The platform now **refuses** an unknown or
+response-only key rather than dropping it, because a key we silently ignore is a key the sender
+believes we honoured.
+
+**The three pending sub-states (§4.2).** `startedAt` was fixed to a timestamp while an
+`allocated` row has none by definition, so the first state the platform creates was the one the
+response could not express. It is nullable, and the table now names all three rows —
+`allocated`, live, ended-and-queued — with the two timestamps that distinguish them and the
+transition that produces each.
+
+**The authorized round projection (§4.2).** §4.1 said objective actors are always stored and
+that whether they are returned "depends on §4.2"; §4.2 said nothing about them. It now gives the
+exact per-caller table, including that a redacted plant is `{ accountId: null, … }` and never a
+missing key.
+
+**Invalidation is submission-time only (§5.2), and that is a restriction we are writing down
+rather than a gap we are hiding.** `event-envelope.md` §6 catalogues `match.invalidated` with an
+`admin` actor and no command can produce one. An honest administrative invalidation needs an
+append-only command plus a compensating career delta; neither exists in this phase, so a
+completed match has no outgoing transition and a second submission is refused. The two things it
+would need are named so the next person does not add half of them.
+
+**The aggregation matrix (§6.1).** §6 said only "invalidated matches do not aggregate", so
+forfeit, abandon and no-contest were inference — and `bomb-rules.md` §9 inferred differently.
+One row per §4.0 outcome now, plus what `result_applied_at` means on a submission that
+aggregates nothing (the application ran; no career changed) and when `match.result_applied` is
+emitted.
+
+**`bomb-rules.md` §9** now names `outcomeReason: forfeit` for a team dropping to zero connected,
+where it previously said only that "the remaining team wins" — a sentence from which a producer
+cannot construct a legal §4.0 tuple. `forfeit` and not `abandon`: the rule fires on an
+observable fact about the match, while `abandon` is a per-player sanction judgement.
+
+**`net-facade.md` §5.3: `matchEnded` is PROVISIONAL.** The facade claimed the outcome carried
+everything the results screen needs. It carries everything the *wire* has, and no wire field
+holds an invalidation reason. Rather than change the protocol for a value that arrives after the
+match server has stopped talking to the client, the socket result is declared provisional and
+the results screen must fetch `GET /v1/matches/:matchId` — mandatory before rendering anything
+about an invalidated match.
+
+**`http-api.md` §11.5** stops restating the history item and defers to `match-result.md` §4.3.
+The copy here was the pre-1.7 shape: it admitted `status: "pending"` while fixing `endedAt` to a
+timestamp and always supplying `result`/`teamScores`/`playerSummary`, so the one status the
+union added could not be serialised by the schema that admitted it.
+
+**`db-schema.md` §4** publishes the `matches` CHECK constraints. They were in migrations 0012,
+0013 and 0016 and not in the contract, so the schema as published permitted rows the union
+forbids and a reader generating a fixture from it produced data the database refuses.
+
+**`errors.md` 1.6.0 adds `CONSENT_RECEIPT_INVALID`** and `telemetry.md` §3.3 carries it on the
+202 as `consentReceiptError` (REQ-CC-042). An expired, forged or subject-mismatched consent
+receipt silently discarded every personal event in the batch and the reason went to a server
+log; the client saw `{accepted: 0}` and had no way to tell which of a dozen causes it was
+looking at, so the one recovery available to it — going back to consent — was unreachable. A
+*valid* receipt recording a decline is deliberately not this error: the player answered, and
+must not be asked again.
+
+**Two smaller REQ-CC-042 residues.** `telemetry.md` §3.3 now binds "the batch's correlation id"
+to the `X-Correlation-Id` request header, which §3.5.1 had been forbidding reuse of without
+anything defining it. And the "nine steps × three outcomes" count in §3.2 was written when the
+`flow.step` enum had nine entries; it has eleven.
+
+**One defect this round was in the code, not the document.** `funnel.preconsent` carried
+`retentionClass: 'standard'` in `platform/src/modules/telemetry/registry.js` while §5's
+amendment giving it its own **internal, short (30 d)** row had already landed. The amendment
+was made in the contract and not in the implementation, so an unlinked pre-consent count was
+being kept thirteen times longer than the contract said — a retention breach that reads as a
+one-word typo. `platform/test/contracttest.mjs` now parses §5's stream table and compares it
+with the registry, so the two cannot diverge again silently.
+
+**How these were found, and the new suite.** Every claim above was verified by opening the file,
+not by reading the commit that claimed to have fixed it — two of the twelve had been reported
+fixed and were not. `platform/test/contracttest.mjs` is the durable version of that check: each
+assertion **parses** the normative sentence out of the contract and then drives the real platform
+over a real socket to assert the behaviour that sentence promises. A check that only parsed the
+document would pass on prose nobody implemented; one that only drove the service would pass on
+an implementation nobody documented. It went red 29 / green 0.
+
+Additive throughout: no field is removed or retyped and no stored value changes meaning.
+Refusing unknown and response-only keys on `POST /v1/matches/:matchId/result` is the one
+behaviour change, and it tightens a service-only endpoint against payloads no correct producer
+sends.
+
+## 2026-08-20 — `db-schema.md` 1.6.0 (additive) — consent and idempotency retention
+
+Two records with a contracted life that nothing ever ended.
+
+**`pre_auth_consent` is deleted at signup, not stamped.** `http-api.md` §3a.3 says the
+signed-out row "is deleted on migration at signup, or on expiry", and `db-schema.md` §2 and
+migration `0001` both repeat it. The implementation stamped `migrated_at` and kept the row.
+Reads treated a stamped row as absent, so the decision was correctly ignored — and retained,
+for the whole remainder of its 30-day TTL, as a standalone consent record keyed by a client
+session, sitting beside the account it had already been copied onto. A record we have decided
+to stop reading is not a record we have deleted; that distinction is the entire subject matter
+of a retention obligation. `markMigrated` is replaced by `deleteFor` on both adapters. The
+column and its partial index stay — dropping a column is a CCR, and both adapters still force
+it to null on write so a backfilled row carrying a stamp cannot make a live decision read as
+already-carried. §2 now says the column is always null and why.
+
+**`idempotency_keys.expires_at` is nullable, and NULL means permanent.** `http-api.md` §8 sets
+two retention classes — "24 h for gameplay, permanent for value-bearing operations" — and the
+column was `NOT NULL`, so the second could not be expressed at all; a value-bearing row would
+have needed a far-future sentinel a sweep would eventually honour. Worse, there was no sweep:
+every writer stamped `expires_at` and nothing ever read it again, so the declared retention was
+a column rather than a policy and the table kept a row forever for every profile PATCH, every
+match result, and every burnt eligibility-receipt nonce. The nonce rows are onboarding
+evidence. `store.idempotency.sweepExpired` now exists on both adapters, skips NULL, and is run
+hourly by the composition root — deliberately NOT paired with an expiry check on read, because
+honouring a row slightly past its window costs nothing while refusing it re-executes a write
+the client already believes happened.
+
+Migration `0017_idempotency_retention.sql`.
+
+Additive: no field is removed or retyped, no stored value changes meaning, and a `NOT NULL`
+becoming nullable cannot break a writer that was already supplying a value.
+
 ## 2026-08-20 — `net-facade.md` 1.8.0 (additive) — §8 scenario table, and a correction
 
 **A claim I made twice was false, and this entry exists to say so.** Answering `REQ-CC-041` I

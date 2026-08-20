@@ -169,10 +169,43 @@ export function createTelemetryService({
       records: accepted,
       accountId,
       consent: consentVerdict.ok,
+      consentReceiptError: receiptFault(consentVerdict, rejected),
     };
   }
 
   return { ingest, seenCorrelation };
+}
+
+/**
+ * The receipt verdicts that mean "this receipt is not usable", as opposed to "this player said
+ * no".  errors.md `CONSENT_RECEIPT_INVALID`, telemetry.md §3.3.
+ *
+ * `consent_declined` is deliberately absent. A valid receipt recording a decline is the system
+ * working: the personal events are dropped and the client must NOT be sent back to the consent
+ * screen to be asked the same question it already answered.
+ */
+const RECEIPT_FAULT_REASONS = new Set([
+  'receipt_absent', 'receipt_malformed', 'receipt_signature_invalid',
+  'receipt_expiry_invalid', 'receipt_expired', 'receipt_policy_stale',
+  'receipt_subject_mismatch', 'receipt_unbound',
+]);
+
+/**
+ * The typed verdict the 202 carries, or null.
+ *
+ * Non-null only when a personal event was ACTUALLY dropped for the receipt. An internal-only
+ * batch legitimately carries no receipt (§3.3), so reporting `receipt_absent` on one would tell
+ * every pre-consent sender to route its visitor to a screen it is already on.
+ *
+ * This exists because the reason previously lived in a server log line and nowhere else: an
+ * expired or subject-mismatched receipt silently discarded the whole personal funnel, the
+ * client saw `202 {accepted: 0}`, and the one recovery available to it — re-obtaining consent —
+ * was unreachable because nothing told it which of a dozen causes it was looking at.
+ */
+function receiptFault(verdict, rejected) {
+  if (verdict.ok || !RECEIPT_FAULT_REASONS.has(verdict.reason)) return null;
+  if (!rejected.some((r) => r.reason === verdict.reason)) return null;
+  return { code: 'CONSENT_RECEIPT_INVALID', reason: verdict.reason };
 }
 
 /**
@@ -186,10 +219,16 @@ export function registerTelemetryRoutes(router, { service, optionalAuth = null }
       actor: ctx.actor,               // set by auth middleware when a token is present; null otherwise
       correlationId: ctx.correlationId,
     });
-    // 202: accepted for processing. Telemetry has no synchronous meaning to the client, and
-    // the per-event reasons stay in the log — a client cannot act on them anyway.
+    // 202: accepted for processing. Telemetry has no synchronous meaning to the client, and the
+    // per-EVENT reasons stay in the log — a client cannot act on a payload it already sent.
+    //
+    // `consentReceiptError` is the one exception, and it is always present so that null is a
+    // stated "the receipt was fine" rather than a key the client has to test for existence.
+    // There IS an action behind it: go back to consent and get a new receipt.
     return raw(202, {
-      accepted: result.accepted, rejected: result.rejected, correlationId: ctx.correlationId,
+      accepted: result.accepted, rejected: result.rejected,
+      consentReceiptError: result.consentReceiptError,
+      correlationId: ctx.correlationId,
     });
     // `{ auth: 'optional' }` was not an option core/http.js reads — it honours `middleware`
     // and `requireBuild` only. So no middleware ran, ctx.actor was permanently undefined, and

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.6.0 |
+| **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
 
@@ -210,7 +210,7 @@ stated here as the implementation rule:
 | Disconnect while carrying | Bomb drops at last position |
 | Disconnect mid-plant/defuse | Progress resets to zero |
 | Team drops below 1 living | Round ends by elimination |
-| Team drops to zero connected | Match ends, `terminationReason: aborted`; the remaining team wins |
+| Team drops to zero connected | Match ends, `terminationReason: aborted`, **`outcomeReason: forfeit`**, `winnerTeam` = the remaining team; stats recorded **and aggregated** (`match-result.md` §6.1). `forfeit` rather than `abandon` because the rule fires on the whole team being gone, which is an observable fact about the match; `abandon` is a per-player sanction judgement about *why* they left (§3 `abandoned`) and is not something the server decides from a connection count |
 | Both teams drop to zero | Match **`aborted`** with `outcomeReason: no-contest` and `winnerTeam: null`; stats recorded but not aggregated. **Not `invalidated`** — invalidation is a review decision, not an outcome the server reaches on its own (`match-result.md` §4.0) |
 
 ## 10. Scoring

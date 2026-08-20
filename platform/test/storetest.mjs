@@ -496,9 +496,15 @@ async function testInterface(store, tag) {
   check('signed-out consent records a decision distinct from undecided',
     consent.telemetryPersonal === false && consent.migratedAt === null,
     JSON.stringify(consent));
-  await store.preAuthConsent.markMigrated(consentId, iso());
-  check('migrating the receipt is recorded',
-    (await store.preAuthConsent.get(consentId)).migratedAt !== null, 'migratedAt is still null');
+  // §3a.3: "deleted on migration at signup, or on expiry". Deleted, not stamped — the stamp
+  // reads as absent and retains as present, which is the whole distinction that matters for a
+  // consent record.
+  check('migration deletes the row', (await store.preAuthConsent.deleteFor(consentId)) === true,
+    'deleteFor reported no row');
+  check('and it is gone, not hidden', (await store.preAuthConsent.get(consentId)) === null,
+    'the row survived deleteFor');
+  check('deleting again reports there was nothing to delete',
+    (await store.preAuthConsent.deleteFor(consentId)) === false, 'deleteFor claimed a second row');
 
   const flagKey = `test.${ulid().slice(-6).toLowerCase()}`;
   await store.flags.set(flagKey, { enabled: true, isKillSwitch: true, updatedBy: 'storetest' });
@@ -1059,21 +1065,51 @@ async function testConformance(store, tag) {
   await throwsCode('control: a profile column that does not exist is still refused', 'VALIDATION_FAILED',
     () => store.profiles.upsert(acct.accountId, { legacyimport: record }));
 
-  // A new consent decision resets the migration receipt.
+  // A new consent decision replaces the old one and is never stamped as already-migrated.
   const consentId = ulid();
   const consentRow = {
     clientSessionId: consentId, telemetryPersonal: false,
     policyVersion: 1, decidedAt: iso(), expiresAt: iso(30 * 86400e3),
   };
   await store.preAuthConsent.put(consentRow);
-  await store.preAuthConsent.markMigrated(consentId, iso());
-  check('control: markMigrated sets the receipt',
-    (await store.preAuthConsent.get(consentId)).migratedAt !== null, 'migratedAt is still null');
+  check('control: the first decision is stored',
+    (await store.preAuthConsent.get(consentId)).telemetryPersonal === false, 'first put did not land');
   await store.preAuthConsent.put({ ...consentRow, telemetryPersonal: true, decidedAt: iso() });
   const redecided = await store.preAuthConsent.get(consentId);
-  check('a new consent decision resets migratedAt',
+  check('a new consent decision replaces the old one with migratedAt null',
     redecided.migratedAt === null && redecided.telemetryPersonal === true,
     JSON.stringify(redecided));
+  // §3a.3 migration is a DELETE on both adapters, and the row does not come back.
+  check('deleteFor removes it', (await store.preAuthConsent.deleteFor(consentId)) === true,
+    'deleteFor reported no row');
+  check('control: and the row is gone', (await store.preAuthConsent.get(consentId)) === null,
+    'the row survived deleteFor');
+
+  // --- §8 idempotency retention ---------------------------------------------------------
+  //
+  // Every writer stamped `expiresAt` and nothing ever deleted on it. A retention window that
+  // nothing enforces is a column, not a policy.
+  const liveKey = `idem-live-${ulid()}`;
+  const deadKey = `idem-dead-${ulid()}`;
+  const foreverKey = `idem-forever-${ulid()}`;
+  for (const [k, expiresAt] of [[liveKey, iso(86400e3)], [deadKey, iso(-60_000)], [foreverKey, null]]) {
+    await store.idempotency.put({
+      key: k, actorId: acct.accountId, requestHash: 'h', responseStatus: 200,
+      responseBody: { k }, createdAt: iso(), expiresAt,
+    });
+  }
+  const swept = await store.idempotency.sweepExpired(iso());
+  check('the sweep deletes at least the one expired key', swept >= 1, `swept ${swept}`);
+  check('an expired idempotency key is deleted',
+    (await store.idempotency.get(deadKey, acct.accountId)) === null, 'the expired row survived');
+  check('control: an unexpired key is untouched',
+    (await store.idempotency.get(liveKey, acct.accountId))?.requestHash === 'h',
+    'the sweep took a live row');
+  // §8: "permanent for value-bearing operations". Null expiry is that class, and 0017 makes
+  // the column nullable so it can be written at all.
+  check('control: a null expiry is the permanent class and is never swept',
+    (await store.idempotency.get(foreverKey, acct.accountId))?.expiresAt == null,
+    'a permanent row was swept or could not be written');
 
   // --- counter deltas are bounded -------------------------------------------------------
   await throwsCode('an absurd negative stat delta is refused', 'VALIDATION_FAILED',

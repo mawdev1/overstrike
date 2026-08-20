@@ -764,9 +764,11 @@ export async function createPostgresStore(config = {}, deps = {}) {
 
   const preAuthConsent = {
     /**
-     * A new decision RESETS migrated_at. Leaving it set — which this adapter used to do — is a
-     * receipt claiming the NEW decision has already been carried onto an account, when what was
-     * migrated was the old one. A consent record that is not true is worse than none.
+     * A write RESETS migrated_at. Nothing stamps it any more — signup DELETES the row rather
+     * than marking it (`deleteFor`, §3a.3) — but a row arriving from a backfill or a
+     * hand-written statement with a stamp on it would otherwise make a live decision read as
+     * already-carried and be silently ignored. A consent record that is not true is worse than
+     * none.
      */
     async put(row, txh) {
       const { rows } = await q(txh,
@@ -803,11 +805,22 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return mapRow(rows[0]);
     },
 
-    async markMigrated(clientSessionId, at, txh) {
+    /**
+     * The migration half of the §3a.3 lifecycle: "deleted on migration at signup, or on expiry".
+     *
+     * This used to be `markMigrated`, which stamped `migrated_at` and kept the row. Reads then
+     * treated a stamped row as absent, so the decision was correctly ignored — and retained,
+     * for the whole remainder of its 30-day TTL, as a standalone consent record keyed by a
+     * client session, sitting beside the account it had already been copied onto. The contract
+     * says three times over (here, db-schema.md §2, migration 0001) that signup DELETES it, and
+     * a record we have decided to stop reading is not a record we have deleted.
+     *
+     * @returns {Promise<boolean>} whether a row was removed.
+     */
+    async deleteFor(clientSessionId, txh) {
       const { rowCount } = await q(txh,
-        'update pre_auth_consent set migrated_at = coalesce($2::timestamptz, now()) where client_session_id = $1',
-        [clientSessionId, at ?? null]);
-      if (rowCount === 0) throw new ApiError('NOT_FOUND', 'No pre-auth consent for that client session.');
+        'delete from pre_auth_consent where client_session_id = $1', [clientSessionId]);
+      return rowCount > 0;
     },
 
     /**
@@ -968,7 +981,8 @@ export async function createPostgresStore(config = {}, deps = {}) {
         [row.key, row.actorId, row.requestHash, row.responseStatus ?? null,
           row.responseBody === null || row.responseBody === undefined
             ? null : JSON.stringify(row.responseBody),
-          row.expiresAt]);
+          // Null is the §8 "permanent" retention class, not a missing value: the sweep skips it.
+          row.expiresAt ?? null]);
       if (rows[0]) return mapRow(rows[0]);
       const cur = await idempotency.get(row.key, row.actorId, txh);
       if (cur && cur.requestHash !== row.requestHash) {
@@ -977,6 +991,32 @@ export async function createPostgresStore(config = {}, deps = {}) {
         });
       }
       return cur;
+    },
+
+    /**
+     * §8 retention: "24 h for gameplay, permanent for value-bearing operations."
+     *
+     * Every writer stamped `expires_at` and NOTHING ever read it or deleted on it, so the
+     * declared retention was a column, not a policy. That table accumulates a row per profile
+     * PATCH, per match result, and per burnt eligibility-receipt nonce — and the nonce rows
+     * are onboarding evidence, which is the class we least want to keep forever by accident.
+     *
+     * A NULL `expires_at` is the "permanent" class and is never swept; 0017 makes the column
+     * nullable so that class is expressible at all. `idempotency_keys_expiry_idx` serves this
+     * predicate.
+     *
+     * Deliberately NOT paired with an expiry check in `get`. An idempotency row honoured a
+     * little past its retention window costs nothing; refusing it would re-execute a write the
+     * client believes already happened, which is the exact failure the table exists to prevent.
+     * Retention here is about not KEEPING the row, not about distrusting it while it is there.
+     *
+     * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
+     */
+    async sweepExpired(at = null, txh) {
+      const { rowCount } = await q(txh,
+        'delete from idempotency_keys where expires_at is not null and expires_at <= $1::timestamptz',
+        [storeNowIso(at)]);
+      return rowCount;
     },
   };
 

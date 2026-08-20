@@ -581,8 +581,11 @@ section('9. CONSENT MIGRATES, AND IS NEITHER CALLER-VERSIONED NOR IMMORTAL');
   ok('the decision landed on the account',
     account.consentTelemetry === true && account.consentPolicyVer === 1);
   ok('the decision time carried over', account.consentDecidedAt === preAuth.decidedAt);
-  ok('the pre-auth row is marked migrated',
-    (await h.store.preAuthConsent.get(clientSessionId)).migratedAt !== null);
+  // §3a.3: "deleted on migration at signup, or on expiry". It used to be stamped `migrated_at`
+  // and kept — which reads as absent and retains as present, so a signed-out consent record
+  // outlived its purpose by up to 30 days sitting beside the account it had been copied onto.
+  ok('the pre-auth row is DELETED on migration, not merely stamped',
+    (await h.store.preAuthConsent.get(clientSessionId)) === null);
 
   const fresh = decode(issued.consentReceipt);
   ok('signup returns a fresh account-scoped receipt',

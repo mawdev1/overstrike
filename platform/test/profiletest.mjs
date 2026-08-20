@@ -1656,8 +1656,8 @@ console.log('\n§3a.3 — signed-out consent expires on the injected clock, and 
   expect(resurrected === null,
     'the expired row was deleted, not hidden behind a read filter — it does not come back '
     + 'when the clock is wound back', JSON.stringify(resurrected));
-  await expectCode(() => store.preAuthConsent.markMigrated(csid, new Date(t).toISOString()),
-    'NOT_FOUND', 'and the row genuinely is not in the table any more');
+  expect((await store.preAuthConsent.deleteFor(csid)) === false,
+    'and the row genuinely is not in the table any more — there is nothing left to delete');
 
   // CONTROL: a fresh decision for the same client session works, so expiry deleted one row
   // rather than breaking the surface.

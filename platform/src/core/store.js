@@ -90,8 +90,9 @@ import { ApiError } from './errors.js';
  *
  * @property {object} preAuthConsent
  *   put(row, tx) -> row                // { clientSessionId, telemetryPersonal, policyVersion, decidedAt, expiresAt }
- *   get(clientSessionId, tx) -> row|null
- *   markMigrated(clientSessionId, at, tx) -> void
+ *   get(clientSessionId, tx) -> row|null   // expiry is enforced here, and it DELETES
+ *   deleteFor(clientSessionId, tx) -> bool // http-api.md §3a.3: deleted on migration at signup
+ *   sweepExpired(at, tx) -> number         // …or on expiry, for the rows nobody reads again
  *
  * @property {object} outbox
  *   insert(event, tx) -> event         // MUST be callable inside tx
@@ -107,7 +108,8 @@ import { ApiError } from './errors.js';
  * @property {object} idempotency
  *   acquire(key, actorId, tx) -> void   // serialise this key for the transaction
  *   get(key, actorId, tx) -> row|null
- *   put(row, tx) -> row
+ *   put(row, tx) -> row                 // expiresAt null = permanent (http-api.md §8)
+ *   sweepExpired(at, tx) -> number      // §8 retention; null expiresAt is never swept
  *
  * @property {object} flags
  *   all(tx) -> row[]
@@ -608,6 +610,22 @@ export function nestedResultProblems(result) {
   const problems = [];
   if (!isPlainObject(result)) return [at('result', 'type', { expected: 'object' })];
 
+  // §5.1 `ResultSubmission`: the terminal record and nothing else.
+  //
+  // The endpoint used to take "the full match-result.md §4 record", which is a reference to a
+  // section containing the pending variant and the response-only correlation envelope as well.
+  // A match server sending `correlationId` in the body was silently accepted and the field
+  // silently dropped, so the producer's belief that it had bound the submission to a trace and
+  // the platform's record of that trace disagreed with nothing able to see the difference.
+  // Unknown keys are refused for the same reason nested unknown keys are: a key we ignore is a
+  // key the sender thinks we honoured.
+  for (const key of Object.keys(result)) {
+    if (!SUBMISSION_KEYS.has(key)) {
+      problems.push(at(key, RESPONSE_ONLY_KEYS.has(key) ? 'response-only' : 'unknown-key',
+        { got: typeof result[key] }));
+    }
+  }
+
   if (Array.isArray(result.players)) {
     const seen = new Set();
     result.players.forEach((player, i) => {
@@ -664,6 +682,26 @@ const TERMINAL_REQUIRED_STRINGS = [
 
 /** Non-terminal rows exist from allocation, before anything about the outcome is known. */
 const PENDING_REQUIRED_STRINGS = ['matchId', 'mapId', 'region', 'mode'];
+
+/**
+ * Every key `ResultSubmission` may carry (match-result.md §5.1).
+ *
+ * The TerminalResult field set, plus the two allocation identifiers the row keeps (`roomId`,
+ * `serverId`) — which are facts about the match, not about the response.
+ */
+const SUBMISSION_KEYS = new Set([
+  'matchId', 'status', 'rulesetVersion', 'statDefinitionVersion', 'rulesSnapshot',
+  'serverBuild', 'mapId', 'mapVersion', 'region', 'mode', 'startedAt', 'endedAt',
+  'terminationReason', 'outcomeReason', 'winnerTeam', 'invalidationReason',
+  'roster', 'teamScores', 'rounds', 'players', 'evidenceRef',
+  'roomId', 'serverId',
+]);
+
+/**
+ * Named separately so the refusal says WHICH mistake was made. "Unknown key" for `retryAfterMs`
+ * reads as a typo; `response-only` says the sender copied a response shape into a request.
+ */
+const RESPONSE_ONLY_KEYS = new Set(['correlationId', 'retryAfterMs', 'resultAppliedAt', 'applied']);
 
 const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 

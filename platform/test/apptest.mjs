@@ -346,6 +346,135 @@ await withApp(async ({ call }) => {
     `${me.status}`);
 });
 
+// ── 7b. one Idempotency-Key collapses a concurrent burst, over real HTTP ──────────────
+//
+// REQ-CC-052 reported that two concurrent identical `PATCH /profile/me` requests under one
+// `Idempotency-Key` both proceed. The read-decide-write in `profile.js` is wrapped in a
+// transaction, and a transaction alone does not stop it: `idempotency.get` takes no lock and
+// there is no row to lock on the first attempt, so on PostgreSQL every racer reads
+// `prior = null` inside its own transaction and every racer executes.
+//
+// This test only means anything against PostgreSQL. The memory adapter serialises every
+// transaction through one lock and its `acquire` is a documented no-op, so a green run there
+// proves the endpoint works and proves NOTHING about the race. `scripts/pgtest.mjs` runs this
+// file against a real database, which is where the claim is settled.
+//
+// The proof of "executed once" is a side effect that counts: a rename writes exactly one
+// `account_name_history` row (auth.md §9). Comparing response bodies is not enough on its own
+// — every racer could execute and still be handed an identical final profile.
+await withApp(async ({ call, app }) => {
+  section('concurrent PATCH /profile/me under one Idempotency-Key');
+  const { signup } = await onboard(call, { sid: '01M0EFV571B7VBQCNXHAT5WTC1', name: 'RaceSubject' });
+  const token = signup.body?.accessToken;
+  const accountId = signup.body?.profile?.accountId;
+  check(typeof token === 'string' && typeof accountId === 'string',
+    'control: the race subject is signed up and holds a usable token',
+    `${signup.status} ${signup.body?.error?.code ?? ''}`);
+
+  const N = 12;
+  const patch = (key, displayName) => call('PATCH', '/v1/profile/me', { displayName },
+    { authorization: `Bearer ${token}`, 'idempotency-key': key });
+
+  const burst = await Promise.all(Array.from({ length: N }, () => patch('race-key-1', 'RaceWinner')));
+
+  check(burst.every((r) => r.status === 200),
+    `all ${N} concurrent retries answer 200`,
+    JSON.stringify(burst.map((r) => `${r.status}:${r.body?.error?.code ?? ''}`)));
+
+  // jsonb does not preserve key order, so the replayed body comes back reordered. Compare on
+  // content, not on the bytes `JSON.stringify` happens to emit.
+  const stable = (v) => (v === null || typeof v !== 'object' ? JSON.stringify(v) ?? 'null'
+    : Array.isArray(v) ? `[${v.map(stable).join(',')}]`
+      : `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(',')}}`);
+  const bodies = new Set(burst.map((r) => stable({ ...r.body, correlationId: undefined })));
+  check(bodies.size === 1, 'every retry returns the same response body', [...bodies].join('\n       vs '));
+
+  const history = await app.deps.store.accountNameHistory.listForAccount(accountId, { limit: 100 });
+  check(history.length === 1,
+    'and the rename EXECUTED EXACTLY ONCE — one name-history row, not one per racer',
+    `${history.length} rows: ${JSON.stringify(history.map((h) => h.previousName))}`);
+
+  // CONTROL: the collapsing above is the idempotency key doing work, not the endpoint being
+  // inert. The same burst under DISTINCT keys is not one request, and must not be collapsed:
+  // it is a rename repeated N times, so §9's 30-day cooldown refuses all but the first.
+  const { signup: s2 } = await onboard(call, { sid: '01M0EFV571B7VBQCNXHAT5WTC2', name: 'ControlSubject' });
+  const t2 = s2.body?.accessToken;
+  const spread = await Promise.all(Array.from({ length: N }, (_, i) =>
+    call('PATCH', '/v1/profile/me', { displayName: `Control${i}` },
+      { authorization: `Bearer ${t2}`, 'idempotency-key': `control-key-${i}` })));
+  const spreadCodes = JSON.stringify(spread.map((r) => `${r.status}:${r.body?.error?.code ?? ''}`));
+  check(spread.some((r) => r.status === 200) && spread.some((r) => r.status !== 200),
+    'CONTROL: distinct keys are distinct requests and are NOT collapsed — some succeed, the '
+    + 'rest hit the §9 rename cooldown',
+    spreadCodes);
+  // The refusals are the ordinary consequences of N genuinely separate renames racing on one
+  // account: the §9 cooldown once a rename has landed, or a unique-name collision between two
+  // that have not yet. Either is proof they EXECUTED; what must not appear is an auth or
+  // validation code, which would mean the control burst never reached the endpoint at all and
+  // the "not collapsed" check above passed for the wrong reason.
+  check(spread.filter((r) => r.status !== 200)
+    .every((r) => ['NAME_CHANGE_COOLDOWN', 'CONFLICT'].includes(r.body?.error?.code)),
+    'CONTROL: and the refusals are rename outcomes, not an auth or validation accident',
+    spreadCodes);
+});
+
+// ── 7c. consent and idempotency retention actually delete ─────────────────────────────
+//
+// Both are records with a contracted life — §3a.3 gives signed-out consent 30 days "deleted on
+// migration at signup, or on expiry"; §8 gives an idempotency key 24 h for gameplay. Both were
+// written with an expiry column that nothing ever acted on, and for the consent row the
+// migration path stamped `migrated_at` and kept it. A row we have decided to stop reading is
+// not a row we have deleted, and retention is the one obligation that cannot be discharged by
+// a read filter.
+await withApp(async ({ call, app }) => {
+  section('consent and idempotency retention');
+  const sid = '01M0EFV571B7VBQCNXHAT5WTC0';
+
+  const consent = await call('PUT', '/v1/onboarding/consent',
+    { telemetryPersonal: true, policyVersion: 1, clientSessionId: sid });
+  check(consent.status === 200, 'control: a signed-out consent decision is recorded',
+    `${consent.status} ${consent.body?.error?.code ?? ''}`);
+  check((await app.deps.store.preAuthConsent.get(sid))?.telemetryPersonal === true,
+    'control: and the row is on disk before signup');
+
+  const elig = await call('POST', '/v1/onboarding/eligibility',
+    { dateOfBirth: '1994-03-02', jurisdiction: 'CA-ON' });
+  const signup = await call('POST', '/v1/auth/signup', {
+    email: 'retention@example.invalid', password: 'correct horse battery staple',
+    displayName: 'RetentionSubject', eligibilityReceipt: elig.body?.receipt,
+    clientSessionId: sid, consentReceipt: consent.body?.receipt,
+  });
+  check(signup.status === 200 || signup.status === 201,
+    'control: signup succeeds and carries the decision onto the account',
+    `${signup.status} ${signup.body?.error?.code ?? ''}`);
+  check(signup.body?.profile?.consent?.telemetryPersonal === true,
+    'control: the account holds the decision now',
+    JSON.stringify(signup.body?.profile?.consent));
+  check((await app.deps.store.preAuthConsent.get(sid)) === null,
+    'the signed-out consent row is DELETED at signup, not stamped and retained',
+    JSON.stringify(await app.deps.store.preAuthConsent.get(sid)));
+
+  // Signup burns the eligibility receipt's nonce into `idempotency_keys`. That row is
+  // onboarding evidence with an expiry nothing used to enforce.
+  const actor = signup.body?.profile?.accountId;
+  await app.deps.store.idempotency.put({
+    key: `retention-live-${actor}`, actorId: actor, requestHash: 'h',
+    responseStatus: 200, responseBody: { ok: true },
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  });
+  await app.deps.store.idempotency.put({
+    key: `retention-dead-${actor}`, actorId: actor, requestHash: 'h',
+    responseStatus: 200, responseBody: { ok: true },
+    expiresAt: new Date(Date.now() - 60_000).toISOString(),
+  });
+  const removed = await app.sweepIdempotencyKeys();
+  check(removed >= 1, 'the assembled app exposes a retention sweep that deletes', `removed ${removed}`);
+  check((await app.deps.store.idempotency.get(`retention-dead-${actor}`, actor)) === null,
+    'an idempotency key past its §8 retention is deleted');
+  check((await app.deps.store.idempotency.get(`retention-live-${actor}`, actor))?.requestHash === 'h',
+    'CONTROL: a key inside its window survives, so the sweep is not simply emptying the table');
+});
+
 // ── 8. the stub layer refuses to exist in production ──────────────────────────────────
 {
   section('stub layer production guard');

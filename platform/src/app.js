@@ -86,16 +86,48 @@ export async function buildApp(config, overrides = {}) {
   const preRoute = deps.stubs?.preRoute ? [deps.stubs.preRoute] : [];
   const server = createApp({ router, deps, preRoute });
 
+  /**
+   * The idempotency-key janitor.  http-api.md §8.
+   *
+   * §8 states a retention — "24 h for gameplay, permanent for value-bearing operations" — and
+   * every writer duly stamped `expires_at`. Nothing ever deleted on it, so the retention was a
+   * column rather than a policy, and `idempotency_keys` grew a permanent row for every profile
+   * PATCH, every match result, and every burnt eligibility-receipt nonce. The nonce rows are
+   * onboarding evidence; keeping those forever by omission is the kind of retention answer
+   * nobody wants to give.
+   *
+   * It lives here rather than in a module because the table belongs to no module: auth burns
+   * receipt nonces into it, profile stores PATCH replays, stats stores match results. A janitor
+   * owned by one of them would be a janitor that stops when that module is not mounted.
+   *
+   * Unref'd, failures logged and swallowed — same rules as auth's consent sweep: a retention
+   * timer must never hold a process open or take it down, and the next tick retries anyway.
+   */
+  const idempotencySweepMs = overrides.idempotencySweepIntervalMs ?? 3600_000;
+  const idempotencyTimer = idempotencySweepMs > 0 && store.idempotency?.sweepExpired
+    ? setInterval(() => {
+      Promise.resolve(store.idempotency.sweepExpired())
+        .then((removed) => { if (removed) logger.info('idempotency.sweep', { removed }); })
+        .catch((err) => logger.warn('idempotency.sweep.failed', { message: err?.message ?? String(err) }));
+    }, idempotencySweepMs)
+    : null;
+  idempotencyTimer?.unref?.();
+
   /** Release every background timer this process started. Called on shutdown. */
   const stop = () => {
     stopJanitor();
+    if (idempotencyTimer) clearInterval(idempotencyTimer);
     // Auth sweeps expired ephemeral tokens on an interval. Unref'd, so it never holds the
     // process open — but a test that builds many apps would otherwise accumulate them.
     try { deps.auth?.stop?.(); } catch { /* nothing useful to do while shutting down */ }
     try { deps.events?.relay?.stop?.(); } catch { /* same */ }
   };
 
-  return { server, router, deps, mounted, stopJanitor, stop };
+  return {
+    server, router, deps, mounted, stopJanitor, stop,
+    /** For an ops task, a worker, or a test that would rather not wait an hour. */
+    sweepIdempotencyKeys: (at = null) => store.idempotency.sweepExpired(at),
+  };
 }
 
 /**

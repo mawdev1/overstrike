@@ -34,24 +34,25 @@ buildable — a single open question does not freeze a whole document.
 
 | # | Contract | Status | Covers |
 |---|---|---|---|
-| 1 | [`http-api.md`](http-api.md) | FROZEN 1.9.0 | Platform REST surface for P1–P4 |
-| 2 | [`errors.md`](errors.md) | FROZEN | Error envelope and the closed error-code enumeration |
+| 1 | [`http-api.md`](http-api.md) | FROZEN 1.10.0 | Platform REST surface for P1–P4 |
+| 2 | [`errors.md`](errors.md) | FROZEN 1.6.0 | Error envelope and the closed error-code enumeration |
 | 3 | [`auth.md`](auth.md) | FROZEN | Tokens, sessions, revocation, recovery |
 | 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN | Lobby WebSocket: presence, roster, teams, ready, launch |
 | 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN | The binary match protocol, as it exists and as it must change |
-| 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.8.0 | The only surface Codex uses to reach netcode |
-| 7 | [`match-result.md`](match-result.md) | FROZEN | Canonical stat definitions and the immutable result record |
+| 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.9.0 | The only surface Codex uses to reach netcode |
+| 7 | [`match-result.md`](match-result.md) | FROZEN 1.8.0 | Canonical stat definitions and the immutable result record |
 | 8 | [`event-envelope.md`](event-envelope.md) | FROZEN | Canonical platform event envelope and catalogue |
 | 9 | [`map-data.md`](map-data.md) | FROZEN | What `level.js` must export for the server to consume |
-| 10 | [`bomb-rules.md`](bomb-rules.md) | FROZEN | The Bomb ruleset |
-| 11 | [`db-schema.md`](db-schema.md) | FROZEN | Initial PostgreSQL schema |
-| 12 | [`telemetry.md`](telemetry.md) | FROZEN 1.9.0 | Client and server telemetry, privacy and retention classes |
+| 10 | [`bomb-rules.md`](bomb-rules.md) | FROZEN 1.7.0 | The Bomb ruleset |
+| 11 | [`db-schema.md`](db-schema.md) | FROZEN 1.7.0 | Initial PostgreSQL schema |
+| 12 | [`telemetry.md`](telemetry.md) | FROZEN 1.10.0 | Client and server telemetry, privacy and retention classes |
 | 13 | [`feature-flags.md`](feature-flags.md) | FROZEN | Flag naming, evaluation, defaults, kill switches |
 
 **All 13 contracts are FROZEN at 1.7.0** (2026-08-20), on the human owner's instruction to
 proceed without a further review round. Frozen means buildable and stable, not immutable:
 additive amendments bump the minor version, breaking ones need a CCR and a dual-support
-window. `REQ-CC-042`…`053` remain open and will land as ordinary amendments — see
+window. `REQ-CC-042`, `043` and `044` are **closed** (2026-08-20); `045`…`053` remain open and
+will land as ordinary amendments — see
 [`CHANGELOG.md`](CHANGELOG.md) for what is known-open and how severe each is.
 
 One caveat carried forward: `auth.md` §11 (age and eligibility) is a **working default**, not a

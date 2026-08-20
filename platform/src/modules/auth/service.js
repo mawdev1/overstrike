@@ -279,9 +279,9 @@ export function createAuthService(deps) {
       policyVersion: version,
       decidedAt,
       expiresAt: iso(clock.now() + PRE_AUTH_CONSENT_TTL_MS),
-      // `migratedAt` is not a column a caller may write — the adapters reset it on every new
-      // decision and only `markMigrated` sets it, so a client that changes its mind after
-      // signup cannot keep a row claiming the new answer was already carried onto an account.
+      // `migratedAt` is not a column a caller may write. Nothing stamps it any more — signup
+      // deletes the row (§3a.3) — and the adapters force it to null on write, so a row that
+      // arrives with a stamp cannot make a live decision read as already-carried.
     });
     return {
       telemetryPersonal, policyVersion: version, decidedAt, subject: 'client-session',
@@ -435,7 +435,12 @@ export function createAuthService(deps) {
         updatedAt: iso(now),
       }, tx);
 
-      if (preAuth && !preAuth.migratedAt) await store.preAuthConsent.markMigrated(clientSessionId, iso(now), tx);
+      // §3a.3: the signed-out row "is deleted on migration at signup, or on expiry". It used to
+      // be stamped `migrated_at` and kept, which reads as absent and retains as present — the
+      // decision now lives on the account, and the second copy is a consent record keyed by a
+      // client session with nothing left to authorise. Inside the transaction, so a signup that
+      // rolls back does not destroy the decision it failed to carry over.
+      if (preAuth) await store.preAuthConsent.deleteFor(clientSessionId, tx);
 
       await emit({
         type: 'account.created',

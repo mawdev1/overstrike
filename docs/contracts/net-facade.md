@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.8.0 |
+| **Version** | 1.9.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -279,6 +279,23 @@ client cannot have, and REQ-CC-012 correctly caught three of them.
 | `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
 | `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, outcomeReason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` — **`outcomeReason`**, the same name and enum as the result record; `reason` is round-level only | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` only when the match had **no** winner — an aborted forfeit/abandon carries a real winner (`match-result.md` §4.0). `null` and `'draw'` are different facts |
 | `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
+
+**`matchEnded` is PROVISIONAL, and the results screen must fetch (REQ-CC-043).** It carries
+what `MSG_OUTCOME` carries and nothing more. It does **not** carry `invalidationReason`, because
+no wire field holds one: `wire-protocol.md` §8.9 encodes `terminationReason` as a single byte
+with no accompanying reason, and adding one would be a protocol change for a value the socket
+learns after the match server has already stopped talking to this client. So:
+
+- a client may render the outcome — winner, reasons, scores — from `matchEnded` immediately;
+- it must call `GET /v1/matches/:matchId` (`match-result.md` §4.2) for the authoritative
+  record, and **must** do so before displaying anything about an `invalidated` match, whose
+  reason exists only there;
+- `matchEnded` and the HTTP record disagreeing is normal in exactly one direction: HTTP is
+  later and wins. The HTTP response may also still be `pending` (§4.2), which the screen shows
+  as "finalising" rather than treating as an error.
+
+This is the honest version of the earlier claim that the outcome "contains everything the
+results screen needs". It contained everything the *wire* has.
 
 **`interactionRefused` maps from `interactRefused` (kind 20) and from nothing else.** An
 earlier paragraph here mapped it from the *cancellation* enum, which was wrong twice over: a

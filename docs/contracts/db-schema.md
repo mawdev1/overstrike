@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.5.0 |
+| **Version** | 1.7.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |
 | **Scope** | P1–P5. Economy, ownership, creator, and agent tables are later contracts |
@@ -91,7 +91,7 @@ pre_auth_consent(
   policy_version     int not null,
   decided_at         timestamptz not null,
   expires_at         timestamptz not null,
-  migrated_at        timestamptz
+  migrated_at        timestamptz          -- always null; see below
 )
 
 sessions(
@@ -111,6 +111,16 @@ also the cheapest possible answer to a deletion request about it.
 `consent_telemetry` is nullable because **null means undecided**, which is distinct from a
 recorded "no". An account predating the policy has no decision, and is treated as no consent
 until it makes one.
+
+**`pre_auth_consent.migrated_at` is always null (1.6.0).** The §3a.3 lifecycle is a DELETE —
+"deleted on migration at signup, or on expiry" — and the application implements exactly that:
+signup removes the row inside the same transaction that writes the decision onto the account,
+and a janitor removes the rows that expire without one. The column was written by an earlier
+implementation that stamped it and kept the row, which reads as absent and retains as present;
+for a consent record those are not the same thing. The column and its partial index survive
+because dropping a column is a CCR, and because forcing it to null on every write keeps a row
+arriving from a backfill with a stamp on it from making a live decision read as already-carried.
+No writer sets it.
 
 `roles` is on the account rather than a join table because P1 has seven fixed roles and no
 role metadata; a join table would be three queries to answer a question one column answers.
@@ -187,7 +197,36 @@ matches(
   rules_snapshot jsonb not null,   -- immutable ruleset copy; a result without it is
                                    -- uninterpretable once the ruleset is retuned
   team_scores jsonb, rounds jsonb, evidence_ref text,
-  allocated_at, started_at, ended_at, result_applied_at
+  allocated_at, started_at, ended_at, result_applied_at,
+
+  -- The match-result.md §4.0 outcome matrix, as CHECK constraints. Migrations 0012, 0013, 0016.
+  check (status in ('allocated','in-progress','completed','aborted','invalidated')),
+  -- termination_reason repeats status on a terminal row, and is null before one.
+  check (status in ('allocated','in-progress') = (termination_reason is null)),
+  -- outcome_reason is closed per status; a non-terminal row carries none.
+  check (
+    (status in ('allocated','in-progress') and outcome_reason is null and winner_team is null)
+    or (status = 'completed' and outcome_reason in ('elimination','defuse','detonation','timer'))
+    or (status = 'aborted'   and outcome_reason in ('forfeit','abandon','no-contest'))
+    or (status = 'invalidated' and outcome_reason = 'no-contest')),
+  -- A DRAW is the regulation timer expiring and nothing else (0016).
+  check (winner_team is distinct from 'draw' or outcome_reason = 'timer'),
+  -- forfeit/abandon carry a winner; no-contest and invalidation carry none.
+  check (outcome_reason not in ('forfeit','abandon') or winner_team in ('alpha','bravo')),
+  check (outcome_reason <> 'no-contest' or winner_team is null),
+  -- invalidation_reason is non-null from the enum iff the row is invalidated.
+  check ((status = 'invalidated') = (invalidation_reason is not null)),
+  check (invalidation_reason is null
+         or invalidation_reason in ('cheat-detected','server-fault','roster-fault','admin-review')),
+  -- A terminal row is COMPLETE (0013): every §4.2 key required on one is non-null and
+  -- non-blank — ruleset_version, stat_definition_version, server_build, map_id, map_version,
+  -- region, started_at, ended_at, team_scores, rounds, evidence_ref.
+  check (status in ('allocated','in-progress')
+         or (started_at is not null and ended_at is not null
+             and team_scores is not null and rounds is not null and evidence_ref is not null)),
+  check (mode in ('tdm','bomb')),
+  -- Nothing has been applied to a career before the match finalised (0012).
+  check (result_applied_at is null or status in ('completed','aborted','invalidated'))
 )
 
 match_participants(match_id, account_id, team, joined_at, left_at,
@@ -198,6 +237,15 @@ match_participants(match_id, account_id, team, joined_at, left_at,
 `matches` rows are created at **allocation**, not completion — a match that dies before its
 first tick still has an id, which is the only way the crash is attributable
 (`match-result.md` §4).
+
+**The `matches` CHECK constraints are the §4.0 union, not a suggestion (REQ-CC-044).** They were
+in the migrations and not in this contract, so the schema published here permitted rows the
+canonical union forbids — a completed match carrying an invalidation reason, a drawn
+elimination, an aborted no-contest with a winner, a terminal row with no `ended_at`. A reader
+generating a fixture from this section produced data the database would refuse. The application
+validates the same rules in one shared function (`core/store.js`) before writing; the constraints
+are the backstop for everything that reaches the table another way — a repair script, a backfill,
+a psql session at 2am.
 
 `match_participants.stats` is `jsonb` deliberately: the stat set evolves per mode and per
 definition version, and a wide sparse column-per-stat table would need a migration for every
@@ -232,7 +280,8 @@ audit_log(
 idempotency_keys(
   key text, actor_id text, request_hash text,
   response_status int, response_body jsonb,
-  created_at, expires_at,
+  created_at,
+  expires_at timestamptz,            -- NULL = permanent (http-api.md §8); otherwise swept
   primary key (key, actor_id)
 )
 
@@ -246,6 +295,16 @@ table an attacker with app credentials can rewrite, and then it proves nothing.
 
 The partial index on `published_at IS NULL` is what keeps the outbox relay cheap as the table
 grows to millions of published rows.
+
+**`idempotency_keys.expires_at` is nullable, and NULL means permanent (1.6.0).** `http-api.md`
+§8 sets the retention — "24 h for gameplay, permanent for value-bearing operations" — which is
+two classes, and the column was `NOT NULL`, so only one of them could be written down. A
+value-bearing row would have had to invent a far-future sentinel that a sweep would eventually
+believe. A sweep now exists (`store.idempotency.sweepExpired`, run hourly by the composition
+root) and skips NULL explicitly; before it there was no sweep at all, so every row — including
+the burnt eligibility-receipt nonces `auth/service.js` records in this table because there is no
+`eligibility_receipts` table — was retained forever with an expiry column nothing read.
+Migration `0017`. P1 writes no permanent rows; the point is that the first one can say so.
 
 ## 6. Moderation
 

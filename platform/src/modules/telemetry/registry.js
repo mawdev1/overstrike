@@ -46,9 +46,16 @@ const strEnumF = (values, { nullable = false } = {}) => ({ kind: 'enum', values,
  * Retention comes from §5's stream table, not from the privacy class:
  *   funnel/KPI      -> standard (13 mo)   the P5 gate is answered from 13 months of funnel
  *   client health   -> short    (30 d)    a month of fps histograms is all a regression needs
- * `funnel.preconsent` and `client.unsupported` are internal-class but funnel-stream, so they
- * keep `standard`. Giving them 30 days would delete the top of the funnel before the gate that
- * needs it, which is why class and retention are two fields and not one.
+ * `client.unsupported` is internal-class but funnel-stream, so it keeps `standard`. Giving it
+ * 30 days would delete the top of the funnel before the gate that needs it, which is why class
+ * and retention are two fields and not one.
+ *
+ * `funnel.preconsent` is the exception, and it is not a judgement call: §5 gives it its own row
+ * — **internal, short (30 d)** — because it is the one stream collected from a visitor who has
+ * not been asked yet. It used to sit on `standard` here and inherit 13 months from the personal
+ * funnel row it no longer shares (REQ-CC-042). The amendment landed in the document and not in
+ * the code, so an unlinked pre-consent count was being kept thirteen times as long as the
+ * contract said, which is a retention breach that reads as a one-word typo.
  */
 export const REGISTRY = new Map(Object.entries({
   'flow.step': {
@@ -68,7 +75,8 @@ export const REGISTRY = new Map(Object.entries({
       : (p.errorCode === null ? null : 'errorCode must be null unless outcome is failed')),
   },
   'funnel.preconsent': {
-    version: 1, privacyClass: 'internal', retentionClass: 'standard',
+    // §5: internal, SHORT (30 d). See the note above the registry.
+    version: 1, privacyClass: 'internal', retentionClass: 'short',
     unlinked: true,   // §3.5.1 — see validate.js; this flag is what turns the rule on
     fields: {
       step: enumF(['landing', 'eligibility', 'consent']),

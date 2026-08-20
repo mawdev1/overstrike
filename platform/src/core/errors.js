@@ -28,6 +28,9 @@ export const CODES = {
   AUTH_VERIFICATION_TOKEN_INVALID:   { status: 400, retryable: false },
   AUTH_VERIFICATION_TOKEN_EXPIRED:   { status: 400, retryable: false },
   ELIGIBILITY_RECEIPT_INVALID:       { status: 400, retryable: false },
+  // Never the status of a telemetry batch — §3.3 keeps that a 202 — but a code the batch
+  // response names, so the client has one thing to branch on instead of guessing (REQ-CC-042).
+  CONSENT_RECEIPT_INVALID:           { status: 400, retryable: false },
 
   // validation + request
   VALIDATION_FAILED:                 { status: 400, retryable: false },

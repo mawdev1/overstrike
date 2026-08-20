@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.9.0 |
+| **Version** | 1.10.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -680,14 +680,19 @@ eventually disagree, and only one is right.
 
 ```json
 // GET /v1/profile/:id/matches?limit=25&cursor=…
-{ "items": [ { "matchId": "…", "mode": "bomb",
-               "mapId": "the-square", "mapVersion": "1.0.0",
-               "endedAt": "…", "status": "completed|aborted|invalidated|pending",
-               "result": "win|loss|draw|null",   // null only when the match had no winner
-               "teamScores": { "alpha": 7, "bravo": 5 },
-               "playerSummary": { "kills": 0, "deaths": 0, "assists": 0, "score": 0 } } ],
+{ "items": [ HistorySummary ],              // match-result.md §4.3 — the discriminated union
   "nextCursor": "…" | null, "correlationId": "…" }
 ```
+
+**`HistorySummary` is `match-result.md` §4.3 and is not restated here (REQ-CC-043).** This
+section carried the pre-1.7 item shape: `status` already included `pending`, while `endedAt` was
+fixed to a timestamp and `result`, `teamScores` and `playerSummary` were always supplied — so
+the one status the union added could not be serialised by the schema that admitted it. §4.3
+publishes both variants exactly, a pending item carrying explicit `null` for every outcome field
+rather than omitting them.
+
+The paging envelope (`items`, `nextCursor`, `correlationId`) is this contract's, per §10. The
+item shape is `match-result.md`'s, and a duplicate copy of it here is what drifted.
 
 ### 11.6 Region probes
 
@@ -787,10 +792,20 @@ left to inference.
 // GET /v1/health, /v1/health/ready → defined once in §7.1; not restated here
 
 // POST /v1/matches/:matchId/result   [S]  Idempotency-Key: match-result:<matchId>
-  body: the full match-result.md §4 record
-  200 → { "applied": bool, "correlationId" }     // applied:false = idempotent replay
-  errors: CONFLICT (finalised with a different payload) · VALIDATION_FAILED
+  body: ResultSubmission (match-result.md §5.1) — the §4.2 TerminalResult field set,
+        terminal status only, WITHOUT correlationId/retryAfterMs, plus optional
+        roomId/serverId. Unknown and response-only keys are refused, not ignored.
+        Path :matchId wins over body matchId; Idempotency-Key must be the derived one.
+  200 → { "matchId", "status", "applied": bool, "resultAppliedAt",
+          "appliedToCount": int, "correlationId" }   // applied:false = idempotent replay
+  errors: CONFLICT (finalised with a different payload) · VALIDATION_FAILED · AUTH_FORBIDDEN
 ```
+
+**The result body is `ResultSubmission`, not "the §4 record" (REQ-CC-043).** §4 contains the
+pending variant and the response-only correlation envelope as well, so the old reference asked a
+producer to send a section rather than a type. `appliedToCount` is `0` for the outcomes
+`match-result.md` §6.1 does not aggregate, and `resultAppliedAt` is stamped on every terminal
+submission including those — it records that the application ran, not that a career changed.
 
 **`?mode=all` on stats** returns `{ "modes": { "tdm": {…}, "bomb": {…} }, "correlationId" }`,
 each value being the §11.5 body. It does **not** sum across modes — a combined K/D over two

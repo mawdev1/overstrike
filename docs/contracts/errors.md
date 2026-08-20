@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.5.0 |
+| **Version** | 1.6.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform endpoint, the lobby socket, the client HTTP layer |
 
@@ -65,6 +65,7 @@ a code is an additive amendment, changing what one *means* is breaking.
 | `AUTH_VERIFICATION_TOKEN_INVALID` | 400 | Verification token bad, used, or superseded | **Resend verification** — not recovery |
 | `AUTH_VERIFICATION_TOKEN_EXPIRED` | 400 | Verification token past TTL | Resend verification |
 | `ELIGIBILITY_RECEIPT_INVALID` | 400 | Signup receipt bad, expired, or for another policy version | Restart the age gate |
+| `CONSENT_RECEIPT_INVALID` | 400 | Telemetry consent receipt absent, malformed, badly signed, expired, issued for a stale policy version, or bound to another subject | **Route to consent** (`http-api.md` §3a.3) and replace the receipt. `details.reason` narrows it. Never surfaced as a batch failure — `telemetry.md` §3.3 carries it on the 202 |
 | `AUTH_RECOVERY_TOKEN_EXPIRED` | 400 | Past its 30-minute TTL | Restart recovery |
 
 ### Validation and request

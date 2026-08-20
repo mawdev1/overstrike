@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.9.0 |
+| **Version** | 1.10.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -57,8 +57,10 @@ its own.
 | `client.unsupported` | Blocked by the D5 matrix, with the failing check |
 
 `flow.step` replaces separate viewed/completed/failed events: `first-run-flow.md` needs all
-three per step, and nine steps × three outcomes as distinct names would be twenty-seven
-registry rows describing one thing.
+three per step, and eleven steps × three outcomes as distinct names would be thirty-three
+registry rows describing one thing. (The count is the §3.3.1 `step` enum; it read "nine" long
+after that enum reached eleven, which is why `platform/test/contracttest.mjs` recounts it from
+the registry row rather than trusting this sentence.)
 
 ### 3.1.1 Supported browser and device matrix — **DECIDED** (D5)
 
@@ -111,8 +113,34 @@ Content-Type: application/json
     "payload": { "step": "display-name", "outcome": "completed", "errorCode": null }
   } ] }
 
-202 → { "accepted": 12, "rejected": 0, "correlationId": "…" }
+202 → { "accepted": 12, "rejected": 0,
+        "consentReceiptError": null | { "code": "CONSENT_RECEIPT_INVALID", "reason": "…" },
+        "correlationId": "…" }
 ```
+
+**The batch's correlation id is the request's `X-Correlation-Id` header, and nothing else
+(REQ-CC-042).** There is no batch-level `correlationId` field in the body above and there must
+not be: `http-api.md` §1 already gives every request one, and a second copy in the body is a
+second value that can disagree with the first. §3.5's "every batch carries the correlation ID"
+means that header; §3.5.1's "never the batch's" forbids a `funnel.preconsent` event reusing that
+header's value as its own event id. Per-event `correlationId` is a different field with a
+different job — it identifies the event, and for `funnel.preconsent` it must be freshly minted.
+
+**`consentReceiptError` (REQ-CC-042).** Always present; `null` when the receipt was usable.
+Non-null **only** when a personal-class event was actually dropped because the receipt was
+unusable — absent, malformed, badly signed, expired, issued for a stale policy version, or bound
+to a different subject. Its `code` is `errors.md`'s `CONSENT_RECEIPT_INVALID` and its UI
+obligation is that code's: send the player back to consent for a fresh receipt.
+
+A **valid** receipt recording a **decline** is not a receipt error and reports `null`. The
+personal events are still dropped, and the player must not be sent back to be asked a question
+they already answered. An internal-only batch, which correctly carries no receipt at all, also
+reports `null` — otherwise every pre-consent sender would be told to route a visitor to a screen
+it is already on.
+
+The batch still succeeds with `202` in every case (see the rules below); this field is the only
+per-batch verdict the client is given, because it is the only one it can act on. Everything else
+stays in the server log.
 
 **`accountId` is never sent by the client.** It is derived server-side from the bearer token
 when present, and is `null` otherwise. The earlier claim that "every batch carries the
@@ -134,7 +162,7 @@ authorization, rate-limit identity, or anything that matters.
 | Retry | Once, after 30 s. Then drop. Telemetry never retries into an outage |
 | Failure | Silent. A telemetry failure is never visible to the player and never blocks a frame |
 | Unknown `name` | Rejected server-side and counted; the batch still succeeds |
-| Missing/invalid `consentReceipt` | Personal-class events in the batch are **rejected**; internal-class still accepted. The batch does not fail as a whole |
+| Missing/invalid `consentReceipt` | Personal-class events in the batch are **rejected**; internal-class still accepted. The batch does not fail as a whole, and the 202 carries `consentReceiptError` naming `CONSENT_RECEIPT_INVALID` |
 | `consentReceipt` on an internal-only batch | **Not required, and should be absent.** A receipt on a batch carrying no personal events is an identifier with no purpose |
 | Payload | Per-name **allowlist**. Keys outside it are dropped server-side, not stored-and-filtered |
 
@@ -245,8 +273,10 @@ stored — the same rule as any other closed enum in §3.3.1.
 | `personal` funnel and KPI | Requires `consent.telemetryPersonal` from `http-api.md` §3a.3 — a record distinct from eligibility and from profile visibility |
 | Before any consent decision | Only `internal` class is sent, **unlinked** — no `clientSessionId`. Personal events are **dropped, not queued**: queuing against a later "yes" is collecting first and asking afterwards |
 
-The landing and eligibility steps therefore contribute aggregate counts and nothing else
-(`http-api.md` §3a.5). This is a deliberate limit on what the funnel can answer, not an
+The landing, eligibility **and consent** steps therefore contribute aggregate counts and nothing
+else (`http-api.md` §3a.5). All three are `funnel.preconsent`; this sentence used to name only
+the first two, which put the consent screen itself on the personal side of a boundary it is the
+last step before. This is a deliberate limit on what the funnel can answer, not an
 oversight — consent is asked after the age gate so it is never solicited from someone who
 cannot give it.
 
