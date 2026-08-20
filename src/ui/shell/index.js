@@ -782,8 +782,15 @@ export function mountAppShell({
 
   const sessionUnsubscribe = session?.subscribe?.((nextSnapshot) => {
     snapshot = nextSnapshot || sessionSnapshot(session);
+    // `route.signedOut` (router.js), not a prefix test on the route id.
+    //
+    // This read `id !== 'welcome' && !id.startsWith('auth.')`, which redirected every
+    // `onboarding.*` route: a signed-out visitor deep-linking to /onboarding/eligibility landed
+    // on sign-in reading "This session ended", having never had one. The whole signup funnel was
+    // unreachable except by clicking through from the welcome page fast enough to beat the boot
+    // refresh resolving. The footer's Terms, Status, Support and Privacy links were the same.
     if (snapshot?.status === 'revoked'
-      || (snapshot?.authenticated === false && route.id !== 'welcome' && !route.id.startsWith('auth.'))) {
+      || (snapshot?.authenticated === false && !route.signedOut)) {
       if (pending.has('signOut') || pending.has('signOutAll')) {
         render();
         return;

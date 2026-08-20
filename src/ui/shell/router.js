@@ -1,14 +1,27 @@
 export const SHELL_ROUTES = Object.freeze([
-  { id: 'welcome', pattern: '/welcome', title: 'Welcome' },
-  { id: 'auth.signIn', pattern: '/auth/sign-in', title: 'Sign in' },
-  { id: 'auth.create', pattern: '/auth/create-account', title: 'Create account' },
-  { id: 'auth.recover', pattern: '/auth/recover', title: 'Recover account' },
-  { id: 'onboarding.eligibility', pattern: '/onboarding/eligibility', title: 'Eligibility' },
-  { id: 'onboarding.consent', pattern: '/onboarding/consent', title: 'Privacy choices' },
-  { id: 'onboarding.displayName', pattern: '/onboarding/display-name', title: 'Choose a display name' },
-  { id: 'onboarding.verify', pattern: '/onboarding/verify', title: 'Verify your account' },
-  { id: 'onboarding.terms', pattern: '/onboarding/terms', title: 'Terms' },
-  { id: 'onboarding.essentialSettings', pattern: '/onboarding/essential-settings', title: 'Essential settings' },
+/**
+ * `signedOut: true` marks a route a visitor with NO SESSION may legitimately be on.
+ *
+ * The shell bounces an unauthenticated visitor to sign-in, which is right for a career page
+ * and wrong for the entire signup funnel. That guard tested `id !== 'welcome' && !id.startsWith('auth.')`,
+ * so every `onboarding.*` route redirected — a deep link to /onboarding/eligibility landed on
+ * sign-in reading "This session ended" at someone who had never had one. Onboarding is BY
+ * DEFINITION for people who are not authenticated.
+ *
+ * A flag rather than another string prefix: the prefix test is what silently omitted six
+ * routes, and it would silently omit the next one too. A new route now has to answer the
+ * question in its own definition.
+ */
+  { signedOut: true, id: 'welcome', pattern: '/welcome', title: 'Welcome' },
+  { signedOut: true, id: 'auth.signIn', pattern: '/auth/sign-in', title: 'Sign in' },
+  { signedOut: true, id: 'auth.create', pattern: '/auth/create-account', title: 'Create account' },
+  { signedOut: true, id: 'auth.recover', pattern: '/auth/recover', title: 'Recover account' },
+  { signedOut: true, id: 'onboarding.eligibility', pattern: '/onboarding/eligibility', title: 'Eligibility' },
+  { signedOut: true, id: 'onboarding.consent', pattern: '/onboarding/consent', title: 'Privacy choices' },
+  { signedOut: true, id: 'onboarding.displayName', pattern: '/onboarding/display-name', title: 'Choose a display name' },
+  { signedOut: true, id: 'onboarding.verify', pattern: '/onboarding/verify', title: 'Verify your account' },
+  { signedOut: true, id: 'onboarding.terms', pattern: '/onboarding/terms', title: 'Terms' },
+  { signedOut: true, id: 'onboarding.essentialSettings', pattern: '/onboarding/essential-settings', title: 'Essential settings' },
   { id: 'play.rooms', pattern: '/play/rooms', title: 'Server browser' },
   { id: 'play.roomDetail', pattern: '/play/rooms/:roomId', title: 'Room details' },
   { id: 'room.home', pattern: '/room/:roomId', title: 'Lobby' },
@@ -25,7 +38,7 @@ export const SHELL_ROUTES = Object.freeze([
   { id: 'match.loading', pattern: '/match/loading', title: 'Loading match' },
   { id: 'match.reconnect', pattern: '/match/reconnect', title: 'Reconnect to match' },
   { id: 'results', pattern: '/results/:matchId', title: 'Match results' },
-  { id: 'system', pattern: '/system/:condition', title: 'System notice' },
+  { signedOut: true, id: 'system', pattern: '/system/:condition', title: 'System notice' },
 ]);
 
 function compileRoute(route) {
