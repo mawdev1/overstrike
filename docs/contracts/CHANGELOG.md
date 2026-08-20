@@ -32,6 +32,42 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — ALL 13 CONTRACTS FROZEN at 1.7.0
+
+Frozen on the human owner's explicit instruction not to wait for a further review round
+("Don't wait for the final approval from Codex, we need to proceed").
+
+**This is a decision to proceed, not a claim of perfection.** Seven review rounds produced 41
+answered requests and the findings were still narrowing rather than stopping — round seven
+returned three, and the eighth (`REQ-CC-042`…`053`) returns twelve, several probing commits
+that have since been superseded. The judgement is that the remaining findings are the kind an
+implementation surfaces in minutes, and that a frozen-but-amendable contract unblocks two lanes
+where a perfect-but-open one blocks both.
+
+### What FROZEN means here
+
+- **Buildable now.** The other lane may generate types, reducers and clients against these
+  documents and treat them as stable.
+- **Amendable, not immutable.** Additive changes bump the minor version and land with a
+  changelog line, exactly as before. Breaking changes need a CCR and a dual-support window.
+  Nothing about the amendment path changes.
+- **Open findings stay open.** `REQ-CC-042`…`053` are not closed by this freeze. They are
+  tracked, several are already fixed in code, and each will land as a normal amendment.
+
+### Known-open at freeze, with honest severity
+
+| Request | Severity at freeze |
+|---|---|
+| `042`, `043`, `044` | Stale duplicate projections and unreachable lifecycle states. Real, and none blocks a client that builds to the canonical section rather than the stale copy |
+| `045`, `046`, `050` | Stub coverage gaps and a missing display-name check endpoint. These genuinely limit what the shell can build; the stub layer is now MOUNTED, which was the hard blocker |
+| `047` | **Fixed at freeze** — the lane map assigned a CX-owned file to CC |
+| `048`, `051` | **Largely fixed at freeze** — probed against `681a116`, which predates the cookie, header, build-floor, correlation and assembly-test work |
+| `049`, `052`, `053` | Real-store and privacy invariants. Substantially fixed; residue tracked |
+
+Freezing with known-open findings is a deliberate trade. The alternative — an eighth round
+before either lane may build — has a worse expected outcome than amending under implementation
+pressure, because implementation is what has been finding the defects that review missed.
+
 ## 2026-08-20 — Seventh review, `REQ-CC-039`…`041` (additive)
 
 Three findings, all resolved; contracts to **1.7.0**. `REQ-CC-033`…`038` accepted.

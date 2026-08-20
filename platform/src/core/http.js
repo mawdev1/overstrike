@@ -23,7 +23,20 @@ const MAX_BODY_BYTES = 256 * 1024;
 
 /** Route table: method -> [{ segments, handler, opts }]. Matching is exact-length, no regex. */
 export class Router {
-  constructor() { this.routes = { GET: [], POST: [], PUT: [], PATCH: [], DELETE: [] }; }
+  constructor() {
+    this.routes = { GET: [], POST: [], PUT: [], PATCH: [], DELETE: [] };
+    /**
+     * Middleware that runs before EVERY matched route.
+     *
+     * Exists for the stub layer, which has to be able to answer any contracted endpoint
+     * without each module remembering to ask it. Global middleware is a blunt tool and is
+     * deliberately the only one: it runs after routing, so an unknown path is still a 404, and
+     * it cannot see a request the router would not have served anyway.
+     */
+    this.globalMiddleware = [];
+  }
+
+  useGlobal(fn) { this.globalMiddleware.push(fn); return this; }
 
   add(method, path, handler, opts = {}) {
     const segments = path.split('/').filter(Boolean).map((s) =>
@@ -174,7 +187,7 @@ function clientIp(req, config) {
  * services. Handlers receive it explicitly rather than importing singletons, so a test can
  * substitute any of them without a module registry.
  */
-export function createApp({ router, deps, onRequestEnd = null }) {
+export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) {
   const { logger, config } = deps;
 
   return createServer((req, res) => {
@@ -211,6 +224,27 @@ export function createApp({ router, deps, onRequestEnd = null }) {
 
       const url = parseTarget(req.url);
       pathForLog = url.pathname;
+
+      // The stub layer runs BEFORE routing, deliberately. It has to answer contracted
+      // endpoints the platform has not implemented yet — the whole point is that the other
+      // lane can build against P2's lobby and match surfaces while P1 is still being written.
+      // After routing it could only ever serve what already exists, which is the opposite.
+      if (preRoute.length) {
+        const early = { correlationId, method: req.method, path: url.pathname,
+          query: url.searchParams, headers: req.headers, deps };
+        for (const mw of preRoute) {
+          const answered = await mw(early, req);
+          if (answered) {
+            if (answered.__dropSocket) { try { res.destroy(); } catch { /* gone */ } return; }
+            status = answered.status ?? 200;
+            extraHeaders = answered.headers || null;
+            payload = (answered.body && typeof answered.body === 'object' && !Array.isArray(answered.body))
+              ? { ...answered.body, correlationId }
+              : answered.body;
+            return finish();
+          }
+        }
+      }
 
       const hit = router.match(req.method, url.pathname);
       if (!hit) throw new ApiError('NOT_FOUND', 'No such endpoint.');
@@ -281,6 +315,9 @@ export function createApp({ router, deps, onRequestEnd = null }) {
       });
     }
 
+    return finish();
+
+    function finish() {
     try {
       // §3a.2: a 204 still carries the correlation id — it is the only place it can travel.
       res.setHeader('X-Correlation-Id', correlationId);
@@ -301,6 +338,7 @@ export function createApp({ router, deps, onRequestEnd = null }) {
     const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
     logger.info('request', { correlationId, method: req.method, path: pathForLog, status, ms });
     if (onRequestEnd) { try { onRequestEnd({ status, ms, correlationId }); } catch { /* never fatal */ } }
+    }
   }
 }
 

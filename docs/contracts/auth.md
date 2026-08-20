@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.5.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Client HTTP layer, lobby socket, match server, Admin Portal |

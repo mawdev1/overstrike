@@ -11,6 +11,7 @@
     "check": "node scripts/check.mjs",
     "lanecheck": "node scripts/lanecheck.mjs",
     "platformtest": "node scripts/platformtest.mjs",
+    "uishell": "node scripts/uishell.mjs",
     "smoke": "node scripts/smoke.mjs",
     "perf": "node scripts/perf.mjs",
     "perfcompare": "node scripts/perfcompare.mjs",

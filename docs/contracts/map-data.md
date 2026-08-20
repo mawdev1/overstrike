@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code (contract) |
 | **Producer** | [CX] Codex — `src/world/level.js`, `src/world/props.js` |

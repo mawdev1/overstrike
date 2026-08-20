@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.7.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |

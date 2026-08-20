@@ -170,6 +170,30 @@ await withApp(async ({ call, app }) => {
   check(after.length === 0, 'the outbox drains to zero', `${after.length} left`);
 });
 
+// ── 4b. the stub layer is REACHABLE over HTTP, not merely constructed ─────────────────
+await withApp(async ({ call }) => {
+  section('stub layer is mounted');
+  // H1.1's blocker: the stub object existed and nothing could reach it, so there was no
+  // address for the other lane to build against.
+  const empty = await call('GET', '/v1/rooms', undefined,
+    { 'x-stub-scenario': 'browser-empty', 'x-client-session-id': 'apptest-1' });
+  check(empty.status === 200 && Array.isArray(empty.body?.items) && empty.body.items.length === 0,
+    'a stub scenario answers an endpoint the platform has not implemented yet',
+    `${empty.status} ${empty.text?.slice(0, 60)}`);
+  check(typeof empty.body?.correlationId === 'string',
+    'a stub response still carries the correlation id');
+
+  const populated = await call('GET', '/v1/rooms', undefined,
+    { 'x-stub-scenario': 'default', 'x-client-session-id': 'apptest-2' });
+  check(populated.body?.items?.length > 0,
+    'control: a different scenario returns different data, so the layer is stateful');
+
+  const real = await call('GET', '/v1/rooms');
+  check(real.status === 404,
+    'WITHOUT the header the platform behaves exactly as production does',
+    'a stub layer that answers unheadered requests is a stub layer serving real players');
+});
+
 // ── 5. rate limiting is actually consulted ────────────────────────────────────────────
 await withApp(async ({ app }) => {
   section('rate limiter wiring');

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — host resolved; awaiting REQ-CX-001 |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.5.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |

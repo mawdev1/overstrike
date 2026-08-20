@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform service, the worker, audit, analytics, Admin Portal |

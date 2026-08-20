@@ -26,8 +26,7 @@
     { "pattern": "platform/**", "lane": "CC" },
 
     { "pattern": "scripts/**", "lane": "CC" },
-    { "pattern": "scripts/uiperf.mjs", "lane": "CX" },
-    { "pattern": "scripts/uiprobe.mjs", "lane": "CX" },
+    { "pattern": "scripts/ui*.mjs", "lane": "CX" },
     { "pattern": "scripts/beauty.mjs", "lane": "CX" },
     { "pattern": "scripts/scopeshot.mjs", "lane": "CX" },
     { "pattern": "scripts/opticglass.mjs", "lane": "CX" },

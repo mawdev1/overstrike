@@ -83,7 +83,8 @@ export async function buildApp(config, overrides = {}) {
     }
   }
 
-  const server = createApp({ router, deps });
+  const preRoute = deps.stubs?.preRoute ? [deps.stubs.preRoute] : [];
+  const server = createApp({ router, deps, preRoute });
 
   /** Release every background timer this process started. Called on shutdown. */
   const stop = () => {
@@ -244,7 +245,31 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
   if (config.env !== 'production') {
     const stubs = await load('stubs', './modules/stubs/index.js');
     if (stubs) {
-      deps.stubs = { enabled: true, api: stubs.createStubApi({ config }) };
+      const api = stubs.createStubApi({ config });
+      deps.stubs = { enabled: true, api };
+      // MOUNTED, not merely constructed. The stub layer existed as an object nothing could
+      // reach over HTTP, so H1.1 — the executable-stub handshake the other lane builds against
+      // — was unmeetable: there was no address to send a request to.
+      //
+      // Intercept BEFORE the real handlers so a scenario overrides live behaviour, and only
+      // when the caller opts in with X-Stub-Scenario. Without that header the platform behaves
+      // exactly as production does, so the stub layer cannot silently answer a real request.
+      deps.stubs.preRoute = async (early, req) => {
+        const scenario = early.headers['x-stub-scenario'];
+        if (!scenario) return null;                       // no header, real platform, always
+        const body = await readBodyForStub(req);
+        const res = api.handle({
+          method: early.method, path: early.path,
+          query: Object.fromEntries(early.query),
+          headers: early.headers, body, scenario,
+        });
+        // `offline` models a TRANSPORT failure, which has no HTTP representation. Synthesising
+        // a 5xx would be indistinguishable from a real server error and would teach the client
+        // the wrong retry behaviour, so the socket is dropped — which is what offline looks
+        // like from the client's side.
+        if (res.transport === 'failed') return { __dropSocket: true };
+        return res;
+      };
       mounted.push('stubs');
     }
   }
@@ -278,6 +303,20 @@ function constantTimeEquals(a, b) {
   const ha = createHash('sha256').update(String(a)).digest();
   const hb = createHash('sha256').update(String(b)).digest();
   return timingSafeEqual(ha, hb);
+}
+
+/** Read a JSON body for the stub layer, which intercepts before the normal body reader runs. */
+async function readBodyForStub(req) {
+  if (req.method === 'GET' || req.method === 'DELETE') return {};
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 256 * 1024) break;
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return {}; }
 }
 
 const shortReason = (err) => String(err && err.message || err).split('\n')[0].slice(0, 200);

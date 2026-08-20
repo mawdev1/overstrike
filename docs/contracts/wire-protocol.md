@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.6.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.7.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |

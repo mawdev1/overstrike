@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |

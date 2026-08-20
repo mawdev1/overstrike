@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
+| **Status** | `FROZEN` — amendments follow CHANGELOG.md |
 | **Version** | 1.6.0 |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
