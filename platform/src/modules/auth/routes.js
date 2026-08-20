@@ -160,6 +160,14 @@ export function createAuthRoutes({ service, sessions, limiter }) {
       return service.putConsent({ ...ctx.body, actor: ctx.actor, ip: ctx.ip, correlationId: ctx.correlationId });
     },
 
+    async checkDisplayName(ctx) {
+      // §3b: "a bearer token is accepted and changes nothing" — no auth middleware, and the
+      // handler never reads ctx.actor. A signed-in player renaming and a signed-out player
+      // choosing a first name get identical verdicts, which is what makes this cacheable in
+      // the client's head rather than per-session.
+      return service.checkDisplayName({ displayName: ctx.body?.displayName });
+    },
+
     async verifyResend(ctx) {
       await service.verificationResend({ actor: ctx.actor, ip: ctx.ip, correlationId: ctx.correlationId });
       return raw(202, { correlationId: ctx.correlationId });
@@ -205,6 +213,9 @@ export function createAuthRoutes({ service, sessions, limiter }) {
     router.delete('/v1/auth/sessions/:id', handlers.revokeSession, A);
     router.post('/v1/auth/recovery/start', handlers.recoveryStart, AUTH_CLASS);
     router.post('/v1/auth/recovery/complete', handlers.recoveryComplete, AUTH_CLASS);
+
+    // §3b availability preflight. Public: the shell calls it before an account exists.
+    router.post('/v1/auth/display-name/check', handlers.checkDisplayName);
 
     router.post('/v1/onboarding/verify/resend', handlers.verifyResend, A);
     router.post('/v1/onboarding/verify/complete', handlers.verifyComplete, A);

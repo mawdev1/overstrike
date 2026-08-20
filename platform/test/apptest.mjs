@@ -173,6 +173,43 @@ await withApp(async ({ call }) => {
     'after deciding, policyVersion is the version decided under and decidedAt is set',
     JSON.stringify(blind.body));
 
+  // §3b DISPLAY-NAME AVAILABILITY, over the socket.
+  //
+  // Contracted in http-api.md §3b, called by the shell, and mounted NOWHERE — the deployed
+  // display-name step rendered "No such endpoint." into its own availability field. §9 forbids
+  // reproducing the ruleset client-side, so without this endpoint the screen cannot be built at
+  // all; the only way to learn a name was taken was to attempt the account and read the failure.
+  {
+    const free = await call('POST', '/v1/auth/display-name/check', { displayName: 'Unclaimed Name' });
+    check(free.status === 200 && free.body?.available === true && free.body?.policy === null,
+      '§3b: an unused, policy-clean name is available with policy null',
+      `${free.status} ${JSON.stringify(free.body)}`);
+
+    const short = await call('POST', '/v1/auth/display-name/check', { displayName: 'ab' });
+    check(short.status === 200 && short.body?.available === false && short.body?.policy?.rule === 'length',
+      '§3b: a policy refusal is a 200 verdict naming the rule, not an error',
+      JSON.stringify(short.body));
+
+    const bad = await call('POST', '/v1/auth/display-name/check', {});
+    check(bad.status === 400 && bad.body?.error?.code === 'VALIDATION_FAILED',
+      '§3b: an absent displayName is a malformed REQUEST, not a refused name',
+      `${bad.status} ${JSON.stringify(bad.body?.error?.code)}`);
+
+    // Policy BEFORE existence (§3b): otherwise the endpoint becomes a directory of which
+    // reserved names are in use.
+    const reserved = await call('POST', '/v1/auth/display-name/check', { displayName: 'admin' });
+    check(reserved.status === 200 && reserved.body?.policy?.rule === 'reserved'
+      && reserved.body?.available === false,
+      '§3b: a reserved name reports the RULE, never merely "taken"',
+      JSON.stringify(reserved.body));
+
+    // The closed set in §3b has no `mixed-script`; §9 calls this homoglyph impersonation.
+    const mixed = await call('POST', '/v1/auth/display-name/check', { displayName: 'Nova\u0430bc' });
+    check(mixed.status === 200 && mixed.body?.policy?.rule === 'impersonation',
+      "§3b: a mixed-script name maps onto the contract's closed set as `impersonation`",
+      JSON.stringify(mixed.body));
+  }
+
   const { elig, consent, signup } = await onboard(call, { sid: SID });
 
   check(elig.status === 200, 'eligibility returns 200', JSON.stringify(elig.body));

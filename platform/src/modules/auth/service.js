@@ -732,6 +732,23 @@ export function createAuthService(deps) {
     });
   }
 
+/**
+ * Map an internal policy rule id onto http-api.md §3b's CLOSED set.
+ *
+ * §3b publishes exactly `length · charset · reserved · impersonation · profanity · confusable`.
+ * `names.js` raises `mixed-script` for a name whose characters cannot come from one script,
+ * which §9 describes as homoglyph impersonation — the same refusal under the name this endpoint
+ * is contracted to use. Mapping it here keeps the wire inside its closed set without renaming
+ * the internal rule, which other callers already assert on.
+ *
+ * An unmapped id passes through rather than being swallowed: a rule outside the set is a real
+ * contract violation, and it should be visible in a response and a test, not silently recoded.
+ */
+const CONTRACT_RULES = { 'mixed-script': 'impersonation' };
+function contractRule(rule) {
+  return CONTRACT_RULES[rule] || rule || 'charset';
+}
+
   // ------------------------------------------------------------------------ display names
 
   /**
@@ -739,6 +756,40 @@ export function createAuthService(deps) {
    * live here because they are identity rules, and having two implementations of confusable
    * folding is having one that is wrong.
    */
+  /**
+   * §3b availability preflight for `POST /v1/auth/display-name/check`.
+   *
+   * The screen it serves was unbuildable without it: §9 forbids reproducing the name ruleset
+   * client-side, so the only way to learn a name was taken was to attempt the account and read
+   * the failure. The endpoint was fully specified in http-api.md §3b, called by the shell, and
+   * mounted nowhere — the deployed display-name step answered "No such endpoint." into its own
+   * availability field.
+   *
+   * POLICY IS EVALUATED BEFORE EXISTENCE, per §3b: a name that fails policy reports the rule
+   * whether or not it is also taken, because answering "taken" for reserved names turns this
+   * into a directory of which reserved names exist.
+   *
+   * The body is exactly `{ available, policy }` — the caller adds `correlationId`. `policy` is
+   * object-or-null and never absent; the ruleset itself is never published, for the same reason
+   * §3a.1 withholds `minimumAge`: a published rule is a rule the next attempt routes around.
+   */
+  async function checkDisplayName({ displayName }) {
+    let normalised;
+    try {
+      normalised = normaliseDisplayName(displayName);
+    } catch (err) {
+      // An absent or non-string candidate is a malformed REQUEST (400), not a refused name.
+      // A refused name is a 200 with a verdict — the field stays usable and the player is told
+      // which rule refused, which is the entire point of the endpoint.
+      if (err?.code === 'NAME_POLICY_VIOLATION') {
+        return { available: false, policy: { rule: contractRule(err.details?.rule) } };
+      }
+      throw err;
+    }
+    const holder = await store.accounts.byNameFolded(normalised.folded);
+    return { available: !holder, policy: null };
+  }
+
   async function changeDisplayName({ actor, displayName, correlationId = null }) {
     requireCapability(actor, 'profile:update', { accountId: actor.accountId });
     // Normalisation and the §9 name policy are decided on the INPUT and need no account, so
@@ -891,7 +942,7 @@ export function createAuthService(deps) {
     recoveryStart, recoveryComplete,
     verificationResend, verificationComplete,
     termsGet, termsAccept,
-    changeDisplayName, nameHistory,
+    changeDisplayName, checkDisplayName, nameHistory,
     sweepPreAuthConsent,
   };
 }
