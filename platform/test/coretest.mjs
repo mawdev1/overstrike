@@ -956,16 +956,28 @@ section('core/migrate.js — the runner refuses what would diverge the schema');
   // `migrateCli({ databaseUrl: undefined })` MIGRATES THE REAL DATABASE under `pgtest`, which
   // is what this test did on its first run. It passed on memory, where the variable happens to
   // be unset. The deploy case is that the variable is not set at all, so that is what is built.
+  //
+  // BOTH variables, because migrateCli now prefers MIGRATION_DATABASE_URL — 0018 requires the
+  // owner that migrates and the role the app connects as to be different credentials. Clearing
+  // only DATABASE_URL would leave the other one live and migrate the real database again, which
+  // is the same false green this comment already exists to describe.
   const saved = process.env.DATABASE_URL;
+  const savedMigration = process.env.MIGRATION_DATABASE_URL;
   delete process.env.DATABASE_URL;
+  delete process.env.MIGRATION_DATABASE_URL;
   let cli;
   try { cli = await migrateCli({}, out); }
-  finally { if (saved !== undefined) process.env.DATABASE_URL = saved; }
+  finally {
+    if (saved !== undefined) process.env.DATABASE_URL = saved;
+    if (savedMigration !== undefined) process.env.MIGRATION_DATABASE_URL = savedMigration;
+  }
   check(cli.ok === false && cli.applied.length === 0 && cli.alreadyApplied === 0,
     'migrateCli with no DATABASE_URL returns ok:false rather than throwing at a connection',
     JSON.stringify(cli));
-  check(lines.length === 1 && lines[0] === 'error:DATABASE_URL is not set',
-    'and it says exactly what is missing, on the error channel', JSON.stringify(lines));
+  check(lines.length === 1
+    && lines[0] === 'error:neither MIGRATION_DATABASE_URL nor DATABASE_URL is set',
+    'and it names BOTH variables, so an operator who set only one is not left guessing',
+    JSON.stringify(lines));
 
   // ── :229 — and the CLI turns that into a NON-ZERO EXIT ──
   //
@@ -973,14 +985,19 @@ section('core/migrate.js — the runner refuses what would diverge the schema');
   // unmigrated database. Driven as the deploy drives it: a real process, its real exit code.
   {
     const env = { ...process.env };
+    // BOTH, for the same reason as above: migrateCli prefers MIGRATION_DATABASE_URL, so
+    // clearing one and leaving the other would spawn a migrator that runs successfully against
+    // the real database and then assert it exited 2.
     delete env.DATABASE_URL;                       // pgtest sets one; the deploy case is that it does not
+    delete env.MIGRATION_DATABASE_URL;
     const r = spawnSync(process.execPath, [join(ROOT, 'platform/src/core/migrate.js')],
       { encoding: 'utf8', env });
     check(r.status === 2,
       'node platform/src/core/migrate.js with no DATABASE_URL exits 2, not 0',
       `exit ${r.status}: ${(r.stdout || '') + (r.stderr || '')}`);
-    check(/DATABASE_URL is not set/.test(`${r.stdout}${r.stderr}`),
-      'and the operator is told why', `${r.stdout}${r.stderr}`.slice(0, 200));
+    check(/neither MIGRATION_DATABASE_URL nor DATABASE_URL is set/.test(`${r.stdout}${r.stderr}`),
+      'and the operator is told why, naming both variables',
+      `${r.stdout}${r.stderr}`.slice(0, 200));
   }
 
   for (const d of tmpDirs) await rm(d, { recursive: true, force: true });

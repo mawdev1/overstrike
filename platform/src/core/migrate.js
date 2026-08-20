@@ -173,6 +173,25 @@ export async function runMigrations({ databaseUrl, client, dir = MIGRATIONS_DIR 
     await db.query('select pg_advisory_lock($1)', [ADVISORY_LOCK_KEY]);
     try {
       const files = await loadMigrations(dir);
+      // The application's role name, published to every migration as a session setting.
+      //
+      // 0009's operator note is load-bearing: the role the app CONNECTS as must not own these
+      // tables, or the audit_log append-only grants are decoration — an owner re-grants to
+      // itself and disables its own triggers. 0009 hard-coded `overstrike_app` and created it
+      // when missing, which needs CREATEROLE. Managed Postgres (Fly, RDS, Cloud SQL) does not
+      // give you that, and its own user names cannot even contain an underscore.
+      //
+      // So the name is configurable, and passed as a PARAMETER into set_config rather than
+      // interpolated into the migration text. A migration reads it with
+      // `current_setting('overstrike.app_role')` and quotes it with `quote_ident`, so a role
+      // name never becomes SQL. The runner still validates it, because a value that reaches
+      // quote_ident having survived no check at all is a habit worth not forming.
+      const appRole = process.env.PLATFORM_APP_ROLE || 'overstrike_app';
+      if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,62}$/.test(appRole)) {
+        throw new Error(`migrate: PLATFORM_APP_ROLE ${JSON.stringify(appRole)} is not a valid role name`);
+      }
+      await db.query('select set_config($1, $2, false)', ['overstrike.app_role', appRole]);
+
       const applied = await appliedMigrations(db);
       const pending = planMigrations(files, applied);
       const done = [];
@@ -213,10 +232,20 @@ export async function runMigrations({ databaseUrl, client, dir = MIGRATIONS_DIR 
  *
  * @returns {Promise<{applied: string[], alreadyApplied: number}>}
  */
-export async function migrateCli({ databaseUrl = process.env.DATABASE_URL, dir = MIGRATIONS_DIR } = {},
+export async function migrateCli({
+  // MIGRATION_DATABASE_URL first, and it is not a convenience.
+  //
+  // 0009/0018 require the app to connect as a role that does NOT own these tables — an owner
+  // re-grants to itself and disables its own triggers, so audit_log cannot be append-only
+  // against its own owner. That means two credentials: the owner runs migrations, the app runs
+  // as something weaker. One DATABASE_URL cannot express that, and the deployment where both
+  // are the same is exactly the one where the audit guarantee is decoration. 0018 asserts they
+  // differ and fails the deploy if they do not.
+  databaseUrl = process.env.MIGRATION_DATABASE_URL || process.env.DATABASE_URL,
+  dir = MIGRATIONS_DIR } = {},
   out = console) {
   if (!databaseUrl) {
-    out.error('DATABASE_URL is not set');
+    out.error('neither MIGRATION_DATABASE_URL nor DATABASE_URL is set');
     return { applied: [], alreadyApplied: 0, ok: false };
   }
   const r = await runMigrations({ databaseUrl, dir });
