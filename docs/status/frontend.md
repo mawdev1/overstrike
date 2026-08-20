@@ -297,6 +297,33 @@ The pass remains unaccepted:
 - Stub/H1.1 and all CX B1 findings are unchanged; `uishell` remains absent and the game runtime
   is still imported statically.
 
+## Twelfth-pass adapter and provenance re-review
+
+At `9c439c8`, the `REQ-CC-055` runtime rule is accepted: authenticated and anonymous internal
+records persist with null account/session identity, linked internal request bodies are rejected,
+and personal bearer attribution remains intact. Missing/malformed builds now fail under the
+default configuration, malformed floors fail closed, session last-seen advances, and result
+replays report `applied:false`. Injected outbox failure also rolls back result, stats,
+idempotency, and event state atomically.
+
+The closure remains partial:
+
+- Consent expiry differs by adapter. Memory uses global `Date.now()` rather than its injected
+  clock and hides rather than deletes expired rows; Postgres has no expiry predicate and still
+  returns them. Signup continues to retain migrated rows, and the account consent triple has no
+  all-null/all-non-null constraint.
+- Stub interception precedes build/auth validation, so missing, malformed, and below-floor
+  builds still receive fixture responses. The stub's own advertised build string violates the
+  newly enforced grammar, which is not yet defined in the frozen contract.
+- Allocated-to-terminal finalization, persisted `result_applied_at`, terminal status events,
+  exact result validation/response/route, hidden-mode privacy, profile idempotency, wildcard
+  settings writes, and pagination remain open.
+- H1.1/CX B1 remain unchanged: the fixture matrix is incomplete, the shell/harness is absent,
+  and the engine is imported statically.
+- Commit `9c439c8` mixes ten CC-owned and five CX-owned files, so lanecheck rejects its exact
+  file set. It also changes frozen `telemetry.md` without a version or changelog/index amendment.
+  `REQ-CC-056` records the required non-destructive provenance/versioning repair.
+
 ## Gate and verification
 
 - Six P0.2 design files: **complete, review pending**; D3/D5 decisions synchronized.
@@ -317,8 +344,9 @@ The pass remains unaccepted:
 - P1 deployed profile/settings/telemetry audit: **failed** despite 475 isolated green checks; `REQ-CC-051`–`053` filed with real-store and HTTP acceptance paths.
 - Tenth-pass `REQ-CC-054` security re-review: **FUNCTIONALLY ACCEPTED**; one requested cross-account regression vector remains absent from the committed suite.
 - Eleventh-pass implementation re-review: **PARTIAL IMPROVEMENT; NOT ACCEPTED**. `REQ-CC-055` filed for bearer-derived identity on internal telemetry.
-- Contract entry: all 13 headers are `FROZEN` by explicit override; technical re-review is **NOT ACCEPTED** and `REQ-CC-042`–`046`, `048`–`053`, `055` retain open or partial findings.
-- Platform suite: **790 checks / 7 suites / 0 failures**; the result is insufficient because key connected vectors are absent and Postgres execution was skipped without `DATABASE_URL`.
+- Twelfth-pass `REQ-CC-055` runtime review: **ACCEPTED**; adapter expiry and contract-provenance findings remain.
+- Contract entry: all 13 headers are `FROZEN` by explicit override; technical re-review is **NOT ACCEPTED** and `REQ-CC-042`–`046`, `048`–`053`, `056` retain open or partial findings.
+- Platform suite: **791 checks / 7 suites / 0 failures**; the result is insufficient because key connected vectors are absent and Postgres execution was skipped without `DATABASE_URL`.
 - Root `npm run check` and `npm run build`: **PASS**.
 - `npm run uishell`: **FAIL**, required CX harness missing.
 - H1.1: **FAIL**. H1.2/H1.3: **NOT ACCEPTED**.
@@ -330,5 +358,6 @@ The pass remains unaccepted:
 The override permits CX to start the isolated shell, lazy runtime boundary, typed client core,
 and required `uishell` harness. Do not accept H1.1 fixtures or switch B3–B6 to live platform
 surfaces until the open request groups pass as connected flows. Backend priority is the
-finalizable match lifecycle/exact result route, internal telemetry identity policy, executable
-route-by-state stubs, and the remaining profile/settings/session exactness gaps.
+finalizable match lifecycle/exact result route, executable route-by-state stubs, consent-expiry
+adapter parity, and the remaining profile/settings exactness
+gaps. Repair `9c439c8` provenance/versioning only through a user-approved, non-destructive plan.
