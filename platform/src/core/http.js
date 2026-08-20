@@ -140,6 +140,34 @@ function buildBelowFloor(build, floor) {
 }
 
 /**
+ * Derive the client IP.
+ *
+ * `X-Forwarded-For` is client-controlled and trusting it blindly lets anyone forge their
+ * rate-limit identity. Trusting it NEVER is also wrong once a proxy is in front: every caller
+ * then shares the proxy's address, so §9's per-IP bucket becomes one global 10/min bucket and
+ * a single bad actor locks out every sign-in on the platform.
+ *
+ * So it is explicit. `trustedProxyHops` says how many proxies we actually run; we take the
+ * entry that many positions from the RIGHT, because everything to the right was appended by
+ * infrastructure we control and everything to the left is attacker-supplied. Zero hops means
+ * the header is ignored entirely, which is the correct default for a directly-exposed process.
+ */
+function clientIp(req, config) {
+  const socketIp = req.socket.remoteAddress || '';
+  const hops = config.trustedProxyHops || 0;
+  if (hops <= 0) return socketIp;
+
+  const header = req.headers['x-forwarded-for'];
+  if (typeof header !== 'string' || !header) return socketIp;
+
+  const chain = header.split(',').map((s) => s.trim()).filter(Boolean);
+  // The socket address is itself the last hop, so N trusted proxies means the client is N
+  // entries from the end of the header.
+  const idx = chain.length - hops;
+  return (idx >= 0 && idx < chain.length) ? chain[idx] : socketIp;
+}
+
+/**
  * Build the app.
  *
  * `deps` is everything a handler may reach: store, config, clock, logger, and the domain
@@ -212,7 +240,7 @@ export function createApp({ router, deps, onRequestEnd = null }) {
         body: await readJson(req),
         actor: null,          // filled by auth middleware when a token is present
         deps,
-        ip: req.socket.remoteAddress || '',
+        ip: clientIp(req, config),
         // Set-Cookie is the one response header a handler legitimately needs and cannot
         // express through a return value: auth §3 requires the refresh cookie to be set on
         // signup/signin/refresh and CLEARED on signout, and a cookie that is assembled and
