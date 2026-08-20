@@ -155,6 +155,82 @@ in; 28 modified files from prior sessions remain untouched.
 **Not pushed.** `origin/master` is 62 commits behind local, so publishing P0 would also publish
 the entire multiplayer phase history. That is well outside P0's scope and is a human decision.
 
+---
+
+## 2026-08-20 — P1 backend, and what the green suite was not measuring
+
+### Where it stands
+
+All 13 contracts are **FROZEN** (the human owner instructed proceeding without a further
+review round). `master` is pushed and CI is green on three jobs: **1368 checks on memory,
+1631 against real PostgreSQL**, migrations replayed as a no-op. Both Fly apps are live; the
+game server has cycled 84 matches with zero ticks behind.
+
+`/v1/matches/*` is mounted and its result payloads are validated to the leaf. Consent and
+idempotency retention now have actual sweeps. Contract amendments this session: `match-result`
+1.8.0, `http-api` 1.10.0, `telemetry` 1.10.0, `errors` 1.6.0, `net-facade` 1.9.0, `bomb-rules`
+1.7.0, `db-schema` 1.7.0.
+
+### The finding that matters more than the fixes
+
+A mutation sweep — delete one guard line, re-run the suite — found that **146 of 253 guards in
+`platform/src/**` can be deleted while the suite still reports every check green.**
+
+That number is the honest summary of this lane's testing to date. The suite is unusually
+explicit about why each test exists; what it did not have is any mechanism that fails when a
+guard stops guarding. Concretely, with the suite fully green:
+
+- deleting one line in `app.js` makes the platform **accept personal telemetry from a player
+  who explicitly declined it**. There is a decline test, but it builds its own verifier — and
+  the composition root replaces that verifier with a different one. The only decline assertion
+  in the repository exercised code that is never deployed.
+- `dateOfBirth: "banana"` returns `eligible: true` **and a signed receipt** that signup accepts.
+- a test titled "If-Match is compare-and-set, not read-then-write" passed with the CAS deleted,
+  including both of its controls, because it exercised the service pre-check — read-then-write,
+  the exact thing its title denied.
+
+### Three claims this lane made that were false
+
+Recorded here because the pattern is the point, not the individual errors.
+
+1. `net-facade.md` §8 was said, twice, to name the Bomb-position and outcome-matrix scenarios,
+   the second time to overrule a reviewer who had checked. `git log -S` shows those strings
+   never existed in the file.
+2. `REQ-CC-042.5` was answered as fixed after reading the amended contract. The contract was
+   right; `telemetry/registry.js` still carried the wrong retention class for pre-consent
+   funnel data.
+3. `REQ-CC-052` claimed If-Match was "verified with 8 concurrent writers on both adapters".
+   No such test existed. The adapter it described was meanwhile diverging: on PostgreSQL a CAS
+   against a version no row had **inserted** a row carrying the patch's own version.
+
+The common shape: a claim written from intention rather than from the file, and a green suite
+that could not contradict it. `match-result.md` §4.0 — cited by number in four documents and
+one source file — had never been written at all.
+
+### What changed structurally
+
+- `contracttest.mjs` parses the normative sentence out of a contract **and** drives the real
+  app over a real socket. A document and an implementation can no longer agree on paper.
+- `citest.mjs` fails if `npm run ci` names a file git does not track. `npm run ci` had passed
+  only on the one machine holding an untracked `tdmtest.mjs`, three times running, and the
+  workflow never called `npm run ci` at all.
+- `lanecheck --range` checks each commit separately. The union check inverted its own rule:
+  §0.2 demands a mixed change be split, and a correct split fails a union check.
+- `pgtest` is in CI with `CI=1`, so a missing database fails rather than skips. `pg` was in no
+  package.json and no lockfile — it survived locally as an unsaved `node_modules` entry.
+
+### Open
+
+- The mutation survivors are being closed in file-partitioned batches; the sweep is becoming a
+  permanent harness rather than a one-off.
+- `changeDisplayName` has no per-account serialisation, so two concurrent renames both pass the
+  30-day cooldown check. `display_name_folded` is `unique`, so the database backstops
+  NAME_TAKEN — nothing backstops the cooldown.
+- 13 of 16 auth HTTP routes have no test calling them. They work when driven by hand; this is a
+  guard gap, not a live defect.
+- `auth.md` §11 (age and eligibility) remains a **working default, not a legal position**, and
+  needs professional review before P8 and P11.
+
 ### Still blocked — the other lane
 
 `REQ-CX-001`, the Codex contract sufficiency sign-off, is the only remaining G0A blocker.
