@@ -4,7 +4,7 @@
 
 **Updated:** 2026-08-20
 **Phase:** P1 — forced contract freeze; connected-flow acceptance review
-**Overall:** BLOCKED AT H1.1/H1.2 — the headers are frozen by explicit override, but the executable stubs, telemetry privacy boundary, result lifecycle, and P1 CX deliverables do not pass
+**Overall:** BLOCKED AT H1.1/H1.2 — the headers are frozen by explicit override, but stub/live parity, result-submission exactness, auth/consent adapter parity, and P1 CX deliverables do not pass
 
 ---
 
@@ -324,6 +324,131 @@ The closure remains partial:
   file set. It also changes frozen `telemetry.md` without a version or changelog/index amendment.
   `REQ-CC-056` records the required non-destructive provenance/versioning repair.
 
+## Thirteenth-pass lifecycle, stub, and PostgreSQL re-review
+
+At `cb005a5`, the central result lifecycle and most named profile defects are materially fixed.
+Allocated rows finalize on both adapters; `result_applied_at` persists; first apply emits the
+terminal status event and `match.result_applied`; replay emits neither and returns
+`applied:false`; top-level required fields and DB outcome checks reject incomplete records.
+Privacy PATCH/idempotency, wildcard settings rejection, pagination validation, exact public
+projection, distinguishable hidden history, real stub delay/build gating/prerequisites/room
+errors/settings round-trip, and lobby invariants also improved.
+
+The real PostgreSQL harness independently started Postgres 16, applied all 13 migrations, passed
+1,283 checks, replayed migrations as a no-op, and removed the container. The memory suite passed
+1,055 checks. `REQ-CC-056` provenance repair is accepted: telemetry is versioned 1.8.0 with
+README/changelog entries, and every post-`9c439c8` commit is lane-clean.
+
+Remaining blockers:
+
+- Nested result validation accepts malformed rules, scores, rounds, roster/player members,
+  response-only fields, and unknown keys; draw+non-timer remains legal. No live result submission
+  or match-detail route exists, and the internal detail service has no participant authorization.
+- Outbox injection remains optional, allocated pending still serializes `startedAt:null` against
+  a timestamp-only contract, and administrative invalidation/queued-pending production remain
+  undefined. Original `REQ-CC-043/044` contract contradictions were not amended.
+- Hidden `mode=all` still uses the flat shape; hidden-history `items:null` has no contracted union;
+  profile idempotency has a Postgres get/execute/put race; rename writes no name-history row.
+- Consent expiry is now correct on access in both adapters, but no sweeper removes untouched
+  expired rows; signup still retains migrated rows and the account consent triple lacks its DB
+  constraint. The original `REQ-CC-042` contradictions remain, and README still says every
+  contract is presently 1.7.0 despite telemetry 1.8.0.
+- H1.1 still fails: no display-name availability endpoint, code-only coverage not frozen into
+  §11.11, client-session-isolated cross-tab state, forged stub tokens, correlation mismatch,
+  missing facade, always-enabled non-production stubs, and uncontracted setup/resume fields.
+- PostgreSQL and staged lane checks are manual-only. Root `ci` invokes neither and no repository
+  workflow exists; `pgtest` exits zero when Docker is unavailable. `REQ-CC-057` makes the protected
+  CI path non-skippable.
+- CX B1 remains unimplemented: no shell or `uishell` harness, and `Game` is still statically
+  imported/constructed.
+
+## Fourteenth-pass connected-contract, CI, and mutation re-review
+
+At committed HEAD `45a4cb7`, the backend has closed several previously central failures. The
+live match detail/result routes are mounted and authorised; result objects are validated to the
+leaf; allocated rows finalise; draw and terminal matrices are constrained in service and SQL;
+result, career, idempotency and both outbox events commit atomically. `REQ-CC-042`'s consent
+contract contradictions and `REQ-CC-044`'s reviewed lifecycle/aggregation paths are satisfied.
+Real CI enforcement also exists now: root `npm run ci` completed. A clean archive of committed
+HEAD passed 1,694 memory checks; its disposable PostgreSQL 16 run applied 16 migrations, passed
+2,014 checks, replayed them as a no-op, and removed the container. `check` and `build` passed;
+all 14 commits since `cb005a5` pass the authoritative per-commit lane-range guard.
+
+Acceptance still fails on connected behavior:
+
+- The contracted live display-name preflight is still 404. Its stub independently implements a
+  weaker policy: it reports long, doubled-space, and mixed-script names available, and stub
+  signup accepts the reserved name `admin`, while canonical auth rejects those names. Live
+  profile/signup/signin also omit the newly required `flags.setupNextStep`.
+- Stub assembly still ignores the default-off `platform.api.stub` flag; `X-Stub-Scenario` enables
+  fixtures in every non-production assembly. Stub settings accepts wildcard `If-Match`, and the
+  net-facade stub omits required `from` event fields and is not exposed through the contracted
+  `net.__stub`/flag surface. Several green coverage cells drive an unrelated endpoint rather
+  than the screen state they claim to own; `onboarding-happy` still skips essential settings.
+- Match-result submission accepts a missing required `Idempotency-Key`. It also accepts
+  contradictory `roster[]` and `players[]`, persists only players, and silently returns a
+  different roster. Its idempotency row lasts 30 days against the HTTP contract's 24-hour
+  gameplay retention. `REQ-CC-058` records these connected invariants.
+- Privacy-hidden career/history return null variants not defined by the frozen exact HTTP
+  schemas. Two valid case-only renames in one clock millisecond collide on the name-history
+  timestamp primary key.
+- PostgreSQL enforces the all-null/all-non-null account-consent triple, but the memory adapter
+  accepts partial triples and `db-schema.md` does not publish migration 0015's invariant.
+  Managed Supabase Auth is still replaced by bespoke stored scrypt credentials, contrary to the
+  frozen authority decision.
+- The contract README contradicts its own version table by saying every contract is presently
+  1.7.0 and that requests already resolved in this pass remain open. Build/correlation recovery
+  grammar and deployed settings ETag/session-touch vectors remain incomplete.
+- An evenly distributed mutation sample killed 28 of 40 guard deletions; 12 survived (30%).
+  This improves materially on the earlier 54% whole-tree measurement, but the ordinary green
+  suite still does not prove every guard. The sample snapshot included the concurrently edited,
+  uncommitted backend test file and is therefore evidence about that snapshot, not a clean-HEAD
+  score.
+- CX B1 is still absent: no `src/ui/shell/**`, no `scripts/uishell.mjs`, and `src/main.js`
+  statically imports and constructs `Game`. Consequently the no-engine-before-match gate and
+  required shell harness remain untestable.
+
+## Fifteenth-pass adversarial-test and adapter re-review
+
+Committed HEAD `7828938` substantially strengthens the proof surface without closing the P1
+integration gates. A clean archive passed 2,393 memory checks. A serial disposable PostgreSQL
+16 run passed 2,800 checks, all 16 migrations, and migration replay. An earlier PostgreSQL run
+performed concurrently with eight mutation workers produced one auth-test failure; the direct
+411-check auth suite and the complete serial rerun both passed, so it is recorded as a
+resource-sensitive test flake rather than a reproduced adapter defect. Build/check and all seven
+new per-commit lane checks pass; `citest` confirms every root-CI script is tracked.
+
+The new adversarial tests genuinely improve confidence. Match-detail authorization now proves a
+viewerless call and an empty roster fail closed, objective-actor redaction is exercised over real
+Bomb rounds, and settings assertions identify the exact rejected field/rule. The fresh mutation
+sample killed 36 of 40 evenly distributed guard deletions; four survived (10%, down from 30%).
+The remaining sampled survivors include two PostgreSQL not-found guards and the active-match 204
+projection, so the suite is stronger but still not complete evidence for every guard.
+
+Release-blocking findings remain:
+
+- `REQ-CC-058` reproduces unchanged. A service result without the required
+  `Idempotency-Key` applies; contradictory roster/player identities validate and persistence
+  silently replaces the submitted roster; the result idempotency TTL remains 30 days against
+  the contracted 24-hour gameplay retention.
+- Privacy-hidden stats and history still return null variants outside the frozen exact schemas.
+  Fresh settings return `updatedAt:null` where §11.2 requires a timestamp. Two valid case-only
+  name edits in one millisecond still collide on the name-history timestamp primary key.
+- The newly contracted live display-name endpoint remains 404 and the stub's independent policy
+  still accepts names canonical auth rejects, including reserved-name signup. Live auth/profile
+  still omit `flags.setupNextStep`; the stub remains default-on in every non-production assembly;
+  wildcard settings, facade payload/flag wiring, semantically unrelated matrix owners, and the
+  skipped essential-settings happy-path remain.
+- PostgreSQL enforces the consent triple as all-null/all-non-null, while the memory adapter still
+  accepts partial rows and the frozen DB contract omits migration 0015's invariant. Managed
+  Supabase Auth remains replaced by locally stored bespoke scrypt credentials.
+- HTTP build grammar and invalid-correlation recovery remain code-only. Session touch and live
+  settings behavior work, but the requested deployed endpoint assertions remain incomplete.
+  The contract README still contradicts its version table and current request statuses.
+- CX B1 remains completely absent: no shell directory, no `uishell` file, no lazy engine import,
+  and no contracted `net.__stub` surface. H1.1 therefore still fails and H1.2/H1.3 remain
+  unaccepted.
+
 ## Gate and verification
 
 - Six P0.2 design files: **complete, review pending**; D3/D5 decisions synchronized.
@@ -345,8 +470,18 @@ The closure remains partial:
 - Tenth-pass `REQ-CC-054` security re-review: **FUNCTIONALLY ACCEPTED**; one requested cross-account regression vector remains absent from the committed suite.
 - Eleventh-pass implementation re-review: **PARTIAL IMPROVEMENT; NOT ACCEPTED**. `REQ-CC-055` filed for bearer-derived identity on internal telemetry.
 - Twelfth-pass `REQ-CC-055` runtime review: **ACCEPTED**; adapter expiry and contract-provenance findings remain.
-- Contract entry: all 13 headers are `FROZEN` by explicit override; technical re-review is **NOT ACCEPTED** and `REQ-CC-042`–`046`, `048`–`053`, `056` retain open or partial findings.
-- Platform suite: **791 checks / 7 suites / 0 failures**; the result is insufficient because key connected vectors are absent and Postgres execution was skipped without `DATABASE_URL`.
+- Thirteenth-pass lifecycle/profile/stub review: **MATERIAL IMPROVEMENT; NOT ACCEPTED**. `REQ-CC-056` accepted; `REQ-CC-057` filed for non-skippable CI enforcement.
+- Fourteenth-pass connected-contract/CI review: **MATERIAL IMPROVEMENT; NOT ACCEPTED**.
+  `REQ-CC-042`, `044`, and `057` accepted; `REQ-CC-058` filed.
+- Fifteenth-pass adversarial/adapter review: **TEST DEPTH IMPROVED; NOT ACCEPTED**.
+  `REQ-CC-044` remains accepted; `REQ-CC-043` is materially improved but its downstream
+  `REQ-CC-058` invariants remain open; `REQ-CC-052` remains partial.
+- Contract entry: technical re-review is **NOT ACCEPTED**. `REQ-CC-043`, `045`, `046`, `048`,
+  `049`, `050`, `051`, `052`, `053`, and `058` retain open or partial findings.
+- Clean-HEAD platform memory suite: **2,393 checks / 10 suites / 0 failures**.
+- Clean-HEAD serial PostgreSQL suite: **2,800 checks / 10 suites / 0 failures**; 16 migrations and no-op replay passed.
+- Root `npm run ci`: **PASS**, including real PostgreSQL, simulation, WebSocket, and server lifecycle.
+- Mutation sample: **36 killed / 4 survived / 40 guards**; 10% survival on clean committed HEAD.
 - Root `npm run check` and `npm run build`: **PASS**.
 - `npm run uishell`: **FAIL**, required CX harness missing.
 - H1.1: **FAIL**. H1.2/H1.3: **NOT ACCEPTED**.
@@ -358,6 +493,86 @@ The closure remains partial:
 The override permits CX to start the isolated shell, lazy runtime boundary, typed client core,
 and required `uishell` harness. Do not accept H1.1 fixtures or switch B3–B6 to live platform
 surfaces until the open request groups pass as connected flows. Backend priority is the
-finalizable match lifecycle/exact result route, executable route-by-state stubs, consent-expiry
-adapter parity, and the remaining profile/settings exactness
-gaps. Repair `9c439c8` provenance/versioning only through a user-approved, non-destructive plan.
+stub/live display-name and resume parity, result-submission relational/idempotency invariants,
+executable route-by-state semantics, consent adapter parity, and the remaining profile contract
+variants. CX priority remains B1's isolated shell, lazy runtime boundary, and executable harness.
+
+## P1 CX shell/client implementation and assembled-app review
+
+The CX-owned P1 surface is now implemented in the shared worktree without modifying the
+pre-existing dirty game/server files. This supersedes the earlier statements in this status
+file that B1 and `uishell` are absent; those statements remain as dated review history.
+
+Delivered:
+
+- B1: a 27-route History API shell with deterministic loading/empty/error/offline/terminal/
+  ready fixtures, one main/h1, route focus, modal trapping/restoration, session/connection
+  layers, responsive scrolling, reduced motion, and a capability gate. `Game` is no longer a
+  static dependency of `src/main.js`; the production build places it in a separate lazy chunk,
+  and WebGL context creation begins only from match loading.
+- B2: one closed platform client with client ULIDs/build headers, strict correlation agreement,
+  memory-only access tokens, httpOnly-cookie refresh, per-tab single-flight plus cross-tab refresh
+  serialization, stale-response-safe terminal revocation, cross-tab logout, closed success-shape
+  guards, deterministic transport errors, and bounded retry restricted to idempotent or
+  idempotency-keyed operations.
+- B3/B4: eligibility/consent/signup/verification/terms/essential setup, signin/recovery/signout,
+  device-session revocation, reload resume, room/career/mode/weapon/history/detail/results views,
+  and stale-response-safe pagination. The shell API maps these operations to frozen HTTP shapes
+  and fails closed where the live platform surface is not contracted or implemented.
+- B5: all 54 inventory settings plus all 31 configurable binding actions, exact seven categories and
+  `ROAM|DEVICE|SESSION|PRACTICE` scopes, local-schema repair/migration, roaming schema v1
+  hydration, edit-safe debounced write-through and ETag conflict handling, explicit rebind
+  conflict choices, reset previews, reduced-motion preset, cross-tab provenance/reconciliation,
+  and exact allowlisted measured-only diagnostics. The shell/controller layer applies every safe
+  preference hook; the current local game runtime still consumes only its legacy subset. Newly
+  inventoried camera/caption/audio/crosshair/HUD values and later-phase chat/ping/mute/spectator
+  bindings that lack a runtime adapter are explicitly labelled pending rather than represented as
+  completed live behavior.
+- B6: the complete closed client-event registry, consent-gated personal events, permanently
+  unlinked internal events, separate 50-event/64-KB batches, a 500-event validated session queue,
+  ten-second cadence, 30-minute expiry, one delayed retry, flag-controlled sender, raw-error/PII
+  exclusion, and shell abandonment/settings-friction/connection/error/WebGL/unsupported hooks.
+  First-match and return-outcome emitters are present but cannot produce authoritative records
+  until the CC-owned live match facade supplies the terminal lifecycle projection; local practice
+  does not fabricate an online result.
+
+- Client-visible feature flags now use the frozen registry and compiled defaults, refresh after
+  authentication/expiry/return, retain stale values during a bounded background retry, hide or
+  disable the contracted shell surfaces, and stop/drop telemetry when its kill switch is off.
+
+Assembled-app defects caught during review were repaired before this entry: the shell and HTTP
+client now share the same `SessionState`; cookie refresh feeds the authoritative profile into
+setup/match/room resume; signed-in settings hydrate before resume where available; hydrated
+accessibility preferences reapply to the document; the D5 floor is dual-core/8 GB system RAM;
+and a real platform handoff cannot accidentally launch an offline practice match. Only explicit
+fixture/local-practice handoffs may load the current local runtime.
+
+D5 enforcement is exact for observable API/pointer/touch/WebGL2/WebSocket signals, Safari 17,
+Windows 10, macOS 13, dual-core, and reported 8-GB RAM. Browser APIs do not expose VRAM and omit
+RAM on Safari/Firefox, and “latest two” Chrome/Edge/Firefox cannot be derived from a user agent
+without an authoritative moving version floor. Those rows remain manual/release-config evidence;
+the client reports unknown values honestly and does not claim they were measured.
+
+Verification at the implementation snapshot:
+
+- `npm run uishell`: **PASS — 1,257 assertions**, including every applicable route × fixture
+  variant, landmarks/headings/focus, dialog keyboard behavior, 200% zoom, reduced motion,
+  no WebGL/game/three before match loading, and one lazy runtime request.
+- `node src/ui/platform/platform.test.mjs`: **PASS**, including ten concurrent expired-token
+  requests with one refresh, retry/correlation/error exactness, cross-tab revocation, telemetry
+  privacy/queue/expiry/retry behavior, and shell-to-contract mappings.
+- `npm run check`: **PASS — 74 modules / 201 imports**.
+- `npm run build`: **PASS**. Initial shell JS is 160.23 KB; the game runtime is a separate
+  819.57 KB lazy chunk.
+- `npm run platformtest`: **PASS — 2,393 checks / 10 suites / 0 failures**.
+- Scoped lanecheck: **PASS — 32 files: 31 CX, one shared handoff file, 0 CC/unowned files**.
+
+External gates remain honest rather than papered over. `REQ-CC-059` records that browser
+`sendBeacon` cannot supply the required build/correlation headers or account bearer subject;
+unload delivery therefore stays fail-closed and queued. `REQ-CC-060` records that the repository
+has no same-origin Vite-to-platform `/v1` path, so the browser cannot exercise the mounted stub
+under the documented development commands. `REQ-CC-061` records the missing closed browser
+transport codes needed for honest `connection.failure` telemetry. `REQ-CC-045/046/050/058` and the prior profile/auth
+findings still prevent H1.1/H1.2/G0 acceptance. The P1 shell/client/controller slice is complete;
+CX P1 overall remains **partial** for the explicitly listed runtime-setting and unmeasurable D5
+rows, and the platform gate is **not** claimed complete until the CC dependencies pass.

@@ -615,7 +615,8 @@ export class HUD {
      ====================================================================== */
 
   _applyAllSettings() {
-    for (const k of ['hudScale', 'crosshairStyle', 'crosshairColor', 'showMinimap', 'showFps', 'showDamageNumbers']) {
+    for (const k of ['hudScale', 'crosshairStyle', 'crosshairColor', 'showMinimap', 'showFps',
+      'showDamageNumbers', 'binds']) {
       this._applySetting(k, this.game?.settings?.get?.(k));
     }
   }
@@ -655,6 +656,12 @@ export class HUD {
       case 'showDamageNumbers':
         this._showDnums = v !== false;
         if (!this._showDnums) for (const d of this._dnums) this._freeDnum(d);
+        break;
+      case 'binds':
+        // Binding labels are read lazily. Invalidate prompt caches so a visible reload or
+        // killstreak prompt changes on the next HUD poll rather than after unrelated ammo state.
+        this._c.ammoState = '';
+        this._c.streaks = '';
         break;
       default:
         break;

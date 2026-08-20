@@ -23,9 +23,9 @@ export class Input {
     this.mouseDX = 0;
     this.mouseDY = 0;
     this.wheelDelta = 0;
-    this.buttons = [false, false, false];
-    this.buttonsPressed = [false, false, false];
-    this.buttonsReleased = [false, false, false];
+    this.buttons = [false, false, false, false, false];
+    this.buttonsPressed = [false, false, false, false, false];
+    this.buttonsReleased = [false, false, false, false, false];
 
     this.locked = false;
     this.enabled = true;
@@ -131,7 +131,7 @@ export class Input {
   _clearHeld() {
     this.actions.clear();
     this.codes.clear();
-    this.buttons[0] = this.buttons[1] = this.buttons[2] = false;
+    this.buttons.fill(false);
     this.mouseDX = this.mouseDY = 0;
   }
 
@@ -161,6 +161,8 @@ export class Input {
     if (action) {
       this.actions.add(action);
       this.pressed.add(action);
+      if (action === 'nextWeapon') this.wheelDelta += 1;
+      else if (action === 'previousWeapon') this.wheelDelta -= 1;
     }
     this.game.bus.emit('keydown', { code: e.code, action });
   }
@@ -169,30 +171,57 @@ export class Input {
     this.codes.delete(e.code);
     const action = this.settings.actionFor(e.code);
     if (action) {
-      this.actions.delete(action);
-      this.released.add(action);
+      if (!this._actionHeld(action)) {
+        this.actions.delete(action);
+        this.released.add(action);
+      }
     }
     this.game.bus.emit('keyup', { code: e.code, action });
   }
 
   _onMouseDown(e) {
-    if (e.button < 3) {
+    if (e.button >= 0 && e.button < this.buttons.length) {
       this.buttons[e.button] = true;
       this.buttonsPressed[e.button] = true;
+      const action = this.settings.actionFor(`Mouse${e.button + 1}`);
+      if (action) {
+        this.actions.add(action);
+        this.pressed.add(action);
+      }
     }
     this.game.bus.emit('mousedown', { button: e.button, target: e.target });
   }
 
   _onMouseUp(e) {
-    if (e.button < 3) {
+    if (e.button >= 0 && e.button < this.buttons.length) {
       this.buttons[e.button] = false;
       this.buttonsReleased[e.button] = true;
+      const action = this.settings.actionFor(`Mouse${e.button + 1}`);
+      if (action) {
+        if (!this._actionHeld(action)) {
+          this.actions.delete(action);
+          this.released.add(action);
+        }
+      }
     }
   }
 
   _onWheel(e) {
     if (this.locked) e.preventDefault();
-    this.wheelDelta += Math.sign(e.deltaY);
+    const action = this.settings.actionFor(e.deltaY < 0 ? 'WheelUp' : 'WheelDown');
+    if (action) {
+      this.pressed.add(action);
+      if (action === 'nextWeapon') this.wheelDelta += 1;
+      else if (action === 'previousWeapon') this.wheelDelta -= 1;
+    }
+  }
+
+  _actionHeld(action) {
+    for (const code of this.codes) if (this.settings.actionFor(code) === action) return true;
+    for (let button = 0; button < this.buttons.length; button += 1) {
+      if (this.buttons[button] && this.settings.actionFor(`Mouse${button + 1}`) === action) return true;
+    }
+    return false;
   }
 
   // ---- query API ----
@@ -200,11 +229,11 @@ export class Input {
   wasPressed(action) { return this.enabled && this.pressed.has(action); }
   wasReleased(action) { return this.enabled && this.released.has(action); }
   isCode(code) { return this.codes.has(code); }
-  get fire() { return this.enabled && this.buttons[0]; }
-  get aim() { return this.enabled && this.buttons[2]; }
-  get firePressed() { return this.enabled && this.buttonsPressed[0]; }
-  get aimPressed() { return this.enabled && this.buttonsPressed[2]; }
-  get aimReleased() { return this.enabled && this.buttonsReleased[2]; }
+  get fire() { return this.isDown('fire'); }
+  get aim() { return this.isDown('aim'); }
+  get firePressed() { return this.wasPressed('fire'); }
+  get aimPressed() { return this.wasPressed('aim'); }
+  get aimReleased() { return this.wasReleased('aim'); }
 
   /** Drain accumulated mouse movement. Returns raw pixels. */
   consumeLook(out = { x: 0, y: 0 }) {
@@ -221,8 +250,8 @@ export class Input {
   endFrame() {
     this.pressed.clear();
     this.released.clear();
-    this.buttonsPressed[0] = this.buttonsPressed[1] = this.buttonsPressed[2] = false;
-    this.buttonsReleased[0] = this.buttonsReleased[1] = this.buttonsReleased[2] = false;
+    this.buttonsPressed.fill(false);
+    this.buttonsReleased.fill(false);
   }
 
   dispose() {

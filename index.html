@@ -2,22 +2,31 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>OVERSTRIKE</title>
 <meta name="description" content="A browser-native first-person shooter. No downloads, no plugins, no assets — everything is generated at runtime." />
 <meta name="color-scheme" content="dark" />
+<script>
+try {
+  const saved = JSON.parse(localStorage.getItem('overstrike.shell.settings.roam.v2') || 'null');
+  if (saved?.values?.reduceMotion === true) document.documentElement.classList.add('os-prefer-reduced-motion');
+} catch { /* Storage is optional; the OS preference remains authoritative. */ }
+</script>
 <link rel="stylesheet" href="/src/styles.css" />
 </head>
 <body>
   <div id="app">
-    <canvas id="game-canvas"></canvas>
-    <div id="hud" aria-hidden="true"></div>
-    <div id="ui"></div>
-    <div id="boot">
-      <div class="boot-logo">OVERSTRIKE</div>
-      <div class="boot-bar"><i></i></div>
-      <div class="boot-msg">initialising</div>
-    </div>
+    <div id="shell-root"></div>
+    <section id="game-layer" aria-label="Match runtime" aria-hidden="true" inert hidden>
+      <canvas id="game-canvas" aria-label="OVERSTRIKE match"></canvas>
+      <div id="hud" aria-hidden="true"></div>
+      <div id="ui"></div>
+      <div id="boot" hidden>
+        <div class="boot-logo">OVERSTRIKE</div>
+        <div class="boot-bar"><i></i></div>
+        <div class="boot-msg">Loading match runtime</div>
+      </div>
+    </section>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

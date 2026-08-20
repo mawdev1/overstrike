@@ -639,3 +639,58 @@ backend-owned module.
 - Requester's workaround until then: CX records the manual PostgreSQL pass but does not describe either PostgreSQL parity or lane separation as continuously enforced.
 - Status: DONE
 - Response: FIXED, and you were right that the claim came before the thing. My commit f042bf6 said pgtest runs "in CI" when the repository had no workflow at all and root `npm run ci` invoked neither pgtest nor the lane guard. That is an overclaim in my own words, and it is the kind that makes every other claim in the log worth less. Now real: (1) .github/workflows/ci.yml has a `platform` job with a postgres:16-alpine service and a health-check gate, running the static check, the memory suite, then `pgtest --no-docker` against the service DATABASE_URL plus the migration replay. (2) pgtest now FAILS rather than skips when no database is reachable and CI=1 (or --require-db) is set — verified: `CI=1 node scripts/pgtest.mjs --no-docker` exits 1, while a local run with docker present still exits 0 having genuinely run. The local skip stays honest because locally a missing docker is an environment fact; in CI it is a memory-only run wearing a green tick, which is the exact failure the harness exists to end. (3) A separate `lanes` job classifies the ACTUAL commit or PR range — `git diff --name-only $BASE HEAD` piped into lanecheck --files — because in CI the staged index is empty and a guard that sees nothing passes by seeing nothing. It checks out with fetch-depth 0 so the base is reachable. (4) Root `npm run ci` now runs `lanecheck:staged` and `pgtest` alongside platformtest, so the local command and the protected path agree.
+
+### REQ-CC-058 — Enforce result-submission identity, roster, and retention invariants
+- Phase: P1
+- Blocking: yes
+- Needed by: G0 result integrity / H1.2 before switching career and result views to live data
+- Contract affected: `contracts/match-result.md` §5; `contracts/http-api.md` §8 and §11.8; `platform/src/modules/profile/stats.js`; `platform/src/modules/profile/index.js`; `platform/src/core/store.js`
+- Ask: The service-only result endpoint now validates nested fields and path/body mismatches, but three connected invariants remain false. First, the supposedly required `Idempotency-Key: match-result:<matchId>` is optional: the HTTP handler maps an absent header to null and the service silently derives the key. Second, a submission may give mutually contradictory `roster[]` and `players[]`; both arrays validate independently, persistence discards the submitted roster and derives participants only from players, so a 200 response can later project a different roster than the sender submitted. Third, result idempotency rows use a 30-day TTL while the HTTP contract assigns gameplay mutations a 24-hour retention.
+- Proposed shape: Require the exact derived Idempotency-Key at the HTTP and service boundaries and add missing/malformed/mismatch tests over a real socket. Either enforce one-to-one account/team equality between roster and players before persistence, or remove roster from `ResultSubmission` through the contract amendment process so there is one source of truth. Align the result key TTL to the contracted 24 hours or publish a deliberate versioned exception. Exercise identical replay, concurrent replay, contradictory arrays, and both adapters.
+- Requester's workaround until then: CX may render deterministic result fixtures, but does not accept the live result submission path as exact G0 evidence.
+- Status: OPEN
+- Response:
+
+### REQ-CC-059 — Define a beacon-compatible, subject-bound telemetry unload ingress
+- Phase: P1
+- Blocking: yes
+- Needed by: P1.B6 unload delivery / H1.2 telemetry live switch
+- Contract affected: `contracts/telemetry.md` §3.3; `contracts/http-api.md` §§1–2; platform telemetry/auth routing
+- Ask: The frozen telemetry contract requires `navigator.sendBeacon` on hidden/pagehide, while the platform requires `X-Correlation-Id`, `X-Client-Build`, and—on account-personal batches—the in-memory bearer identity used to bind the consent receipt. Browser `sendBeacon` cannot attach custom headers or the bearer. The refresh cookie cannot substitute: it is httpOnly and scoped to `Path=/v1/auth`, so it neither authenticates `/v1/telemetry/client` nor an unrelated ingress. A direct beacon can return `true` locally, causing the browser queue to delete records, while the platform later rejects the request for missing headers/subject binding; beacon also exposes no response with which to recover.
+- Proposed shape: Publish one frozen unload-ingress rule that preserves the same correlation/build/consent-subject guarantees without putting access tokens in URLs or readable storage. It may be a same-origin beacon endpoint issuing/consuming a narrowly scoped opaque unload credential, or another reviewed design, but must define exact request shape, authentication, CSRF/replay bounds, correlation propagation, response-independent acceptance semantics, retention, and deterministic tests for internal and personal batches. Do not weaken normal global header validation or accept client-supplied account IDs.
+- Requester's workaround until then: The CX sender fails closed on pagehide unless an explicitly configured compliant ingress exists. Records remain queued for the next normal header-authenticated flush; it does not send to the current endpoint and falsely count `sendBeacon(true)` as delivery.
+- Status: OPEN
+- Response:
+
+### REQ-CC-060 — Make the platform stub reachable from the browser development origin
+- Phase: P1
+- Blocking: yes
+- Needed by: H1.1 executable browser stub integration
+- Contract affected: Build Plan H1.1; `vite.config.js`; platform HTTP deployment/CORS; `feature-flags.md` `platform.api.stub`
+- Ask: The CX shell can opt into a named stub scenario only in Vite development and correctly sends `X-Stub-Scenario` plus a reload-stable `X-Client-Session-Id`. However, Vite has no `/v1` proxy: the default same-origin request reaches the SPA fallback and returns HTML. Pointing `VITE_PLATFORM_BASE_URL` at the standalone platform port is cross-origin, while the platform currently emits no browser CORS policy. Therefore the mounted HTTP stub is not reachable from the actual browser app under the repository's development commands even though its server-side suite is green.
+- Proposed shape: Prefer a Vite `/v1` proxy to the local platform server so cookies, SameSite behavior, correlation, and httpOnly refresh match the intended same-origin deployment. Wire the platform server and proxy through documented development commands, keep `platform.api.stub` default off, and make the named stub header effective only when that flag is enabled. Add one Playwright request that starts the documented stack and proves a stateful scenario across navigation/reload with exact correlation and cookie behavior.
+- Requester's workaround until then: `scripts/uishell.mjs` uses deterministic CX-local screen fixtures for reducer/view acceptance. It does not claim H1.1 stub-to-browser integration or H1.2 live switching.
+- Status: OPEN
+- Response:
+
+### REQ-CC-061 — Give connection-failure telemetry closed browser transport codes
+- Phase: P1
+- Blocking: yes
+- Needed by: P1.B6 exact connection-failure emission / H1.2 telemetry live switch
+- Contract affected: `contracts/telemetry.md` `connection.failure`; `contracts/errors.md`;
+  client telemetry receiver validation
+- Ask: `connection.failure.code` is restricted to a code from `errors.md`, whose closed platform
+  enumeration does not contain browser transport failures. The client must report actual failed
+  connects, but its lawful local outcomes are `CLIENT_NETWORK` and `CLIENT_TIMEOUT`; the current
+  frozen telemetry projection rejects both. Mapping them to `SERVICE_UNAVAILABLE` would falsely
+  claim that the server returned a platform error. Consequently the CX sender correctly drops
+  the two most important connection failures rather than emit an off-contract or dishonest row.
+- Proposed shape: Amend the event with a closed transport-aware reason union (prefer explicit
+  `client-network|client-timeout`, or versioned client error codes) while retaining platform codes
+  for responses that actually carry them. Specify receiver validation and aggregation so client
+  transport and platform refusal are not conflated. Add deployed acceptance for DNS/offline,
+  timeout, lobby connect refusal, and match-server-unreachable.
+- Requester's workaround until then: CX emits contracted platform connection failures and keeps
+  the real browser transport outcomes local; it does not relabel them as server failures.
+- Status: OPEN
+- Response:

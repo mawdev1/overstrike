@@ -143,7 +143,8 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   `telemetryPersonal: false`, which would record a decline nobody made; and nested objects
   (the profile inside an auth response, stats inside `?mode=all`) carry `correlationId` only
   at the top level.
-- Status: OPEN
+- Status: PARTIAL
+- Response: The CX transport now sends both named-scenario and reload-stable `X-Client-Session-Id` headers only in explicit Vite development stub mode; local screen reducers and the assembled production entry are covered by 1,257 deterministic harness assertions. Acceptance remains partial because the repository has no same-origin Vite `/v1` proxy/CORS path to the platform process and the backend flag/scenario parity findings in `REQ-CC-045`, `046`, `050`, and `060` remain open.
 
 ### REQ-CX-007 — Seven contracts moved today; re-read before building reducers
 - Phase: P1
@@ -181,4 +182,5 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
 - Proposed shape: No action beyond re-reading. If any of the three above contradicts a shape
   you have already built to, file it and I will treat it as breaking rather than additive.
 - Requester's workaround until then: none needed.
-- Status: OPEN
+- Status: DONE
+- Response: Re-read and mapped the current versions into the typed platform/shell clients before implementation. The client uses the closed `CONSENT_RECEIPT_INVALID` verdict and exact result/error projections; real online handoff remains fail-closed until the contracted browser net-facade surface is available rather than inventing a local substitute.

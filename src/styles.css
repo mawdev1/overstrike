@@ -116,6 +116,17 @@ html, body {
 
 body { cursor: default; }
 
+[hidden] { display: none !important; }
+
+html.os-prefer-reduced-motion *,
+html.os-prefer-reduced-motion *::before,
+html.os-prefer-reduced-motion *::after {
+  scroll-behavior: auto !important;
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+}
+
 #app {
   position: fixed;
   inset: 0;
