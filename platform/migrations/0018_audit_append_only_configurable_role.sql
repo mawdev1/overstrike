@@ -86,6 +86,45 @@ begin
   end loop;
   execute format('grant insert, select on audit_log to %I', app_role);
 
+  -- Explicit DML on everything EXCEPT audit_log.
+  --
+  -- The reason this is needed is the reason the revoke above was not enough. PostgreSQL's
+  -- built-in `pg_write_all_data` grants INSERT/UPDATE/DELETE on every table IMPLICITLY — the
+  -- privilege is not in any table's ACL, so it cannot be revoked per table. A member of it
+  -- holds UPDATE on audit_log no matter what this file does, and `has_table_privilege` says so.
+  -- Fly's `writer` role is a member, which is why the first two deployment attempts failed
+  -- here with the app role still holding UPDATE and DELETE.
+  --
+  -- So the app role must NOT be a member of pg_write_all_data — on Fly that means the `reader`
+  -- role, which carries only pg_read_all_data — and its write privileges must be granted
+  -- explicitly, per table, by this migration. That is a better arrangement than the group
+  -- anyway: writes are enumerated rather than ambient, and audit_log is excluded by being
+  -- absent from the list rather than by a revoke that a built-in role can outvote.
+  for bad in
+    select quote_ident(tablename) from pg_tables
+     where schemaname = 'public' and tablename <> 'audit_log'
+  loop
+    execute 'grant select, insert, update, delete on ' || bad || ' to ' || quote_ident(app_role);
+  end loop;
+
+  -- Sequences behind any identity/serial column; without USAGE an insert fails at nextval.
+  for bad in
+    select quote_ident(sequencename) from pg_sequences where schemaname = 'public'
+  loop
+    execute 'grant usage, select on sequence ' || bad || ' to ' || quote_ident(app_role);
+  end loop;
+
+  -- The membership itself, asserted. If the app role is in pg_write_all_data, everything above
+  -- is decoration and the deploy must stop rather than report an append-only audit_log it does
+  -- not have.
+  if pg_has_role(app_role, 'pg_write_all_data', 'USAGE') then
+    raise exception
+      'migrate 0018: % is a member of pg_write_all_data, which grants UPDATE and DELETE on '
+      'every table implicitly and cannot be revoked per table. audit_log cannot be append-only '
+      'for this role. Use a role without that membership (on Fly Managed Postgres: `reader`, '
+      'not `writer`); this migration grants the writes the application actually needs.', app_role;
+  end if;
+
   -- Prove it, in the same transaction as the grant. A migration that asserts nothing is a
   -- migration that can silently do nothing — which is exactly how 0007 shipped green.
   select string_agg(priv, ', ') into bad
