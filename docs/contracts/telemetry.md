@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.6.0 |
+| **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -46,7 +46,7 @@ its own.
 | Event | Measures |
 |---|---|
 | `flow.step` | Each first-run step from `consent` onward, with its outcome — the spine of the funnel |
-| `funnel.preconsent` | Landing and eligibility, as **unlinked internal counts**. The only lawful measurement of the two steps that precede consent |
+| `funnel.preconsent` | Landing, eligibility, **and the consent screen itself**, as unlinked internal counts. The only lawful measurement of the steps that precede a decision |
 | `session.first_match` | Time to first match and whether it completed |
 | `lobby.abandoned` | Left before launch, with the last state reached |
 | `connection.failure` | Failed connect, by stage and `errors.md` code |
@@ -135,6 +135,7 @@ authorization, rate-limit identity, or anything that matters.
 | Failure | Silent. A telemetry failure is never visible to the player and never blocks a frame |
 | Unknown `name` | Rejected server-side and counted; the batch still succeeds |
 | Missing/invalid `consentReceipt` | Personal-class events in the batch are **rejected**; internal-class still accepted. The batch does not fail as a whole |
+| `consentReceipt` on an internal-only batch | **Not required, and should be absent.** A receipt on a batch carrying no personal events is an identifier with no purpose |
 | Payload | Per-name **allowlist**. Keys outside it are dropped server-side, not stored-and-filtered |
 
 **Never persisted in the queue:** access tokens, refresh cookies, raw error strings, chat
@@ -152,8 +153,8 @@ Every payload below is closed: unlisted keys are dropped server-side, not stored
 
 | `name` | v | Class | Payload |
 |---|---:|---|---|
-| `flow.step` | 1 | personal | `{ step, outcome }` — step `consent`\|`signup`\|`signin`\|`verify`\|`terms`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results`; outcome `viewed`\|`completed`\|`failed`; `errorCode` required when `failed`, else null. **`landing` and `eligibility` are absent** — they precede the consent decision and can never be lawfully emitted here (REQ-CC-034) |
-| `funnel.preconsent` | 1 | internal | `{ step, outcome }` — step `landing`\|`eligibility`; outcome `viewed`\|`completed`\|`failed`. **Unlinked**: no `clientSessionId`, no account, no correlation to any later event. Carries the top-of-funnel counts §3.1 promises |
+| `flow.step` | 1 | personal | `{ step, outcome }` — step `signup`\|`signin`\|`verify`\|`terms`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results`; outcome `viewed`\|`completed`\|`failed`; `errorCode` required when `failed`, else null. **Begins at `signup`** — every earlier step precedes the decision that authorises personal telemetry (REQ-CC-039) |
+| `funnel.preconsent` | 1 | internal | `{ step, outcome }` — step `landing`\|`eligibility`\|`consent`; outcome `viewed`\|`completed`\|`failed`. **Never carries the decision value.** Unlinked — see §3.5.1 |
 | `session.first_match` | 1 | personal | `{ completed: bool, mode, timeToFirstMatchSec: 0–86400 }` |
 | `lobby.abandoned` | 1 | personal | `{ lastState, dwellSec: 0–86400 }` — lastState `browsing`\|`joining`\|`in-lobby`\|`countdown` |
 | `room.join_failure` | 1 | personal | `{ code, joinBlockedReason }` — both closed enums from `errors.md` / `http-api.md` §11.3; `joinBlockedReason` null when the failure was not a block |
@@ -184,6 +185,22 @@ display names and chat.
 
 Adding an event is additive — a new row plus a version. Changing an existing payload's meaning
 is a CCR, because the warehouse already has rows under the old interpretation.
+
+### 3.5.1 What "unlinked" means, enforceably (REQ-CC-039)
+
+"No correlation to any later event" is only real if the correlation ID cannot be the link.
+Every other event carries the originating request's id; `funnel.preconsent` must not.
+
+| Rule | Value |
+|---|---|
+| `correlationId` | **Freshly generated per event.** Never the eligibility or consent request's id, never the batch's, never reused between two `funnel.preconsent` events |
+| `clientSessionId` | Absent from the event **and** from any batch containing one (§3.3) |
+| Batch mixing | A batch containing `funnel.preconsent` carries **no** personal-class events. The two never travel together |
+| Server handling | Stored without any join key. There is no column to correlate on, so the guarantee survives a future query nobody has written yet |
+
+Reusing the eligibility request's correlation ID would have re-linked the visitor through the
+server logs of a request they made two screens earlier — which is precisely the linkage the
+class exists to prevent.
 
 ### 3.6 Bound vocabulary (REQ-CC-032)
 

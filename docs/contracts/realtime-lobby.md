@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.5.0 |
+| **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] shell UI, presence service, room service |
 
@@ -252,6 +252,21 @@ authoritative and discard local deltas rather than merging.
 
 ## 10. Stub
 
-`lobby.stub` replays scripted timelines with no server: `happy-path`, `player-joins-mid`,
-`team-full`, `ready-cleared`, `countdown-abort`, `allocation-failed`, `disconnect-resync`,
-`sanctioned`, `chat-flood`. Codex builds every lobby state against these in P1.
+`lobby.stub` replays deterministic timelines with no server. Every branch a lobby screen can
+reach has one (REQ-CC-041):
+
+| Scenario | Covers |
+|---|---|
+| `happy-path` | join → roster → team → ready → countdown → `match.ready` |
+| `player-joins-mid` | `roster.delta` add during lobby |
+| `team-full` / `ready-cleared` | Refused switch; readiness invalidation with `clearedReason` |
+| `countdown-abort-unready` | Abort below `requiredReady`, readiness preserved |
+| `countdown-continues` | A leaver that does **not** break the threshold; countdown runs on |
+| `countdown-abort-imbalance` | Abort with readiness cleared |
+| `allocation-failed` | `match.failed`, room returns to `open` |
+| `room-closed` | `room.updated` → `closing` → socket close with `ROOM_CLOSED` |
+| `kicked` | `ROOM_REMOVED` with reason; no auto-rejoin |
+| `disconnect-resync` | Drop → reconnect-ticket → `state.resync` → `state.snapshot` |
+| `reconnect-grace-exhausted` | 5 attempts, backoff, then `RECONNECT_GRACE_EXPIRED` |
+| `handoff-version-mismatch` | `match.ready` → match socket → `PROTOCOL_VERSION_MISMATCH` |
+| `sanctioned` / `chat-flood` | `SANCTIONED`; `CHAT_RATE_LIMITED` without socket close |

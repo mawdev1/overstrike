@@ -32,6 +32,29 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — Seventh review, `REQ-CC-039`…`041` (additive)
+
+Three findings, all resolved; contracts to **1.7.0**. `REQ-CC-033`…`038` accepted.
+
+- **039 — the consent boundary measured itself.** Personal `flow.step` still included the
+  `consent` step, so a declining player would have had to authorise an event recording that
+  they declined. Personal telemetry now begins at **signup**; the consent screen is an unlinked
+  internal count that records *that* a decision happened, never which. Decline rate is
+  consequently unmeasurable, and that cost is written down rather than quietly absorbed.
+  §3.5.1 makes "unlinked" enforceable: fresh correlation id per event, never the originating
+  request's, no session id on the event or its batch, no join key stored.
+- **040 — the union was values without shapes.** Exact `TerminalResult` refinements with a
+  status-dependent invariant table, and a history union whose pending item carries null for
+  every outcome field rather than omitting them.
+- **041 — stubs were fixtures, not a contract.** Build Plan §0.5 makes stubs this phase's exit
+  condition, so single responses were never enough: a multi-request transition cannot be
+  expressed by one fixture. Scenarios are now stateful and keyed per client session, with a
+  route-to-scenario coverage map so coverage is auditable rather than inferred from names.
+
+**P0 contract work closes here.** Every backend request 001–041 is answered. Implementation
+starts against these contracts; remaining review findings are the kind a compiler and a test
+suite surface in minutes.
+
 ## 2026-08-20 — Sixth cross-reference review, `REQ-CC-033`…`038` (additive)
 
 Six resolved; contracts to **1.6.0**. The settings/capability chain passed this round — the

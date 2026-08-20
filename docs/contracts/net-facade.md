@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.6.0 |
+| **Version** | 1.7.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |

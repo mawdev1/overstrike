@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.6.0 |
+| **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -156,104 +156,92 @@ switch rule changes, and then every historical match silently reinterprets.
 Objective actors (`plant.accountId`, `defuse.accountId`) are always present in the stored
 record. Whether they are **returned** depends on §4.2.
 
-### 4.2 What `GET /v1/matches/:matchId` returns before the result exists
+### 4.2 `TerminalResult` — the exact response union (REQ-CC-040)
 
-A match that has ended but whose result is still queued must not look like a 404 — that reads
-as "your match vanished" and invites a client to try to supply its own stats.
+No ellipses, no "every other field", no comment standing in for a variant. `GET
+/v1/matches/:matchId` returns exactly one of four shapes, discriminated by `status`.
+
+**`TerminalResult`** is the shared field set — every key present in all three terminal
+variants:
 
 ```jsonc
-// queued, or the match is still live
-{ "matchId": "…", "status": "pending",
-  "mode": "bomb", "mapId": "the-square", "mapVersion": "1.0.0",
-  "startedAt": "…",
-  "endedAt": null,          // null while LIVE; the real timestamp once ended and queued
-  "retryAfterMs": 2000, "correlationId": "…" }
-
-// invalidated — the FULL record, not a short form. Same field set as completed/aborted.
-{ "matchId": "…", "status": "invalidated",
-  "terminationReason": "invalidated",
-  "outcomeReason": "no-contest",
-  "winnerTeam": null,
-  "invalidationReason": "…",
-  /* …every other field of the §4 record; stats are recorded but NOT aggregated… */
-  "correlationId": "…" }
-
-// aborted — a full, durable record. May carry a winner (forfeit/abandon) or not (no-contest)
-{ "matchId": "…", "status": "aborted",
-  "terminationReason": "aborted",
-  "outcomeReason": "forfeit|abandon|no-contest",
-  "winnerTeam": "alpha|bravo|null",
-  /* …every other field of the §4 record… */ }
-
-// completed → the full §4 record with "status": "completed"
+{
+  "matchId": "…", "status": "completed|aborted|invalidated",
+  "rulesetVersion": "…", "statDefinitionVersion": "…", "rulesSnapshot": { … },
+  "serverBuild": "…", "mapId": "…", "mapVersion": "…", "region": "…",
+  "mode": "tdm|bomb",
+  "startedAt": "…", "endedAt": "…",
+  "terminationReason": "completed|aborted|invalidated",
+  "outcomeReason": "elimination|defuse|detonation|timer|forfeit|abandon|no-contest",
+  "winnerTeam": "alpha|bravo|draw|null",
+  "invalidationReason": "cheat-detected|server-fault|roster-fault|admin-review|null",
+  "roster": [ … ], "teamScores": { … }, "rounds": [ … ], "players": [ … ],
+  "evidenceRef": "…",
+  "correlationId": "…"
+}
 ```
 
-**`status` is a required top-level field on every response**, including the full record, and is
-the discriminant of the union:
+`invalidationReason` is a **closed enum or null** — it was previously fixed to null in the base
+record while the invalidated variant required it non-null, with no type stated.
 
-| `status` | Carries |
-|---|---|
-| `pending` | The short form above. No `players`, no `rounds` |
-| `completed` | The full §4 record. `winnerTeam` is `alpha`, `bravo`, or `draw` |
-| `aborted` | The full §4 record. `winnerTeam` may be a team **or** `null` |
-| `invalidated` | The full §4 record plus `invalidationReason`. `winnerTeam` is `null`, `outcomeReason` is `no-contest` |
+Status-dependent invariants, which is what makes the union checkable rather than decorative:
 
-`completed`, `aborted`, and `invalidated` share the same field set; only the values differ. A
-client renders one shape and branches on `status`.
+| `status` | `terminationReason` | `outcomeReason` | `winnerTeam` | `invalidationReason` |
+|---|---|---|---|---|
+| `completed` | `completed` | elimination \| defuse \| detonation \| timer | `alpha` \| `bravo` \| `draw` | **null** |
+| `aborted` | `aborted` | forfeit \| abandon \| no-contest | `alpha` \| `bravo` **if** forfeit/abandon; **null** if no-contest | **null** |
+| `invalidated` | `invalidated` | `no-contest` | **null** | **non-null**, from the enum |
+
+Plus the non-terminal fourth shape, which shares only its identifiers:
+
+```jsonc
+// status: "pending" — live, or ended and awaiting persistence
+{ "matchId": "…", "status": "pending",
+  "mode": "tdm|bomb", "mapId": "…", "mapVersion": "…",
+  "startedAt": "…",
+  "endedAt": "…"|null,        // null while LIVE; the real timestamp once ended and queued
+  "retryAfterMs": 2000,
+  "correlationId": "…" }
+```
 
 | Case | Response |
 |---|---|
-| Live | `200`, `status: "pending"`, **`endedAt: null`** |
-| Ended, result queued | `200`, `status: "pending"`, **`endedAt` set** — the database already has `ended_at`, and hardcoding null here contradicted it (REQ-CC-019) |
-| Completed | `200` with the immutable record |
-| Invalidated | `200` with `status: "invalidated"`; stats are **not** in career totals |
+| Live | `200`, `pending`, `endedAt: null` |
+| Ended, result queued | `200`, `pending`, `endedAt` set |
+| Completed / aborted / invalidated | `200`, the matching `TerminalResult` refinement |
 | Never existed | `404 NOT_FOUND` |
-| Exists, caller not a participant, subject privacy forbids | `404 NOT_FOUND` — **not 403**, which would confirm the match exists |
+| Exists, caller not a participant, privacy forbids | `404 NOT_FOUND` — **not 403**, which would confirm the match exists |
+
+`correlationId` is present on **every** variant, per §1. It previously appeared on the
+invalidated example alone.
 
 A `pending` response never invites the browser to submit anything. Result submission is
-service-only (§5), and no field in this response hints otherwise.
+service-only (§5), and no field in it hints otherwise.
 
-### 4.0 The outcome matrix (REQ-CC-025)
+### 4.3 History summary — a discriminated union too (REQ-CC-040)
 
-One matrix, applied identically by the wire, the facade, this record, the HTTP surface, the
-database, career aggregation, and the event stream. Previously the wire allowed
-`forfeit`/`abandon` with a decided winner and `terminationReason: aborted`, while this contract
-required every aborted match to have a null winner — so a team that won because the other side
-walked would have been recorded as having won nothing.
+`GET /v1/profile/:id/matches` permits `status: "pending"` but its item shape fixed `endedAt` to
+a timestamp and always supplied `result` and `playerSummary`, so it could not represent the
+live pending state its own detail endpoint defines.
 
-| Situation | `winner` (wire) | `winnerTeam` | `terminationReason` | `outcomeReason` | Career | Event |
-|---|---|---|---|---|---|---|
-| Normal finish | 1\|2 | `alpha`\|`bravo` | `completed` | elimination / defuse / detonation / timer | W/L | `match.completed` |
-| 6-6 after 12 | 3 | `draw` | `completed` | `timer` | **Draw** | `match.completed` |
-| Opponent forfeits | 1\|2 | `alpha`\|`bravo` | `aborted` | `forfeit` | **W/L** | `match.aborted` |
-| Opponent all disconnect | 1\|2 | `alpha`\|`bravo` | `aborted` | `abandon` | **W/L** | `match.aborted` |
-| Both teams gone | 0 | `null` | `aborted` | `no-contest` | Not counted | `match.aborted` |
-| Server crash, evidence intact | 0 | `null` | `aborted` | `no-contest` | Not counted | `match.aborted` |
-| Invalidated by review | 0 | `null` | `invalidated` | `no-contest` | Not counted | `match.invalidated` |
+```jsonc
+// terminal item — status completed | aborted | invalidated
+{ "matchId": "…", "status": "completed",
+  "mode": "bomb", "mapId": "the-square", "mapVersion": "1.0.0",
+  "endedAt": "…",                          // always present
+  "result": "win|loss|draw|null",           // null iff winnerTeam is null
+  "teamScores": { "alpha": 7, "bravo": 5 },
+  "playerSummary": { "kills": 0, "deaths": 0, "assists": 0, "score": 0 } }
 
-**An aborted match can have a winner.** That is the row that was missing, and it matters: a
-forfeit is the most common abnormal ending and the winning team earns the win.
+// pending item
+{ "matchId": "…", "status": "pending",
+  "mode": "bomb", "mapId": "the-square", "mapVersion": "1.0.0",
+  "endedAt": "…"|null,
+  "result": null, "teamScores": null, "playerSummary": null }
+```
 
-`outcomeReason` is a **top-level, closed** field. The per-round `reason` describes the last
-round; it cannot describe why the *match* ended, and reading round-level reasons to infer a
-match-level one is how a forfeit becomes a "timer" win.
-
-**`mapId` and `mapVersion` are separate fields, everywhere (REQ-CC-019).** This record
-previously combined them as `"the-square@…"` while `map-data.md`, `db-schema.md`, the room
-schema, and the facade all kept them apart — so the one place that had to join against the
-others was the one place that had to re-parse a string first.
-
-**`rulesSnapshot` is immutable and copied at allocation.** `bomb-rules.md` says `maxRounds`
-appears in the result; without this block it did not. A result that names only
-`rulesetVersion` is uninterpretable the moment that ruleset is retuned, which is exactly what
-`REQ-CX-002` may do to the bomb timer.
-
-`statDefinitionVersion` is what makes a five-year-old match still interpretable after the
-definitions change. Without it, a career total is a sum of numbers that meant different
-things.
-
-**`matchId` is assigned at allocation.** A match that crashes before its first tick still has
-an id, which is how the crash is attributable at all.
+A pending entry carries **null** for every outcome field rather than omitting them, so one
+renderer handles both and a missing key is always a bug rather than a state.
 
 ## 5. Submission and idempotency
 

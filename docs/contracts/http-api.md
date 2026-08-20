@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.6.0 |
+| **Version** | 1.7.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -158,9 +158,17 @@ PUT /v1/onboarding/consent    auth OPTIONAL
 ```
 
 `clientSessionId` is **required when signed out** and ignored when authenticated — the account
-is the stronger subject. The response carries a signed `receipt`; `telemetry.md` §3.3 requires
-it on every batch, and without it the server cannot tell a consented pre-auth batch from an
-unconsented one.
+is the stronger subject. The response carries a signed `receipt`, without which the server
+cannot tell a consented pre-auth batch from an unconsented one.
+
+**The receipt is required on batches carrying personal-class events, not on every batch**
+(REQ-CC-039). An internal-only pre-consent batch carries no receipt and no `clientSessionId` —
+`telemetry.md` §3.5.1. An earlier line here said "every batch", contradicting that.
+
+**Sign-in returns the account-scoped receipt.** `POST /v1/auth/signin` includes
+`consentReceipt` (or `null` when consent is undecided) in its success body, exactly as signup
+does. Without it a returning player had no declared way to obtain one and would have had to
+guess at calling `GET /v1/onboarding/consent`, which is not a contract.
 
 Auth-optional because the funnel starts before an account exists. Signed out, the decision is
 keyed to `clientSessionId`; at signup the decision migrates to the account and a new
@@ -191,13 +199,14 @@ than claim a complete funnel:
 
 | Step | Class | Linkage |
 |---|---|---|
-| `landing`, `eligibility` | **internal** | **Unlinked aggregate counts.** No `clientSessionId`, so no per-visitor path |
-| `consent` onward | personal, if consented | Linked by `clientSessionId`, then by account |
+| `landing`, `eligibility`, `consent` | **internal** | **Unlinked aggregate counts.** No `clientSessionId`, no reused correlation id (`telemetry.md` §3.5.1) |
+| `signup` onward | personal, if consented | Linked by `clientSessionId`, then by account |
 
-So funnel **volume** at the top is measurable; per-visitor **paths** through the first two
-steps are not, and `time_to_first_match_sec` is measured from the consent step rather than from
-the first byte. `telemetry.md` §3.1 states the same limitation so the two documents cannot
-drift apart on what the KPI means.
+So funnel **volume** at the top is measurable; per-visitor **paths** through those steps are
+not, `time_to_first_match_sec` is measured from **signup**, and **decline rate is not
+measurable at all** — the consent screen is counted, the answer never is. `telemetry.md` §3.1
+and §3.5.1 state the same limits, so the two documents cannot drift apart on what the KPI
+means.
 
 **Until a decision exists, personal-class events are dropped, not queued.** Queuing them
 against a later "yes" would mean collecting first and asking afterwards. `internal`-class
@@ -650,7 +659,7 @@ left to inference.
 // POST /v1/auth/signin   { "email", "password" }
 201/200 → { "accessToken", "expiresAt", "session": { "sessionId", "deviceLabel", "createdAt" },
             "profile": { /* §4 GET /profile/me */ }, "correlationId" }
-  signup additionally returns { "consentReceipt": "…" }   ← account-scoped, replaces the session one
+  signup AND signin return { "consentReceipt": "…"|null }   ← account-scoped; null = undecided
   errors: VALIDATION_FAILED · AUTH_INVALID_CREDENTIALS · AUTH_RATE_LIMITED ·
           NAME_TAKEN · NAME_POLICY_VIOLATION · AUTH_ELIGIBILITY_DENIED ·
           ELIGIBILITY_RECEIPT_INVALID
@@ -768,35 +777,74 @@ clamped setting is a setting the player did not choose and cannot see they did n
 `schemaVersion` (§11.2) is `1` for `RoamingSettingsV1`. Adding a ROAM row is additive within
 the version; removing or retyping one is a CCR against both documents.
 
-### 11.10 Stub scenarios (REQ-CC-010)
+### 11.10 Stub scenarios — stateful, and coverage-mapped (REQ-CC-041)
 
-§12's single populated fixture cannot express an empty server browser, a pending result, or a
-privacy-filtered profile — and reusing a populated fixture as an "empty" state is how a UI ships
-with an empty state nobody ever saw. Deterministic named scenarios, selected by the
-`X-Stub-Scenario` request header (ignored in production):
+Build Plan §0.5 makes stubs the exit condition for this phase, so "a fixture exists" is not the
+bar: **every designed screen state must be reachable deterministically.** Single-response
+fixtures cannot express a multi-request transition — verification pending *then* accepted,
+consent decided *then* migrated at signup — and `?__stub=error:CODE` cannot model a sequence at
+all.
 
-| Scenario | Produces |
+Scenarios are therefore **stateful**: selected by `X-Stub-Scenario`, keyed per
+`clientSessionId`, and advanced by the requests the client actually makes. Same scenario, same
+sequence, same responses, every run.
+
+| Scenario | Timeline |
 |---|---|
-| `default` | Signed-in account, 3 rooms across 2 regions, 20 matches of history |
-| `first-run` | No account; signup/signin succeed; empty history |
-| `browser-empty` | `GET /v1/rooms` → `{ items: [], nextCursor: null, correlationId }` — the canonical §6 envelope, not a bare array |
-| `browser-unreachable` | `SERVICE_UNAVAILABLE` on room endpoints only; auth still works |
-| `room-full` | Join returns `ROOM_FULL` |
-| `room-in-progress` | Join returns `ROOM_IN_PROGRESS` |
-| `room-password` | Join returns `ROOM_PASSWORD_REQUIRED`, then succeeds with any non-empty password |
-| `result-pending` | `GET /v1/matches/:id` → `status: "pending"` for 3 calls, then completed |
-| `result-invalidated` | `status: "invalidated"` |
-| `history-empty` | Career totals all zero, no matches |
-| `privacy-filtered` | `GET /v1/profile/:id` with `stats: null, presence: null` |
-| `sanctioned` | `SANCTIONED` on room join and chat; profile still readable |
-| `name-taken` | Signup and name change return `NAME_TAKEN` |
-| `session-revoked` | Third authenticated call returns `AUTH_SESSION_REVOKED` |
-| `token-expiry` | Access token expires after 30 s so refresh can be exercised |
-| `slow` | Every response delayed 2 s, for loading states |
-| `offline` | Every request fails at the transport layer |
+| `default` | Signed-in account, 3 rooms across 2 regions, 20 terminal matches |
+| `onboarding-happy` | eligibility ✓ → consent accept → signup (migrates receipt) → verify pending → verify ✓ → terms ✓ → shell |
+| `onboarding-eligibility-denied` | eligibility → `AUTH_ELIGIBILITY_DENIED`, terminal |
+| `onboarding-consent-declined` | eligibility ✓ → consent decline → signup ✓ → receipt marks personal telemetry unauthorised |
+| `onboarding-verify-invalid` | …→ verify → `AUTH_VERIFICATION_TOKEN_INVALID` → resend → ✓ |
+| `onboarding-verify-expired` | …→ verify → `AUTH_VERIFICATION_TOKEN_EXPIRED` → resend → ✓ |
+| `onboarding-terms-conflict` | …→ terms accept v1 → `CONFLICT` with v2 → accept v2 → ✓ |
+| `onboarding-receipt-invalid` | eligibility ✓ → consent ✓ → signup → `ELIGIBILITY_RECEIPT_INVALID` |
+| `account-pre-policy` | Signed-in, `consent: null`; consent prompt on first personal action |
+| `browser-empty` | `{ items: [], nextCursor: null, correlationId }` |
+| `browser-unreachable` | `SERVICE_UNAVAILABLE` on room endpoints only; auth unaffected |
+| `room-full` / `room-in-progress` / `room-password` | Join refusals; `room-password` succeeds on a second attempt with any non-empty password |
+| `match-active-none` | `GET /v1/matches/active` → 204 |
+| `match-active-reconnect` | active → 200 with `matchId` → reconnect-ticket → 200 with handoff + `graceEndsAt` |
+| `match-active-grace-expired` | active → 200 → reconnect-ticket → `RECONNECT_GRACE_EXPIRED` |
+| `result-pending-live` | `pending`, `endedAt: null`, 3 polls, then `completed` |
+| `result-pending-queued` | `pending`, `endedAt` set, 2 polls, then `completed` |
+| `result-aborted-forfeit` | `aborted` / `forfeit` / `winnerTeam: "alpha"` |
+| `result-aborted-nocontest` | `aborted` / `no-contest` / `winnerTeam: null` |
+| `result-invalidated` | `invalidated` / `no-contest` / null winner / non-null `invalidationReason` |
+| `result-draw` | `completed` / `timer` / `winnerTeam: "draw"` |
+| `history-mixed` | Terminal **and** pending items, so the §4.3 union is exercised |
+| `history-empty` | Zero matches, zero career totals |
+| `privacy-filtered` | `stats: null`, `presence: null` |
+| `sanctioned` | `SANCTIONED` on join and chat; profile readable |
+| `name-taken` | Signup and rename → `NAME_TAKEN` |
+| `session-revoked` | Third authenticated call → `AUTH_SESSION_REVOKED` |
+| `token-expiry` | Access token expires after 30 s, exercising single-flight refresh |
+| `slow` | Every response delayed 2 s |
+| `offline` | Transport-layer failure on every request |
 
-Each is deterministic: the same scenario returns the same data every run, so a screenshot test
-is stable. `?__stub=error:CODE` remains available for one-off error injection.
+### 11.11 Coverage map
+
+Which scenario owns which route's states, so coverage is **auditable rather than inferred from
+names** (`design/shell-ia.md` route hierarchy):
+
+| Route | Owning scenarios |
+|---|---|
+| `/welcome` | `default`, `offline`, `slow` |
+| `/auth/sign-in` | `default`, `session-revoked`, `token-expiry`, `account-pre-policy` |
+| `/auth/create-account` | `onboarding-happy`, `name-taken`, `onboarding-receipt-invalid` |
+| `/onboarding/eligibility` | `onboarding-happy`, `onboarding-eligibility-denied` |
+| `/onboarding/consent` | `onboarding-happy`, `onboarding-consent-declined` |
+| `/onboarding/verify` | `onboarding-verify-invalid`, `onboarding-verify-expired` |
+| `/onboarding/terms` | `onboarding-happy`, `onboarding-terms-conflict` |
+| `/play/rooms` | `default`, `browser-empty`, `browser-unreachable`, `slow` |
+| `/room/:roomId` | `room-full`, `room-in-progress`, `room-password`, `sanctioned` |
+| Match reconnect | `match-active-none`, `match-active-reconnect`, `match-active-grace-expired` |
+| `/career/overview` | `default`, `history-empty`, `privacy-filtered` |
+| `/career/modes`, history | `history-mixed`, `result-pending-live`, `result-pending-queued` |
+| Results screen | `result-aborted-forfeit`, `result-aborted-nocontest`, `result-invalidated`, `result-draw` |
+
+A CX acceptance row with no owning scenario is a gap in this table, not in the UI — file a
+`REQ-CC` and it gets a scenario.
 
 ## 12. Stub mode
 
