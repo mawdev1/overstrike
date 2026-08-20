@@ -84,26 +84,31 @@ export function createAuthRoutes({ service, sessions, limiter }) {
       return { accessToken: issued.accessToken, expiresAt: issued.expiresAt, session: issued.session };
     },
 
+    /**
+     * The actor comes from `sessions.authenticate` and is passed through whole. Handlers used
+     * to forward `accountId` alone, which meant the service had no actor to authorise and the
+     * §10 capability check had nothing to check.
+     */
     async signout(ctx) {
       await sessions.revoke({
-        accountId: ctx.actor.accountId, sessionId: ctx.actor.sessionId,
+        actor: ctx.actor, sessionId: ctx.actor.sessionId,
         reason: 'user-signout', correlationId: ctx.correlationId,
       });
       queueCookie(ctx, sessions.clearRefreshCookie());
     },
 
     async signoutAll(ctx) {
-      await sessions.revokeAll({ accountId: ctx.actor.accountId, correlationId: ctx.correlationId });
+      await sessions.revokeAll({ actor: ctx.actor, correlationId: ctx.correlationId });
       queueCookie(ctx, sessions.clearRefreshCookie());
     },
 
     async listSessions(ctx) {
-      return { sessions: await sessions.list(ctx.actor.accountId, ctx.actor.sessionId) };
+      return { sessions: await sessions.list(ctx.actor, ctx.actor.sessionId) };
     },
 
     async revokeSession(ctx) {
       await sessions.revoke({
-        accountId: ctx.actor.accountId, sessionId: ctx.params.id,
+        actor: ctx.actor, sessionId: ctx.params.id,
         reason: 'user-revoked', correlationId: ctx.correlationId,
       });
     },
@@ -115,13 +120,16 @@ export function createAuthRoutes({ service, sessions, limiter }) {
     },
 
     async recoveryComplete(ctx) {
-      await service.recoveryComplete({ ...ctx.body, correlationId: ctx.correlationId });
+      await service.recoveryComplete({ ...ctx.body, ip: ctx.ip, correlationId: ctx.correlationId });
       queueCookie(ctx, sessions.clearRefreshCookie());
     },
 
+    // §9's auth class covers the whole of onboarding, not just the endpoints with passwords on
+    // them: eligibility mints a receipt signup accepts, and consent writes a legally
+    // significant row. Both now carry `ip` so the limiter has a subject to count.
     eligibility(ctx) {
       return service.eligibilityPreflight({
-        dateOfBirth: ctx.body.dateOfBirth, jurisdiction: ctx.body.jurisdiction ?? null,
+        dateOfBirth: ctx.body.dateOfBirth, jurisdiction: ctx.body.jurisdiction ?? null, ip: ctx.ip,
       });
     },
 
@@ -130,11 +138,13 @@ export function createAuthRoutes({ service, sessions, limiter }) {
     },
 
     putConsent(ctx) {
-      return service.putConsent({ actor: ctx.actor, ...ctx.body });
+      // Spread first: a body field named `ip` or `actor` must not be able to override the
+      // request's own.
+      return service.putConsent({ ...ctx.body, actor: ctx.actor, ip: ctx.ip, correlationId: ctx.correlationId });
     },
 
     async verifyResend(ctx) {
-      await service.verificationResend({ actor: ctx.actor, correlationId: ctx.correlationId });
+      await service.verificationResend({ actor: ctx.actor, ip: ctx.ip, correlationId: ctx.correlationId });
       return raw(202, { correlationId: ctx.correlationId });
     },
 
@@ -145,7 +155,7 @@ export function createAuthRoutes({ service, sessions, limiter }) {
     terms() { return service.termsGet(); },
 
     async acceptTerms(ctx) {
-      await service.termsAccept({ actor: ctx.actor, version: ctx.body.version });
+      await service.termsAccept({ actor: ctx.actor, version: ctx.body.version, correlationId: ctx.correlationId });
     },
   };
 

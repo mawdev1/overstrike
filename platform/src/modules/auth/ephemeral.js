@@ -16,19 +16,38 @@
  */
 import { handleOf } from './crypto.js';
 
-export function createEphemeralTokens({ clock }) {
+export function createEphemeralTokens({ clock, sweepIntervalMs = 60_000 }) {
   const byHandle = new Map();
   const latestForAccount = new Map();     // `${purpose}:${accountId}` -> handle
 
+  /**
+   * Swept on a timer, not on every `issue()`.
+   *
+   * Sweeping per issue is O(live tokens) per call and therefore O(n²) over a run, and
+   * `recovery/start` is unauthenticated: 40 000 requests for addresses that do not exist used
+   * to cost 2.9 s of sweeping and leave 8.3 MB resident *after* every token had expired,
+   * because `latestForAccount` was never touched by the sweep and the `absent:<hash>` keys it
+   * accumulated are unbounded and never consumed.
+   */
   const sweep = () => {
     const now = clock.now();
-    for (const [h, row] of byHandle) if (row.expiresAt <= now) byHandle.delete(h);
+    for (const [h, row] of byHandle) {
+      if (row.expiresAt > now) continue;
+      byHandle.delete(h);
+      const key = `${row.purpose}:${row.accountId}`;
+      // Only when it still points at THIS handle: a newer token for the same account has
+      // already claimed the key, and dropping it would orphan the live token.
+      if (latestForAccount.get(key) === h) latestForAccount.delete(key);
+    }
   };
+
+  const timer = sweepIntervalMs > 0 ? setInterval(sweep, sweepIntervalMs) : null;
+  // A sweep timer must never be the reason the process refuses to exit.
+  timer?.unref?.();
 
   return {
     /** Issuing supersedes any outstanding token of the same purpose for the account. */
     issue(purpose, accountId, raw, ttlMs) {
-      sweep();
       const key = `${purpose}:${accountId}`;
       const previous = latestForAccount.get(key);
       if (previous) byHandle.delete(previous);
@@ -54,6 +73,20 @@ export function createEphemeralTokens({ clock }) {
       return { ok: true, accountId: row.accountId };
     },
 
+    /**
+     * The same verdict as `consume`, without consuming.
+     *
+     * Verification has to compare the token's owner with the caller BEFORE burning it: burning
+     * first let any authenticated account destroy another account's verification link by
+     * pasting it, permanently, since the link is single-use and the owner never sees an error.
+     */
+    peek(purpose, raw) {
+      const row = byHandle.get(handleOf(raw ?? ''));
+      if (!row || row.purpose !== purpose || row.usedAt) return { ok: false, reason: 'invalid' };
+      if (clock.now() >= row.expiresAt) return { ok: false, reason: 'expired' };
+      return { ok: true, accountId: row.accountId };
+    },
+
     /** A password change invalidates outstanding recovery tokens (auth.md §8). */
     invalidateAll(purpose, accountId) {
       const key = `${purpose}:${accountId}`;
@@ -61,5 +94,13 @@ export function createEphemeralTokens({ clock }) {
       if (handle) byHandle.delete(handle);
       latestForAccount.delete(key);
     },
+
+    /** Exposed for the sweep test and for an ops gauge; neither map is otherwise observable. */
+    size() { return { handles: byHandle.size, accounts: latestForAccount.size }; },
+
+    sweep,
+
+    /** The module owns the timer, so whoever owns the module can stop it. */
+    stop() { if (timer) clearInterval(timer); },
   };
 }

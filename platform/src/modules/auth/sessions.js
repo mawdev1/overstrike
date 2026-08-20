@@ -12,8 +12,10 @@
  */
 import { ApiError } from '../../core/errors.js';
 import { ulid } from '../../core/ids.js';
+import { requireCapability } from '../events/rbac.js';
 import { sign, verify, opaqueToken, handleOf } from './crypto.js';
-import { makeEvent, emit } from './events.js';
+import { playerActor, SYSTEM_ACTOR, correlationFor } from './events.js';
+import { internalise } from './faults.js';
 
 export const REFRESH_COOKIE = 'os_rt';
 
@@ -46,7 +48,8 @@ export function classifyUserAgent(ua) {
 }
 
 export function createSessionService(deps) {
-  const { store, config, clock, logger, geo = null } = deps;
+  const { store, config, clock, logger, geo = null, outbox, audit } = deps;
+  if (!outbox || !audit) throw new Error('auth/sessions: an outbox and an audit log are required');
   const accessTtlMs = config.accessTokenTtlSec * 1000;
   const refreshTtlMs = config.refreshTokenTtlSec * 1000;
 
@@ -89,7 +92,32 @@ export function createSessionService(deps) {
     const claims = verify(config.tokenSecret, token);
     if (!claims || claims.k !== 'access') throw new ApiError('AUTH_TOKEN_INVALID', 'Sign in again.');
     if (clock.now() >= claims.exp) throw new ApiError('AUTH_TOKEN_EXPIRED', 'Your session expired. Sign in again.');
-    return { accountId: claims.sub, sessionId: claims.sid, roles: claims.r || ['player'], expiresAtMs: claims.exp };
+    return actorFromClaims(claims);
+  }
+
+  /**
+   * The actor shape, in one place, and it is the shape `rbac.check()` reads.
+   *
+   * It used to be `{ accountId, sessionId, roles }` while `check()` read `actor.role` and
+   * `actor.id`, so every real actor came back `unknown_role` and every capability check in the
+   * platform refused — which is only invisible because nothing called one. `accountId` and
+   * `roles` stay for the handlers that already use them; `id`, `role`, `kind` and `mfa` are
+   * what authorization and the audit trail consume.
+   */
+  function actorFromClaims(claims) {
+    const roles = Array.isArray(claims.r) && claims.r.length ? claims.r : ['player'];
+    return {
+      kind: 'player',
+      id: claims.sub,
+      accountId: claims.sub,
+      sessionId: claims.sid,
+      role: roles[0],
+      roles,
+      // §10's second factor. Absent from the token today, so an elevated role authenticated
+      // here cannot pass an elevated capability check — which is the correct direction to fail.
+      mfa: claims.m === true,
+      expiresAtMs: claims.exp,
+    };
   }
 
   /**
@@ -115,13 +143,20 @@ export function createSessionService(deps) {
       sessionId,
       expiresAt: iso(clock.now() + refreshTtlMs),
       usedAt: null,
-      createdAt: iso(clock.now()),
+      // `issuedAt`, which is the column. `refresh_tokens` has no `createdAt` in either
+      // adapter (db-schema.md §2), and sending one made every token mint a schema error.
+      issuedAt: iso(clock.now()),
     }, tx);
     return raw;
   }
 
-  /** Create a session and its first token pair. Called by signup, signin, and recovery. */
-  async function start({ accountId, roles = ['player'], ip, userAgent, deviceLabel, correlationId = null }, tx) {
+  /**
+   * Create a session and its first token pair. Called by signup and signin.
+   *
+   * Takes the transaction AND the outbox emitter bound to it: the session row and
+   * `session.started` are one write or neither (§4).
+   */
+  async function start({ accountId, roles = ['player'], ip, userAgent, deviceLabel }, tx, emit) {
     const now = clock.now();
     const sessionId = ulid(now);
     const familyId = ulid(now);
@@ -139,12 +174,13 @@ export function createSessionService(deps) {
     }, tx);
     const refreshToken = await mintRefresh({ accountId, sessionId, familyId }, tx);
     const access = issueAccessToken({ accountId, sessionId, roles });
-    await emit(store, makeEvent('session.started', {
-      actor: { kind: 'player', id: accountId, role: roles[0] ?? 'player' },
+    await emit({
+      type: 'session.started',
+      actor: playerActor(accountId, roles),
       subject: { kind: 'session', id: sessionId },
       payload: { deviceLabel: session.deviceLabel, ipClass: session.ipClass, userAgentClass: session.userAgentClass },
-      correlationId, occurredAt: now,
-    }), tx);
+      occurredAt: iso(now),
+    });
     return {
       accessToken: access.accessToken,
       expiresAt: access.expiresAt,
@@ -153,27 +189,55 @@ export function createSessionService(deps) {
     };
   }
 
+  /**
+   * Revoke a reused family and say so, in a transaction of its own.
+   *
+   * This is separate from `rotateOnce` because it CANNOT share its transaction. The revocation
+   * and the `session.reuse_detected` event used to be written inside the rotation transaction
+   * and then the refusal was thrown from inside it too — and the throw rolled both back. The
+   * observable result of "reuse detected" was: `revokedAt` still null, no event in the outbox,
+   * the access token still valid, and the family still minting. The detection ran and
+   * detected; nothing else was true.
+   *
+   * So: commit the response first, then refuse. The refusal is a return value up to here.
+   */
+  async function revokeReusedFamily(row, correlationId) {
+    const now = clock.now();
+    await internalise(() => audit.recordWithEvent(
+      outbox,
+      { correlationId, actor: SYSTEM_ACTOR, eventActor: SYSTEM_ACTOR },
+      {
+        action: 'session.reuse_revoke',
+        capability: null,             // system-initiated security response; no operator acted
+        subject: { kind: 'session', id: row.sessionId },
+        reasonCode: 'security_incident',
+        before: { familyId: row.familyId, revoked: false },
+        after: { familyId: row.familyId, revoked: true },
+      },
+      {
+        type: 'session.reuse_detected',
+        actor: SYSTEM_ACTOR,
+        subject: { kind: 'session', id: row.sessionId },
+        payload: { familyId: row.familyId, accountId: row.accountId, firstUsedAt: row.usedAt },
+        occurredAt: iso(now),
+      },
+      (tx) => store.sessions.revokeFamily(row.familyId, 'refresh-reuse', iso(now), tx),
+    ));
+    logger.warn('session.reuse_detected', { familyId: row.familyId, accountId: row.accountId, correlationId });
+  }
+
   async function rotateOnce(raw, { correlationId = null } = {}) {
     const tokenId = handleOf(raw);
     const now = clock.now();
-    return store.tx(async (tx) => {
+    const outcome = await internalise(() => store.tx(async (tx) => {
       const row = await store.refreshTokens.byId(tokenId, tx);
       if (!row) throw new ApiError('AUTH_TOKEN_INVALID', 'Sign in again.');
 
       // A used token is theft until proven otherwise, and it cannot be proven otherwise: a
       // legitimate client never replays one. Revoke the family, not just the token — the
-      // attacker may already hold the successor.
-      if (row.usedAt) {
-        await store.sessions.revokeFamily(row.familyId, 'refresh-reuse', iso(now), tx);
-        await emit(store, makeEvent('session.reuse_detected', {
-          actor: { kind: 'system', id: 'auth', role: 'service' },
-          subject: { kind: 'session', id: row.sessionId },
-          payload: { familyId: row.familyId, accountId: row.accountId, firstUsedAt: row.usedAt },
-          correlationId, occurredAt: now,
-        }), tx);
-        logger.warn('session.reuse_detected', { familyId: row.familyId, accountId: row.accountId, correlationId });
-        throw new ApiError('AUTH_SESSION_REVOKED', 'You were signed out. Sign in again.');
-      }
+      // attacker may already hold the successor. Returned as a sentinel, not thrown: see
+      // `revokeReusedFamily`.
+      if (row.usedAt) return { reuse: row };
 
       if (now >= new Date(row.expiresAt).getTime()) throw new ApiError('AUTH_TOKEN_INVALID', 'Sign in again.');
 
@@ -187,12 +251,20 @@ export function createSessionService(deps) {
         { accountId: row.accountId, sessionId: row.sessionId, familyId: row.familyId }, tx);
       const access = issueAccessToken({ accountId: row.accountId, sessionId: row.sessionId, roles });
       return {
-        accessToken: access.accessToken,
-        expiresAt: access.expiresAt,
-        refreshToken,
-        session: { sessionId: session.sessionId, deviceLabel: session.deviceLabel, createdAt: session.createdAt },
+        issued: {
+          accessToken: access.accessToken,
+          expiresAt: access.expiresAt,
+          refreshToken,
+          session: { sessionId: session.sessionId, deviceLabel: session.deviceLabel, createdAt: session.createdAt },
+        },
       };
-    });
+    }));
+
+    if (outcome.reuse) {
+      await revokeReusedFamily(outcome.reuse, correlationFor(correlationId, now));
+      throw new ApiError('AUTH_SESSION_REVOKED', 'You were signed out. Sign in again.');
+    }
+    return outcome.issued;
   }
 
   /** Serialised per token handle — see `inflight` above. */
@@ -208,7 +280,12 @@ export function createSessionService(deps) {
     return run;
   }
 
-  async function list(accountId, currentSessionId) {
+  async function list(accountIdOrActor, currentSessionId) {
+    // Accepts an actor or a bare account id: the routes hand over the authenticated actor and
+    // the check applies; internal callers and tests that hold only an id read without one.
+    const actor = typeof accountIdOrActor === 'object' && accountIdOrActor !== null ? accountIdOrActor : null;
+    const accountId = actor ? actor.accountId : accountIdOrActor;
+    if (actor) requireCapability(actor, 'session:list', { accountId });
     const rows = await store.sessions.listForAccount(accountId);
     return rows.filter((s) => !s.revokedAt).map((s) => ({
       sessionId: s.sessionId,
@@ -221,7 +298,16 @@ export function createSessionService(deps) {
     }));
   }
 
-  async function revoke({ accountId, sessionId, reason = 'user-signout', correlationId = null, actorRole = 'player' }) {
+  /**
+   * Revoke one session.
+   *
+   * `actor` is the authenticated actor, not a caller-supplied role string: the previous
+   * signature took `actorRole` and wrote whatever it was handed into the event, which is an
+   * attribution the caller gets to choose. The capability is asserted here rather than in the
+   * route, so calling the service directly cannot skip it.
+   */
+  async function revoke({ actor, accountId = actor?.accountId, sessionId, reason = 'user-signout', correlationId = null }) {
+    requireCapability(actor, 'session:revoke', { accountId });
     const session = await store.sessions.byId(sessionId);
     // NOT_FOUND rather than FORBIDDEN for someone else's session: whether a session id exists
     // is not something one account gets to learn about another.
@@ -229,29 +315,77 @@ export function createSessionService(deps) {
       throw new ApiError('NOT_FOUND', 'No such session.');
     }
     const now = clock.now();
-    await store.tx(async (tx) => {
-      await store.sessions.revoke(sessionId, reason, iso(now), tx);
-      await emit(store, makeEvent('session.revoked', {
-        actor: { kind: 'player', id: accountId, role: actorRole },
+    await internalise(() => audit.recordWithEvent(
+      outbox,
+      { correlationId: correlationFor(correlationId, now), actor },
+      {
+        action: 'session.revoke',
+        subject: { kind: 'session', id: sessionId },
+        target: { accountId },
+        reasonCode: 'account_self_service',
+        before: { revokedAt: null }, after: { revokedAt: iso(now), reason },
+      },
+      {
+        type: 'session.revoked',
+        actor: playerActor(accountId, actor.roles),
         subject: { kind: 'session', id: sessionId },
         payload: { reason },
-        correlationId, occurredAt: now,
-      }), tx);
-    });
+        occurredAt: iso(now),
+      },
+      (tx) => store.sessions.revoke(sessionId, reason, iso(now), tx),
+    ));
   }
 
-  async function revokeAll({ accountId, reason = 'signout-all', correlationId = null }) {
+  /**
+   * Revoke every session for an account, one `session.revoked` per session.
+   *
+   * Not one event for the account: §6 registers `session.revoked` against a **session**
+   * subject, and §3 orders events per subject — a single account-subject event is both
+   * off-catalogue (it was rejected outright by the envelope validator) and unorderable against
+   * the session it silently ends.
+   *
+   * `actor` is optional: recovery completion revokes on the account holder's behalf without an
+   * authenticated session, so it passes the account itself as the actor and no capability
+   * check applies (proving control of the recovery token is the authorization).
+   */
+  async function revokeAll({ actor = null, accountId = actor?.accountId, reason = 'signout-all', correlationId = null }) {
+    if (actor) requireCapability(actor, 'session:revoke', { accountId });
     const now = clock.now();
-    return store.tx(async (tx) => {
-      const count = await store.sessions.revokeAllForAccount(accountId, reason, iso(now), tx);
-      await emit(store, makeEvent('session.revoked', {
-        actor: { kind: 'player', id: accountId, role: 'player' },
-        subject: { kind: 'account', id: accountId },
-        payload: { reason, count },
-        correlationId, occurredAt: now,
-      }), tx);
-      return count;
-    });
+    const live = (await store.sessions.listForAccount(accountId)).filter((s) => !s.revokedAt);
+    // Nothing to revoke is not a state change, and a unit of work that changes nothing must
+    // not write an event or an audit row claiming it did.
+    if (!live.length) return 0;
+
+    const auditActor = actor ?? playerActor(accountId);
+    const { result } = await internalise(() => outbox.commit(
+      { correlationId: correlationFor(correlationId, now), actor: auditActor },
+      async (tx, emit) => {
+        const count = await store.sessions.revokeAllForAccount(accountId, reason, iso(now), tx);
+        for (const s of live) {
+          await emit({
+            type: 'session.revoked',
+            actor: playerActor(accountId, actor?.roles),
+            subject: { kind: 'session', id: s.sessionId },
+            payload: { reason },
+            occurredAt: iso(now),
+          });
+        }
+        await audit.record({
+          actor: { ...auditActor, accountId },
+          action: 'session.revoke_all',
+          // Named, not derived: the action is `revoke_all`, the capability is still
+          // `session:revoke`. Null only for the recovery path, which has no operator actor.
+          capability: actor ? 'session:revoke' : null,
+          subject: { kind: 'account', id: accountId },
+          target: { accountId },
+          reasonCode: reason === 'recovery-completed' ? 'account_recovery' : 'account_self_service',
+          before: { liveSessions: live.length }, after: { liveSessions: 0, reason },
+          correlationId: correlationFor(correlationId, now),
+        }, tx);
+        return count;
+      },
+    ));
+    return result;
   }
 
   /**

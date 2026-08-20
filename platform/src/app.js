@@ -66,7 +66,16 @@ export async function buildApp(config, overrides = {}) {
   }
 
   const server = createApp({ router, deps });
-  return { server, router, deps, mounted, stopJanitor };
+
+  /** Release every background timer this process started. Called on shutdown. */
+  const stop = () => {
+    stopJanitor();
+    // Auth sweeps expired ephemeral tokens on an interval. Unref'd, so it never holds the
+    // process open — but a test that builds many apps would otherwise accumulate them.
+    try { deps.auth?.stop?.(); } catch { /* nothing useful to do while shutting down */ }
+  };
+
+  return { server, router, deps, mounted, stopJanitor, stop };
 }
 
 /** Order matters: events first, because auth and profile emit through its outbox. */
@@ -110,7 +119,14 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
   // ── auth: sessions, tokens, the onboarding chain ─────────────────────────────────────
   const auth = await load('auth', './modules/auth/index.js');
   if (auth) {
-    deps.auth = auth.createAuthModule({ store: deps.store, config, logger, clock: { now: deps.clock } });
+    // Pass the events module's outbox and audit log rather than letting auth build its own.
+    // Both are stateless over the same store so there is no behavioural divergence today, but
+    // one process should have one of each — a second instance is a second place to change a
+    // rule and forget the other.
+    deps.auth = auth.createAuthModule({
+      store: deps.store, config, logger, clock: { now: deps.clock },
+      outbox: deps.events?.outbox, audit: deps.events?.audit,
+    });
     deps.auth.register(router);
     mounted.push('auth');
   }

@@ -17,12 +17,23 @@ import { STAT_DEFINITION_VERSION } from './stats.js';
 
 const NAME_MIN = 3;
 const NAME_MAX = 16;
-const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _.-]*[A-Za-z0-9]$/;
 
-/** auth.md §9 folding: NFKC + case fold. Uniqueness is enforced on this, not the raw name. */
-export function foldName(name) {
-  return name.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
-}
+/**
+ * Display-name policy lives in ONE place: `auth/names.js`.  auth.md §9.
+ *
+ * This module previously carried its own `foldName` — NFKC plus lowercase, no confusable
+ * folding, no script restriction — and it owns `PATCH /v1/profile/me`, the endpoint players
+ * actually rename through. Two folding implementations for one uniqueness constraint is the
+ * failure auth.md §9 warns about: the weaker one decides, and the constraint is only as strong
+ * as the weakest writer. An ASCII-only regex here happened to mask it, which is luck, not a
+ * design.
+ *
+ * Re-exported so existing importers keep working while there is exactly one implementation.
+ */
+import { fold as foldName, normaliseDisplayName } from '../auth/names.js';
+
+// Re-exported so existing importers keep working while there is exactly one implementation.
+export { foldName, normaliseDisplayName };
 
 /** §4: the two closed enums. `friends` exists for presence and NOT for stats. */
 const PRESENCE_VISIBILITY = ['everyone', 'friends', 'nobody'];
@@ -139,13 +150,12 @@ export function createProfileService({
 
     const account = await requireAccount(accountId);
     const name = String(patch.displayName ?? '').normalize('NFKC').trim();
-    if (name.length < NAME_MIN || name.length > NAME_MAX || !NAME_RE.test(name)) {
-      throw new ApiError('NAME_POLICY_VIOLATION', 'That display name is not allowed.', {
-        details: { min: NAME_MIN, max: NAME_MAX },
-      });
-    }
-
-    const folded = foldName(name);
+    // Policy — length, charset, reserved words, single-script — comes from the shared
+    // implementation, so a rename cannot slip past a check the signup path applies.
+    // Length, charset, reserved words and the single-script rule all come from the shared
+    // implementation, which also returns the canonical fold — so the rename path cannot apply
+    // a weaker check than signup did.
+    const { displayName: normalisedName, folded } = normaliseDisplayName(name);
     if (folded !== foldName(account.displayName || '')) {
       const taken = await store.accounts.byNameFolded(folded);
       if (taken && taken.accountId !== accountId) {
@@ -163,7 +173,7 @@ export function createProfileService({
       // `name_changed_at` is the column that exists (0008). The availability instant is derived
       // from it on the way out, so there is one fact stored and one place it can be wrong.
       await store.accounts.update(accountId, {
-        displayName: name,
+        displayName: normalisedName,
         displayNameFolded: folded,
         nameChangedAt: new Date(now).toISOString(),
       });

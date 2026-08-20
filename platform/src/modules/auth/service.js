@@ -13,9 +13,11 @@
  */
 import { ApiError } from '../../core/errors.js';
 import { ulid } from '../../core/ids.js';
+import { requireCapability } from '../events/rbac.js';
 import { emailHash, hashPassword, verifyPassword, opaqueToken } from './crypto.js';
 import { normaliseDisplayName, assertCooldown } from './names.js';
-import { makeEvent, emit } from './events.js';
+import { playerActor, correlationFor } from './events.js';
+import { internalise } from './faults.js';
 
 export const RECOVERY_TTL_MS = 30 * 60 * 1000;
 export const VERIFICATION_TTL_MS = 24 * 3600 * 1000;
@@ -67,7 +69,11 @@ function requireString(value, path, { min = 1, max = 320 } = {}) {
 }
 
 export function createAuthService(deps) {
-  const { store, config, clock, logger, sessions, receipts, ephemeral, limiter, sleep = defaultSleep, mailer = null } = deps;
+  const {
+    store, config, clock, logger, sessions, receipts, ephemeral, limiter, outbox, audit,
+    sleep = defaultSleep, mailer = null,
+  } = deps;
+  if (!outbox || !audit) throw new Error('auth/service: an outbox and an audit log are required');
   const iso = (ms) => new Date(ms).toISOString();
 
   /**
@@ -100,6 +106,48 @@ export function createAuthService(deps) {
     };
   }
 
+  /**
+   * The shape every self-service account mutation takes: capability already asserted by the
+   * caller, then the row, its `profile.updated` event and its audit row in ONE transaction.
+   *
+   * §10 requires every privileged action to be audited, and auth's mutating paths wrote no
+   * audit row at all — six state changes a support investigation could not see. The event type
+   * is `profile.updated` because that is what the catalogue registers for a change to the
+   * account projection; auth may not invent a type (event-envelope.md §6).
+   */
+  async function updateAccountWithEvent(actor, patch, { action, capability = 'account:update', reasonCode, correlationId, summaryKeys, spec }) {
+    const before = await store.accounts.byId(actor.accountId);
+    if (!before) throw new ApiError('NOT_FOUND', 'No such account.');
+    const { result } = await internalise(() => audit.recordWithEvent(
+      outbox,
+      { correlationId: correlationFor(correlationId, clock.now()), actor },
+      (updated) => ({
+        action,
+        capability,
+        subject: { kind: 'account', id: actor.accountId },
+        target: { accountId: actor.accountId },
+        reasonCode,
+        before, after: updated, summaryKeys,
+      }),
+      spec,
+      (tx) => store.accounts.update(actor.accountId, patch, tx),
+    ));
+    return result;
+  }
+
+  /** The common case: a field on the account changed, which is `profile.updated` (§6). */
+  const updateAccount = (actor, action, patch, opts) => updateAccountWithEvent(actor, patch, {
+    ...opts,
+    action,
+    spec: {
+      type: 'profile.updated',
+      actor: playerActor(actor.accountId, actor.roles),
+      subject: { kind: 'account', id: actor.accountId },
+      payload: { fields: Object.keys(patch) },
+      occurredAt: iso(clock.now()),
+    },
+  });
+
   const accountConsentReceipt = (account) =>
     (account.consentTelemetry == null ? null : receipts.issueConsent({
       subject: 'account',
@@ -121,7 +169,11 @@ export function createAuthService(deps) {
    *     policy version, and the decision time are the entire record, and they are written at
    *     signup, not here.
    */
-  function eligibilityPreflight({ dateOfBirth, jurisdiction = null }) {
+  function eligibilityPreflight({ dateOfBirth, jurisdiction = null, ip = null }) {
+    // §9 auth class. The endpoint mints a signed credential that signup accepts, so leaving it
+    // unlimited meant receipts were free to farm — and it is also a birthdate oracle, since an
+    // unlimited caller can binary-search the minimum age the response refuses to state.
+    limiter.enforceAuth({ ip, subject: null });
     const dob = parseDateOfBirth(dateOfBirth);
     const age = ageAt(dob, clock.now());
     if (age < config.minimumAge) {
@@ -169,20 +221,38 @@ export function createAuthService(deps) {
     };
   }
 
-  async function putConsent({ actor = null, telemetryPersonal, policyVersion, clientSessionId = null }) {
+  async function putConsent({ actor = null, telemetryPersonal, policyVersion, clientSessionId = null, ip = null, correlationId = null }) {
+    limiter.enforceAuth({ ip, subject: actor?.accountId ?? clientSessionId ?? null });
     if (typeof telemetryPersonal !== 'boolean') {
       throw new ApiError('VALIDATION_FAILED', 'A consent decision is required.', {
         details: { fields: [{ path: 'telemetryPersonal', rule: 'boolean', message: 'true or false.' }] },
       });
     }
-    const version = Number.isInteger(policyVersion) ? policyVersion : config.consentPolicyVersion;
+    // The policy version is the server's, never the caller's. It was accepted from the request
+    // and stored verbatim, so `policyVersion: 999999` recorded agreement to a policy that does
+    // not exist — and the next real policy version would then look already-agreed.
+    const version = policyVersion === undefined || policyVersion === null
+      ? config.consentPolicyVersion : policyVersion;
+    if (version !== config.consentPolicyVersion) {
+      throw new ApiError('VALIDATION_FAILED', 'That consent policy version is not the current one.', {
+        details: {
+          fields: [{ path: 'policyVersion', rule: 'enum', message: 'Not the current policy version.' }],
+          currentVersion: config.consentPolicyVersion,
+        },
+      });
+    }
     const decidedAt = iso(clock.now());
 
     if (actor) {
       // `clientSessionId` is ignored when authenticated: the account is the stronger subject
       // and letting a request name a different one would be an assignment primitive.
-      const account = await store.accounts.update(actor.accountId, {
+      requireCapability(actor, 'account:update', { accountId: actor.accountId });
+      const account = await updateAccount(actor, 'account.consent_set', {
         consentTelemetry: telemetryPersonal, consentPolicyVer: version, consentDecidedAt: decidedAt,
+      }, {
+        summaryKeys: ['consentTelemetry', 'consentPolicyVer'],
+        reasonCode: 'account_self_service',
+        correlationId,
       });
       return {
         telemetryPersonal, policyVersion: version, decidedAt, subject: 'account',
@@ -197,7 +267,9 @@ export function createAuthService(deps) {
       policyVersion: version,
       decidedAt,
       expiresAt: iso(clock.now() + PRE_AUTH_CONSENT_TTL_MS),
-      migratedAt: null,
+      // `migratedAt` is not a column a caller may write — the adapters reset it on every new
+      // decision and only `markMigrated` sets it, so a client that changes its mind after
+      // signup cannot keep a row claiming the new answer was already carried onto an account.
     });
     return {
       telemetryPersonal, policyVersion: version, decidedAt, subject: 'client-session',
@@ -209,6 +281,55 @@ export function createAuthService(deps) {
   }
 
   // ------------------------------------------------------------------------------- signup
+
+  /**
+   * Burn the eligibility receipt's nonce, once, for all time.
+   *
+   * There is no `eligibility_receipts` table and inventing one in another module's contract is
+   * not this module's call (the same reason `ephemeral.js` gives), so this uses
+   * `idempotency_keys`, which is precisely a "this exact token has already been spent" table —
+   * first writer wins, and a second write under the same key with a different request hash is
+   * refused by both adapters. The request hash is the account id, so a replay is always a
+   * different hash and is always refused rather than silently returning the first row.
+   */
+  async function consumeEligibilityNonce(eligibility, accountId, tx) {
+    const key = `eligibility-receipt:${eligibility.nonce}`;
+    try {
+      await store.idempotency.put({
+        key,
+        // A constant actor, because the composite key is (key, actorId): keying by account
+        // would put every replay in its own namespace and consume nothing.
+        actorId: 'onboarding',
+        requestHash: accountId,
+        responseStatus: null,
+        responseBody: null,
+        createdAt: iso(clock.now()),
+        expiresAt: eligibility.expiresAt,
+      }, tx);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'IDEMPOTENCY_KEY_REUSED') {
+        // Same code as every other receipt failure (receipts.js): "restart the age gate".
+        throw new ApiError('ELIGIBILITY_RECEIPT_INVALID',
+          'That age check is no longer valid. Please start again.');
+      }
+      throw err;
+    }
+  }
+
+  /** A racing signup on the same address must not answer differently from a losing one. */
+  async function createAccountRow(row, tx) {
+    try {
+      return await store.accounts.create(row, tx);
+    } catch (err) {
+      // The store's unique constraints are the authority; the pre-checks above are only the
+      // fast path. A CONFLICT here means "that email is registered", which is the one thing
+      // signup may not say (§8).
+      if (err instanceof ApiError && err.code === 'CONFLICT') {
+        throw new ApiError('AUTH_INVALID_CREDENTIALS', 'We could not complete that sign-up.');
+      }
+      throw err;
+    }
+  }
 
   /**
    * Step 4. Takes no `dateOfBirth` — it never leaves the preflight.
@@ -240,6 +361,15 @@ export function createAuthService(deps) {
     const lookup = emailHash(config.tokenSecret, email);
     const now = clock.now();
 
+    // Hash BEFORE the uniqueness lookups.
+    //
+    // The email-collision check used to throw first, so a registered address answered in
+    // 0.0 ms and a fresh one paid the 21.8 ms scrypt cost — a 21.7 ms gap that turns signup
+    // into the account-enumeration oracle §8 forbids, exactly the one signin and recovery are
+    // hardened against. The cost is that a refused signup still runs a KDF, which is the point.
+    const passwordHash = hashPassword(password);
+    const accountId = ulid(now);
+
     if (await store.accounts.byNameFolded(folded)) throw new ApiError('NAME_TAKEN', 'That name is taken.');
     // An existing address is reported as a name conflict would not be: signup cannot say
     // "that email is registered" without becoming the enumeration oracle §8 forbids, so it
@@ -247,9 +377,6 @@ export function createAuthService(deps) {
     if (await store.accounts.byEmailHash(lookup)) {
       throw new ApiError('AUTH_INVALID_CREDENTIALS', 'We could not complete that sign-up.');
     }
-
-    const accountId = ulid(now);
-    const passwordHash = hashPassword(password);
 
     // The stored pre-auth row is the source of truth (§3a.3 Storage); the receipt proves the
     // caller is entitled to it. When the row has aged out, the signature is still ours and
@@ -263,8 +390,17 @@ export function createAuthService(deps) {
     // and does not model roles or the §9 cooldown clock. They are written here because
     // auth.md §9 and §10 require them and this module cannot invent schema. Either §2 gains
     // the three columns or credentials move to the provider; both are contract decisions.
-    const result = await store.tx(async (tx) => {
-      const account = await store.accounts.create({
+    const newActor = { ...playerActor(accountId), accountId, roles: ['player'] };
+    const correlation = correlationFor(correlationId, now);
+    const { result } = await internalise(() => outbox.commit({ correlationId: correlation, actor: newActor }, async (tx, emit) => {
+      // §3a.1 says signup CONSUMES the receipt. It did not: the `n` nonce was minted, signed,
+      // and never looked at again, so one age-gate pass created accounts without limit — three
+      // on three client sessions in the reviewer's run. Recorded inside the transaction so a
+      // signup that fails does not burn the receipt, and recorded BEFORE the account so two
+      // concurrent presentations cannot both get past it.
+      await consumeEligibilityNonce(eligibility, accountId, tx);
+
+      const account = await createAccountRow({
         accountId,
         status: 'active',
         emailHash: lookup,
@@ -289,16 +425,32 @@ export function createAuthService(deps) {
 
       if (preAuth && !preAuth.migratedAt) await store.preAuthConsent.markMigrated(clientSessionId, iso(now), tx);
 
-      await emit(store, makeEvent('account.created', {
-        actor: { kind: 'player', id: accountId, role: 'player' },
+      await emit({
+        type: 'account.created',
+        actor: newActor,
         subject: { kind: 'account', id: accountId },
         payload: { displayName: name, eligibilityPolicyVersion: eligibility.policyVersion },
-        correlationId, occurredAt: now,
-      }), tx);
+        occurredAt: iso(now),
+      });
 
-      const issued = await sessions.start({ accountId, roles: ['player'], ip, userAgent, correlationId }, tx);
+      const issued = await sessions.start({ accountId, roles: ['player'], ip, userAgent }, tx, emit);
+
+      await audit.record({
+        actor: newActor,
+        action: 'account.signup',
+        // No authenticated actor exists before signup, and the account being created is the
+        // only party to the action. audit.js allows this exactly for an unprivileged actor
+        // acting on itself and refuses it for anything else.
+        capability: null,
+        subject: { kind: 'account', id: accountId },
+        reasonCode: 'account_self_service',
+        after: { displayName: name, status: 'active' },
+        summaryKeys: ['displayName', 'status'],
+        correlationId: correlation,
+      }, tx);
+
       return { account, issued };
-    });
+    }));
 
     const verificationToken = ephemeral.issue('verification', accountId, opaqueToken(), VERIFICATION_TTL_MS);
     await mailer?.sendVerification?.({ email, token: verificationToken, correlationId });
@@ -332,9 +484,26 @@ export function createAuthService(deps) {
       throw new ApiError('AUTH_ACCOUNT_LOCKED', 'This account is locked.');
     }
 
-    const issued = await store.tx((tx) => sessions.start({
-      accountId: account.accountId, roles: account.roles ?? ['player'], ip, userAgent, correlationId,
-    }, tx));
+    const roles = account.roles ?? ['player'];
+    const actor = { ...playerActor(account.accountId, roles), accountId: account.accountId, roles };
+    const correlation = correlationFor(correlationId, clock.now());
+    const { result: issued } = await internalise(() => outbox.commit(
+      { correlationId: correlation, actor },
+      async (tx, emit) => {
+        const started = await sessions.start({ accountId: account.accountId, roles, ip, userAgent }, tx, emit);
+        await audit.record({
+          actor,
+          action: 'account.signin',
+          capability: null,                 // the credential is the authorization; see signup
+          subject: { kind: 'account', id: account.accountId },
+          reasonCode: 'account_self_service',
+          after: { sessionId: started.session.sessionId },
+          summaryKeys: ['sessionId'],
+          correlationId: correlation,
+        }, tx);
+        return started;
+      },
+    ));
 
     return {
       accessToken: issued.accessToken,
@@ -378,7 +547,10 @@ export function createAuthService(deps) {
   }
 
   /** Completing recovery revokes **every** session — otherwise the attacker's stays live. */
-  async function recoveryComplete({ token, newPassword, correlationId = null }) {
+  async function recoveryComplete({ token, newPassword, ip = null, correlationId = null }) {
+    // §9 lists recovery in the auth class; only `recovery/start` enforced it, so the half of
+    // the flow that actually changes a password was the unlimited one.
+    limiter.enforceAuth({ ip, subject: null });
     requireString(newPassword, 'newPassword', { min: 10, max: 200 });
     const claim = ephemeral.consume('recovery', token);
     if (!claim.ok) {
@@ -390,8 +562,13 @@ export function createAuthService(deps) {
     const account = await store.accounts.byId(claim.accountId);
     if (!account) throw new ApiError('AUTH_RECOVERY_TOKEN_INVALID', 'That reset link is no longer valid. Start again.');
 
-    await store.accounts.update(account.accountId, {
+    // The account holder is the actor: proving control of the single-use token is the
+    // authorization, and there is no session to derive an actor from.
+    const actor = { ...playerActor(account.accountId, account.roles), accountId: account.accountId, roles: account.roles ?? ['player'] };
+    await updateAccount(actor, 'account.recovery_complete', {
       passwordHash: hashPassword(newPassword), updatedAt: iso(clock.now()),
+    }, {
+      summaryKeys: ['status', 'updatedAt'], reasonCode: 'account_recovery', correlationId, capability: null,
     });
     ephemeral.invalidateAll('recovery', account.accountId);
     await sessions.revokeAll({ accountId: account.accountId, reason: 'recovery-completed', correlationId });
@@ -400,7 +577,11 @@ export function createAuthService(deps) {
 
   // ------------------------------------------------------------------------- verification
 
-  async function verificationResend({ actor, correlationId = null }) {
+  async function verificationResend({ actor, ip = null, correlationId = null }) {
+    // §9: resend sends mail and mints a credential on every call. Unlimited, it is both a free
+    // mailer and a way to invalidate the link a player is holding, over and over.
+    limiter.enforceAuth({ ip, subject: actor?.accountId ?? null });
+    requireCapability(actor, 'account:update', { accountId: actor.accountId });
     const account = await store.accounts.byId(actor.accountId);
     if (!account) throw new ApiError('NOT_FOUND', 'No such account.');
     const raw = ephemeral.issue('verification', account.accountId, opaqueToken(), VERIFICATION_TTL_MS);
@@ -416,17 +597,28 @@ export function createAuthService(deps) {
    * reset. `AUTH_VERIFICATION_TOKEN_INVALID` / `_EXPIRED` route to "resend verification".
    */
   async function verificationComplete({ actor, token, correlationId = null }) {
-    const claim = ephemeral.consume('verification', token);
-    if (!claim.ok) {
-      if (claim.reason === 'expired') {
+    requireCapability(actor, 'account:update', { accountId: actor.accountId });
+    // PEEK, then compare, then consume.
+    //
+    // It used to consume first and compare afterwards, so any authenticated account could burn
+    // any other account's verification link by pasting it: single-use means the owner's link
+    // was then permanently dead, with no error anyone could see and no way to distinguish it
+    // from an expired one. Ownership is checked before anything is spent.
+    const seen = ephemeral.peek('verification', token);
+    if (!seen.ok || seen.accountId !== actor.accountId) {
+      if (seen.reason === 'expired') {
         throw new ApiError('AUTH_VERIFICATION_TOKEN_EXPIRED', 'That verification link expired. Send a new one.');
       }
       throw new ApiError('AUTH_VERIFICATION_TOKEN_INVALID', 'That verification link is no longer valid. Send a new one.');
     }
-    if (claim.accountId !== actor.accountId) {
+    const claim = ephemeral.consume('verification', token);
+    if (!claim.ok || claim.accountId !== actor.accountId) {
+      // Only reachable if something else spent it between the peek and here.
       throw new ApiError('AUTH_VERIFICATION_TOKEN_INVALID', 'That verification link is no longer valid. Send a new one.');
     }
-    await store.accounts.update(actor.accountId, { emailVerifiedAt: iso(clock.now()) });
+    await updateAccount(actor, 'account.verify', { emailVerifiedAt: iso(clock.now()) }, {
+      summaryKeys: ['emailVerifiedAt'], reasonCode: 'account_self_service', correlationId,
+    });
     logger.info('auth.verification.completed', { correlationId, accountId: actor.accountId });
   }
 
@@ -440,7 +632,8 @@ export function createAuthService(deps) {
     };
   }
 
-  async function termsAccept({ actor, version }) {
+  async function termsAccept({ actor, version, correlationId = null }) {
+    requireCapability(actor, 'account:update', { accountId: actor.accountId });
     const current = termsGet();
     // Accepting a stale version is a conflict, not a validation error: the client's copy was
     // right when it loaded, and `details` carries what it needs to re-present.
@@ -449,8 +642,11 @@ export function createAuthService(deps) {
         details: { currentVersion: current.version, url: current.url, publishedAt: current.publishedAt },
       });
     }
-    await store.accounts.update(actor.accountId, {
+    await updateAccount(actor, 'account.terms_accept', {
       termsVersionAccepted: current.version, termsAcceptedAt: iso(clock.now()),
+    }, {
+      summaryKeys: ['termsVersionAccepted', 'termsAcceptedAt'],
+      reasonCode: 'account_self_service', correlationId,
     });
   }
 
@@ -462,29 +658,40 @@ export function createAuthService(deps) {
    * folding is having one that is wrong.
    */
   async function changeDisplayName({ actor, displayName, correlationId = null }) {
+    requireCapability(actor, 'profile:update', { accountId: actor.accountId });
     const account = await store.accounts.byId(actor.accountId);
     if (!account) throw new ApiError('NOT_FOUND', 'No such account.');
     const { displayName: name, folded } = normaliseDisplayName(displayName);
     const now = clock.now();
 
-    if (folded !== account.displayNameFolded) {
+    const foldChanged = folded !== account.displayNameFolded;
+    if (foldChanged) {
       const holder = await store.accounts.byNameFolded(folded);
       if (holder && holder.accountId !== account.accountId) throw new ApiError('NAME_TAKEN', 'That name is taken.');
       assertCooldown(account.nameChangedAt, now);
     }
 
-    return store.tx(async (tx) => {
-      const updated = await store.accounts.update(account.accountId, {
-        displayName: name, displayNameFolded: folded, nameChangedAt: iso(now), updatedAt: iso(now),
-      }, tx);
-      await emit(store, makeEvent('account.name_changed', {
-        actor: { kind: 'player', id: account.accountId, role: 'player' },
+    const patch = { displayName: name, displayNameFolded: folded, updatedAt: iso(now) };
+    // A case-only edit skips the cooldown check — the name is the same name — so it must not
+    // restart the cooldown clock either. It did, which meant `ada` → `Ada` bought another 30
+    // days of lockout for a change the §9 rule does not consider a change at all.
+    if (foldChanged) patch.nameChangedAt = iso(now);
+
+    const updated = await updateAccountWithEvent(actor, patch, {
+      action: 'account.name_change',
+      capability: 'profile:update',
+      reasonCode: 'account_self_service',
+      correlationId,
+      summaryKeys: ['displayName'],
+      spec: {
+        type: 'account.name_changed',
+        actor: playerActor(account.accountId, actor.roles),
         subject: { kind: 'account', id: account.accountId },
         payload: { previousName: account.displayName, displayName: name },
-        correlationId, occurredAt: now,
-      }), tx);
-      return projectProfile(updated);
+        occurredAt: iso(now),
+      },
     });
+    return projectProfile(updated);
   }
 
   return {

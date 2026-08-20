@@ -23,7 +23,7 @@ process.on('uncaughtException', (err) => {
 });
 
 const config = loadConfig();
-const { server, deps } = await buildApp(config);
+const { server, deps, stop } = await buildApp(config);
 
 server.listen(config.port, () => {
   deps.logger.info('platform.listening', { port: config.port, env: config.env, storage: config.storage });
@@ -37,6 +37,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     deps.logger.info('platform.shutdown', { signal });
     // Stop accepting, let in-flight requests finish, then release the store.
     server.close(async () => {
+      stop();
       try { await deps.store.close(); } catch (err) { deps.logger.error('store.close.failed', { err: String(err) }); }
       process.exit(0);
     });
