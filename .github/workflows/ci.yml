@@ -38,7 +38,6 @@ jobs:
           --health-retries 20
     env:
       CI: '1'
-      DATABASE_URL: postgres://postgres:overstrike-test@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -46,9 +45,17 @@ jobs:
       - run: npm ci --ignore-scripts || npm install --ignore-scripts
       - name: static check
         run: npm run check
+      # DATABASE_URL is set PER STEP, not on the job.
+      #
+      # As a job-level variable it leaked into the memory step, so a step named "(memory)" ran
+      # storetest's PostgreSQL half too — and failed there on a missing `pg`, which made a
+      # dependency defect look like a memory-adapter defect. Each step now runs the adapter its
+      # name claims, and only one of them can fail for database reasons.
       - name: platform suite (memory)
         run: npm run platformtest
       - name: platform suite (real postgres) + migration replay
+        env:
+          DATABASE_URL: postgres://postgres:overstrike-test@127.0.0.1:5432/postgres
         run: node scripts/pgtest.mjs --no-docker
 
   lanes:
@@ -60,15 +67,20 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
-      - name: cross-lane guard over the real range
+      # EACH COMMIT, not the union of the push.
+      #
+      # The union inverts the rule. §0.2 says a change touching both lanes must be split, and a
+      # correct split produces single-lane commits whose union spans both lanes — so obeying the
+      # rule failed this job and the only way to pass was to not split. That is not hypothetical:
+      # it rejected a [CC] contract amendment pushed alongside the [CX]-owned request file that
+      # answered it, which is precisely the shape the rule asks for.
+      - name: cross-lane guard, one commit at a time
         run: |
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
           if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             BASE=$(git rev-parse HEAD~1)
           fi
-          FILES=$(git diff --name-only "$BASE" HEAD | paste -sd, -)
-          if [ -z "$FILES" ]; then echo "no files changed"; exit 0; fi
-          node scripts/lanecheck.mjs --files="$FILES"
+          node scripts/lanecheck.mjs --range="$BASE..HEAD"
 
   game:
     name: game simulation

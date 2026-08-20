@@ -22,10 +22,20 @@
  *   node scripts/lanecheck.mjs                 # staged + unstaged vs HEAD
  *   node scripts/lanecheck.mjs --staged        # exactly what `git commit` would record
  *   node scripts/lanecheck.mjs --base=master   # every change since a base ref (CI)
+ *   node scripts/lanecheck.mjs --range=A..B    # EACH COMMIT in the range, separately (CI)
  *   node scripts/lanecheck.mjs --files=a,b,c    # explicit list, for testing the guard
  *   node scripts/lanecheck.mjs --expect-fail    # invert the exit code (self-test)
+ *
+ * ── --range, and why the union is the wrong question ─────────────────────────────────
+ * CI used to flatten a whole push into one file list. That inverts the rule it enforces.
+ * The rule says a change touching both lanes must be SPLIT; splitting it produces two
+ * single-lane commits whose UNION spans both lanes, so obeying the rule failed the guard
+ * and the only way to pass was to not split. A real push was rejected for exactly this:
+ * one [CC] commit amending a contract, one [CX]-owned request file answering it.
+ *
+ * The unit the rule talks about is the commit, so that is the unit checked.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -51,6 +61,56 @@ const git = (...args) => {
 
 // ── which files changed ───────────────────────────────────────────────────────────────
 
+/**
+ * `--range=A..B`: check every commit in the range on its own, and fail if ANY commit fails.
+ *
+ * Each commit is evaluated in a child process rather than in a loop here, because the guards
+ * below read `--commit` from argv and a fresh process is the honest way to get a fresh
+ * evaluation with no state carried between commits.
+ */
+if (arg('range')) {
+  const range = arg('range');
+  const shas = git('rev-list', '--reverse', range).split('\n').filter(Boolean);
+  if (shas.length === 0) {
+    console.log(`lanecheck: no commits in ${range}.`);
+    process.exit(flag('expect-fail') ? 1 : 0);
+  }
+  console.log(`lanecheck: ${shas.length} commit(s) in ${range}, checked one at a time\n`);
+  let bad = 0;
+  for (const sha of shas) {
+    const subject = git('log', '-1', '--format=%s', sha).trim();
+    console.log(`── ${sha.slice(0, 8)} ${subject}`);
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), `--commit=${sha}`],
+      { cwd: ROOT, encoding: 'utf8', stdio: 'inherit' });
+    if (r.status !== 0) bad++;
+    console.log('');
+  }
+  if (bad) console.error(`lanecheck FAILED — ${bad} of ${shas.length} commit(s) span both lanes.`);
+  else console.log(`lanecheck OK — all ${shas.length} commit(s) are single-lane.`);
+  process.exit((bad > 0) === flag('expect-fail') ? 0 : 1);
+}
+
+/**
+ * The commit range every guard below reads its diffs from.
+ *
+ *   --commit=SHA  that commit alone (SHA^..SHA), the unit `--range` checks
+ *   --base=REF    everything this branch did since REF
+ *   neither       the working tree against HEAD
+ */
+function diffRange() {
+  const commit = arg('commit');
+  if (commit) {
+    // A root commit has no parent to diff against; the empty-tree hash is what git itself uses.
+    const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+    const parent = git('rev-list', '--parents', '-n', '1', commit).trim().split(' ')[1] || EMPTY_TREE;
+    return [`${parent}..${commit}`];
+  }
+  const base = arg('base');
+  if (base) return [`${git('merge-base', base, 'HEAD').trim()}..HEAD`];
+  return ['HEAD'];
+}
+
+
 function changedFiles() {
   const explicit = arg('files');
   if (explicit) return explicit.split(',').map((s) => s.trim()).filter(Boolean);
@@ -61,6 +121,10 @@ function changedFiles() {
   // check, which is the step that failed.
   if (flag('staged')) {
     return git('diff', '--name-only', '--cached').split('\n').filter(Boolean);
+  }
+
+  if (arg('commit')) {
+    return git('diff', '--name-only', ...diffRange()).split('\n').filter(Boolean);
   }
 
   const base = arg('base');
@@ -126,12 +190,12 @@ function onlyStatusLines(file) {
   // An untracked file has no baseline, so there is no way to prove only the status lines
   // moved — the whole file reads as added. The carve-out therefore cannot apply, and the file
   // belongs wholly to its owning lane until that lane commits it once.
-  const tracked = git('ls-files', '--', file).trim() !== '';
+  const tracked = arg('commit')
+    ? git('ls-tree', '--name-only', `${arg('commit')}^`, '--', file).trim() !== ''
+    : git('ls-files', '--', file).trim() !== '';
   if (!tracked) return false;
 
-  const base = arg('base');
-  const range = base ? [`${git('merge-base', base, 'HEAD').trim()}..HEAD`] : ['HEAD'];
-  const diff = git('diff', '--unified=0', ...range, '--', file);
+  const diff = git('diff', '--unified=0', ...diffRange(), '--', file);
   const touched = diff
     .split('\n')
     .filter((l) => (l.startsWith('+') || l.startsWith('-')) && !/^(\+\+\+|---)/.test(l))
@@ -189,9 +253,7 @@ if (byLane.CC.length && byLane.CX.length) {
 // 3. wire format vs version constant
 const pv = cfg.protocolVersionGuard;
 if (files.includes(pv.watch)) {
-  const base = arg('base');
-  const range = base ? [`${git('merge-base', base, 'HEAD').trim()}..HEAD`] : ['HEAD'];
-  const diff = git('diff', '--unified=0', ...range, '--', pv.constantFile);
+  const diff = git('diff', '--unified=0', ...diffRange(), '--', pv.constantFile);
   const bumped = diff
     .split('\n')
     .some((l) => l.startsWith('+') && !l.startsWith('+++') && l.includes(pv.constantName));

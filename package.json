@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OVERSTRIKE \u2014 a browser-native first-person shooter built on three.js",
+  "description": "OVERSTRIKE — a browser-native first-person shooter built on three.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -39,6 +39,7 @@
     "ci:deep": "npm run ci && npm run collisiontest && npm run geomtest"
   },
   "dependencies": {
+    "pg": "^8.23.0",
     "three": "^0.185.1",
     "ws": "^8.21.3"
   },
