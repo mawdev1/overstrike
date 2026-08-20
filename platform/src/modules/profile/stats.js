@@ -18,7 +18,9 @@
  *   weaponStats.applyDelta / weaponStats.listForAccount
  *   matches.record(result, tx)                       — the immutable result row + participants
  *   matches.listForAccount(accountId, opts, tx)      — history, newest first
+ *   idempotency.get(key, actorId, tx) / idempotency.put(row, tx)   — §5.2/§5.4 replay
  */
+import { createHash } from 'node:crypto';
 import { ApiError } from '../../core/errors.js';
 
 /** Exactly the typed columns of `player_stats` minus the identity key. `score` is absent by
@@ -112,6 +114,14 @@ export function resolveMatchStats({ roster, events = [], assistWindowTicks = 320
     }
     return life.get(id);
   };
+  /** A new life: not dead, no killer, no carried-over damage, a fresh assist budget. */
+  const resetLife = (id) => {
+    const st = lifeOf(id);
+    st.deadAtTick = null;
+    st.killerId = null;
+    st.contributors.clear();
+    st.assisted.clear();
+  };
 
   for (const ev of events) {
     switch (ev.type) {
@@ -171,12 +181,18 @@ export function resolveMatchStats({ roster, events = [], assistWindowTicks = 320
 
         victim.deaths += 1;                     // §3: any death, cause irrelevant
 
-        const selfInflicted = !attacker || attackerId === ev.victim
+        // §3: a suicide is a death with NO ENEMY ATTACKER, or a self-inflicted one. An
+        // attacker id we cannot resolve to a roster row — killstreak hardware submitted
+        // without its `owner`, an entity purged from the roster — is still an enemy attacker,
+        // so it is not a suicide. Booking it as one fabricates a suicide and loses a kill.
+        const selfInflicted = !attackerId || attackerId === ev.victim
           || ev.source === 'self' || ev.source === 'world';
         if (selfInflicted) {
-          // §3: a death with no enemy attacker is a suicide, and still a death.
           victim.suicides += 1;
           victim.score += SCORE.suicidePenalty;
+        } else if (!attacker) {
+          // An enemy killed them and nobody on the roster can be credited. The death stands,
+          // no suicide is invented, and no kill is awarded to a row that does not exist.
         } else if (team.get(attackerId) === team.get(ev.victim)) {
           // §3.1: a team kill by a player who then leaves is retained. Nothing in the
           // disconnect path removes it, which is the whole point of applying it here.
@@ -209,11 +225,7 @@ export function resolveMatchStats({ roster, events = [], assistWindowTicks = 320
       }
 
       case 'respawn': {
-        const st = lifeOf(ev.actor);
-        st.deadAtTick = null;
-        st.killerId = null;
-        st.contributors.clear();
-        st.assisted.clear();     // a new life is a new assist budget
+        resetLife(ev.actor);
         break;
       }
 
@@ -233,6 +245,12 @@ export function resolveMatchStats({ roster, events = [], assistWindowTicks = 320
           const p = get(id);
           if (p) p.roundsPlayed += 1;
         }
+        // A round transition, not a respawn, is what restores players in Bomb. Without this
+        // reset every player stays flagged dead from their first death for the rest of the
+        // match, and from then on their deaths — and their killers' kills — are dropped as
+        // "a later blow on an un-respawned corpse". Reset the whole roster: a player absent
+        // from `present` emits no events, so resetting them changes nothing.
+        for (const id of players.keys()) resetLife(id);
         break;
       }
 
@@ -268,18 +286,101 @@ export function resultFor(winnerTeam, playerTeam) {
   return winnerTeam === playerTeam ? 'win' : 'loss';
 }
 
+/** §4.2: the three terminal statuses. `pending` is not one of them, and neither is anything
+ * a caller invented — the union is closed or it is decoration. */
+export const TERMINAL_STATUSES = ['completed', 'aborted', 'invalidated'];
+
+/** The §4.0 matrix, executable. One row per status; every cell is checkable. */
+const OUTCOME_REASONS = {
+  completed: ['elimination', 'defuse', 'detonation', 'timer'],
+  aborted: ['forfeit', 'abandon', 'no-contest'],
+  invalidated: ['no-contest'],
+};
+const INVALIDATION_REASONS = ['cheat-detected', 'server-fault', 'roster-fault', 'admin-review'];
+
+/**
+ * Validate one result against the §4.0 status matrix.
+ *
+ * Fields the caller did not supply are not invented — `recomputeCareer` reads history rows that
+ * carry `status` and `winnerTeam` and nothing else — but every field that IS present must agree
+ * with the row for its status. That is what makes the union checkable rather than decorative.
+ *
+ * @returns {Array<object>} field-level problems, empty when the result is well-formed
+ */
+export function outcomeProblems(result) {
+  const { status, winnerTeam = null, outcomeReason, invalidationReason, terminationReason } = result || {};
+  const problems = [];
+  if (!TERMINAL_STATUSES.includes(status)) {
+    return [{ key: 'status', reason: 'enum', allowed: TERMINAL_STATUSES, got: status ?? null }];
+  }
+  if (terminationReason !== undefined && terminationReason !== null && terminationReason !== status) {
+    problems.push({ key: 'terminationReason', reason: 'must-equal-status', expected: status, got: terminationReason });
+  }
+  if (outcomeReason !== undefined && !OUTCOME_REASONS[status].includes(outcomeReason)) {
+    problems.push({ key: 'outcomeReason', reason: 'enum', allowed: OUTCOME_REASONS[status], got: outcomeReason });
+  }
+
+  // winnerTeam, per row. `draw` exists only for a completed match; an abort is never a draw.
+  if (status === 'completed') {
+    if (!['alpha', 'bravo', 'draw'].includes(winnerTeam)) {
+      problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo', 'draw'], got: winnerTeam });
+    }
+  } else if (status === 'aborted') {
+    if (outcomeReason === 'no-contest') {
+      if (winnerTeam !== null) problems.push({ key: 'winnerTeam', reason: 'must-be-null', got: winnerTeam });
+    } else if (outcomeReason === 'forfeit' || outcomeReason === 'abandon') {
+      if (!['alpha', 'bravo'].includes(winnerTeam)) {
+        problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo'], got: winnerTeam });
+      }
+    } else if (![null, 'alpha', 'bravo'].includes(winnerTeam)) {
+      problems.push({ key: 'winnerTeam', reason: 'enum', allowed: ['alpha', 'bravo', null], got: winnerTeam });
+    }
+  } else if (winnerTeam !== null) {
+    problems.push({ key: 'winnerTeam', reason: 'must-be-null', got: winnerTeam });
+  }
+
+  // invalidationReason is non-null from the enum for `invalidated`, and null for everything
+  // else. A completed match carrying "cheat-detected" is two truths in one row.
+  if (status === 'invalidated') {
+    if (invalidationReason !== undefined && !INVALIDATION_REASONS.includes(invalidationReason)) {
+      problems.push({ key: 'invalidationReason', reason: 'enum', allowed: INVALIDATION_REASONS, got: invalidationReason ?? null });
+    }
+  } else if (invalidationReason !== undefined && invalidationReason !== null) {
+    problems.push({ key: 'invalidationReason', reason: 'must-be-null', got: invalidationReason });
+  }
+  return problems;
+}
+
+/** Throwing form, for the write path. §4.0 violations are malformed submissions, not variants. */
+export function assertTerminalResult(result) {
+  const problems = outcomeProblems(result);
+  if (problems.length) {
+    throw new ApiError('VALIDATION_FAILED', 'The match result does not satisfy the §4.0 status matrix.', {
+      details: { fields: problems },
+    });
+  }
+}
+
 /**
  * The per-player career delta for one match.
  *
  * `null` means "does not aggregate" — §3.1 and §6: an invalidated match is recorded on the
  * match record and never applied to a career.
  *
+ * A status outside the §4.2 union THROWS rather than aggregating. Treating "anything that is
+ * not literally invalidated" as aggregatable minted a career match and a win out of `pending`,
+ * `allocated`, and `undefined` — and disagreed by construction with `recomputeCareer`, which
+ * skips pending, so the §6 reconciliation check could never hold.
+ *
  * An **aborted** match is NOT invalidated. If it ended by forfeit or abandon it carries a real
  * winner (§4.2), and that W/L counts: the player who quit still lost, and the opponents who
  * stayed still won.
  */
-export function careerDelta(player, { status, winnerTeam }) {
+export function careerDelta(player, result) {
+  const { status, winnerTeam } = result || {};
+  // Checked before the matrix: an invalidated match never aggregates, whatever else it carries.
   if (status === 'invalidated') return null;
+  assertTerminalResult(result);
 
   const delta = emptyTotals();
   for (const k of CAREER_KEYS) {
@@ -287,11 +388,11 @@ export function careerDelta(player, { status, winnerTeam }) {
     delta[k] = Number(player[k] || 0);
   }
   delta.matches = 1;
-  const result = resultFor(winnerTeam, player.team);
-  if (result === 'win') delta.wins = 1;
-  else if (result === 'loss') delta.losses = 1;
-  else if (result === 'draw') delta.draws = 1;
-  // result === null (no-contest) counts as a match played with no W/L/D, because the stats are
+  const outcome = resultFor(winnerTeam, player.team);
+  if (outcome === 'win') delta.wins = 1;
+  else if (outcome === 'loss') delta.losses = 1;
+  else if (outcome === 'draw') delta.draws = 1;
+  // outcome === null (no-contest) counts as a match played with no W/L/D, because the stats are
   // real and the outcome is not.
   return delta;
 }
@@ -301,12 +402,41 @@ export function addTotals(into, delta) {
   return into;
 }
 
+/** §5.2: "Idempotency key derived from matchId, so a retry is inherently the same key." */
+export const idempotencyKeyFor = (matchId) => `match-result:${matchId}`;
+
+/**
+ * The idempotency row is keyed by (key, actorId) in the store. The actor is pinned to one
+ * constant rather than the submitting service instance: the endpoint is service-only, and
+ * keying on the instance would make a retry from a *different* worker a different key, which
+ * is exactly the retry the deduplication exists for.
+ */
+const RESULT_ACTOR = 'service:match-result';
+
+/** A result row is immutable forever; the replay window only has to outlive the retry queue. */
+const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Key order must not change the hash, or a re-serialised retry looks like a different truth. */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+export const resultHash = (result) => createHash('sha256').update(stableStringify(result)).digest('hex');
+
 export function createStatsService({ store, clock = Date }) {
   /**
    * Apply one terminal result. SERVICE ONLY (§5.1) — this is the single door career numbers
    * come through, and it is closed to anything holding a player token.
+   *
+   * §5.3–§5.5: the record, the career application, and the idempotency row are ONE transaction.
+   * A replay with the same payload returns the stored response without re-applying; a replay
+   * with a different payload for a finalised match is a CONFLICT, because a match finalises
+   * once and a second, different truth is a bug or an attack.
    */
-  async function applyMatchResult({ actor, result }) {
+  async function applyMatchResult({ actor, result, idempotencyKey = null }) {
     if (!actor || actor.kind !== 'service') {
       throw new ApiError('AUTH_FORBIDDEN', 'Match results are service-submitted only.', {
         details: { reason: 'service-only' },
@@ -315,9 +445,31 @@ export function createStatsService({ store, clock = Date }) {
     if (!result || !result.matchId || !result.status) {
       throw new ApiError('VALIDATION_FAILED', 'A match result needs a matchId and a status.');
     }
+    const key = idempotencyKeyFor(result.matchId);
+    // §5.2 fixes the key's derivation, so a header that disagrees is a caller bug and not a
+    // second, competing key — accepting it would let one match finalise twice under two keys.
+    if (idempotencyKey !== null && idempotencyKey !== undefined && idempotencyKey !== key) {
+      throw new ApiError('VALIDATION_FAILED', 'Idempotency-Key must be match-result:<matchId>.', {
+        details: { fields: [{ key: 'Idempotency-Key', reason: 'derived-key-mismatch', expected: key }] },
+      });
+    }
+    assertTerminalResult(result);
     const sdv = result.statDefinitionVersion || STAT_DEFINITION_VERSION;
+    const requestHash = resultHash(result);
 
     return store.tx(async (tx) => {
+      // Read INSIDE the transaction. Checking outside it is a read-then-write race, and the
+      // two racers are precisely the duplicate submissions this check exists to collapse.
+      const prior = await store.idempotency.get(key, RESULT_ACTOR, tx);
+      if (prior) {
+        if (prior.requestHash !== requestHash) {
+          throw new ApiError('CONFLICT', 'This match was already finalised with a different result.', {
+            details: { matchId: result.matchId, reason: 'result-already-finalised' },
+          });
+        }
+        return prior.responseBody;      // §5.4: the stored response, and nothing re-applied
+      }
+
       // Recorded whatever the status — an invalidated match still has an immutable record, it
       // simply never reaches a career total.
       await store.matches.record(result, tx);
@@ -335,7 +487,18 @@ export function createStatsService({ store, clock = Date }) {
         }
         applied.push(player.accountId);
       }
-      return { matchId: result.matchId, status: result.status, applied, appliedAt: new Date(clock.now()).toISOString() };
+
+      const appliedAt = new Date(clock.now()).toISOString();
+      const response = { matchId: result.matchId, status: result.status, applied, appliedAt };
+      // Same transaction as the write above: a crash between them would leave a career applied
+      // with nothing recording that it was, and the retry would apply it a second time.
+      await store.idempotency.put({
+        key, actorId: RESULT_ACTOR, requestHash,
+        responseStatus: 200, responseBody: response,
+        createdAt: appliedAt,
+        expiresAt: new Date(clock.now() + IDEMPOTENCY_TTL_MS).toISOString(),
+      }, tx);
+      return response;
     });
   }
 
@@ -349,7 +512,10 @@ export function createStatsService({ store, clock = Date }) {
       addTotals(totals, row);
     }
     const weapons = {};
-    for (const w of await store.weaponStats.listForAccount(accountId, mode)) {
+    // `all` is this endpoint's DEFAULT, and it is not a mode. Passing it down as a mode filter
+    // matched no row, so every per-weapon number on the default career view was empty.
+    const modeFilter = mode === 'all' ? undefined : mode;
+    for (const w of await store.weaponStats.listForAccount(accountId, modeFilter)) {
       if (w.statDefinitionVersion !== sdv) continue;
       if (mode !== 'all' && w.mode !== mode) continue;
       const into = (weapons[w.weaponId] ||= { shots: 0, hits: 0, kills: 0, headshots: 0 });

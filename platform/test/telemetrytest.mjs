@@ -13,6 +13,7 @@ import { createConsentReceipts } from '../src/modules/telemetry/consent.js';
 import { lookupEvent, REGISTRY } from '../src/modules/telemetry/registry.js';
 import { LIMITS } from '../src/modules/telemetry/validate.js';
 import { ulid } from '../src/core/ids.js';
+import { createHmac } from 'node:crypto';
 
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
@@ -488,6 +489,115 @@ console.log('\n§3.5 nothing identifying is carried');
   assert('an IP address smuggled into a payload is not stored', !blob.includes('203.0.113.9'));
   assert('the accepted events themselves did land',
     sink.records.length === 2, String(sink.records.length));
+}
+
+// =============================================================================================
+console.log('\n§3.4 a receipt expires, and it expires against the policy it was given for');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service, sink } = harness({ clock });
+
+  // A correctly SIGNED receipt whose expiry cannot be read. `Date.parse` gives NaN and every
+  // comparison with NaN is false, so the bare `<= now` check made this receipt immortal.
+  const forge = (claims) => {
+    const body = Buffer.from(JSON.stringify(claims)).toString('base64url');
+    const mac = createHmac('sha256', SECRET).update(body).digest('base64url');
+    return `${body}.${mac}`;
+  };
+  const baseClaims = {
+    subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 1,
+    decidedAt: new Date(clock.now()).toISOString(),
+  };
+  const personal = () => batch([ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock)]);
+
+  for (const expiresAt of ['soon', '', null, undefined, 'never', {}]) {
+    const res = await service.ingest({
+      body: { ...personal(), consentReceipt: forge({ ...baseClaims, expiresAt }) },
+      actor: { accountId: 'A1' }, correlationId: ulid(),
+    });
+    assert(`an expiry of ${JSON.stringify(expiresAt)} is not consent`,
+      res.accepted === 0 && res.rejections[0]?.reason === 'receipt_expiry_invalid',
+      JSON.stringify(res.rejections));
+  }
+  assert('no event slipped through on an unreadable expiry', sink.records.length === 0,
+    JSON.stringify(sink.records.map((r) => r.name)));
+
+  // CONTROL: the same forged receipt with a readable, future expiry is accepted — so the
+  // rejections above are about the expiry and not about the forging.
+  const good = await service.ingest({
+    body: {
+      ...personal(),
+      consentReceipt: forge({ ...baseClaims, expiresAt: new Date(clock.now() + 3600e3).toISOString() }),
+    },
+    actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: a readable future expiry is accepted', good.accepted === 1, JSON.stringify(good.rejections));
+
+  // The policy version the subject actually agreed to. Consent to policy 1 is not consent to 2.
+  const clock2 = fakeClock();
+  const { service: s2, consent: c2 } = harness({ clock: clock2 });
+  const oldPolicy = c2.issue({ subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 0 });
+  const stale = await s2.ingest({
+    body: { ...personal(), consentReceipt: oldPolicy }, actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('a receipt for a different policy version is not consent',
+    stale.accepted === 0 && stale.rejections[0]?.reason === 'receipt_policy_stale',
+    JSON.stringify(stale.rejections));
+
+  // CONTROL 1: the same receipt against a verifier configured for that policy is accepted.
+  const c0 = createConsentReceipts({ secret: SECRET, clock: clock2, policyVersion: 0 });
+  assert('CONTROL: the same receipt verifies under the policy it was issued for',
+    c0.verify(oldPolicy, { accountId: 'A1' }).ok === true,
+    JSON.stringify(c0.verify(oldPolicy, { accountId: 'A1' })));
+  // CONTROL 2: a receipt for the CURRENT policy is accepted by the current verifier.
+  const current = c2.issue({ subject: 'account', subjectId: 'A1', telemetryPersonal: true, policyVersion: 1 });
+  const fresh = await s2.ingest({
+    body: { ...personal(), consentReceipt: current }, actor: { accountId: 'A1' }, correlationId: ulid(),
+  });
+  assert('CONTROL: a receipt for the current policy is accepted', fresh.accepted === 1,
+    JSON.stringify(fresh.rejections));
+}
+
+// =============================================================================================
+console.log('\n§3.5.1 pre-consent is classified by (name, version), like everything else');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const { service, sink, consent } = harness({ clock });
+  const sessionId = ulid();
+  const receipt = consent.issue({
+    subject: 'client-session', subjectId: sessionId, telemetryPersonal: true, policyVersion: 1,
+  });
+
+  // A version this server never registered. Classifying pre-consent by NAME alone let this
+  // event impose the §3.5.1 rules on a batch it is not part of — the whole batch lost its
+  // clientSessionId, or was refused outright for "mixing".
+  const res = await service.ingest({
+    body: batch([
+      ev('funnel.preconsent', { step: 'landing', outcome: 'viewed' }, clock,
+        { version: 99, correlationId: ulid() }),
+      ev('lobby.abandoned', { lastState: 'in-lobby', dwellSec: 30 }, clock),
+    ], { clientSessionId: sessionId, consentReceipt: receipt }),
+    actor: null, correlationId: ulid(),
+  });
+  assert('an unregistered funnel.preconsent version is just an unknown event',
+    res.accepted === 1 && res.rejections.length === 1 && res.rejections[0].reason === 'unknown_event',
+    JSON.stringify(res.rejections));
+  const stored = sink.records.find((r) => r.name === 'lobby.abandoned');
+  assert('the batch keeps its clientSessionId — a bogus version cannot strip it',
+    stored?.clientSessionId === sessionId, String(stored?.clientSessionId));
+
+  // CONTROL: the REGISTERED version of the same event still imposes every §3.5.1 rule.
+  await refuses('CONTROL: a real funnel.preconsent in that batch is still refused for mixing',
+    () => service.ingest({
+      body: batch([
+        ev('funnel.preconsent', { step: 'landing', outcome: 'viewed' }, clock, { correlationId: ulid() }),
+        ev('lobby.abandoned', { lastState: 'in-lobby', dwellSec: 30 }, clock),
+      ], { clientSessionId: ulid() }),
+      actor: null, correlationId: ulid(),
+    }),
+    'preconsent_batch_mixing');
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nclient telemetry runs clean');

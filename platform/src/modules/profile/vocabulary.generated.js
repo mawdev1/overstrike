@@ -8,7 +8,7 @@
  * Scope is ROAM". This file IS that projection, machine-derived, so the validator cannot
  * disagree with the design document.
  */
-export const VOCABULARY = {
+const RAW = {
   "vocabularyVersion": 1,
   "categories": [
     "input",
@@ -540,6 +540,20 @@ export const VOCABULARY = {
       "reserved": true
     }
   }
+};
+
+/**
+ * `scopes`, `roam` and `keybinds` are looked up with client-supplied keys, so they are
+ * prototype-less: a plain object answers `constructor`, `toString` and `__proto__` with a
+ * truthy value the inventory never declared, and that value was accepted as a definition.
+ */
+const lookup = (o) => Object.assign(Object.create(null), o);
+
+export const VOCABULARY = {
+  ...RAW,
+  scopes: lookup(RAW.scopes),
+  roam: lookup(RAW.roam),
+  keybinds: lookup(RAW.keybinds),
 };
 
 export default VOCABULARY;

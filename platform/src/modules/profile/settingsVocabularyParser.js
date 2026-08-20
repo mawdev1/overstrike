@@ -115,9 +115,13 @@ export function parseSettingsInventory(markdown) {
   if (!vm) throw new Error('settings-inventory: no vocabulary version declared');
 
   const categories = [];
-  const scopes = {};        // every key we saw, with its persistence class
-  const roam = {};          // ROAM keys only — the RoamingSettingsV1 allowlist
-  const keybinds = {};
+  // Prototype-less on purpose. These three are LOOKUP maps against untrusted client keys, and
+  // a plain object answers `constructor`, `toString`, `valueOf` and `__proto__` with something
+  // truthy that the inventory never declared. A vocabulary that vouches for keys it does not
+  // contain is not an allowlist.
+  const scopes = Object.create(null);   // every key we saw, with its persistence class
+  const roam = Object.create(null);     // ROAM keys only — the RoamingSettingsV1 allowlist
+  const keybinds = Object.create(null);
 
   let i = 0;
   while (i < lines.length) {

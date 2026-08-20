@@ -79,7 +79,11 @@ function checkKeybinds(binds, vocab, errors) {
   }
   const seen = new Map();   // code -> action, so a conflict cannot be stored
   for (const [action, entry] of Object.entries(binds)) {
-    const def = vocab.keybinds[action];
+    // `vocab.keybinds[action]` alone accepted `constructor`, `toString`, `valueOf` and
+    // `__proto__` as binding actions, because every plain object inherits them — the client
+    // got a truthy "definition" that came from Object.prototype and the junk was stored
+    // verbatim. Own-property only; the vocabulary is the allowlist or it is nothing.
+    const def = Object.hasOwn(vocab.keybinds, action) ? vocab.keybinds[action] : undefined;
     if (!def) { errors.push({ key: `keybinds.${action}`, reason: 'unknown-binding-action' }); continue; }
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
       errors.push({ key: `keybinds.${action}`, reason: 'type', expected: '{primary, secondary?}' });
@@ -135,11 +139,13 @@ export function validateRoamingSettings(values, vocab = VOCABULARY) {
   }
   for (const [key, value] of Object.entries(values)) {
     if (key === 'keybinds') { checkKeybinds(value, vocab, errors); continue; }
-    const spec = vocab.roam[key];
+    // Own-property lookups throughout: the vocabulary must not answer for `constructor` or
+    // `toString` just because every object inherits them.
+    const spec = Object.hasOwn(vocab.roam, key) ? vocab.roam[key] : undefined;
     if (!spec) {
       // A DEVICE/SESSION/PRACTICE key is a *known* key in the wrong scope. Saying so is the
       // difference between a client bug that is fixable and one that looks like a typo.
-      const scope = vocab.scopes[key];
+      const scope = Object.hasOwn(vocab.scopes, key) ? vocab.scopes[key] : undefined;
       errors.push(scope && scope !== 'ROAM'
         ? { key, reason: 'scope-not-roaming', scope }
         : { key, reason: 'unknown-key' });
@@ -174,8 +180,8 @@ function parseIfMatch(header) {
 }
 
 export function createSettingsService({ store, clock = Date, vocab = VOCABULARY }) {
-  async function read(accountId) {
-    const profile = await store.profiles.byAccountId(accountId);
+  async function read(accountId, tx) {
+    const profile = await store.profiles.byAccountId(accountId, tx);
     const version = profile?.settingsVersion ?? 1;
     const values = profile?.roamingSettings ?? defaultRoamingValues(vocab);
     return {
@@ -189,9 +195,19 @@ export function createSettingsService({ store, clock = Date, vocab = VOCABULARY 
   /**
    * Full replace. Absent ROAM keys revert to their documented default — that is what "full
    * replace" means, and a partial merge would make a reset-to-default unexpressible.
+   *
+   * The version check and the write are ONE transaction, and the write is conditional on the
+   * version the check read. Comparing outside the transaction is a read-then-write race: two
+   * tabs both read version 7, both find their `If-Match: "7"` current, and both write — so the
+   * §11.2 check reports success to a client whose rebind was silently discarded, which is the
+   * exact failure If-Match exists to prevent.
    */
   async function replace(accountId, { schemaVersion, values }, ifMatchHeader) {
-    const current = await read(accountId);
+    return store.tx((tx) => replaceInTx(tx, accountId, { schemaVersion, values }, ifMatchHeader));
+  }
+
+  async function replaceInTx(tx, accountId, { schemaVersion, values }, ifMatchHeader) {
+    const current = await read(accountId, tx);
 
     const expected = parseIfMatch(ifMatchHeader);
     if (expected === null) {
@@ -226,12 +242,21 @@ export function createSettingsService({ store, clock = Date, vocab = VOCABULARY 
 
     const merged = { ...defaultRoamingValues(vocab), ...values };
     merged.keybinds = values.keybinds ?? {};
-    const updatedAt = new Date(clock.now()).toISOString();
-    const saved = await store.profiles.upsert(accountId, {
-      roamingSettings: merged,
-      settingsVersion: current.version + 1,
-      updatedAt,
-    });
+    // `updated_at` is the adapter's to stamp (it has a trigger in Postgres and is not a
+    // patchable column); the service supplies only what it decides.
+    const patch = { roamingSettings: merged, settingsVersion: current.version + 1 };
+    // Compare-and-set where the adapter offers one: the update matches only while the stored
+    // version is still the one we validated against, and no matching row is a 409 rather than
+    // an overwrite. Without it the transaction's isolation is what carries the guarantee.
+    const saved = store.profiles.upsertIfVersion
+      ? await store.profiles.upsertIfVersion(accountId, current.version, patch, tx)
+      : await store.profiles.upsert(accountId, patch, tx);
+    if (!saved) {
+      const now = await read(accountId, tx);
+      throw new ApiError('CONFLICT', 'Settings changed on another device.', {
+        details: { currentVersion: now.version, values: now.values },
+      });
+    }
 
     return {
       schemaVersion: SCHEMA_VERSION,

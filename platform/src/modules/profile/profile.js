@@ -13,6 +13,7 @@
  *     that does not exist is a 404.
  */
 import { ApiError } from '../../core/errors.js';
+import { STAT_DEFINITION_VERSION } from './stats.js';
 
 const NAME_MIN = 3;
 const NAME_MAX = 16;
@@ -23,16 +24,26 @@ export function foldName(name) {
   return name.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-const DEFAULT_PRIVACY = { presenceVisibility: 'everyone', statsVisibility: 'everyone' };
+/** §4: the two closed enums. `friends` exists for presence and NOT for stats. */
+const PRESENCE_VISIBILITY = ['everyone', 'friends', 'nobody'];
+const STATS_VISIBILITY = ['everyone', 'nobody'];
 
-/** Stored privacy is a jsonb blob; unknown or missing members fall back rather than throw. */
+/**
+ * Stored privacy is a jsonb blob, so anything can be in it: a value from a newer client, a
+ * mis-cased `NOBODY`, a `friends` the stats enum does not have, a null from a half-written row.
+ *
+ * An unrecognised visibility falls to the MOST RESTRICTIVE member of its enum, never to
+ * `everyone`. Failing open here publishes a career the subject asked us to hide, and does it
+ * silently — the subject sees their own setting and has no way to learn it was not honoured.
+ */
 export function normalizePrivacy(raw) {
   const p = raw && typeof raw === 'object' ? raw : {};
-  const presence = ['everyone', 'friends', 'nobody'].includes(p.presenceVisibility)
-    ? p.presenceVisibility : DEFAULT_PRIVACY.presenceVisibility;
-  const stats = ['everyone', 'nobody'].includes(p.statsVisibility)
-    ? p.statsVisibility : DEFAULT_PRIVACY.statsVisibility;
-  return { presenceVisibility: presence, statsVisibility: stats };
+  return {
+    presenceVisibility: PRESENCE_VISIBILITY.includes(p.presenceVisibility)
+      ? p.presenceVisibility : 'nobody',
+    statsVisibility: STATS_VISIBILITY.includes(p.statsVisibility)
+      ? p.statsVisibility : 'nobody',
+  };
 }
 
 /** §3a.3: object-or-null, from `consent_telemetry` / `consent_policy_ver` / `consent_decided_at`. */
@@ -45,19 +56,53 @@ export function projectConsent(account) {
   };
 }
 
-function projectModeration(account) {
+/**
+ * §4 moderation state, from columns that exist.
+ *
+ * `accounts.moderation_status` and `accounts.active_sanctions` are in no schema — reading them
+ * returned `undefined` forever, which the `||` then dressed up as a clean account. The real
+ * source is `accounts.status` (0001, `active|restricted|banned|deleted`) for the summary, and
+ * the `sanctions` table (0006) for the list. The store has no sanctions accessor yet, so the
+ * list is supplied by an injected reader when one exists and is an honest empty array when it
+ * does not — an empty list is at least a state the schema can produce.
+ */
+const MODERATION_STATUS = {
+  active: 'clear', restricted: 'restricted', banned: 'banned', deleted: 'banned',
+};
+
+function projectModeration(account, activeSanctions = []) {
   return {
-    status: account.moderationStatus || 'clear',
-    activeSanctions: account.activeSanctions || [],
+    status: MODERATION_STATUS[account.status] ?? 'clear',
+    activeSanctions,
   };
 }
 
-export function createProfileService({ store, clock = Date, nameChangeCooldownMs = 30 * 24 * 3600e3 }) {
+/**
+ * §4 `flags.nameChangeAvailableAt` is DERIVED, not stored. The stored column is
+ * `accounts.name_changed_at` (migration 0008); the availability instant is that plus the
+ * cooldown. Storing the derived instant is what broke the feature — it was written to a column
+ * no schema declares, so the read side was permanently undefined and the cooldown never fired.
+ */
+export function nameChangeAvailableAt(account, cooldownMs) {
+  const changedAt = Date.parse(account?.nameChangedAt ?? '');
+  if (!Number.isFinite(changedAt)) return null;      // never changed: available now
+  return new Date(changedAt + cooldownMs).toISOString();
+}
+
+export function createProfileService({
+  store, clock = Date, nameChangeCooldownMs = 30 * 24 * 3600e3,
+  // Presence is a live lobby-socket value (§5) and has no column; a reader is injected when a
+  // presence service exists. Defaulting to null keeps the key present without inventing state.
+  readPresence = null,
+  readActiveSanctions = null,
+}) {
   async function requireAccount(accountId) {
     const account = await store.accounts.byId(accountId);
     if (!account || account.deletedAt) throw new ApiError('NOT_FOUND', 'No such account.');
     return account;
   }
+
+  const sanctionsFor = async (accountId) => (readActiveSanctions ? await readActiveSanctions(accountId) : []);
 
   /** §4 `GET /v1/profile/me`. Everything the owner is entitled to see about themselves. */
   async function getOwnProfile(accountId) {
@@ -68,8 +113,8 @@ export function createProfileService({ store, clock = Date, nameChangeCooldownMs
       createdAt: account.createdAt,
       privacy: normalizePrivacy(account.privacy),
       consent: projectConsent(account),
-      moderation: projectModeration(account),
-      flags: { nameChangeAvailableAt: account.nameChangeAvailableAt ?? null },
+      moderation: projectModeration(account, await sanctionsFor(accountId)),
+      flags: { nameChangeAvailableAt: nameChangeAvailableAt(account, nameChangeCooldownMs) },
     };
   }
 
@@ -107,17 +152,20 @@ export function createProfileService({ store, clock = Date, nameChangeCooldownMs
         throw new ApiError('NAME_TAKEN', 'That name is taken.');
       }
       const now = clock.now();
-      const availableAt = account.nameChangeAvailableAt ? Date.parse(account.nameChangeAvailableAt) : 0;
-      if (Number.isFinite(availableAt) && availableAt > now) {
+      const availableAt = nameChangeAvailableAt(account, nameChangeCooldownMs);
+      const availableAtMs = availableAt === null ? 0 : Date.parse(availableAt);
+      if (availableAtMs > now) {
         throw new ApiError('NAME_CHANGE_COOLDOWN', 'You changed your name too recently.', {
-          retryAfterMs: availableAt - now,
-          details: { availableAt: account.nameChangeAvailableAt },
+          retryAfterMs: availableAtMs - now,
+          details: { availableAt },
         });
       }
+      // `name_changed_at` is the column that exists (0008). The availability instant is derived
+      // from it on the way out, so there is one fact stored and one place it can be wrong.
       await store.accounts.update(accountId, {
         displayName: name,
         displayNameFolded: folded,
-        nameChangeAvailableAt: new Date(now + nameChangeCooldownMs).toISOString(),
+        nameChangedAt: new Date(now).toISOString(),
       });
     }
     return getOwnProfile(accountId);
@@ -144,10 +192,12 @@ export function createProfileService({ store, clock = Date, nameChangeCooldownMs
       // Every key present in both states so one renderer handles both and a missing key is a
       // bug rather than a state (the §4.3 convention, applied here for the same reason).
       statsVisible,
-      stats: statsVisible ? { statDefinitionVersion: account.statDefinitionVersion ?? null } : null,
-      presence: presenceVisible ? (account.presence ?? null) : null,
+      // The definitions that produced the counters are a property of the stats service, not a
+      // column on the account — `accounts.stat_definition_version` does not exist.
+      stats: statsVisible ? { statDefinitionVersion: STAT_DEFINITION_VERSION } : null,
+      presence: presenceVisible && readPresence ? (await readPresence(subjectId)) ?? null : null,
       // Moderation state is owner-only; a public banner is a pillory, not a product feature.
-      moderation: isSelf ? projectModeration(account) : null,
+      moderation: isSelf ? projectModeration(account, await sanctionsFor(subjectId)) : null,
       consent: isSelf ? projectConsent(account) : null,
     };
   }

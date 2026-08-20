@@ -30,8 +30,13 @@ function withHeaders(status, body, headers, correlationId) {
   return out;
 }
 
-export function createProfileModule({ store, clock = Date, logger = console }) {
-  const profiles = createProfileService({ store, clock });
+export function createProfileModule({
+  store, clock = Date, logger = console,
+  // Presence has no column and sanctions have no store accessor yet (profile.js). They are
+  // injected when a service for them exists rather than read from fields no schema declares.
+  readPresence = null, readActiveSanctions = null,
+}) {
+  const profiles = createProfileService({ store, clock, readPresence, readActiveSanctions });
   const settings = createSettingsService({ store, clock });
   const stats = createStatsService({ store, clock });
   const migration = createMigrationService({ store, clock });

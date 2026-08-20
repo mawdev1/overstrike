@@ -113,11 +113,17 @@ export function enforcePreconsentRules(body, { requestCorrelationId, seenCorrela
   const indices = [];
   let personalPresent = false;
 
+  // BOTH sides of this classification use the same (name, version) lookup. Classifying
+  // pre-consent by name alone while classifying "personal" by lookup let an event this server
+  // does not know — `funnel.preconsent` at a version that was never registered — turn an
+  // ordinary batch into a pre-consent batch, stripping its clientSessionId and applying rules
+  // to events that are about to be rejected as unknown anyway.
   body.events.forEach((e, i) => {
     if (!isPlainObject(e)) return;
-    if (e.name === 'funnel.preconsent') { indices.push(i); return; }
     const spec = lookupEvent(e.name, e.version);
-    if (spec && spec.privacyClass === 'personal') personalPresent = true;
+    if (!spec) return;
+    if (spec.unlinked) { indices.push(i); return; }
+    if (spec.privacyClass === 'personal') personalPresent = true;
   });
 
   if (indices.length === 0) return { preconsentIndices: [] };

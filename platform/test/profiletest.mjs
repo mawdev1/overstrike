@@ -13,8 +13,12 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import { createProfileModule } from '../src/modules/profile/index.js';
-import { resolveMatchStats, careerDelta, timePlayedSec, emptyTotals, addTotals, deriveRatios, CAREER_KEYS }
-  from '../src/modules/profile/stats.js';
+import { createMemoryStore } from '../src/core/store/memory.js';
+import { normalizePrivacy } from '../src/modules/profile/profile.js';
+import {
+  resolveMatchStats, careerDelta, timePlayedSec, emptyTotals, addTotals, deriveRatios,
+  CAREER_KEYS, idempotencyKeyFor, STAT_DEFINITION_VERSION,
+} from '../src/modules/profile/stats.js';
 import { parseSettingsInventory } from '../src/modules/profile/settingsVocabularyParser.js';
 import { VOCABULARY } from '../src/modules/profile/vocabulary.generated.js';
 
@@ -45,18 +49,43 @@ async function expectNoThrow(fn, name) {
 
 // ------------------------------------------------------------------ fake store
 
+/**
+ * Columns `accounts` actually has (migrations 0001 + 0008, mirrored from the memory adapter's
+ * ACCOUNT_COLUMNS). The fake enforces them for the same reason the memory adapter does: a fake
+ * that shrugs at a column no schema declares is how a write to `nameChangeAvailableAt` passed
+ * every test while doing nothing at all.
+ */
+const ACCOUNT_COLUMNS = new Set([
+  'accountId', 'status', 'emailHash', 'displayName', 'displayNameFolded',
+  'passwordHash', 'roles', 'nameChangedAt',
+  'eligibilityVerdict', 'eligibilityPolicyVer', 'eligibilityDecidedAt',
+  'emailVerifiedAt', 'termsVersionAccepted', 'termsAcceptedAt',
+  'consentTelemetry', 'consentPolicyVer', 'consentDecidedAt',
+  'privacy', 'createdAt', 'updatedAt', 'deletedAt',
+]);
+
 function makeStore() {
   const accounts = new Map();
   const profiles = new Map();
   const statRows = new Map();        // `${account}|${mode}|${sdv}`
   const weaponRows = new Map();      // `${account}|${mode}|${weapon}|${sdv}`
   const matches = [];                // newest last; listForAccount reverses
+  const idem = new Map();            // `${key}|${actorId}`
 
   const key = (...p) => p.join('|');
 
+  // The documented adapter serialises every transaction (store/memory.js). Without that here,
+  // "the same result submitted ten times concurrently" would be testing the fake's interleaving
+  // rather than the service's idempotency.
+  let chain = Promise.resolve();
+
   return {
-    _accounts: accounts, _matches: matches,
-    async tx(fn) { return fn({ fake: true }); },
+    _accounts: accounts, _matches: matches, _idem: idem,
+    async tx(fn) {
+      const run = chain.then(() => fn({ fake: true }));
+      chain = run.then(() => {}, () => {});
+      return run;
+    },
 
     accounts: {
       async byId(id) { return accounts.get(id) || null; },
@@ -65,16 +94,46 @@ function makeStore() {
         return null;
       },
       async update(id, patch) {
+        for (const k of Object.keys(patch || {})) {
+          if (!ACCOUNT_COLUMNS.has(k)) throw new Error(`Unknown column for accounts: ${k}`);
+        }
         const a = { ...accounts.get(id), ...patch };
         accounts.set(id, a);
         return a;
       },
     },
 
+    // §5.2/§5.4 replay storage. First writer wins; the same key with a different request hash
+    // is refused rather than overwritten (store.js).
+    idempotency: {
+      async get(k, actorId) { return idem.get(key(k, actorId)) || null; },
+      async put(row) {
+        const k = key(row.key, row.actorId);
+        const cur = idem.get(k);
+        if (cur) {
+          if (cur.requestHash !== row.requestHash) throw new Error('IDEMPOTENCY_KEY_REUSED');
+          return cur;
+        }
+        idem.set(k, row);
+        return row;
+      },
+    },
+
     profiles: {
       async byAccountId(id) { return profiles.get(id) || null; },
+      // Patchable columns only, and `updated_at` is the adapter's to stamp — same rules as
+      // store/memory.js, so a service that patches a column the schema does not have fails here.
       async upsert(id, patch) {
-        const p = { accountId: id, ...(profiles.get(id) || {}), ...patch };
+        for (const k of Object.keys(patch || {})) {
+          if (!['roamingSettings', 'legacyImport', 'settingsVersion'].includes(k)) {
+            throw new Error(`Unknown column for profiles: ${k}`);
+          }
+        }
+        const p = {
+          accountId: id, roamingSettings: null, legacyImport: null, settingsVersion: 1,
+          ...(profiles.get(id) || {}), ...patch,
+          updatedAt: new Date().toISOString(),
+        };
         profiles.set(id, p);
         return p;
       },
@@ -101,7 +160,13 @@ function makeStore() {
         weaponRows.set(k, row);
         return row;
       },
-      async listForAccount(a) { return [...weaponRows.values()].filter((r) => r.accountId === a); },
+      // Filters by mode exactly as the memory adapter does: `undefined` means every mode, and
+      // any other value is matched literally. A fake that ignored the argument is what let
+      // `mode: 'all'` reach the adapter as a literal filter and match nothing.
+      async listForAccount(a, mode) {
+        return [...weaponRows.values()]
+          .filter((r) => r.accountId === a && (mode === undefined || r.mode === mode));
+      },
     },
 
     matches: {
@@ -131,19 +196,19 @@ const ACCOUNT = '01JPROFILEACCOUNT0000000AA';
 const OTHER = '01JPROFILEACCOUNT0000000BB';
 
 function seed(store) {
+  // Only real columns. `moderationStatus`/`activeSanctions` were never in any schema, so
+  // seeding them here would have kept the ghost-field bug invisible.
   store._accounts.set(ACCOUNT, {
-    accountId: ACCOUNT, displayName: 'Mawdev', displayNameFolded: 'mawdev',
-    createdAt: '2026-01-01T00:00:00.000Z',
+    accountId: ACCOUNT, status: 'active', displayName: 'Mawdev', displayNameFolded: 'mawdev',
+    createdAt: '2026-01-01T00:00:00.000Z', nameChangedAt: null,
     privacy: { presenceVisibility: 'everyone', statsVisibility: 'everyone' },
     consentTelemetry: true, consentPolicyVer: 1, consentDecidedAt: '2026-01-01T00:00:00.000Z',
-    moderationStatus: 'clear', activeSanctions: [],
   });
   store._accounts.set(OTHER, {
-    accountId: OTHER, displayName: 'Quiet', displayNameFolded: 'quiet',
-    createdAt: '2026-01-02T00:00:00.000Z',
+    accountId: OTHER, status: 'active', displayName: 'Quiet', displayNameFolded: 'quiet',
+    createdAt: '2026-01-02T00:00:00.000Z', nameChangedAt: null,
     privacy: { presenceVisibility: 'nobody', statsVisibility: 'nobody' },
     consentTelemetry: null, consentPolicyVer: null, consentDecidedAt: null,
-    moderationStatus: 'clear', activeSanctions: [],
   });
 }
 
@@ -509,6 +574,8 @@ console.log('\nCareer aggregation — service-only, recomputable, status-aware')
 function matchResult({ matchId, status, winnerTeam, outcomeReason, players, mode = 'tdm' }) {
   return {
     matchId, status, mode,
+    // `region` is NOT NULL on `matches` (0004) — the real adapter refuses a result without one.
+    region: 'yyz',
     mapId: 'the-square', mapVersion: '1.0.0',
     statDefinitionVersion: '1.0.0',
     terminationReason: status, outcomeReason,
@@ -723,6 +790,427 @@ console.log('\nProgression migration — one-time, unverified, non-authoritative
   expect(junk.data.lifetime.kills === 0 && junk.data.lifetime.deaths === 0 && junk.data.xp === 0,
     'control: a hostile blob coerces to zeros instead of throwing or storing garbage',
     JSON.stringify(junk.data.lifetime));
+}
+
+// ------------------------------------------------------------------ 8. idempotency (§5)
+
+console.log('\nmatch-result.md §5 — a retry applies once');
+
+{
+  const store = makeStore();
+  seed(store);
+  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const service = { kind: 'service', serviceId: 'match-server' };
+  const result = matchResult({ matchId: 'IDEM1', status: 'completed', winnerTeam: 'alpha',
+    outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] });
+
+  const first = await mod.stats.applyMatchResult({ actor: service, result });
+  const second = await mod.stats.applyMatchResult({ actor: service, result });
+  const afterTwo = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(afterTwo.totals.kills === 10 && afterTwo.totals.matches === 1 && afterTwo.totals.wins === 1,
+    'the identical result submitted twice is applied exactly once', JSON.stringify(afterTwo.totals));
+  expect(JSON.stringify(first) === JSON.stringify(second),
+    '§5.4: the replay returns the STORED response rather than a fresh application',
+    `${JSON.stringify(first)} vs ${JSON.stringify(second)}`);
+  expect(store._matches.filter((m) => m.matchId === 'IDEM1').length === 1,
+    'the immutable match record is written once, not once per retry',
+    String(store._matches.filter((m) => m.matchId === 'IDEM1').length));
+  expect(store._idem.size === 1 && [...store._idem.values()][0].key === idempotencyKeyFor('IDEM1'),
+    '§5.2: the key is derived from the matchId, so a retry is inherently the same key',
+    JSON.stringify([...store._idem.values()].map((r) => r.key)));
+
+  // §8.1: submit the identical payload ten times concurrently.
+  await Promise.all(Array.from({ length: 10 },
+    () => mod.stats.applyMatchResult({ actor: service, result })));
+  const afterTen = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(JSON.stringify(afterTen.totals) === JSON.stringify(afterTwo.totals),
+    'ten concurrent duplicate submissions change nothing', JSON.stringify(afterTen.totals));
+  const recomputed = await mod.stats.recomputeCareer(ACCOUNT, 'tdm');
+  expect(JSON.stringify(recomputed.totals) === JSON.stringify(afterTen.totals),
+    '§6: the recompute still equals the stored totals after the retries',
+    `${JSON.stringify(recomputed.totals)}\n       vs ${JSON.stringify(afterTen.totals)}`);
+
+  // §5.5: a DIFFERENT payload for a finalised match is a conflict, not a second truth.
+  await expectCode(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: { ...result, players: [playerRow(ACCOUNT, 'alpha', { kills: 99 })] },
+  }), 'CONFLICT', 'a different payload for a finalised match is refused');
+  const afterConflict = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(afterConflict.totals.kills === 10, 'the refused re-submission changed nothing',
+    String(afterConflict.totals.kills));
+
+  await expectCode(() => mod.stats.applyMatchResult({
+    actor: service, result, idempotencyKey: 'whatever-i-like',
+  }), 'VALIDATION_FAILED', 'an Idempotency-Key that is not match-result:<matchId> is refused');
+
+  // CONTROL: a different match still applies, so the deduplication is per match and not a
+  // service that has simply stopped accepting results.
+  await expectNoThrow(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: matchResult({ matchId: 'IDEM2', status: 'completed', winnerTeam: 'alpha',
+      outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha', { kills: 3 })] }),
+  }), 'CONTROL: a different matchId applies normally');
+  const afterSecond = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(afterSecond.totals.kills === 13 && afterSecond.totals.matches === 2,
+    'CONTROL: the second, genuinely different match aggregated', JSON.stringify(afterSecond.totals));
+}
+
+// The same proof against the real adapter, whose `matches` surface is being added separately.
+{
+  const store = createMemoryStore({ storage: 'memory' });
+  if (typeof store.matches?.record === 'function' && typeof store.matches?.listForAccount === 'function') {
+    const account = await store.accounts.create({
+      accountId: ACCOUNT, displayName: 'Mawdev', displayNameFolded: 'mawdev',
+    });
+    const mod = createProfileModule({ store, logger: { debug() {} } });
+    const service = { kind: 'service', serviceId: 'match-server' };
+    const result = matchResult({ matchId: 'REALIDEM1', status: 'completed', winnerTeam: 'alpha',
+      outcomeReason: 'timer', players: [playerRow(account.accountId, 'alpha')] });
+
+    await mod.stats.applyMatchResult({ actor: service, result });
+    await Promise.all(Array.from({ length: 10 },
+      () => mod.stats.applyMatchResult({ actor: service, result })));
+    const totals = await mod.stats.getCareer(account.accountId, 'tdm');
+    expect(totals.totals.kills === 10 && totals.totals.matches === 1,
+      'REAL STORE: eleven submissions of one result apply it once', JSON.stringify(totals.totals));
+    await expectCode(() => mod.stats.applyMatchResult({
+      actor: service, result: { ...result, teamScores: { alpha: 1, bravo: 0 } },
+    }), 'CONFLICT', 'REAL STORE: a different payload for the same match is refused');
+  } else {
+    console.log('  ---- store.matches is not on the adapter yet; the real-store idempotency '
+      + 'proof did not run (fake-store proof above still applies)');
+  }
+  await store.close();
+}
+
+// ------------------------------------------------------------------ 9. the §4.0 status matrix
+
+console.log('\nmatch-result.md §4.0 — only a terminal status aggregates');
+
+{
+  const player = playerRow(ACCOUNT, 'alpha');
+  for (const status of ['pending', 'in-progress', 'allocated', undefined, null, 'Completed']) {
+    await expectCode(() => careerDelta(player, { status, winnerTeam: 'alpha' }),
+      'VALIDATION_FAILED', `careerDelta refuses status ${JSON.stringify(status)}`);
+  }
+  // CONTROL: the three terminal statuses behave as the matrix says.
+  expect(careerDelta(player, { status: 'completed', winnerTeam: 'alpha' })?.wins === 1,
+    'CONTROL: a completed match still mints a win');
+  expect(careerDelta(player, { status: 'aborted', winnerTeam: 'bravo', outcomeReason: 'forfeit' })?.losses === 1,
+    'CONTROL: an aborted forfeit still mints a loss');
+  expect(careerDelta(player, { status: 'invalidated', winnerTeam: null }) === null,
+    'CONTROL: an invalidated match still returns no delta');
+
+  // The matrix invariants themselves.
+  await expectCode(() => careerDelta(player, { status: 'completed', winnerTeam: null }),
+    'VALIDATION_FAILED', 'a completed match with no winner violates the matrix');
+  await expectCode(() => careerDelta(player, { status: 'completed', winnerTeam: 'alpha', outcomeReason: 'forfeit' }),
+    'VALIDATION_FAILED', 'a completed match cannot end by forfeit');
+  await expectCode(() => careerDelta(player, { status: 'aborted', winnerTeam: 'draw', outcomeReason: 'forfeit' }),
+    'VALIDATION_FAILED', 'an aborted match is never a draw');
+  await expectCode(() => careerDelta(player, { status: 'aborted', winnerTeam: 'alpha', outcomeReason: 'no-contest' }),
+    'VALIDATION_FAILED', 'a no-contest abort cannot carry a winner');
+  await expectCode(() => careerDelta(player, {
+    status: 'completed', winnerTeam: 'alpha', outcomeReason: 'timer', invalidationReason: 'cheat-detected',
+  }), 'VALIDATION_FAILED', 'a completed match cannot carry an invalidation reason');
+  await expectCode(() => careerDelta(player, {
+    status: 'completed', winnerTeam: 'alpha', terminationReason: 'aborted', outcomeReason: 'timer',
+  }), 'VALIDATION_FAILED', 'terminationReason must agree with status');
+
+  // And through the write path: a non-terminal status applies nothing and records nothing.
+  const store = makeStore();
+  seed(store);
+  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const service = { kind: 'service', serviceId: 'match-server' };
+  await expectCode(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: { ...matchResult({ matchId: 'P1', status: 'completed', winnerTeam: 'alpha',
+      outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }),
+      status: 'pending', terminationReason: 'pending' },
+  }), 'VALIDATION_FAILED', 'applyMatchResult refuses a pending result outright');
+  const totals = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(totals.totals.matches === 0 && store._matches.length === 0,
+    'the refused pending result minted neither a career match nor a record',
+    JSON.stringify({ matches: totals.totals.matches, recorded: store._matches.length }));
+
+  // §6 reconciliation is only meaningful if both paths agree on what aggregates. `pending` is
+  // skipped by the recompute, so the incremental path must refuse it rather than count it.
+  await expectNoThrow(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: matchResult({ matchId: 'P2', status: 'completed', winnerTeam: 'alpha',
+      outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }),
+  }), 'CONTROL: the same result with status completed applies');
+  const stored = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  const recomputed = await mod.stats.recomputeCareer(ACCOUNT, 'tdm');
+  expect(JSON.stringify(stored.totals) === JSON.stringify(recomputed.totals),
+    'the incremental path and the recompute agree on exactly one match',
+    `${JSON.stringify(stored.totals)}\n       vs ${JSON.stringify(recomputed.totals)}`);
+}
+
+// ------------------------------------------------------------------ 10. display name
+
+console.log('\nDisplay-name change writes a column that exists, and the cooldown fires');
+
+{
+  const store = makeStore();
+  seed(store);
+  let t = Date.parse('2026-08-19T00:00:00.000Z');
+  const clock = { now: () => t };
+  const mod = createProfileModule({ store, clock, logger: { debug() {} } });
+
+  const before = await mod.profiles.getOwnProfile(ACCOUNT);
+  expect(before.flags.nameChangeAvailableAt === null,
+    'an account that never changed its name has no cooldown', JSON.stringify(before.flags));
+
+  const renamed = await expectNoThrow(() => mod.profiles.patchProfile(ACCOUNT, { displayName: 'Renamed' }),
+    'the display name change goes through');
+  const row = store._accounts.get(ACCOUNT);
+  expect(row.nameChangedAt === new Date(t).toISOString(),
+    'the change stamps name_changed_at — the column migration 0008 declares', String(row.nameChangedAt));
+  expect(!('nameChangeAvailableAt' in row),
+    'nothing writes nameChangeAvailableAt, which is a column in no schema',
+    JSON.stringify(Object.keys(row)));
+  expect(renamed?.flags.nameChangeAvailableAt === new Date(t + 30 * 24 * 3600e3).toISOString(),
+    'nameChangeAvailableAt is DERIVED at read time as name_changed_at + 30 days',
+    JSON.stringify(renamed?.flags));
+
+  // The cooldown is now reachable, which it never was while the read side was undefined.
+  t += 29 * 24 * 3600e3;
+  const cooling = await expectCode(() => mod.profiles.patchProfile(ACCOUNT, { displayName: 'Again' }),
+    'NAME_CHANGE_COOLDOWN', 'a second change inside 30 days is refused');
+  expect(cooling?.retryAfterMs === 24 * 3600e3,
+    'the refusal carries the real time remaining', String(cooling?.retryAfterMs));
+  expect(store._accounts.get(ACCOUNT).displayName === 'Renamed',
+    'the refused change did not rename the account', store._accounts.get(ACCOUNT).displayName);
+
+  // CONTROL: past the cooldown the same change is accepted, so the refusal is the 30 days and
+  // not a rename path that has stopped working.
+  t += 2 * 24 * 3600e3;
+  const later = await expectNoThrow(() => mod.profiles.patchProfile(ACCOUNT, { displayName: 'Again' }),
+    'CONTROL: the same change past the cooldown is accepted');
+  expect(later?.displayName === 'Again' && store._accounts.get(ACCOUNT).nameChangedAt === new Date(t).toISOString(),
+    'CONTROL: the accepted change re-stamps name_changed_at',
+    JSON.stringify({ name: later?.displayName, at: store._accounts.get(ACCOUNT).nameChangedAt }));
+
+  // Moderation comes from accounts.status (0001), not from a field nothing writes.
+  store._accounts.set(OTHER, { ...store._accounts.get(OTHER), status: 'restricted' });
+  const restricted = await mod.profiles.getOwnProfile(OTHER);
+  expect(restricted.moderation.status === 'restricted' && Array.isArray(restricted.moderation.activeSanctions),
+    'moderation status projects from accounts.status', JSON.stringify(restricted.moderation));
+  const clear = await mod.profiles.getOwnProfile(ACCOUNT);
+  expect(clear.moderation.status === 'clear', 'CONTROL: an active account is clear',
+    JSON.stringify(clear.moderation));
+
+  // statDefinitionVersion is the stats service's, not a column on the account.
+  const view = await mod.profiles.getPublicProfile(ACCOUNT, ACCOUNT);
+  expect(view.stats.statDefinitionVersion === STAT_DEFINITION_VERSION,
+    'the public projection reports the real stat definition version, never undefined',
+    JSON.stringify(view.stats));
+  expect('presence' in view && view.presence === null,
+    'presence has no column, so the key is present and honestly null', JSON.stringify(view.presence));
+}
+
+// ------------------------------------------------------------------ 11. If-Match is a CAS
+
+console.log('\nhttp-api.md §11.2 — If-Match is compare-and-set, not read-then-write');
+
+{
+  const store = createMemoryStore({ storage: 'memory' });
+  const account = await store.accounts.create({
+    accountId: ACCOUNT, displayName: 'Racer', displayNameFolded: 'racer',
+  });
+  const mod = createProfileModule({ store, logger: { debug() {} } });
+
+  // Two writers, both holding the same fresh ETag. One must win and one must be told.
+  const [a, b] = await Promise.allSettled([
+    mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 100 } }, '"1"'),
+    mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 110 } }, '"1"'),
+  ]);
+  const winners = [a, b].filter((r) => r.status === 'fulfilled');
+  const losers = [a, b].filter((r) => r.status === 'rejected');
+  expect(winners.length === 1 && losers.length === 1,
+    'exactly one of two concurrent writers with the same If-Match succeeds',
+    JSON.stringify([a.status, b.status]));
+  expect(losers[0]?.reason?.code === 'CONFLICT' && losers[0]?.reason?.status === 409,
+    'the loser is told with a 409, not silently discarded',
+    `${losers[0]?.reason?.code} ${losers[0]?.reason?.status}`);
+
+  const final = await mod.settings.read(account.accountId);
+  expect(final.version === 2, 'exactly one version was consumed by the pair', String(final.version));
+  expect(final.values.fov === winners[0].value.values.fov,
+    'the stored value is the winner\'s, and the loser wrote nothing',
+    `${final.values.fov} vs ${winners[0].value.values.fov}`);
+
+  // CONTROL: sequential writes, each with the current ETag, both land.
+  const next = await mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 95 } }, '"2"');
+  expect(next.version === 3 && next.values.fov === 95,
+    'CONTROL: a write with the current version is accepted', JSON.stringify({ v: next.version, fov: next.values.fov }));
+  await expectCode(
+    () => mod.settings.replace(account.accountId, { schemaVersion: 1, values: { fov: 90 } }, '"2"'),
+    'CONFLICT', 'CONTROL: the now-stale version is refused');
+  await store.close();
+}
+
+// ------------------------------------------------------------------ 12. privacy fails closed
+
+console.log('\nPrivacy fails CLOSED — an unrecognised visibility hides, never publishes');
+
+{
+  for (const bad of ['friends', 'NOBODY', 'Everyone', null, undefined, 42, '']) {
+    expect(normalizePrivacy({ statsVisibility: bad, presenceVisibility: 'everyone' }).statsVisibility === 'nobody',
+      `statsVisibility ${JSON.stringify(bad)} normalises to nobody, not everyone`);
+  }
+  expect(normalizePrivacy({}).statsVisibility === 'nobody' && normalizePrivacy(null).presenceVisibility === 'nobody',
+    'a missing or unreadable privacy blob hides rather than publishes');
+  // CONTROL: the documented members survive untouched, so this is not a blanket "hide all".
+  expect(normalizePrivacy({ statsVisibility: 'everyone', presenceVisibility: 'friends' }).statsVisibility === 'everyone'
+      && normalizePrivacy({ statsVisibility: 'everyone', presenceVisibility: 'friends' }).presenceVisibility === 'friends',
+    'CONTROL: recognised visibilities are preserved exactly');
+
+  // End to end: a subject whose stored blob says "friends" does not leak a career.
+  const store = makeStore();
+  seed(store);
+  store._accounts.set(OTHER, {
+    ...store._accounts.get(OTHER),
+    privacy: { presenceVisibility: 'friends', statsVisibility: 'friends' },
+  });
+  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const leaked = await mod.handlers.getStats(
+    ctxFor(ACCOUNT, { params: { accountId: OTHER }, query: new URLSearchParams() }));
+  expect(leaked.totals === null && leaked.weapons === null,
+    'a statsVisibility the enum does not contain hides the career', JSON.stringify(leaked));
+  // CONTROL: the same call for a subject who really did choose `everyone` returns counters.
+  const shown = await mod.handlers.getStats(
+    ctxFor(OTHER, { params: { accountId: ACCOUNT }, query: new URLSearchParams() }));
+  expect(shown.totals !== null, 'CONTROL: an explicit everyone still returns counters');
+}
+
+// ------------------------------------------------------------------ 13. mode=all weapons
+
+console.log('\n§11.5 — mode=all is the default, and it must carry the weapon breakdown');
+
+{
+  const store = makeStore();
+  seed(store);
+  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const service = { kind: 'service', serviceId: 'match-server' };
+
+  await mod.stats.applyMatchResult({ actor: service,
+    result: matchResult({ matchId: 'W1', status: 'completed', winnerTeam: 'alpha',
+      outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }) });
+  await mod.stats.applyMatchResult({ actor: service,
+    result: matchResult({ matchId: 'W2', status: 'completed', winnerTeam: 'alpha', mode: 'bomb',
+      outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }) });
+
+  const all = await mod.stats.getCareer(ACCOUNT, 'all');
+  expect(all.weapons.ar_vector?.kills === 20,
+    'mode=all sums the per-weapon rows across every mode', JSON.stringify(all.weapons));
+  const tdm = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(tdm.weapons.ar_vector?.kills === 10,
+    'CONTROL: a real mode filter still returns only that mode\'s weapon rows', JSON.stringify(tdm.weapons));
+
+  // The default view of the endpoint is the one that was permanently empty.
+  const view = await mod.handlers.getStats(
+    ctxFor(OTHER, { params: { accountId: ACCOUNT }, query: new URLSearchParams() }));
+  expect(Object.keys(view.weapons).length > 0 && view.mode === 'all',
+    'GET /v1/profile/:id/stats with no mode returns a populated weapons map',
+    JSON.stringify(view.weapons));
+}
+
+// ------------------------------------------------------------------ 14. binding vocabulary
+
+console.log('\n§11.9 — the binding vocabulary is an allowlist, not an object lookup');
+
+{
+  const store = makeStore();
+  seed(store);
+  const mod = createProfileModule({ store, logger: { debug() {} } });
+
+  for (const action of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    const err = await expectCode(() => mod.settings.replace(ACCOUNT, {
+      schemaVersion: 1, values: { keybinds: JSON.parse(`{"${action}": {"primary": "KeyB"}}`) },
+    }, '"1"'), 'VALIDATION_FAILED', `the inherited member "${action}" is not a binding action`);
+    expect(err?.details.fields[0].reason === 'unknown-binding-action',
+      `"${action}" is rejected as unknown, not accepted as a definition`,
+      JSON.stringify(err?.details.fields));
+  }
+  const settingsKey = await expectCode(() => mod.settings.replace(ACCOUNT, {
+    schemaVersion: 1, values: { constructor: 1 },
+  }, '"1"'), 'VALIDATION_FAILED', 'an inherited member is not a roaming settings key either');
+  expect(settingsKey?.details.fields[0].reason === 'unknown-key',
+    'and it is reported as an unknown key rather than a scope violation',
+    JSON.stringify(settingsKey?.details.fields));
+
+  const state = await mod.settings.read(ACCOUNT);
+  expect(state.version === 1 && Object.keys(state.values.keybinds ?? {}).length === 0,
+    'none of the refused writes stored anything', JSON.stringify(state.values.keybinds));
+
+  // CONTROL: a canonical action ID with the same value shape is accepted.
+  const good = await expectNoThrow(() => mod.settings.replace(ACCOUNT, {
+    schemaVersion: 1, values: { keybinds: { crouch: { primary: 'KeyB' } } },
+  }, '"1"'), 'CONTROL: a canonical binding action with the same shape is accepted');
+  expect(good?.values.keybinds.crouch.primary === 'KeyB', 'CONTROL: and it is stored verbatim',
+    JSON.stringify(good?.values.keybinds));
+
+  expect(Object.getPrototypeOf(VOCABULARY.keybinds) === null
+      && Object.getPrototypeOf(VOCABULARY.roam) === null
+      && Object.getPrototypeOf(VOCABULARY.scopes) === null,
+    'the vocabulary lookup maps have no prototype to answer for keys they do not contain');
+}
+
+// ------------------------------------------------------------------ 15. resolver defects
+
+console.log('\n§3 — an unrostered enemy is not a suicide, and a round restores life');
+
+{
+  // A killstreak kill submitted without its owner: an enemy turret is an ENEMY attacker.
+  const orphan = resolveMatchStats({ roster, events: [
+    { type: 'kill', tick: 40, attacker: 'turret:1', victim: 'V', source: 'killstreak' },
+  ] });
+  const v = byId(orphan, 'V');
+  expect(v.deaths === 1 && v.suicides === 0,
+    'a killstreak kill with no owner is a death and NOT the victim\'s suicide',
+    JSON.stringify({ deaths: v.deaths, suicides: v.suicides }));
+  expect(byId(orphan, 'A').kills === 0 && byId(orphan, 'B').kills === 0,
+    'and no rostered player is credited for it',
+    JSON.stringify({ a: byId(orphan, 'A').kills, b: byId(orphan, 'B').kills }));
+
+  // CONTROL: a genuine self-inflicted death is still a suicide.
+  const real = resolveMatchStats({ roster, events: [
+    { type: 'kill', tick: 40, attacker: 'V', victim: 'V', source: 'self' },
+  ] });
+  expect(byId(real, 'V').suicides === 1 && byId(real, 'V').deaths === 1,
+    'CONTROL: a self-inflicted death is still a suicide',
+    JSON.stringify(byId(real, 'V')));
+
+  // Bomb: rounds, not respawns, restore players. A second round's kill and death must count.
+  const bomb = resolveMatchStats({ roster, events: [
+    { type: 'roundStart', tick: 0, index: 0, present: ['A', 'B', 'V'] },
+    { type: 'kill', tick: 50, attacker: 'A', victim: 'V', source: 'weapon', weaponId: 'ar_vector' },
+    { type: 'roundStart', tick: 600, index: 1, present: ['A', 'B', 'V'] },
+    { type: 'kill', tick: 650, attacker: 'A', victim: 'V', source: 'weapon', weaponId: 'ar_vector' },
+    { type: 'roundStart', tick: 1200, index: 2, present: ['A', 'B', 'V'] },
+    { type: 'damage', tick: 1240, attacker: 'B', victim: 'V', amount: 40 },
+    { type: 'kill', tick: 1250, attacker: 'A', victim: 'V', source: 'weapon', weaponId: 'ar_vector' },
+  ] });
+  expect(byId(bomb, 'V').deaths === 3 && byId(bomb, 'A').kills === 3,
+    'every round\'s kill and death counts, not just the first',
+    JSON.stringify({ deaths: byId(bomb, 'V').deaths, kills: byId(bomb, 'A').kills }));
+  expect(byId(bomb, 'A').weapons.ar_vector.kills === 3,
+    'and the per-weapon breakdown agrees', JSON.stringify(byId(bomb, 'A').weapons));
+  expect(byId(bomb, 'B').assists === 1,
+    'a new round is a new assist budget, so the third round\'s assist is awarded',
+    String(byId(bomb, 'B').assists));
+
+  // CONTROL: without the round transition the corpse rule still holds — a second blow on a
+  // player who never came back is not a second death.
+  const corpse = resolveMatchStats({ roster, events: [
+    { type: 'kill', tick: 50, attacker: 'A', victim: 'V', source: 'weapon' },
+    { type: 'kill', tick: 650, attacker: 'A', victim: 'V', source: 'weapon' },
+  ] });
+  expect(byId(corpse, 'V').deaths === 1 && byId(corpse, 'A').kills === 1,
+    'CONTROL: with no respawn and no round transition, the second blow is not a stat',
+    JSON.stringify({ deaths: byId(corpse, 'V').deaths, kills: byId(corpse, 'A').kills }));
 }
 
 console.log('');

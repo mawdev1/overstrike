@@ -134,7 +134,13 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     // signature is two ways to mint a receipt and only one way to verify it — the telemetry
     // module ships its own so it can be tested alone, and here the auth one wins.
     const consent = deps.auth?.receipts?.consent
-      || telemetry.createConsentReceipts({ secret: config.tokenSecret });
+      || telemetry.createConsentReceipts({
+        secret: config.tokenSecret,
+        // Passed explicitly, not defaulted. A receipt is only meaningful against the policy
+        // version it was issued under, and a verifier that hardcodes 1 keeps accepting stale
+        // receipts the moment the policy moves — which is the whole reason it is versioned.
+        policyVersion: config.consentPolicyVersion,
+      });
     // The service REQUIRES a sink and destructures it; building without one made every
     // non-empty batch a 500. The suite passed a sink of its own, so nothing caught it —
     // which is why wiring needs its own boot check, not just module tests.
