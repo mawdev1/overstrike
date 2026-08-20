@@ -208,11 +208,45 @@ export async function createPostgresStore(config = {}, deps = {}) {
     // on an IPv6 literal, so an IPv6 DATABASE_URL resolves to nothing. See core/pgurl.js.
     ...pgConnectionConfig(databaseUrl),
     max: config.poolMax ?? 10,
-    // A statement that has run for 30s inside a request is not going to save the request; it
-    // is going to hold a connection while the client has already given up.
-    statement_timeout: config.statementTimeoutMs ?? 30_000,
   });
   pool.on?.('error', (err) => logger?.error('store.pool.error', { message: err.message }));
+
+  /**
+   * `statement_timeout`, applied per connection rather than as a startup parameter.
+   *
+   * A statement still running after 30s inside a request is not going to save that request; it
+   * is going to hold a connection while the client has already given up. That reasoning has not
+   * changed — how it is applied has.
+   *
+   * `new Pool({ statement_timeout })` sends it as a libpq STARTUP parameter, and pgbouncer
+   * refuses startup parameters it does not know:
+   *
+   *     08P01  unsupported startup parameter: statement_timeout
+   *
+   * so the platform could not open a single connection through a transaction-mode pooler. That
+   * is not an exotic configuration — it is the default shape of managed Postgres (Fly, Supabase's
+   * pooler, RDS Proxy), and it is what `fly mpg attach` writes into DATABASE_URL. The deployed
+   * platform booted, answered /v1/health, and reported `db: down` on every request, with the
+   * cause masked to "Database error." by the driver-error translator.
+   *
+   * `SET` after connect works through a pooler and needs no server configuration. The value is
+   * coerced to a non-negative integer and interpolated, because `SET` does not take a bind
+   * parameter — hence the `Number.isInteger` check rather than trusting the config.
+   *
+   * Under TRANSACTION pooling this runs once per server connection, not once per checkout, so a
+   * server connection reused by another client keeps the timeout. That is the desired direction:
+   * every client of this database wants it, and pgbouncer resets it at `server_reset_query`.
+   */
+  const statementTimeoutMs = config.statementTimeoutMs ?? 30_000;
+  if (!Number.isInteger(statementTimeoutMs) || statementTimeoutMs < 0) {
+    throw new Error(`postgres store: statementTimeoutMs must be a non-negative integer, got ${statementTimeoutMs}`);
+  }
+  pool.on?.('connect', (client) => {
+    // Fire-and-forget with a caught rejection: a failure here must not take down the pool, and
+    // the next query will surface anything genuinely wrong with the connection.
+    client.query(`set statement_timeout = ${statementTimeoutMs}`)
+      .catch((err) => logger?.error('store.statement_timeout.failed', { message: err.message }));
+  });
 
   /** Identity of THIS store, so a handle from another instance is rejected rather than used. */
   const storeTag = Symbol('overstrike.pgstore');
