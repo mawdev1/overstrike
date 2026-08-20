@@ -562,7 +562,7 @@ Verification at the implementation snapshot:
   requests with one refresh, retry/correlation/error exactness, cross-tab revocation, telemetry
   privacy/queue/expiry/retry behavior, and shell-to-contract mappings.
 - `npm run check`: **PASS — 74 modules / 201 imports**.
-- `npm run build`: **PASS**. Initial shell JS is 160.23 KB; the game runtime is a separate
+- `npm run build`: **PASS**. Initial shell JS is 162.17 KB; the game runtime is a separate
   819.57 KB lazy chunk.
 - `npm run platformtest`: **PASS — 2,393 checks / 10 suites / 0 failures**.
 - Scoped lanecheck: **PASS — 32 files: 31 CX, one shared handoff file, 0 CC/unowned files**.
