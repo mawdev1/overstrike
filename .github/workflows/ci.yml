@@ -45,6 +45,11 @@ jobs:
       - run: npm ci --ignore-scripts || npm install --ignore-scripts
       - name: static check
         run: npm run check
+      # `npm run ci` referenced an untracked scripts/tdmtest.mjs three times running. It passed
+      # on the one machine holding an untracked copy and aborted everywhere else, and this
+      # workflow never noticed because it does not call `npm run ci`.
+      - name: the ci script only names files that are in the repository
+        run: node scripts/citest.mjs
       # DATABASE_URL is set PER STEP, not on the job.
       #
       # As a job-level variable it leaked into the memory step, so a step named "(memory)" ran
