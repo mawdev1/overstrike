@@ -481,6 +481,9 @@ export function createAuthService(deps) {
         accountId,
         status: 'active',
         emailHash: lookup,
+        // PERSONAL class (0019). Stored so this platform can address the mail it owes the
+        // player; lookup and uniqueness still go through `emailHash`, never this.
+        email,
         passwordHash,
         displayName: name,
         displayNameFolded: folded,
@@ -667,7 +670,12 @@ export function createAuthService(deps) {
     const account = await store.accounts.byId(actor.accountId);
     if (!account) throw new ApiError('NOT_FOUND', 'No such account.');
     const raw = ephemeral.issue('verification', account.accountId, opaqueToken(), VERIFICATION_TTL_MS);
-    await mailer?.sendVerification?.({ accountId: account.accountId, token: raw, correlationId });
+    // The EMAIL, not just the accountId: a mailer given only an account id has no recipient and
+    // silently delivers nothing. This path is the one a player uses when the first message never
+    // arrived, so it is the worst one to have quietly send nowhere.
+    await mailer?.sendVerification?.({
+      accountId: account.accountId, email: account.email, token: raw, correlationId,
+    });
     return { accepted: true, verificationToken: raw };
   }
 

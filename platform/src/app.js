@@ -24,7 +24,7 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 
 // The modules a production process MUST have. `stubs` is deliberately absent: in production
 // it is not mounted at all, which is a stronger guarantee than mounting it disabled.
-const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags'];
+const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'mail'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
@@ -273,6 +273,22 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     mounted.push('events');
   }
 
+  // ── mail: the transactional sender auth has always taken and never had ───────────────
+  //
+  // `auth/index.js` accepted a `mailer` and every call site is `await mailer?.send…?.(…)`, so a
+  // null mailer made every send a silent no-op. Signup minted a verification token and wrote it
+  // nowhere a player could reach; onboarding step 5 asked for a code nothing had sent.
+  //
+  // Built BEFORE auth so it can be injected rather than patched in afterwards. `none` is the
+  // default, so a process with no mail configured still boots and reports its transport instead
+  // of pretending to send.
+  const mail = await load('mail', './modules/mail/index.js');
+  if (mail) {
+    deps.mail = mail.createMailer({ config, logger });
+    logger.info('mail.transport', deps.mail.describe());
+    mounted.push('mail');
+  }
+
   // ── auth: sessions, tokens, the onboarding chain ─────────────────────────────────────
   const auth = await load('auth', './modules/auth/index.js');
   if (auth) {
@@ -283,6 +299,7 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     deps.auth = auth.createAuthModule({
       store: deps.store, config, logger, clock: { now: deps.clock },
       outbox: deps.events?.outbox, audit: deps.events?.audit,
+      mailer: deps.mail,
     });
     deps.auth.register(router);
     mounted.push('auth');

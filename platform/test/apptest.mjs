@@ -482,6 +482,43 @@ await withApp(async ({ call }) => {
     'a stub layer that answers unheadered requests is a stub layer serving real players');
 });
 
+// ── 4b. the address is STORED, and never projected ────────────────────────────────────
+//
+// 0001 kept only `email_hash` because decision D1 put the address with Supabase Auth. The
+// self-hosted fallback is what shipped, so nobody held it, and every transactional mail this
+// platform owes a player had no recipient — verification RESEND had an accountId and nothing
+// else. Signup and recovery only worked because the address was in the request body at that
+// moment, which is a value passing through, not storage.
+await withApp(async ({ call, app }) => {
+  section('the email address is stored for mail, and leaks nowhere');
+  const email = `stored${Date.now().toString(36)}@example.invalid`;
+  const { signup } = await onboard(call, { sid: SID, email });
+  const accountId = signup.body?.profile?.accountId;
+  const auth = { authorization: `Bearer ${signup.body?.accessToken}` };
+
+  const row = await app.deps.store.accounts.byId(accountId);
+  check(row?.email === email,
+    'the address is persisted so a resend has a recipient at all',
+    JSON.stringify({ stored: row?.email ?? null }));
+  check(typeof row?.emailHash === 'string' && row.emailHash !== email,
+    'and emailHash is still the lookup key — the address is never what is enumerated',
+    JSON.stringify({ hashIsAddress: row?.emailHash === email }));
+
+  // PERSONAL class: readable by the platform to address a message, by nothing else. §11.8
+  // closes /v1/profile/me to five keys and this is not one of them.
+  const me = await call('GET', '/v1/profile/me', undefined, auth);
+  const body = JSON.stringify(me.body);
+  check(!body.includes(email), '/v1/profile/me does not carry the address', body.slice(0, 160));
+
+  const pub = await call('GET', `/v1/profile/${accountId}`, undefined, auth);
+  check(!JSON.stringify(pub.body).includes(email),
+    'nor does the public profile', JSON.stringify(pub.body).slice(0, 160));
+
+  const sessions = await call('GET', '/v1/auth/sessions', undefined, auth);
+  check(!JSON.stringify(sessions.body).includes(email),
+    'nor the session list', JSON.stringify(sessions.body).slice(0, 160));
+});
+
 // ── 4c. client-visible feature flags (feature-flags.md §3.1) ──────────────────────────
 //
 // Contracted in two documents, called by the shell on boot, and implemented ONLY in the stub

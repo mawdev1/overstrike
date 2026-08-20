@@ -44,7 +44,7 @@ buildable — a single open question does not freeze a whole document.
 | 8 | [`event-envelope.md`](event-envelope.md) | FROZEN | Canonical platform event envelope and catalogue |
 | 9 | [`map-data.md`](map-data.md) | FROZEN | What `level.js` must export for the server to consume |
 | 10 | [`bomb-rules.md`](bomb-rules.md) | FROZEN 1.7.0 | The Bomb ruleset |
-| 11 | [`db-schema.md`](db-schema.md) | FROZEN 1.7.0 | Initial PostgreSQL schema |
+| 11 | [`db-schema.md`](db-schema.md) | FROZEN 1.8.0 | Initial PostgreSQL schema |
 | 12 | [`telemetry.md`](telemetry.md) | FROZEN 1.10.0 | Client and server telemetry, privacy and retention classes |
 | 13 | [`feature-flags.md`](feature-flags.md) | FROZEN | Flag naming, evaluation, defaults, kill switches |
 

@@ -62,7 +62,7 @@ const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
  */
 export const TABLE_COLUMNS = {
   accounts: [
-    'accountId', 'status', 'emailHash', 'displayName', 'displayNameFolded',
+    'accountId', 'status', 'emailHash', 'email', 'displayName', 'displayNameFolded',
     'passwordHash', 'roles', 'nameChangedAt',
     'eligibilityVerdict', 'eligibilityPolicyVer', 'eligibilityDecidedAt',
     'emailVerifiedAt', 'termsVersionAccepted', 'termsAcceptedAt',

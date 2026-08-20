@@ -28,6 +28,19 @@ const SPEC = {
   // non-boolean values are REFUSED at boot (modules/flags), because a typo'd kill switch that
   // silently does nothing fails at the exact moment it is most needed.
   flagOverrides: { env: 'PLATFORM_FLAG_OVERRIDES', type: 'string', default: '' },
+
+  // Transactional mail. `none` is the default so a process without mail configured runs and
+  // says so, rather than failing to boot; `log` is refused in production because it prints
+  // tokens, and a token IS the credential. See modules/mail.
+  mailTransport: { env: 'PLATFORM_MAIL_TRANSPORT', type: 'string', default: 'none' },
+  mailFrom: { env: 'PLATFORM_MAIL_FROM', type: 'string', default: '' },
+  mailApiKey: { env: 'PLATFORM_MAIL_API_KEY', type: 'string', default: '' },
+  mailApiUrl: { env: 'PLATFORM_MAIL_API_URL', type: 'string', default: '' },
+  appName: { env: 'PLATFORM_APP_NAME', type: 'string', default: 'Overstrike' },
+  // The origin a player's mail link points at — the SITE, not this API. They differ: the shell
+  // is served from overstrike.fly.dev and proxies /v1 here, so a link built from this process's
+  // own host would send players to an API that has no such page.
+  publicBaseUrl: { env: 'PLATFORM_PUBLIC_BASE_URL', type: 'string', default: '' },
   termsVersion:    { env: 'PLATFORM_TERMS_VERSION', type: 'int', default: 1, min: 1, max: 1e6 },
   env:             { env: 'NODE_ENV', type: 'string', default: 'development' },
 };

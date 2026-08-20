@@ -122,6 +122,9 @@ const ACCOUNT_COLUMNS = columns({
   accountId: undefined,
   status: 'active',
   emailHash: null,
+  // PERSONAL class (migration 0019). Lookup and uniqueness go through `emailHash`; this is only
+  // ever read to address transactional mail, and is projected into no API response.
+  email: null,
   displayName: undefined,
   displayNameFolded: undefined,
   // Migration 0008. Null when identity is delegated to the provider (D1); roles default to

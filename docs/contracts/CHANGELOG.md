@@ -2,6 +2,33 @@
 
 Every contract amendment lands here. Newest at the top.
 
+## 2026-08-20 — `db-schema.md` 1.8.0 (additive) — `accounts.email`
+
+0001 stored `email_hash` and only the hash, with a comment saying "the address itself lives
+with the auth provider". That was true of the PLAN: decision D1 chose Supabase Auth, and
+`password_hash` exists in 0001 explicitly "so a self-hosted fallback does not need a schema
+change".
+
+The fallback is what shipped. Signup writes a scrypt hash, signin verifies it, sessions are
+minted here — this platform IS the identity provider, and the address was therefore held by
+nobody. Every transactional mail the platform owes a player had no recipient. Verification
+RESEND, the one action a player takes when the first message never arrived, had an accountId
+and nothing else. Signup and recovery-start appeared to work only because the address was in
+the request body at that moment, which is a value passing through rather than storage.
+
+`accounts.email` is PERSONAL class. `email_hash` remains the lookup and uniqueness key, so the
+address is never the thing enumerated against and a case or unicode variant still cannot mint a
+second account. The column is projected into no API response — asserted in `apptest.mjs` against
+`/v1/profile/me`, the public profile and the session list — and its retention is the account's:
+deleting the account deletes the row that holds it.
+
+Additive: no existing column changed.
+
+Worth recording as a pattern rather than an incident. This is the second gap today created by a
+decision that was recorded, then not taken: D1 named an auth provider that was never adopted,
+and the schema kept the shape that decision implied. A contract describing an architecture
+nobody built reads exactly like one describing the architecture that exists.
+
 ## 2026-08-20 — `http-api.md` 1.11.0 (additive) — `currentPolicyVersion` on consent
 
 `PUT /v1/onboarding/consent` requires `policyVersion` in its body, and no endpoint published

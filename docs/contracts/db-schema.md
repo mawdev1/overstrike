@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.7.0 |
+| **Version** | 1.8.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |
 | **Scope** | P1–P5. Economy, ownership, creator, and agent tables are later contracts |
@@ -55,7 +55,8 @@ Identity lives in the same database (D1, Supabase Auth), so the `accounts` ↔ `
 accounts(
   account_id        text primary key,
   status            text not null default 'active',   -- active|restricted|banned|deleted
-  email_hash        text unique,          -- lookup only; the address itself lives with the auth provider
+  email_hash        text unique,          -- lookup and uniqueness; never the address itself
+  email             text,                 -- PERSONAL. Transactional mail only (migration 0019)
   display_name      text not null,
   -- Credentials and authorisation. `password_hash` is null when identity is delegated to the
   -- provider (D1, Supabase Auth); it exists so a self-hosted fallback does not need a schema
