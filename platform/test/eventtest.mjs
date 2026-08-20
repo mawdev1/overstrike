@@ -10,10 +10,10 @@
  */
 import { createOutbox } from '../src/modules/events/outbox.js';
 import { createRelay } from '../src/modules/events/relay.js';
-import { createConsumer } from '../src/modules/events/consumer.js';
-import { createAuditLog } from '../src/modules/events/audit.js';
+import { createConsumer, createMemoryDedupe } from '../src/modules/events/consumer.js';
+import { createAuditLog, capabilityForAction, summarise } from '../src/modules/events/audit.js';
 import { buildEvent, validateEvent, EventContractError } from '../src/modules/events/envelope.js';
-import { check, requireCapability, capabilitiesOf, ROLES } from '../src/modules/events/rbac.js';
+import { check, requireCapability, capabilitiesOf, isSharedIdentity, ROLES } from '../src/modules/events/rbac.js';
 import { ulid } from '../src/core/ids.js';
 
 let failures = 0;
@@ -185,6 +185,163 @@ console.log('\nenvelope + catalogue');
 }
 
 // =============================================================================================
+console.log('\nbuildEvent — every refusal, by the reason it gives');
+// =============================================================================================
+{
+  // The block above proves the well-known refusals. This one exists because a mutation sweep
+  // (`scripts/mutatetest.mjs --file=platform/src/modules/events/envelope.js`) showed the rest of
+  // `buildEvent`'s guards could be deleted one at a time without a single check changing: the
+  // suite only ever built VALID specs, so a guard that stopped guarding was invisible.
+  //
+  // Each case breaks exactly one field of a spec that is otherwise buildable, and matches on the
+  // MESSAGE. Matching on "it threw" would not distinguish: delete the subject.kind guard and the
+  // build still throws, from the guard below it, with a different reason. The reason is the
+  // assertion.
+  const clock = fakeClock();
+  const opts = { clock, defaults: { correlationId: ulid(clock.now()) } };
+  const build = (patch) => buildEvent(
+    { type: 'match.completed', actor: SERVICE, subject: { kind: 'match', id: 'M1' }, ...patch }, opts);
+
+  await refuses('a spec that is not an object is refused before any field is read',
+    async () => buildEvent(null, opts), 'spec must be an object');
+
+  await refuses('a version the catalogue does not list for the type is refused',
+    async () => build({ version: 2 }), 'unsupported version for type');
+  assert('CONTROL: the version the catalogue does list is accepted',
+    build({ version: 1 }).version === 1);
+
+  await refuses('an actor that is not an object at all is refused',
+    async () => build({ actor: 'match-allocator' }), 'actor.kind must be one of');
+  await refuses('an actor kind outside the closed §2 set is refused',
+    async () => build({ actor: { kind: 'robot', id: 'r1' } }), 'actor.kind must be one of');
+
+  await refuses('a subject kind outside the closed §2 set is refused',
+    async () => build({ subject: { kind: 'planet', id: 'X' } }), 'subject.kind must be one of');
+  await refuses('a real subject kind the catalogue forbids for this type is refused',
+    async () => build({ subject: { kind: 'account', id: 'A1' } }), 'subject kind not permitted');
+  await refuses('a subject with no id is refused — it is the §3 ordering key',
+    async () => build({ subject: { kind: 'match', id: '' } }), 'subject.id is required');
+
+  await refuses('a payload that is an array, not an object, is refused',
+    async () => build({ payload: [1, 2] }), 'payload must be an object');
+  assert('CONTROL: an absent payload is fine and becomes {}',
+    JSON.stringify(build({}).payload) === '{}');
+
+  await refuses('a causationId that is not a ULID is refused',
+    async () => build({ causationId: 'the-one-before' }), 'causationId must be a ULID');
+  assert('CONTROL: a null causationId is the documented "no parent" value, not an error',
+    build({ causationId: null }).causationId === null);
+
+  await refuses('a retentionClass override is refused just as a privacyClass override is',
+    async () => build({ retentionClass: 'short' }), 'may not be overridden');
+
+  await refuses('an occurredAt that is not an ISO-8601 UTC instant is refused',
+    async () => build({ occurredAt: '19 August 2026' }), 'occurredAt must be an ISO-8601');
+  await refuses('an occurredAt with an offset rather than Z is refused',
+    async () => build({ occurredAt: '2026-08-19T12:00:00+02:00' }), 'occurredAt must be an ISO-8601');
+  assert('CONTROL: a Z instant is accepted and carried through verbatim',
+    build({ occurredAt: '2026-08-19T12:00:00.000Z' }).occurredAt === '2026-08-19T12:00:00.000Z');
+
+  await refuses('a caller-supplied eventId that is not a ULID is refused',
+    async () => build({ eventId: 'evt-00017' }), 'eventId must be a ULID');
+  assert('CONTROL: a caller-supplied ULID eventId is honoured, not overwritten', (() => {
+    const id = ulid(clock.now());
+    return build({ eventId: id }).eventId === id;
+  })());
+}
+
+// =============================================================================================
+console.log('\nvalidateEvent — the negative path, one problem at a time');
+// =============================================================================================
+{
+  // Until this block existed, `validateEvent` was only ever called on events `buildEvent` had
+  // just produced, and the assertion was `length === 0`. That asserts nothing about any of the
+  // fourteen `problems.push` lines: all fourteen could be deleted and the list would still be
+  // empty. The mutation sweep measured exactly that.
+  //
+  // `length > 0` would not fix it either — one surviving guard satisfies it for every malformed
+  // event, so the other thirteen deletions stay invisible. So each case asserts the COMPLETE
+  // problem list, in source order, for an envelope with exactly one field broken. Deleting the
+  // guard under test drops its string; deleting any other changes a different case's list.
+  const clock = fakeClock();
+  const good = buildEvent({
+    type: 'match.completed', actor: SERVICE, subject: { kind: 'match', id: 'M1' }, payload: { winner: 0 },
+  }, { clock, defaults: { correlationId: ulid(clock.now()) } });
+
+  // A throw is reported as a problem string rather than allowed to abort the suite, so that a
+  // guard whose deletion turns a report into a crash still fails its own check and not the file.
+  const listOf = (v) => {
+    try { return validateEvent(v); }
+    catch (err) { return [`validateEvent threw: ${err.message}`]; }
+  };
+  const exactly = (name, patch, expected) => {
+    const subject = (patch === null || typeof patch !== 'object' || Array.isArray(patch))
+      ? patch : { ...good, ...patch };
+    const got = listOf(subject);
+    assert(name, got.length === expected.length && got.every((p, i) => p === expected[i]),
+      `got [${got.join(' | ')}] want [${expected.join(' | ')}]`);
+  };
+
+  exactly('an intact envelope produces no problems at all', {}, []);
+
+  exactly('a non-object is rejected whole, before any field is touched', null,
+    ['event is not an object']);
+  exactly('an array is not a plain object either', [good],
+    ['event is not an object']);
+  exactly('a string is not an envelope', 'match.completed',
+    ['event is not an object']);
+
+  exactly('a non-ULID eventId is named', { eventId: 'evt-17' },
+    ['eventId is not a ULID']);
+  exactly('an uncatalogued type is named, and stops the catalogue-derived checks',
+    { type: 'match.finished' },
+    ['type match.finished is not in the catalogue']);
+
+  // schemaRef is derived from (type, version), so a version change that left the old ref behind
+  // would report two problems. Moving the ref with it isolates the version guard.
+  exactly('a version the catalogue does not list is named',
+    { version: 2, schemaRef: 'events/match.completed/v2' },
+    ['version is not supported for type']);
+  exactly('a schemaRef that does not match type/version is named',
+    { schemaRef: 'events/match.completed/v2' },
+    ['schemaRef does not match type/version']);
+
+  // A KNOWN class that is the wrong one for this type: the catalogue check fires, the
+  // known-class check does not. That separation is what makes the two guards distinguishable.
+  exactly('a privacyClass that is valid but not this type\'s is a catalogue mismatch',
+    { privacyClass: 'internal' }, ['privacyClass does not match the catalogue']);
+  exactly('a retentionClass that is valid but not this type\'s is a catalogue mismatch',
+    { retentionClass: 'standard' }, ['retentionClass does not match the catalogue']);
+
+  exactly('a privacyClass outside the closed set fails BOTH the catalogue and the class check',
+    { privacyClass: 'secret' },
+    ['privacyClass does not match the catalogue', 'privacyClass is not a known class']);
+  exactly('a retentionClass outside the closed set fails both as well',
+    { retentionClass: 'forever' },
+    ['retentionClass does not match the catalogue', 'retentionClass is not a known class']);
+
+  exactly('an actor with a blank id is unattributed', { actor: { kind: 'service', id: '' } },
+    ['actor is missing or unattributed']);
+  exactly('a missing actor is the same finding', { actor: undefined },
+    ['actor is missing or unattributed']);
+  exactly('a subject with no id has no ordering key', { subject: { kind: 'match' } },
+    ['subject is missing or has no id']);
+
+  exactly('a non-instant occurredAt is named', { occurredAt: '19 August 2026' },
+    ['occurredAt is not an ISO instant']);
+  exactly('an epoch-millis recordedAt is not an instant either', { recordedAt: 1755600000000 },
+    ['recordedAt is not an ISO instant']);
+  exactly('a blank correlationId is missing', { correlationId: '' },
+    ['correlationId is missing']);
+
+  // And the problems compose: a row that is wrong in several ways reports each of them, so a
+  // dead-letter handler can say what it found rather than "invalid".
+  exactly('several faults are reported together, not just the first',
+    { eventId: 'x', correlationId: '', occurredAt: 'soon' },
+    ['eventId is not a ULID', 'occurredAt is not an ISO instant', 'correlationId is missing']);
+}
+
+// =============================================================================================
 console.log('\n§4 transactional outbox — no state change without its event');
 // =============================================================================================
 {
@@ -246,6 +403,81 @@ console.log('\n§4 transactional outbox — no state change without its event');
     });
     return events[1].causationId === events[0].eventId && events[0].correlationId === events[1].correlationId;
   })());
+}
+
+// =============================================================================================
+console.log('\n§4 outbox — the arguments it refuses to start from');
+// =============================================================================================
+{
+  // `createOutbox`'s store check and `commit`'s two argument checks all survived deletion: the
+  // suite only ever handed them a real store and a well-formed ctx. Each case below matches the
+  // MESSAGE, because deleting any of these still produces *a* throw further down — from a
+  // missing method, a missing correlationId inside buildEvent, or "work is not a function".
+  const clock = fakeClock();
+  const store = createFakeStore({ clock });
+  const outbox = createOutbox({ store, clock });
+  const correlationId = ulid(clock.now());
+
+  await refuses('a store with no tx() is refused when the outbox is created',
+    async () => createOutbox({ store: { outbox: store.outbox }, clock }),
+    'store must expose tx() and outbox');
+  await refuses('a store with no outbox table is refused too',
+    async () => createOutbox({ store: { tx: store.tx }, clock }),
+    'store must expose tx() and outbox');
+  assert('CONTROL: a store with both is accepted',
+    typeof createOutbox({ store, clock }).commit === 'function');
+
+  await refuses('commit without a unit of work is refused',
+    () => outbox.commit({ correlationId }, null), 'work must be a function');
+  await refuses('commit with a plain object where the work should be is refused',
+    () => outbox.commit({ correlationId }, { run: () => {} }), 'work must be a function');
+
+  await refuses('commit with no ctx at all is refused',
+    () => outbox.commit(null, async () => {}), 'ctx.correlationId is required');
+  await refuses('commit with a blank correlationId is refused',
+    () => outbox.commit({ correlationId: '' }, async (tx, emit) => {
+      await emit({ type: 'room.created', actor: PLAYER, subject: { kind: 'room', id: 'R9' }, payload: {} });
+    }),
+    'ctx.correlationId is required');
+  assert('none of the refused units of work opened a transaction',
+    store.state.outbox.size === 0 && store.state.rooms.size === 0,
+    `outbox=${store.state.outbox.size} rooms=${store.state.rooms.size}`);
+}
+
+// =============================================================================================
+console.log('\n§3 dedupe memory is bounded, and idempotent about its own bookkeeping');
+// =============================================================================================
+{
+  // Both guards inside `createMemoryDedupe` survived deletion, and one of them is not cosmetic:
+  // without the "already seen" early return, a re-add pushes the same id onto the eviction queue
+  // again, so the FIFO evicts an id that is still live and the consumer stops deduping it.
+  const dedupe = createMemoryDedupe({ capacity: 3 });
+  dedupe.add('E1'); dedupe.add('E1'); dedupe.add('E1'); dedupe.add('E1');
+  assert('re-adding an id neither grows the set nor spends eviction budget',
+    dedupe.size() === 1 && dedupe.has('E1') === true, `size=${dedupe.size()} has=${dedupe.has('E1')}`);
+
+  const fifo = createMemoryDedupe({ capacity: 3 });
+  for (const id of ['A', 'B', 'C', 'D', 'E']) fifo.add(id);
+  assert('the memory is bounded at its capacity', fifo.size() === 3, String(fifo.size()));
+  assert('and it evicts oldest-first, keeping the most recent ids',
+    fifo.has('A') === false && fifo.has('B') === false
+    && fifo.has('C') === true && fifo.has('D') === true && fifo.has('E') === true,
+    ['A', 'B', 'C', 'D', 'E'].map((id) => `${id}=${fifo.has(id)}`).join(' '));
+
+  // The consumer-level consequence, since a dedupe that forgets is a dedupe that double-counts.
+  const logger = capturingLogger();
+  const counted = [];
+  const consumer = createConsumer({
+    name: 'bounded', logger, dedupe: createMemoryDedupe({ capacity: 2 }),
+    handlers: { 'match.completed': (e) => counted.push(e.eventId) },
+  });
+  const clock = fakeClock();
+  const one = buildEvent({ type: 'match.completed', actor: SERVICE, subject: { kind: 'match', id: 'M1' } },
+    { clock, defaults: { correlationId: ulid(clock.now()) } });
+  for (let i = 0; i < 5; i++) await consumer.deliver(one);
+  assert('five deliveries of one event are handled once, whatever the capacity',
+    counted.length === 1 && consumer.stats.duplicates === 4,
+    `handled=${counted.length} duplicates=${consumer.stats.duplicates}`);
 }
 
 // =============================================================================================
@@ -491,6 +723,56 @@ console.log('\n§3 dead-letter after the retry budget, with an alert');
 }
 
 // =============================================================================================
+console.log('\nrelay lifecycle — drain terminates, stop() stops');
+// =============================================================================================
+{
+  const clock = fakeClock();
+  const store = createFakeStore({ clock });
+  const outbox = createOutbox({ store, clock });
+  const logger = capturingLogger();
+  const delivered = [];
+  const relay = createRelay({ store, logger, clock, publish: async (e) => { delivered.push(e.eventId); } });
+
+  assert('drain over an empty outbox takes exactly one pass to learn there is nothing to do',
+    (await relay.drain()).passes === 1);
+
+  await outbox.commit({ correlationId: ulid(clock.now()), actor: SERVICE }, async (tx, emit) => {
+    await emit({ type: 'match.started', subject: { kind: 'match', id: 'M-drain' }, payload: {} });
+  });
+  // Two passes: one that publishes, one that finds nothing and breaks. Without the break the
+  // loop runs its full 1000-pass bound every time, which is the difference this asserts.
+  const drained = await relay.drain();
+  assert('drain stops on the first idle pass rather than burning its whole bound',
+    drained.passes === 2 && drained.published === 1,
+    `passes=${drained.passes} published=${drained.published}`);
+  // stop() means stopped. The guard under test is the one at the top of the poll tick, and the
+  // sequence that reaches it is a supervisor that called start() twice: stop() can only clear
+  // the timer it last stored, so the earlier one is still armed and fires after the stop.
+  const store2 = createFakeStore({ clock });
+  const outbox2 = createOutbox({ store: store2, clock });
+  await outbox2.commit({ correlationId: ulid(clock.now()), actor: SERVICE }, async (tx, emit) => {
+    await emit({ type: 'match.started', subject: { kind: 'match', id: 'M-stop' }, payload: {} });
+  });
+  const afterStop = [];
+  const polled = createRelay({ store: store2, logger, clock, publish: async (e) => { afterStop.push(e.eventId); } });
+  polled.start({ intervalMs: 5 });
+  polled.start({ intervalMs: 5 });     // orphans the first timer, which stop() cannot clear
+  polled.stop();
+  await new Promise((r) => setTimeout(r, 60));
+  assert('a stopped relay publishes nothing, even from a timer stop() could not clear',
+    afterStop.length === 0 && [...store2.state.outbox.values()].every((r) => r.publishedAt === null),
+    `${afterStop.length} published after stop`);
+
+  // CONTROL: the same relay, started and left running, does publish — so the assertion above is
+  // about stop() and not about a relay that never worked.
+  polled.start({ intervalMs: 5 });
+  await new Promise((r) => setTimeout(r, 60));
+  polled.stop();
+  assert('CONTROL: the same relay running does publish', afterStop.length === 1,
+    `${afterStop.length} published while running`);
+}
+
+// =============================================================================================
 console.log('\naudit log — append-only, reason code mandatory');
 // =============================================================================================
 {
@@ -543,6 +825,104 @@ console.log('\naudit log — append-only, reason code mandatory');
 }
 
 // =============================================================================================
+console.log('\naudit log — the attribution rules, one refusal at a time');
+// =============================================================================================
+{
+  // Ten of thirteen guards in audit.js survived deletion. The section above proves the famous
+  // four (reason code, free text, shared identity, correlation id); these are the rest, and they
+  // are the ones that decide whether the two attribution columns can disagree.
+  const clock = fakeClock();
+  const store = createFakeStore({ clock });
+  const logger = capturingLogger();
+  const audit = createAuditLog({ store, clock, logger });
+  const correlationId = ulid(clock.now());
+  const MOD = { kind: 'admin', id: 'mod.rivera@overstrike.gg', role: 'moderator', mfa: true };
+  const entry = (patch) => ({
+    actor: MOD, action: 'sanction.apply', subject: { kind: 'account', id: 'A9' },
+    reasonCode: 'policy_violation', correlationId, ...patch,
+  });
+
+  // ── capabilityForAction: the derivation, including the case that has no capability ─────────
+  assert('an action derives the capability it is checked against',
+    capabilityForAction('sanction.apply') === 'sanction:apply'
+    && capabilityForAction('match.invalidate') === 'match:invalidate'
+    && capabilityForAction('admin.action.executed') === 'admin.action:executed',
+    [capabilityForAction('sanction.apply'), capabilityForAction('admin.action.executed')].join(' '));
+  assert('an action with no dot derives NO capability rather than a mangled one',
+    capabilityForAction('signin') === null && capabilityForAction('') === null
+    && capabilityForAction('.leading') === null,
+    `${capabilityForAction('signin')} ${capabilityForAction('')} ${capabilityForAction('.leading')}`);
+
+  // ── summarise: a summary, not a second copy of the personal data ───────────────────────────
+  assert('a primitive is summarised as a value, not silently flattened to nothing',
+    JSON.stringify(summarise('Ghost', [])) === '{"value":"Ghost"}'
+    && JSON.stringify(summarise(7, ['status'])) === '{"value":7}',
+    JSON.stringify(summarise('Ghost', [])));
+  assert('null and undefined summarise to null, which is what the column stores',
+    summarise(null, ['a']) === null && summarise(undefined, ['a']) === null);
+  assert('a requested key the row does not have is OMITTED, not recorded as undefined',
+    Object.keys(summarise({ status: 'clear' }, ['status', 'displayName'])).join(',') === 'status',
+    Object.keys(summarise({ status: 'clear' }, ['status', 'displayName'])).join(','));
+  assert('CONTROL: a requested key the row does have is recorded',
+    summarise({ status: 'clear', displayName: 'Ghost' }, ['status', 'displayName']).displayName === 'Ghost');
+  assert('a nested object is stubbed rather than copied into the trail',
+    summarise({ secret: { token: 'x' } }, ['secret']).secret === '[object]');
+
+  // ── record(): every refusal, by its own reason ─────────────────────────────────────────────
+  await refuses('a row with no actor is refused before any field of it is read',
+    () => audit.record(entry({ actor: undefined })), 'actor is required');
+  await refuses('an actor with a blank id is refused as unattributed',
+    () => audit.record(entry({ actor: { ...MOD, id: '' } })),
+    'actor.id is required');
+  await refuses('a role that is not a contract role is refused',
+    () => audit.record(entry({ actor: { ...MOD, role: 'wizard' } })),
+    'actor.role must be a contract role');
+  await refuses('an actor kind outside the closed set is refused, with no admin default',
+    () => audit.record(entry({ actor: { ...MOD, kind: 'robot' } })),
+    'actor.kind must be one of');
+  await refuses('a kind and a role that disagree are refused — the trail must be queryable',
+    () => audit.record(entry({ actor: { ...MOD, kind: 'player' } })),
+    'actor.kind and actor.role disagree');
+  await refuses('a row with a blank action is refused',
+    () => audit.record(entry({ action: '' })), 'action is required');
+  await refuses('a row with no subject is refused',
+    () => audit.record(entry({ subject: undefined })), 'subject.kind and subject.id are required');
+  await refuses('a subject with a blank id is refused too',
+    () => audit.record(entry({ subject: { kind: 'account', id: '' } })),
+    'subject.kind and subject.id are required');
+
+  // The `capability: null` opt-out. It exists for signup/signin, which have no authenticated
+  // actor to check — so it must be unusable by anything privileged, and unusable by a player
+  // against an account that is not their own.
+  await refuses('an elevated role may not opt out of the capability check',
+    () => audit.record(entry({ capability: null })),
+    'only an unprivileged self-service action');
+  await refuses('and a player may not opt out against somebody else\'s account',
+    () => audit.record(entry({
+      capability: null, actor: { kind: 'player', id: 'P1', accountId: 'P1', role: 'player' },
+      action: 'account.signin', subject: { kind: 'account', id: 'P2' },
+      reasonCode: 'account_self_service',
+    })),
+    'only an unprivileged self-service action');
+  const selfServed = await audit.record(entry({
+    capability: null, actor: { kind: 'player', id: 'P1', accountId: 'P1', role: 'player' },
+    action: 'account.signin', subject: { kind: 'account', id: 'P1' },
+    reasonCode: 'account_self_service',
+  }));
+  assert('CONTROL: a player acting on their OWN account may be recorded without a capability',
+    selfServed.actorId === 'P1' && selfServed.actorRole === 'player' && selfServed.actorKind === 'player',
+    JSON.stringify(selfServed));
+
+  assert('exactly one of those rows was written — the refusals wrote nothing',
+    store.state.audit.length === 1, String(store.state.audit.length));
+  assert('and writing one emits the audit.recorded log line that makes it findable',
+    logger.lines.some((l) => l.event === 'audit.recorded' && l.level === 'info'
+      && l.auditId === selfServed.auditId && l.action === 'account.signin'
+      && l.correlationId === correlationId && l.reasonCode === 'account_self_service'),
+    JSON.stringify(logger.lines));
+}
+
+// =============================================================================================
 console.log('\nRBAC — least privilege, scoped, no shared identity');
 // =============================================================================================
 {
@@ -582,6 +962,74 @@ console.log('\nRBAC — least privilege, scoped, no shared identity');
   assert('CONTROL: a moderator passes the same check',
     requireCapability({ kind: 'admin', id: 'mod@x.gg', role: 'moderator', mfa: true },
       'sanction:apply', { accountId: 'P2' }).allowed);
+
+  // ── the refusals nothing was asserting ────────────────────────────────────────────────────
+  // Five guards in rbac.js survived deletion. Each is a refusal that the block above reached
+  // only along paths where a LATER guard refused anyway, so the reason is the assertion: an
+  // actor with a bogus role that comes back `capability_not_granted` instead of `unknown_role`
+  // has been quietly told the rule is about the capability when it is about the identity.
+  //
+  // `check()` is called through a wrapper that reports a throw as a reason string, so a guard
+  // whose deletion turns a refusal into a TypeError fails this check rather than the suite.
+  const reasonFor = (actor, capability, target) => {
+    try {
+      const v = check(actor, capability, target);
+      return v.allowed ? 'ALLOWED' : v.reason;
+    } catch (err) { return `threw: ${err.message}`; }
+  };
+  const shared = (id) => {
+    try { return isSharedIdentity(id); } catch (err) { return `threw: ${err.message}`; }
+  };
+
+  assert('an absent actor id is a shared identity, not a lookup that explodes',
+    shared(undefined) === true && shared(null) === true && shared('') === true,
+    `${shared(undefined)} ${shared(null)} ${shared('')}`);
+  assert('CONTROL: a named human is not a shared identity',
+    isSharedIdentity('sam.okafor@overstrike.gg') === false);
+  assert('a role-mailbox prefix is shared however it is cased or padded',
+    isSharedIdentity('  Support@overstrike.gg ') === true && isSharedIdentity('ROOT') === true);
+
+  assert('no actor at all is refused as no_actor, before any field is read',
+    reasonFor(null, 'account:read', { accountId: 'P1' }) === 'no_actor'
+    && reasonFor(undefined, 'account:read', { accountId: 'P1' }) === 'no_actor'
+    && reasonFor('P1', 'account:read', { accountId: 'P1' }) === 'no_actor',
+    [null, undefined, 'P1'].map((a) => reasonFor(a, 'account:read', { accountId: 'P1' })).join(' '));
+  assert('an actor object with no id is unattributed, which is a different refusal',
+    reasonFor({ kind: 'player', role: 'player' }, 'account:read', { accountId: 'P1' })
+      === 'unattributed_actor');
+
+  assert('an actor carrying no role at all is unknown_role, not merely ungranted',
+    reasonFor({ kind: 'player', id: 'P1', accountId: 'P1' }, 'account:read', { accountId: 'P1' })
+      === 'unknown_role');
+  assert('a role outside the contract set is unknown_role, not a table lookup on undefined',
+    reasonFor({ kind: 'admin', id: 'x@y.gg', role: 'wizard', mfa: true }, 'account:read', { accountId: 'P1' })
+      === 'unknown_role');
+  assert('one bad role spoils the array — a real role does not launder a fake one',
+    reasonFor({ kind: 'admin', id: 'x@y.gg', roles: ['moderator', 'wizard'], mfa: true },
+      'sanction:apply', { accountId: 'P1' }) === 'unknown_role');
+  assert('CONTROL: the same array without the fake role is allowed',
+    reasonFor({ kind: 'admin', id: 'x@y.gg', roles: ['moderator'], mfa: true },
+      'sanction:apply', { accountId: 'P1' }) === 'ALLOWED');
+
+  // Each role is evaluated on its own terms (the module header). A player who also holds an
+  // elevated role they have not second-factored must still be able to read their own account as
+  // a player — the elevated refusal is about the elevated role, not about the actor.
+  assert('a granting role wins even when an earlier role refused for a more specific reason',
+    reasonFor({ kind: 'player', id: 'P1', accountId: 'P1', roles: ['support', 'player'], mfa: false },
+      'account:read', { accountId: 'P1' }) === 'ALLOWED');
+  assert('CONTROL: with no granting role the specific refusal is what comes back',
+    reasonFor({ kind: 'admin', id: 'sam.okafor@overstrike.gg', roles: ['support'], mfa: false },
+      'account:read', { accountId: 'P1' }) === 'mfa_required');
+
+  assert('a service token with no service name is refused; an audit row would name nobody',
+    reasonFor({ kind: 'service', id: 'allocator-1', role: 'service' }, 'match:allocate') === 'unnamed_service'
+    && reasonFor({ kind: 'service', id: 'allocator-1', role: 'service', serviceName: '   ' }, 'match:allocate')
+      === 'unnamed_service'
+    && reasonFor({ kind: 'service', id: 'allocator-1', role: 'service', serviceName: null }, 'match:allocate')
+      === 'unnamed_service');
+  assert('CONTROL: the same token with a name is allowed',
+    reasonFor({ kind: 'service', id: 'allocator-1', role: 'service', serviceName: 'allocator' },
+      'match:allocate') === 'ALLOWED');
 }
 
 // =============================================================================================

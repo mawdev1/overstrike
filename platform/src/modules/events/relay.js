@@ -54,6 +54,15 @@ export function createRelay({ store, publish, logger, clock = Date, config = {},
     const claimed = await store.outbox.claimUnpublished(cfg.batchSize);
     const now = clock.now();
     const due = claimed.filter((e) => (notBefore.get(e.eventId) ?? 0) <= now);
+    // EQUIVALENT MUTANT, measured — not an untested line. Deleting this early return changes
+    // nothing observable: with `due` empty the grouping loop and the `Promise.all` both run over
+    // nothing, and the `pass` object built below is `{ claimed: claimed.length, published: 0,
+    // failed: 0, deadLettered: 0 }` — the same object, field for field. Verified by running both
+    // versions of this file side by side through `runOnce()` and `drain()` over four shapes of
+    // "claimed rows, none of them due" (nothing claimed; one row backed off; several rows on one
+    // subject; several rows across three subjects), comparing the returned passes, every
+    // store call, every log line and `stats`: identical in all eight comparisons. Kept because a
+    // pass with nothing to do should not build a Map and an empty task list to find that out.
     if (due.length === 0) return { claimed: claimed.length, published: 0, failed: 0, deadLettered: 0 };
 
     // Group by ordering key. Within a group, strictly sequential and stop-on-failure: letting
