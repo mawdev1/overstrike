@@ -789,6 +789,14 @@ Scenarios are therefore **stateful**: selected by `X-Stub-Scenario`, keyed per
 `clientSessionId`, and advanced by the requests the client actually makes. Same scenario, same
 sequence, same responses, every run.
 
+**Send `X-Client-Session-Id` on every request in a scenario.** The key falls back to
+`clientSessionId` in the query or body, so supplying it on only some requests splits one
+timeline into two and the transitions never fire.
+
+The table below is **32 scenarios**; three join refusals previously shared one row, which made
+the count read as 31 and is the kind of miscount a coverage test catches by enumerating rather
+than trusting prose.
+
 | Scenario | Timeline |
 |---|---|
 | `default` | Signed-in account, 3 rooms across 2 regions, 20 terminal matches |
@@ -802,7 +810,9 @@ sequence, same responses, every run.
 | `account-pre-policy` | Signed-in, `consent: null`; consent prompt on first personal action |
 | `browser-empty` | `{ items: [], nextCursor: null, correlationId }` |
 | `browser-unreachable` | `SERVICE_UNAVAILABLE` on room endpoints only; auth unaffected |
-| `room-full` / `room-in-progress` / `room-password` | Join refusals; `room-password` succeeds on a second attempt with any non-empty password |
+| `room-full` | Join → `ROOM_FULL` |
+| `room-in-progress` | Join → `ROOM_IN_PROGRESS` |
+| `room-password` | Join → `ROOM_PASSWORD_REQUIRED`, then succeeds with any non-empty password |
 | `match-active-none` | `GET /v1/matches/active` → 204 |
 | `match-active-reconnect` | active → 200 with `matchId` → reconnect-ticket → 200 with handoff + `graceEndsAt` |
 | `match-active-grace-expired` | active → 200 → reconnect-ticket → `RECONNECT_GRACE_EXPIRED` |

@@ -116,3 +116,31 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   `http-api.md` §11.9. I am deliberately not inventing them a second time.
 - Status: ACCEPTED
 - Response: Published settings vocabulary version `1` in `design/settings-inventory.md` 0.2. Canonical category IDs are `input`, `bindings`, `graphics`, `audioCaptions`, `crosshairHud`, `accessibility`, and `network`; every binding row now has a stable lower-camel-case action ID aligned with existing client actions where one already exists. Labels remain presentation copy and may change without changing IDs.
+
+### REQ-CX-006 — Stub layer is live; drive it with X-Client-Session-Id
+- Phase: P1
+- Blocking: no — this unblocks you
+- Needed by: whenever you start the P1 shell
+- Contract affected: `contracts/http-api.md` §§11.10–11.11, `contracts/realtime-lobby.md` §10
+- Ask: The P1.A8 stub layer is implemented and green (65 checks). All 32 §11.10 scenarios, all
+  15 lobby timelines, and the §11.11 coverage map are enumerated **from the contract markdown
+  by the test**, so a scenario the contract names and the registry lacks is a build failure
+  rather than a silent gap. Three operational notes:
+  1. **Send `X-Client-Session-Id` on every request in a scenario.** The key falls back to
+     `clientSessionId` in query/body, so sending it on only some requests splits one timeline
+     into two and the multi-step transitions never fire.
+  2. `slow` and `offline` are transport behaviours, not payloads: `slow` returns the normal
+     body plus `delayMs: 2000` for your transport to apply; `offline` returns
+     `{ transport: 'failed', status: null, body: null }`. Synthesising a 5xx would be
+     indistinguishable from a real server error, which is the opposite of what an offline
+     fixture is for.
+  3. `token-expiry` uses a virtual clock stepping 10 s per request, so expiry lands on the
+     4th call with zero wall-clock waiting.
+- Also resolved in this round: §11.10 said 31 scenarios and the table yields 32 (three join
+  refusals shared a row). The contract now lists them separately.
+- Two shapes I resolved literally rather than inventing, flag if you disagree:
+  `GET /v1/onboarding/consent` when undecided returns **204** rather than
+  `telemetryPersonal: false`, which would record a decline nobody made; and nested objects
+  (the profile inside an auth response, stats inside `?mode=all`) carry `correlationId` only
+  at the top level.
+- Status: OPEN
