@@ -47,7 +47,9 @@ async function withApp(fn, envOverrides = {}) {
   const call = async (method, path, body, headers = {}) => {
     const res = await fetch(base + path, {
       method,
-      headers: { 'content-type': 'application/json', ...headers },
+      // §1: every client request carries X-Client-Build. The app enforces it on client routes
+      // now, including when no floor is configured, so the harness must send it like a client.
+      headers: { 'content-type': 'application/json', 'x-client-build': '1.0.0', ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await res.text();

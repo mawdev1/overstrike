@@ -471,7 +471,10 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
             details: { matchId: result.matchId, reason: 'result-already-finalised' },
           });
         }
-        return prior.responseBody;      // §5.4: the stored response, and nothing re-applied
+        // §5.4 returns the STORED response, and §5's `applied` answers "did THIS call apply".
+        // Returning the stored `true` told a retrying match server it had just applied a
+        // result it had not, which is the one thing idempotency exists to stop it believing.
+        return { ...prior.responseBody, applied: false };
       }
 
       // Recorded whatever the status — an invalidated match still has an immutable record, it

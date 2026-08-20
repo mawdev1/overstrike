@@ -265,8 +265,12 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
       // §1 says every request carries X-Client-Build. Skipping the check when it is absent
       // means the floor is bypassed by omitting the header the contract requires — the check
       // has to fail closed or it is not a floor.
-      if (hit.route.opts.requireBuild !== false && config.minClientBuild) {
+      if (hit.route.opts.requireBuild !== false) {
         const build = req.headers['x-client-build'];
+        // §1: "Every request carries X-Client-Build." Skipping the check when no floor is
+        // configured meant a DEFAULT deployment — which is most of them — accepted a request
+        // that omitted a header the contract requires, so the field was optional in practice
+        // exactly where it was least examined.
         // A build we cannot parse is not a build we can compare, and treating it as passing
         // is the fail-open we already fixed once for the absent header. `2garbage` reached
         // business logic through a numeric prefix.
@@ -274,9 +278,18 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
           throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
             { details: { reason: 'build' } });
         }
-        if (buildBelowFloor(build, config.minClientBuild)) {
-          throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
-            { details: { reason: 'build' } });
+        if (config.minClientBuild !== null && config.minClientBuild !== undefined) {
+          // A floor we cannot parse cannot be enforced, and treating it as "no floor" is a
+          // misconfiguration that silently disables a gate. Fail closed and make the operator
+          // fix the value.
+          if (!isWellFormedBuild(config.minClientBuild)) {
+            throw new ApiError('SERVICE_UNAVAILABLE', 'Client version policy is misconfigured.',
+              { details: { reason: 'floor-malformed' } });
+          }
+          if (buildBelowFloor(build, config.minClientBuild)) {
+            throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
+              { details: { reason: 'build' } });
+          }
         }
       }
 

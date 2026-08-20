@@ -132,6 +132,19 @@ export function createTelemetryService({
         record.clientSessionId = null;
         record.correlationId = raw.correlationId;
         record.unlinked = true;
+      } else if (spec.privacyClass === 'internal') {
+        // REQ-CC-055. An account id IS personal linkage, so a record carrying one is not
+        // `internal` whatever its class field says — the contract asserted both "internal
+        // means no personal data" and "accountId is bearer-derived", and an authenticated
+        // client.fps was landing in storage linked to an account.
+        //
+        // The linkage is dropped, not the event: crash and performance data stays useful in
+        // aggregate, and the request correlation id is retained so an operator can still
+        // follow one request across tiers. Reclassifying these events as `personal` was the
+        // alternative, and it would have made ordinary crash reporting require consent.
+        record.accountId = null;
+        record.clientSessionId = null;
+        record.correlationId = typeof raw.correlationId === 'string' ? raw.correlationId : correlationId;
       } else {
         record.accountId = accountId;
         record.clientSessionId = clientSessionId;

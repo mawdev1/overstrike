@@ -2,8 +2,8 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.1  
-**Status:** Ready for art-direction and dimensions-envelope approval  
+**Version:** 0.2
+**Status:** Dimensions envelope accepted; ready for art-direction approval
 **Last updated:** 2026-08-19
 
 ## Creative thesis
@@ -30,20 +30,21 @@ The Square receives its own map ID, version, callouts, objective volumes, bounda
 
 ## Competitive dimensions envelope
 
-The exact envelope is a P0.3 human decision. Codex recommends the following targets for approval and will not author final geometry until they are accepted or replaced:
+The P0.3 D3 envelope is accepted as the binding geometry target. Contract guards must use
+these same values before final geometry begins:
 
-| Measure | Recommended Alpha target | How it is verified |
+| Measure | Alpha target | How it is verified |
 |---|---:|---|
-| Competitive footprint | 88–104 m on each horizontal axis | Exported bounds |
-| Spawn to first credible contact | 10–16 s, median by intended primary route | `mapbalance.mjs` bot/player route samples |
-| Cross-map safe rotation | 18–28 s | Route timing samples excluding sprint exploits |
-| Spawn to near bomb site | 8–13 s | Rules/configured movement timing |
-| Spawn to far bomb site | 14–22 s | Rules/configured movement timing |
-| Ordinary combat sightline | 8–42 m | Eye-height ray distribution |
-| Longest deliberate sightline | <= 65 m, with at least two counters | Ray probe plus human review |
-| Accessible combat levels | Ground + one common upper level; rare roof overlook | Vertical reachability report |
+| Competitive footprint | 88 m × 88 m (`EDGE = 44`), ±5% | Exported bounds |
+| Spawn to first credible contact | 9–14 s; teams within 15% | `mapbalance.mjs` route samples |
+| Spawn to nearest bomb site | 12–16 s; teams within 15% | Route timing samples |
+| A↔B defender rotation | 16–22 s; teams within 15% | Route timing samples excluding exploits |
+| Longest deliberate sightline | ≤48 m, hard ceiling | Eye-height ray probe |
+| Accessible combat levels | 3 usable levels; rooftops bounded | Vertical reachability report |
 
-These are design inputs, not rules. Final accepted values must be dated in the human decision record and then enforced by the CC-owned map guards.
+The envelope comes from `docs/decisions/P0-decisions.md` §D3. The art programme—plaza,
+two distinct sites, dense interiors, and route identity—must fit it without weakening the
+guard values. `REQ-CX-002` supplies measured A↔B timing once the graybox exists.
 
 ## District plan
 
@@ -211,7 +212,6 @@ Final acceptance additionally requires every map/collision/stair/vertical/nav/ba
 
 ## Open approvals
 
-- Human owner: competitive dimensions/timing envelope.
 - Human art owner: creative thesis, palette, Signal Spire, and late-afternoon lighting.
 - Backend + human: Bomb site volumes/rules and side-switch behavior.
 - Backend: frozen map-data structure, stable IDs, callout export, nav-bake artifact format, and performance metadata.

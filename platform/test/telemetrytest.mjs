@@ -86,8 +86,8 @@ console.log('\nthe registry is the allowlist');
 console.log('\n§3.3 accountId is derived server-side, never taken from the client');
 // =============================================================================================
 {
-  const { service, sink } = harness();
   const clock = fakeClock();
+  const { service, sink, consent } = harness({ clock });
 
   // Signed out, and the client claims to be somebody.
   const anon = await service.ingest({
@@ -100,16 +100,32 @@ console.log('\n§3.3 accountId is derived server-side, never taken from the clie
   assert('the client-supplied accountId is discarded, not stored',
     sink.records[0].accountId === null, String(sink.records[0].accountId));
 
-  // Signed in as someone else entirely, still claiming a third identity.
+  // Signed in as someone else entirely, still claiming a third identity. A PERSONAL event,
+  // because the point is bearer-derived attribution — and §3.5.0 now stores internal records
+  // with no account at all, so `client.fps` could not demonstrate this even when it worked.
   const authed = await service.ingest({
-    body: batch([ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock)],
-      { accountId: 'ACCOUNT-I-WISH-I-WAS' }),
+    body: batch([ev('flow.step', { step: 'signup', outcome: 'completed', errorCode: null }, clock)],
+      { accountId: 'ACCOUNT-I-WISH-I-WAS',
+        consentReceipt: consent.issue({ subject: 'account', subjectId: 'REAL-ACCOUNT-01', telemetryPersonal: true, policyVersion: 1 }) }),
     actor: { accountId: 'REAL-ACCOUNT-01' },
     correlationId: ulid(),
   });
   assert('the accountId comes from the bearer token', authed.accountId === 'REAL-ACCOUNT-01');
-  assert('and that is what is stored',
-    sink.records[1].accountId === 'REAL-ACCOUNT-01', String(sink.records[1].accountId));
+  const personalRecord = sink.records.find((r) => r.name === 'flow.step');
+  assert('and that is what is stored on a PERSONAL record',
+    personalRecord?.accountId === 'REAL-ACCOUNT-01', String(personalRecord?.accountId));
+
+  // §3.5.0: an authenticated INTERNAL record is stored with no account linkage at all. An
+  // account id is personal linkage, so a linked record is not internal whatever its class says.
+  await service.ingest({
+    body: batch([ev('client.fps', { p50: 60, p01: 30, windowSec: 60 }, clock)]),
+    actor: { accountId: 'REAL-ACCOUNT-01' },
+    correlationId: ulid(),
+  });
+  const internalRecord = sink.records.find((r) => r.name === 'client.fps');
+  assert('an authenticated INTERNAL record stores no accountId',
+    internalRecord?.accountId === null && internalRecord?.clientSessionId === null,
+    JSON.stringify({ a: internalRecord?.accountId, c: internalRecord?.clientSessionId }));
   // CONTROL: if the body were trusted, this value would have reached the warehouse.
   assert('CONTROL: the forged value appears nowhere in the stored records',
     !JSON.stringify(sink.records).includes('ACCOUNT-I-WISH-I-WAS'));

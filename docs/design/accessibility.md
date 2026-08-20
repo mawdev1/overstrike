@@ -2,15 +2,18 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.1  
-**Status:** Ready for product and supported-device review  
+**Version:** 0.2
+**Status:** Supported-device matrix accepted; ready for product/accessibility review
 **Last updated:** 2026-08-19
 
 ## Standard and scope
 
 Target WCAG 2.2 AA for the out-of-match shell, account flows, settings, lobbies, results, and all conventional web controls. Real-time first-person combat has modality constraints, but essential objective, team, connection, damage, and interaction information must still be available without relying on one color, sound, or animation.
 
-The Alpha recommendation is desktop keyboard/mouse on the approved browser matrix. Controller, touch gameplay, console, and screen-reader operation of live 3D combat are not claimed until implemented and tested. Unsupported input/device combinations receive a clear compatibility message rather than a broken flow.
+Alpha is desktop keyboard/mouse on the D5 browser matrix. Controller, touch gameplay,
+console, and screen-reader operation of live 3D combat are not claimed until implemented and
+tested. Unsupported input/device combinations receive a clear compatibility message rather
+than a broken flow.
 
 ## Non-negotiable principles
 
@@ -190,7 +193,12 @@ Gaps to close:
 
 ## Verification matrix
 
-Pending the human-supported browser/device decision, the recommended minimum matrix is current and previous major versions of Chrome, Edge, and Firefox on Windows 11, plus current and previous Safari and Chrome on macOS. Keyboard-only and mouse/pointer-lock paths are tested on every supported browser; screen reader combinations are selected after the matrix is approved.
+The D5 minimum matrix is Chrome/Edge latest two major versions, Firefox latest two major
+versions, and Safari 17+ on Windows 10+, macOS 13+, and Linux where the selected browser is
+available. Match entry requires WebGL2, pointer lock, binary WebSocket frames, dual-core CPU,
+8 GB RAM, and approximately 2 GB VRAM. Mobile and tablets are unsupported. Keyboard-only and
+mouse/pointer-lock paths are tested on every supported browser; screen-reader combinations
+cover the semantic shell rather than claiming live-combat operation.
 
 Automated checks:
 
@@ -223,7 +231,6 @@ Human checks:
 
 ## Open approvals
 
-- Human owner: supported browser/OS/device/input matrix.
 - Human product/accessibility owner: live-combat accessibility claim and any WCAG exceptions.
 - Human art owner: final team/objective palette after shape-independent testing.
 - Backend: authorized spectator/objective information and error/timing fields.

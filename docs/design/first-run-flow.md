@@ -15,9 +15,9 @@ The approved new-account path is:
 `Landing -> Eligibility -> Telemetry consent -> Account details -> Display name and signup -> Verify -> Terms -> Essential setup -> Server browser -> Room lobby -> Green up -> Loading/handoff -> Match -> Results -> Return to lobby`
 
 This ordering is the D6 working default recorded by `http-api.md` §3a and `auth.md` §11.
-Eligibility comes before consent so an ineligible visitor is never asked to consent. Landing
-and eligibility may emit only unlinked internal aggregate counts; linked personal telemetry
-starts at consent and only after an affirmative decision. The sign-in branch remains available
+Eligibility comes before consent so an ineligible visitor is never asked to consent. Landing,
+eligibility, and the consent screen may emit only unlinked internal aggregate counts; linked
+personal telemetry starts at signup and only after an affirmative decision. The sign-in branch remains available
 from landing and resumes at the first incomplete account-policy step returned by the platform.
 
 Bomb is not forced as the first match. The browser may recommend an eligible TDM room with open slots; the player may choose either Alpha mode when rooms exist.
@@ -226,7 +226,7 @@ Only one tab may own an active match connection for the account. Other tabs disp
 
 ## Telemetry and privacy
 
-Emit only events authorized by `contracts/telemetry.md`: flow step viewed/completed/failed, time to first match, settings friction, room join failure, lobby abandonment, handoff failure, first-match completion, and return-to-lobby outcome. Before consent, landing and eligibility produce only the contract's unlinked internal aggregate events; `flow.step` is not used for them. Consent and later personal events carry the required receipt and `clientSessionId`. Correlation IDs propagate through every request. Raw password, birthdate, chat, display-name candidate, IP, or free-form server message is never included unless a contract explicitly classifies and permits it.
+Emit only events authorized by `contracts/telemetry.md`: flow step viewed/completed/failed, time to first match, settings friction, room join failure, lobby abandonment, handoff failure, first-match completion, and return-to-lobby outcome. Landing, eligibility, and the consent screen produce only the contract's unlinked internal aggregate events; `flow.step` is not used for them. Signup and later personal events carry the required receipt and `clientSessionId` after an affirmative decision; a decline emits no personal events. Request correlation IDs propagate through platform actions, while each unlinked `funnel.preconsent` event uses a fresh ID that is never reused from its request or another event. Raw password, birthdate, chat, display-name candidate, IP, or free-form server message is never included unless a contract explicitly classifies and permits it.
 
 ## Acceptance checklist
 

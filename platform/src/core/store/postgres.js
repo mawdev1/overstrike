@@ -354,6 +354,14 @@ export async function createPostgresStore(config = {}, deps = {}) {
      * meant a mistyped session id looked exactly like a successful revocation on a security
      * path, while the memory adapter raised NOT_FOUND. NOT_FOUND is the behaviour both keep.
      */
+    /** Advance `lastSeenAt`. auth.md §5 — see the memory adapter for why this must exist. */
+    async touch(sessionId, at, txh) {
+      const { rowCount } = await q(txh,
+        'update sessions set last_seen_at = $2 where session_id = $1',
+        [sessionId, at ?? new Date().toISOString()]);
+      if (!rowCount) throw new ApiError('NOT_FOUND', 'No such session.');
+    },
+
     async revoke(sessionId, reason, at, txh) {
       const { rowCount } = await q(txh,
         'update sessions set revoked_at = coalesce($2::timestamptz, now()), revoked_reason = $3 '

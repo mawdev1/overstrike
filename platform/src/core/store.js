@@ -44,6 +44,7 @@ import { ApiError } from './errors.js';
  *   create(row, tx) -> session
  *   byId(sessionId, tx) -> session|null
  *   listForAccount(accountId, tx) -> session[]
+ *   touch(sessionId, at, tx) -> void      // advance lastSeenAt (auth.md §5)
  *   revoke(sessionId, reason, at, tx) -> void
  *   revokeAllForAccount(accountId, reason, at, tx) -> number
  *   revokeFamily(familyId, reason, at, tx) -> number

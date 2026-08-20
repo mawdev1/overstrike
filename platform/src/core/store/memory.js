@@ -508,6 +508,21 @@ export function createMemoryStore(config = {}, deps = {}) {
      * be silent, which meant a typo'd session id and a successful revocation were the same
      * outcome — and the caller was a security path.
      */
+    /**
+     * Advance `lastSeenAt`.  auth.md §5.
+     *
+     * The session list shows a player where their account has been used, which is how a
+     * compromise is spotted. Without this the column held the creation time forever, so every
+     * session looked equally fresh and the list answered a question it appeared to answer.
+     */
+    touch(sessionId, at, txh) {
+      return write(txh, (st) => {
+        const row = st.sessions.get(sessionId);
+        if (!row) throw new ApiError('NOT_FOUND', 'No such session.');
+        row.lastSeenAt = toIso(at) ?? nowIso();
+      });
+    },
+
     revoke(sessionId, reason, at, txh) {
       assertCloneable(reason, 'sessions.revokedReason');
       return write(txh, (st) => {
@@ -835,7 +850,15 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
 
     get(clientSessionId, txh) {
-      return read(txh, (st) => clone(st.preAuthConsent.get(clientSessionId) ?? null));
+      return read(txh, (st) => {
+        const row = st.preAuthConsent.get(clientSessionId);
+        if (!row) return null;
+        // A 30-day TTL that only a sweep enforces is not a TTL: it is a row that stops being
+        // valid at a time nothing checks. Expiry is decided on READ, so a decision cannot be
+        // honoured past its life just because no cleanup has run yet.
+        if (row.expiresAt && Date.parse(row.expiresAt) <= Date.now()) return null;
+        return clone(row);
+      });
     },
 
     markMigrated(clientSessionId, at, txh) {

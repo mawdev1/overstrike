@@ -186,6 +186,24 @@ display names and chat.
 Adding an event is additive — a new row plus a version. Changing an existing payload's meaning
 is a CCR, because the warehouse already has rows under the old interpretation.
 
+### 3.5.0 Internal-class records are never account-linked (REQ-CC-055)
+
+This contract said two things that could not both hold: that `internal` carries no personal
+data, and that `accountId` is derived server-side from the bearer token. It never said which
+events the second applied to, so an authenticated `client.fps` was stored linked to an account
+and still labelled internal.
+
+**The rule, stated once:** a record whose `privacyClass` is `internal` is persisted with
+`accountId: null` and `clientSessionId: null`, **even when the request is authenticated**. An
+account id is personal linkage; a linked record is not internal whatever its class field says.
+
+The request `correlationId` is retained, because it identifies a request rather than a person
+and is what lets an operator follow one action across tiers.
+
+The alternative was reclassifying crash and performance events as `personal`. That was
+rejected deliberately: it would put ordinary crash reporting behind consent, so a player who
+declines analytics also stops us being able to diagnose the crash that loses them the match.
+
 ### 3.5.1 What "unlinked" means, enforceably (REQ-CC-039)
 
 "No correlation to any later event" is only real if the correlation ID cannot be the link.

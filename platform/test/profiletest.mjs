@@ -820,8 +820,9 @@ console.log('\nmatch-result.md §5 — a retry applies once');
   const afterTwo = await mod.stats.getCareer(ACCOUNT, 'tdm');
   expect(afterTwo.totals.kills === 10 && afterTwo.totals.matches === 1 && afterTwo.totals.wins === 1,
     'the identical result submitted twice is applied exactly once', JSON.stringify(afterTwo.totals));
-  expect(JSON.stringify(first) === JSON.stringify(second),
-    '§5.4: the replay returns the STORED response rather than a fresh application',
+  expect(first.applied === true && second.applied === false
+      && JSON.stringify({ ...first, applied: null }) === JSON.stringify({ ...second, applied: null }),
+    '§5.4: the replay returns the STORED response, with applied:false because THIS call did not apply',
     `${JSON.stringify(first)} vs ${JSON.stringify(second)}`);
   expect(store._matches.filter((m) => m.matchId === 'IDEM1').length === 1,
     'the immutable match record is written once, not once per retry',

@@ -2,9 +2,9 @@
 
 # Frontend status — [CX] Codex
 
-**Updated:** 2026-08-19
-**Phase:** P0 — Contract freeze
-**Overall:** BLOCKED AT G0A — seventh-pass review accepts the six 1.6.0 amendments but finds three remaining executable-contract gaps
+**Updated:** 2026-08-20
+**Phase:** P1 — forced contract freeze; connected-flow acceptance review
+**Overall:** BLOCKED AT H1.1/H1.2 — the headers are frozen by explicit override, but the executable stubs, telemetry privacy boundary, result lifecycle, and P1 CX deliverables do not pass
 
 ---
 
@@ -205,6 +205,98 @@ Measured on the current tree without modifying product source:
 | World | MERIDIAN 86×86 m, 18 spawns | Technical fixture only; The Square is a new map ID/manifest |
 | Network UI | Scoreboard synthesizes deterministic ping | Remove when measured facade data exists; never propagate into shell |
 
+## Eighth-pass freeze audit
+
+Three independent reviews traced the 1.7.0 amendments through their repeated schemas,
+storage, transport, UI routes, and deterministic stub ownership. The amended canonical
+paragraphs improve all three chains, but G0A still cannot pass:
+
+| Chain | Eighth-pass result |
+|---|---|
+| Onboarding / telemetry | **BLOCKED.** Stale producer prose still begins personal telemetry at consent; a recorded decline cannot serialize through the exact profile example; receipt placement and retention disagree; pre-auth consent has incompatible deletion/migration lifecycles; invalid consent receipts have no typed recovery path. `REQ-CC-042` |
+| Match result / history | **BLOCKED.** HTTP history retains the old non-null pending shape; the “exact” terminal union still contains placeholders; wire/facade/submission/redaction projections remain incomplete or contradictory. `REQ-CC-043` |
+| Result lifecycle | **BLOCKED.** Allocated and queued-pending states are not both reachable, administrative invalidation has no append-only command, aggregation/no-contest and `match.result_applied` semantics disagree, and DB constraints do not encode the union. `REQ-CC-044` |
+| Executable stubs / resume | **BLOCKED.** Seven top-level shell routes and many nested routes have no coverage owner; essential setup, incomplete-policy resume, active-lobby discovery, sessions, settings conflicts, recovery, and system states are unreachable. `REQ-CC-045` |
+| Display-name feedback | **BLOCKED.** P1 B3 requires live authoritative availability/policy feedback, but no preflight endpoint or fixture exists. `REQ-CC-046` |
+| Required UI harness | **BLOCKED FOR P1 EXIT.** The plan assigns `scripts/ui*.mjs` to CX and requires `scripts/uishell.mjs`, while the machine ownership map assigns that exact path to CC and `package.json` is CC-owned. `REQ-CC-047` |
+| P1 HTTP implementation | **BLOCKED FOR LIVE INTEGRATION.** Runtime probing of committed `681a116` shows queued refresh cookies and custom response headers are discarded; build-floor comparison is lexical and required request identity headers are not validated. `REQ-CC-048` |
+| P1 module integration | **BLOCKED FOR H1.2.** Real-store probing contradicts the green fake-store auth tests: row shapes disagree, outbox writes use the wrong representation, reuse detection rolls itself back, and auth/telemetry receipts are incompatible. `REQ-CC-049` |
+| P1 executable stubs | **BLOCKED FOR H1.1.** The current stub router is unmounted, state identity splits flows, several fixtures violate contracts, no match facade stub exists, and `stubtest` aborts before assertions complete. `REQ-CC-050` |
+| P1 deployed assembly | **BLOCKED FOR H1.2/H1.3.** The aggregate green suite has no production composition-root HTTP flow; live telemetry 500s, optional bearer auth is unwired, last-seen cannot advance, and proxy-aware client identity is unused. `REQ-CC-051` |
+| Profile/settings/history | **BLOCKED FOR B4/B5.** Real-store probes fail match persistence and profile mutations; settings CAS loses updates, `mode=all` has the forbidden aggregate shape, and required privacy/idempotency semantics are absent. `REQ-CC-052` |
+| Telemetry privacy | **BLOCKED FOR B6.** Internal-only linkage is retained outside preconsent, first-match modes are stale, and consent expiry/policy/nullability invariants are unenforced. `REQ-CC-053` |
+
+The CX-owned first-run projection now agrees with the lawful boundary: landing, eligibility,
+and the consent screen are unlinked internal counts; linked personal telemetry begins at
+signup after affirmative consent. The malformed `@@###` headings for `REQ-CC-039`–`041`
+were also repaired in the CX-owned append-only handoff log.
+
+## Ninth-pass frozen-HEAD audit
+
+Three independent reviews re-ran the connected contract and implementation flows at
+`08b9862`. The 13 contract headers are now `FROZEN`, but the changelog explicitly records that
+freeze as permission to proceed without final Codex approval; it did not amend the open
+cross-file findings. The deployed platform suite reports 786 checks across seven suites with
+zero failures, but several tests assert stale behavior and the Postgres path is skipped without
+`DATABASE_URL`.
+
+| Area | Ninth-pass result |
+|---|---|
+| Consent / telemetry | **BLOCKED.** A real HTTP probe accepted a personal event for client session B using a receipt issued to session A. Internal-only telemetry still stores account/session linkage; `session.first_match` rejects `bomb` and accepts stale `ffa`; producer prose, receipt placement, retention, and pre-auth lifecycle remain contradictory. `REQ-CC-042`, `053` |
+| HTTP / auth assembly | **PARTIAL.** Cookies, ETags, numeric version ordering, refresh-family revocation, telemetry sink/auth wiring, and proxy derivation are fixed. Missing builds are enforced only when a floor is configured, malformed `2garbage` passes floor `2`, invalid-correlation recovery remains undocumented, and session `lastSeenAt` never advances because no adapter implements `touch`. `REQ-CC-048`, `049`, `051` |
+| Executable stubs | **BLOCKED.** Interception and offline socket failure work, but delay, auth, prerequisite state, account-shared cross-tab state, correlation consistency, settings round-trip, active-room discovery, name preflight, resume state, and most shell variants do not. The passing stub test parses the incomplete HTTP table rather than the full shell matrix. `REQ-CC-045`, `046`, `050` |
+| Result / history lifecycle | **BLOCKED.** An allocated match cannot be finalized because both stores treat the terminal write as a conflicting insert. No-contest results aggregate, result application emits no outbox event, pending/terminal projections remain contradictory, and the result route/exact submission/redaction rules remain absent. `REQ-CC-043`, `044` |
+| Profile / settings | **PARTIAL.** Real match-store methods, atomic settings CAS, canonical name folding, and legacy-import storage landed. Wildcard `If-Match`, flat summed `mode=all`, missing privacy/idempotency/history-event behavior, extra public fields, and permissive pagination remain. `REQ-CC-052` |
+| CX P1 product | **NOT IMPLEMENTED.** `src/main.js` still statically imports and constructs `Game`; no `src/ui/shell/**` or typed platform client/sender exists. Ownership and the package entry for `scripts/uishell.mjs` are fixed, but the file is absent and `npm run uishell` fails `MODULE_NOT_FOUND`. `REQ-CC-047` itself is satisfied. |
+
+H1.1 therefore fails, and H1.2/H1.3 cannot be accepted. The cross-subject consent-receipt
+acceptance is the highest-priority current defect because it breaks the stated privacy boundary,
+not merely a presentation fixture.
+
+## Tenth-pass targeted security re-review
+
+At `c13d52f`, `REQ-CC-054` is **functionally accepted**. Deployed memory/socket controls reject
+session-A receipt/session-B submission, account-A receipt/account-B bearer, a session receipt on
+an authenticated request, and a signed-out personal batch without a subject; matching session
+and account controls succeed. The committed suite covers all except the explicit cross-account
+negative, which the independent manual HTTP probe passed and should still be added as a
+regression vector.
+
+The commit changed only the consent adapter, its assembly tests, and the backend handoff. It did
+not alter the remaining contract, stub, result, profile, HTTP, session, or CX shell files.
+Accordingly `REQ-CC-042`–`046`, `048`–`053` retain their ninth-pass verdicts. The highest-priority
+remaining failures are internal-only telemetry retaining account/session linkage, allocated
+matches that cannot finalize, no-contest career aggregation/outbox behavior, and the absent
+H1.1 shell fixture matrix. This pass also isolated a result-response contradiction: frozen HTTP
+defines `applied` as a boolean and replay as `false`, while the service returns an account-ID
+array and replays the original response; no live result route currently exposes either shape.
+
+## Eleventh-pass implementation re-review
+
+At `a6d4b4e`, six corrections are genuine: malformed client builds are rejected when a valid
+floor is configured; Bomb replaces the stale FFA/CTF/Search telemetry modes; internal-only
+request bodies cannot carry session/receipt linkage; no-contest results no longer aggregate;
+visible `mode=all` returns separate TDM/Bomb projections; and a production-wired first result
+application emits one `match.result_applied` event. Tests that previously defended three of the
+violations were corrected.
+
+The pass remains unaccepted:
+
+- Allocated matches still conflict instead of finalizing, `result_applied_at` is not persisted,
+  terminal status events are absent, and result validation accepts incomplete terminal records.
+- HTTP says replay returns `applied:false`, while the service replays its stored
+  `applied:true` response and adds forbidden response fields. No live result endpoint resolves
+  the projection.
+- Hidden `mode=all` retains the stale flat shape; privacy PATCH/idempotency, rename events/history,
+  wildcard `If-Match`, public projection, and pagination remain off-contract.
+- Missing builds still pass under the default null floor, malformed configured floors fail open,
+  session last-seen never advances, expired pre-auth consent is returned after 31 days, and the
+  chosen delete-on-migration lifecycle/account consent constraint remain absent.
+- Authenticated internal-only telemetry persists bearer-derived `accountId`, contradicting the
+  stated internal/no-personal-data class. `REQ-CC-055` requests one explicit privacy rule.
+- Stub/H1.1 and all CX B1 findings are unchanged; `uishell` remains absent and the game runtime
+  is still imported statically.
+
 ## Gate and verification
 
 - Six P0.2 design files: **complete, review pending**; D3/D5 decisions synchronized.
@@ -219,15 +311,24 @@ Measured on the current tree without modifying product source:
 - Seventh-pass executable-contract audit: **complete** across telemetry, result unions, and stub coverage.
 - `REQ-CX-005`: **ACCEPTED**; settings vocabulary v1 published in the CX inventory.
 - Settings/unsupported-reason chain: **PASSED** after `REQ-CC-032`.
-- G0A: **NOT PASSED** — three residual amendment groups remain (`REQ-CC-039`–`041`).
-- Product tests: not run; this pass changes only the CX-owned shell/HUD specifications,
-  frontend status, and requests-to-backend handoff.
+- Eighth-pass 1.7.0 review: **complete; not accepted**. `REQ-CC-042`–`047` filed with exact cross-file and P1 verification requirements.
+- P1 HTTP-core integration probe: **failed** cookie, custom-header, build-order, and request-ID invariants; `REQ-CC-048` filed with executable vectors.
+- P1 real-object-graph and executable-stub probes: **failed**; `REQ-CC-049`–`050` filed with integration-level acceptance paths.
+- P1 deployed profile/settings/telemetry audit: **failed** despite 475 isolated green checks; `REQ-CC-051`–`053` filed with real-store and HTTP acceptance paths.
+- Tenth-pass `REQ-CC-054` security re-review: **FUNCTIONALLY ACCEPTED**; one requested cross-account regression vector remains absent from the committed suite.
+- Eleventh-pass implementation re-review: **PARTIAL IMPROVEMENT; NOT ACCEPTED**. `REQ-CC-055` filed for bearer-derived identity on internal telemetry.
+- Contract entry: all 13 headers are `FROZEN` by explicit override; technical re-review is **NOT ACCEPTED** and `REQ-CC-042`–`046`, `048`–`053`, `055` retain open or partial findings.
+- Platform suite: **790 checks / 7 suites / 0 failures**; the result is insufficient because key connected vectors are absent and Postgres execution was skipped without `DATABASE_URL`.
+- Root `npm run check` and `npm run build`: **PASS**.
+- `npm run uishell`: **FAIL**, required CX harness missing.
+- H1.1: **FAIL**. H1.2/H1.3: **NOT ACCEPTED**.
 - Worktree: remains dirty with pre-existing mixed product changes; none were modified by this
-  review and no commit was created.
+  review except this CX-owned status update; no commit was created.
 
 ## Next frontend action
 
-Re-review `REQ-CC-039` through `041` as executable flows, not isolated paragraphs. Sign off G0A
-only when consent telemetry is lawful and emit-able, terminal result/history unions are exact,
-and the backend stubs can deterministically drive every required CX state. P1 implementation
-remains blocked until the affected contracts are frozen.
+The override permits CX to start the isolated shell, lazy runtime boundary, typed client core,
+and required `uishell` harness. Do not accept H1.1 fixtures or switch B3–B6 to live platform
+surfaces until the open request groups pass as connected flows. Backend priority is the
+finalizable match lifecycle/exact result route, internal telemetry identity policy, executable
+route-by-state stubs, and the remaining profile/settings/session exactness gaps.
