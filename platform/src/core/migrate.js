@@ -117,8 +117,37 @@ export function planMigrations(files, applied) {
 }
 
 /**
- * Apply everything pending. `client` is any pg client or pool with `.query`; pass one when
- * the caller already has a connection, otherwise supply `databaseUrl` and one is opened here.
+ * A pool is not a connection, and this runner needs a connection.
+ *
+ * `pool.query()` takes a different pooled client per call. Both things this runner depends on
+ * are per-session: `pg_advisory_lock` is held by the SESSION that took it, so the lock would be
+ * taken on one connection and the unlock attempted on another, leaving the lock held until the
+ * pool recycles; and `begin`/`commit` would be issued on unrelated connections, so each
+ * migration's DDL and its schema_migrations row would land in two different transactions —
+ * exactly the "recorded as applied but not applied" state the per-migration transaction exists
+ * to prevent. Both failures are invisible on a single-connection pool and appear later.
+ */
+function assertDedicatedConnection(db) {
+  if (!db || typeof db.query !== 'function') {
+    throw new Error('migrate: `client` must be a connected pg Client (it has no .query)');
+  }
+  const pooled = typeof db.totalCount === 'number' || typeof db.idleCount === 'number'
+    || typeof db.waitingCount === 'number' || typeof db.connect === 'function' && typeof db.options?.max === 'number';
+  if (pooled) {
+    throw new Error(
+      'migrate: a Pool was passed where a dedicated connection is required. '
+      + 'The advisory lock and the per-migration transaction are session-scoped, and a pool '
+      + 'runs each statement on whichever connection is free. Pass `databaseUrl`, or a single '
+      + 'client from `await pool.connect()`.');
+  }
+}
+
+/**
+ * Apply everything pending.
+ *
+ * Pass `databaseUrl` and a dedicated connection is opened and closed here — that is the
+ * intended entry point. `client` is for a caller that already holds ONE connection (a
+ * `pg.Client`, or a `PoolClient` from `pool.connect()`); a Pool is refused, loudly.
  */
 export async function runMigrations({ databaseUrl, client, dir = MIGRATIONS_DIR } = {}, deps = {}) {
   const logger = deps.logger ?? null;
@@ -130,6 +159,8 @@ export async function runMigrations({ databaseUrl, client, dir = MIGRATIONS_DIR 
     own = new pg.default.Client({ connectionString: databaseUrl });
     await own.connect();
     db = own;
+  } else {
+    assertDedicatedConnection(db);
   }
 
   try {
@@ -166,18 +197,36 @@ export async function runMigrations({ databaseUrl, client, dir = MIGRATIONS_DIR 
   }
 }
 
+/**
+ * The deploy entry point.  `node platform/src/core/migrate.js`, or `migrateCli()` from a
+ * process that owns the deploy.
+ *
+ * It is deliberately NOT called from `app.js` boot. A server that migrates on start migrates
+ * once per instance in a rolling deploy, from N instances racing for the advisory lock, with
+ * the losers blocked on it while their health checks time out — and a failed migration then
+ * looks like a failed rollout rather than a failed migration. Migrations are a deploy step
+ * that runs to completion before the new instances start.
+ *
+ * @returns {Promise<{applied: string[], alreadyApplied: number}>}
+ */
+export async function migrateCli({ databaseUrl = process.env.DATABASE_URL, dir = MIGRATIONS_DIR } = {},
+  out = console) {
+  if (!databaseUrl) {
+    out.error('DATABASE_URL is not set');
+    return { applied: [], alreadyApplied: 0, ok: false };
+  }
+  const r = await runMigrations({ databaseUrl, dir });
+  out.log(r.applied.length
+    ? `applied ${r.applied.length}: ${r.applied.join(', ')}`
+    : `nothing to do (${r.alreadyApplied} already applied)`);
+  return { ...r, ok: true };
+}
+
 // CLI: `node platform/src/core/migrate.js`
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    console.error('DATABASE_URL is not set');
-    process.exit(2);
-  }
   try {
-    const r = await runMigrations({ databaseUrl });
-    console.log(r.applied.length
-      ? `applied ${r.applied.length}: ${r.applied.join(', ')}`
-      : `nothing to do (${r.alreadyApplied} already applied)`);
+    const r = await migrateCli();
+    if (!r.ok) process.exit(2);
   } catch (err) {
     console.error(err.message);
     process.exit(1);

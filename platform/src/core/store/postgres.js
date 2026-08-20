@@ -20,21 +20,125 @@
  * Timestamps cross the interface as ISO strings, matching the memory adapter. `pg` returns
  * `Date`; code written against one adapter must not break on the other.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ApiError } from '../errors.js';
 import { ulid as defaultUlid } from '../ids.js';
+import {
+  STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
+  MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
+} from '../store.js';
 
 const TX = Symbol('overstrike.pgtx');
+
+/**
+ * Handle state lives outside the handle, and reentrancy is tracked async-locally — same
+ * reasoning as the memory adapter: a handle that carries its pg client hands every caller a
+ * connection with which they can `commit`, `rollback`, or run any statement they like, and a
+ * nested `tx` that grabs a second pooled connection is not nested at all, it is a second
+ * transaction that can deadlock against the first.
+ */
+const handleState = new WeakMap();
+const txContext = new AsyncLocalStorage();
 
 const toSnake = (s) => s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 
-/** bigint columns arrive as strings from `pg` (they can exceed 2^53). Career counters cannot. */
-const STAT_COUNTERS = [
-  'kills', 'deaths', 'assists', 'suicides', 'teamKills', 'headshots',
-  'shotsFired', 'shotsHit', 'damageDealt', 'plants', 'defuses',
-  'matches', 'wins', 'losses', 'draws', 'roundsPlayed', 'timePlayedSec',
-];
-const WEAPON_COUNTERS = ['shots', 'hits', 'kills', 'headshots'];
+/**
+ * Per-table column allow-lists. Nothing reaches a statement that is not in one of these.
+ *
+ * `insertRow`/`updateRow` build column names from the KEYS of a caller-supplied object. Those
+ * keys were pasted into SQL after `toSnake`, and `toSnake` is not an escape — it lower-cases
+ * capitals and leaves everything else, quotes and all. So
+ *
+ *   accounts.update(id, { "status = 'banned', roles = '{admin}', display_name": 'x' })
+ *
+ * executed every clause in that key. Any surface that forwards a JSON body into a patch is
+ * then a privilege-escalation endpoint. An allow-list is the fix rather than escaping, because
+ * a column that is not in the schema has no business in a statement whether it is quotable
+ * or not.
+ */
+const TABLE_COLUMNS = {
+  accounts: [
+    'accountId', 'status', 'emailHash', 'displayName', 'displayNameFolded',
+    'passwordHash', 'roles', 'nameChangedAt',
+    'eligibilityVerdict', 'eligibilityPolicyVer', 'eligibilityDecidedAt',
+    'emailVerifiedAt', 'termsVersionAccepted', 'termsAcceptedAt',
+    'consentTelemetry', 'consentPolicyVer', 'consentDecidedAt',
+    'privacy', 'createdAt', 'updatedAt', 'deletedAt',
+  ],
+  sessions: [
+    'sessionId', 'accountId', 'deviceLabel', 'userAgentClass', 'ipClass',
+    'createdAt', 'lastSeenAt', 'revokedAt', 'revokedReason', 'refreshFamilyId', 'updatedAt',
+  ],
+  refresh_tokens: [
+    'tokenId', 'familyId', 'accountId', 'sessionId', 'issuedAt', 'expiresAt', 'usedAt',
+    'createdAt', 'updatedAt',
+  ],
+  events_outbox: [
+    'eventId', 'eventType', 'eventVersion', 'subjectKind', 'subjectId',
+    'correlationId', 'causationId', 'actor', 'payload', 'privacyClass', 'retentionClass',
+    'schemaRef', 'occurredAt', 'recordedAt', 'publishedAt', 'attempts', 'lastError',
+    'deadLetteredAt', 'createdAt', 'updatedAt',
+  ],
+  audit_log: [
+    'auditId', 'actorKind', 'actorId', 'actorRole', 'action', 'subjectKind', 'subjectId',
+    'reasonCode', 'beforeSummary', 'afterSummary', 'correlationId', 'createdAt',
+  ],
+  matches: MATCH_COLUMNS,
+  match_participants: [
+    'matchId', 'accountId', 'team', 'joinedAt', 'leftAt', 'disconnected', 'abandoned', 'stats',
+  ],
+};
+
+/**
+ * jsonb columns, by table. Their values are stringified before they reach the driver.
+ *
+ * `pg` renders a plain object as JSON but a JS ARRAY as a Postgres ARRAY LITERAL, so an array
+ * bound for a jsonb column — `rounds`, a rollout list, a response body that happens to be a
+ * list — arrives as '{"[object Object]"}'. Text bound to an untyped parameter is parsed by the
+ * target column, so stringifying is correct for objects and arrays alike.
+ */
+const JSONB_COLUMNS = Object.assign(Object.create(null), {
+  accounts: new Set(['privacy']),
+  events_outbox: new Set(['actor', 'payload']),
+  audit_log: new Set(['beforeSummary', 'afterSummary']),
+  matches: new Set(['rulesSnapshot', 'teamScores', 'rounds']),
+  match_participants: new Set(['stats']),
+});
+
+function encode(table, camelKey, value) {
+  if (value === null || value === undefined) return value;
+  if (!JSONB_COLUMNS[table]?.has(camelKey)) return value;
+  // Checked BEFORE stringifying: JSON.stringify silently drops a function and throws on a
+  // BigInt, so encoding first would turn "this value cannot be stored" into a quietly
+  // truncated row — the same silent-discard failure the memory adapter refuses.
+  assertStorable(value, `${table}.${camelKey}`);
+  return JSON.stringify(value);
+}
+
+/** Null-prototype sets, so `constructor` and `__proto__` are not columns of every table. */
+const ALLOWED = Object.assign(Object.create(null), Object.fromEntries(
+  Object.entries(TABLE_COLUMNS).map(([t, cols]) => [t, new Set(cols)])));
+
+/**
+ * Resolve one caller-supplied key to a column name, or refuse.
+ *
+ * Belt and braces: the allow-list decides, and the shape check catches an allow-list entry
+ * that was itself mistyped rather than trusting the table above to stay clean forever.
+ */
+function columnName(table, camelKey) {
+  const allowed = ALLOWED[table];
+  if (!allowed || !allowed.has(camelKey)) {
+    throw new ApiError('VALIDATION_FAILED', `Unknown column for ${table}: ${camelKey}`, {
+      details: { table, column: String(camelKey).slice(0, 64) },
+    });
+  }
+  const col = toSnake(camelKey);
+  if (!/^[a-z][a-z0-9_]*$/.test(col)) {
+    throw new ApiError('VALIDATION_FAILED', `Unusable column name for ${table}`, { details: { table } });
+  }
+  return col;
+}
 
 function mapRow(row, numeric = []) {
   if (!row) return null;
@@ -93,16 +197,43 @@ export async function createPostgresStore(config = {}, deps = {}) {
   });
   pool.on?.('error', (err) => logger?.error('store.pool.error', { message: err.message }));
 
-  function handleOf(txh) {
+  /** Identity of THIS store, so a handle from another instance is rejected rather than used. */
+  const storeTag = Symbol('overstrike.pgstore');
+
+  function entryOf(txh) {
     if (txh === undefined || txh === null) return null;
     if (!txh[TX]) throw new ApiError('INTERNAL_ERROR', 'Not a transaction handle from this store.');
-    if (txh.done) throw new ApiError('INTERNAL_ERROR', 'Transaction handle used after the transaction ended.');
-    return txh;
+    const entry = handleState.get(txh);
+    if (!entry || entry.store !== storeTag) {
+      throw new ApiError('INTERNAL_ERROR', 'Not a transaction handle from this store.');
+    }
+    if (entry.done) throw new ApiError('INTERNAL_ERROR', 'Transaction handle used after the transaction ended.');
+    return entry;
   }
 
+  /**
+   * The connection a call should use: the explicit handle's, else the transaction ambient on
+   * the async call stack, else the pool. store.js rule 4 — a call that omits the handle inside
+   * `tx(fn)` means the transaction it is written inside, not a separate autocommit statement
+   * that survives the rollback.
+   */
+  function entryFor(txh) {
+    const explicit = entryOf(txh);
+    if (explicit) return explicit;
+    const ambient = txContext.getStore();
+    if (ambient && ambient.store === storeTag && !ambient.done) return ambient;
+    return null;
+  }
+
+  const inTransaction = (txh) => entryFor(txh) !== null;
+
   async function q(txh, sql, params = []) {
-    const h = handleOf(txh);
-    const target = h ? h.client : pool;
+    // One chokepoint for every value that reaches the driver. `pg` does not refuse a Symbol or
+    // a function — it stringifies them — so without this the same bad argument that the memory
+    // adapter rejects would be stored here as the text "Symbol(x)".
+    for (const p of params) assertStorable(p, 'query parameter');
+    const entry = entryFor(txh);
+    const target = entry ? entry.client : pool;
     try {
       return await target.query(sql, params);
     } catch (err) {
@@ -111,11 +242,19 @@ export async function createPostgresStore(config = {}, deps = {}) {
   }
 
   async function tx(fn) {
+    const outer = txContext.getStore();
+    // Reentrant: run on the outer transaction. Opening a second one would take a second
+    // connection, and the two would then wait on each other's locks with the pool exhausted.
+    // There are no savepoints, so an inner failure the outer swallows still commits.
+    if (outer && outer.store === storeTag && !outer.done) return fn(outer.handle);
+
     const client = await pool.connect();
-    const handle = { [TX]: true, client, done: false };
+    const handle = Object.freeze({ [TX]: true });
+    const entry = { store: storeTag, client, done: false, handle };
+    handleState.set(handle, entry);
     try {
       await client.query('begin');
-      const out = await fn(handle);
+      const out = await txContext.run(entry, () => fn(handle));
       await client.query('commit');
       return out;
     } catch (err) {
@@ -126,26 +265,30 @@ export async function createPostgresStore(config = {}, deps = {}) {
       }
       throw translate(err);
     } finally {
-      handle.done = true;
+      entry.done = true;
       client.release();
     }
   }
 
-  /** INSERT built from a camelCase object. Column names come from the object, never a caller string. */
+  /**
+   * INSERT built from a camelCase object. Every column name is resolved through the table's
+   * allow-list first, so a caller-supplied KEY cannot become SQL.
+   */
   async function insertRow(txh, table, obj, { returning = '*', onConflict = '' } = {}) {
     const cols = Object.keys(obj).filter((k) => obj[k] !== undefined);
-    const sql = `insert into ${table} (${cols.map(toSnake).join(', ')}) `
+    const names = cols.map((c) => columnName(table, c));
+    const sql = `insert into ${table} (${names.join(', ')}) `
       + `values (${cols.map((_, i) => `$${i + 1}`).join(', ')}) ${onConflict} `
       + (returning ? `returning ${returning}` : '');
-    const { rows } = await q(txh, sql, cols.map((c) => obj[c]));
+    const { rows } = await q(txh, sql, cols.map((c) => encode(table, c, obj[c])));
     return rows[0] ?? null;
   }
 
   async function updateRow(txh, table, patch, where, whereValues, returning = '*') {
     const cols = Object.keys(patch).filter((k) => patch[k] !== undefined);
     if (!cols.length) return null;
-    const sets = cols.map((c, i) => `${toSnake(c)} = $${i + 1}`);
-    const params = cols.map((c) => patch[c]).concat(whereValues);
+    const sets = cols.map((c, i) => `${columnName(table, c)} = $${i + 1}`);
+    const params = cols.map((c) => encode(table, c, patch[c])).concat(whereValues);
     const wh = where.replace(/\$(\d+)/g, (_, n) => `$${Number(n) + cols.length}`);
     const { rows } = await q(txh, `update ${table} set ${sets.join(', ')} where ${wh} returning ${returning}`, params);
     return rows[0] ?? null;
@@ -177,7 +320,9 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
 
     async update(accountId, patch, txh) {
-      const { accountId: _ignored, createdAt: _ignored2, ...rest } = patch;
+      // account_id and created_at are immutable; updated_at belongs to the 0001 trigger, and
+      // accepting one from the patch is a clock the caller writes. Same rule on both adapters.
+      const { accountId: _ignored, createdAt: _ignored2, updatedAt: _ignored3, ...rest } = patch;
       const row = await updateRow(txh, 'accounts', rest, 'account_id = $1', [accountId]);
       if (!row) throw new ApiError('NOT_FOUND', 'No such account.', { details: { accountId } });
       return mapRow(row);
@@ -200,13 +345,24 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return rows.map((r) => mapRow(r));
     },
 
+    /**
+     * `where revoked_at is null` keeps the first revocation's timestamp and reason, which is
+     * the one that explains what happened; a re-stamp would overwrite it with the retry.
+     *
+     * Zero rows is therefore ambiguous — already revoked, or no such session — so it is
+     * resolved rather than shrugged at. This adapter used to return silently either way, which
+     * meant a mistyped session id looked exactly like a successful revocation on a security
+     * path, while the memory adapter raised NOT_FOUND. NOT_FOUND is the behaviour both keep.
+     */
     async revoke(sessionId, reason, at, txh) {
-      // `where revoked_at is null` keeps the first revocation's timestamp and reason, which is
-      // the one that explains what happened; a re-stamp would overwrite it with the retry.
-      await q(txh,
+      const { rowCount } = await q(txh,
         'update sessions set revoked_at = coalesce($2::timestamptz, now()), revoked_reason = $3 '
         + 'where session_id = $1 and revoked_at is null',
         [sessionId, at ?? null, reason ?? null]);
+      if (rowCount === 0) {
+        const { rows } = await q(txh, 'select 1 from sessions where session_id = $1', [sessionId]);
+        if (!rows.length) throw new ApiError('NOT_FOUND', 'No such session.', { details: { sessionId } });
+      }
     },
 
     async revokeAllForAccount(accountId, reason, at, txh) {
@@ -256,16 +412,97 @@ export async function createPostgresStore(config = {}, deps = {}) {
   };
 
   const profiles = {
-    async upsert(accountId, patch, txh) {
+    /**
+     * A key PRESENT in the patch sets the column, including to null; an absent key leaves it.
+     *
+     * This used to be `coalesce(excluded.x, profiles.x)`, under which null meant "leave it" —
+     * so roaming settings could never be cleared, the clear-my-settings path silently did
+     * nothing, and the memory adapter (which did clear) disagreed. The presence flags below
+     * are what let one statement express both operations.
+     */
+    /**
+     * Compare-and-set on `settings_version`.  http-api.md §11.2.
+     *
+     * The `where profiles.settings_version = $8` on the conflict branch is the whole point:
+     * the comparison happens IN the statement that writes, so two concurrent If-Match writers
+     * cannot both win. A read-then-write in application code — even inside a transaction —
+     * lets both read the same version under READ COMMITTED and both proceed.
+     *
+     * Zero rows back means the version moved; the caller raises CONFLICT with current state.
+     */
+    async upsertIfVersion(accountId, expectedVersion, patch, txh) {
+      const p = patch ?? {};
+      for (const k of Object.keys(p)) {
+        if (!['roamingSettings', 'legacyImport', 'settingsVersion'].includes(k)) {
+          throw new ApiError('VALIDATION_FAILED', `Unknown column for profiles: ${k}`, {
+            details: { table: 'profiles', column: k },
+          });
+        }
+      }
+      if (!Number.isInteger(expectedVersion)) {
+        throw new ApiError('VALIDATION_FAILED', 'expectedVersion must be an integer.');
+      }
+      const hasRoaming = Object.hasOwn(p, 'roamingSettings');
+      const hasLegacy = Object.hasOwn(p, 'legacyImport');
+      const hasVersion = Object.hasOwn(p, 'settingsVersion');
+      if (hasVersion && !Number.isInteger(p.settingsVersion)) {
+        throw new ApiError('VALIDATION_FAILED', 'profiles.settingsVersion must be an integer.', {
+          details: { table: 'profiles', column: 'settingsVersion' },
+        });
+      }
       const { rows } = await q(txh,
-        `insert into profiles (account_id, roaming_settings, settings_version)
-         values ($1, $2::jsonb, coalesce($3::int, 1))
+        `insert into profiles (account_id, roaming_settings, settings_version, legacy_import)
+         values ($1, $2::jsonb, coalesce($3::int, 1), $4::jsonb)
          on conflict (account_id) do update set
-           roaming_settings = coalesce(excluded.roaming_settings, profiles.roaming_settings),
-           settings_version = coalesce($3::int, profiles.settings_version),
+           roaming_settings = case when $5::boolean then $2::jsonb else profiles.roaming_settings end,
+           legacy_import    = case when $6::boolean then $4::jsonb else profiles.legacy_import end,
+           settings_version = case when $7::boolean then $3::int   else profiles.settings_version end,
+           updated_at = now()
+         where profiles.settings_version = $8::int
+         returning *`,
+        [accountId,
+          hasRoaming && p.roamingSettings != null ? JSON.stringify(p.roamingSettings) : null,
+          hasVersion ? p.settingsVersion : null,
+          hasLegacy && p.legacyImport != null ? JSON.stringify(p.legacyImport) : null,
+          hasRoaming, hasLegacy, hasVersion, expectedVersion]);
+      // A brand-new row inserts (no conflict) and is correct only when the caller expected the
+      // initial version; otherwise it would create a row the caller did not think existed.
+      if (!rows[0]) return null;
+      return mapRow(rows[0]);
+    },
+
+    async upsert(accountId, patch, txh) {
+      const p = patch ?? {};
+      const hasRoaming = Object.hasOwn(p, 'roamingSettings');
+      const hasLegacy = Object.hasOwn(p, 'legacyImport');
+      const hasVersion = Object.hasOwn(p, 'settingsVersion');
+      for (const k of Object.keys(p)) {
+        if (!['roamingSettings', 'legacyImport', 'settingsVersion'].includes(k)) {
+          throw new ApiError('VALIDATION_FAILED', `Unknown column for profiles: ${k}`, {
+            details: { table: 'profiles', column: k },
+          });
+        }
+      }
+      // settings_version is NOT NULL, so "present and null" is not an operation it has.
+      if (hasVersion && !Number.isInteger(p.settingsVersion)) {
+        throw new ApiError('VALIDATION_FAILED', 'profiles.settingsVersion must be an integer.', {
+          details: { table: 'profiles', column: 'settingsVersion' },
+        });
+      }
+      const { rows } = await q(txh,
+        `insert into profiles (account_id, roaming_settings, settings_version, legacy_import)
+         values ($1, $2::jsonb, coalesce($3::int, 1), $4::jsonb)
+         on conflict (account_id) do update set
+           roaming_settings = case when $5::boolean then $2::jsonb else profiles.roaming_settings end,
+           legacy_import    = case when $6::boolean then $4::jsonb else profiles.legacy_import end,
+           settings_version = case when $7::boolean then $3::int   else profiles.settings_version end,
            updated_at = now()
          returning *`,
-        [accountId, patch?.roamingSettings ?? null, patch?.settingsVersion ?? null]);
+        [accountId,
+          hasRoaming && p.roamingSettings != null ? JSON.stringify(p.roamingSettings) : null,
+          hasVersion ? p.settingsVersion : null,
+          hasLegacy && p.legacyImport != null ? JSON.stringify(p.legacyImport) : null,
+          hasRoaming, hasLegacy, hasVersion]);
       return mapRow(rows[0]);
     },
 
@@ -289,11 +526,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
      * and the losing match is a player's kills that silently never existed.
      */
     async applyDelta(accountId, mode, statDefinitionVersion, delta, txh) {
-      for (const k of Object.keys(delta ?? {})) {
-        if (!STAT_COUNTERS.includes(k)) {
-          throw new ApiError('VALIDATION_FAILED', `Unknown stat counter: ${k}`, { details: { counter: k } });
-        }
-      }
+      assertCounterDelta(delta, STAT_COUNTERS, STAT_DELTA_LIMITS, 'player_stats');
       const cols = STAT_COUNTERS.map(toSnake);
       const values = STAT_COUNTERS.map((c) => delta?.[c] ?? 0);
       const { rows } = await q(txh,
@@ -317,11 +550,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
 
   const weaponStats = {
     async applyDelta(accountId, mode, weaponId, statDefinitionVersion, delta, txh) {
-      for (const k of Object.keys(delta ?? {})) {
-        if (!WEAPON_COUNTERS.includes(k)) {
-          throw new ApiError('VALIDATION_FAILED', `Unknown weapon counter: ${k}`, { details: { counter: k } });
-        }
-      }
+      assertCounterDelta(delta, WEAPON_COUNTERS, WEAPON_DELTA_LIMITS, 'player_weapon_stats');
       const cols = WEAPON_COUNTERS.map(toSnake);
       const values = WEAPON_COUNTERS.map((c) => delta?.[c] ?? 0);
       const { rows } = await q(txh,
@@ -345,7 +574,89 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
   };
 
+  /** The columns listForAccount reads, named explicitly: `m.*, p.*` collides on match_id. */
+  const MATCH_SELECT = MATCH_COLUMNS.map((c) => `m.${toSnake(c)}`).join(', ');
+
+  const matches = {
+    /**
+     * The match row and its participants, in ONE transaction. Written once per match and
+     * immutable thereafter (match-result.md §4): a second record for the same id is CONFLICT,
+     * because §5.5 makes a second, different truth for a finalised match a bug or an attack,
+     * and an upsert would erase the first one either way.
+     */
+    async record(result, txh) {
+      const { match, participants } = normaliseMatchResult(result);
+      const run = async (t) => {
+        const { rowCount } = await q(t, 'select 1 from matches where match_id = $1', [match.matchId]);
+        if (rowCount) {
+          throw new ApiError('CONFLICT', 'That match already has a result.', {
+            details: { matchId: match.matchId },
+          });
+        }
+        // insertRow encodes the jsonb columns (JSONB_COLUMNS): `rounds` is an array, and an
+        // array reaches Postgres as an array literal unless it is stringified first.
+        await insertRow(t, 'matches', match, { returning: '' });
+        for (const p of participants) await insertRow(t, 'match_participants', p, { returning: '' });
+        return { matchId: match.matchId, participants: participants.length };
+      };
+      // Already enrolled (the result submission path holds a transaction, §5.3); otherwise open
+      // one, because the row and its participants must not land separately.
+      return inTransaction(txh) ? run(txh) : tx((t) => run(t));
+    },
+
+    /**
+     * History, newest first, cursor-paginated.
+     *
+     * Ordered by match id descending rather than ended_at: ids are ULIDs assigned at allocation
+     * (0004) so they are already chronological, they are unique, and they are not null on a
+     * match that never ended — ordering on ended_at would collapse every live match into one
+     * null bucket and make the cursor ambiguous there. `match_participants_account_idx` serves
+     * the account predicate; the sort is over one account's matches, not the table.
+     */
+    async listForAccount(accountId, { limit = 25, cursor = null } = {}, txh) {
+      const size = Math.max(1, Math.min(Number(limit) || 25, 200));
+      const { rows } = await q(txh,
+        `select ${MATCH_SELECT},
+                p.team as p_team, p.joined_at as p_joined_at, p.left_at as p_left_at,
+                p.disconnected as p_disconnected, p.abandoned as p_abandoned, p.stats as p_stats
+           from match_participants p
+           join matches m on m.match_id = p.match_id
+          where p.account_id = $1
+            and ($2::text is null or p.match_id < $2::text)
+          order by p.match_id desc
+          limit $3`,
+        [accountId, cursor ?? null, size + 1]);      // +1 answers "is there another page"
+
+      const page = rows.slice(0, size);
+      const items = page.map((r) => {
+        const m = mapRow(Object.fromEntries(
+          Object.entries(r).filter(([k]) => !k.startsWith('p_'))));
+        m.status = toHistoryMatchStatus(m.status);
+        m.participant = {
+          team: r.p_team,
+          joinedAt: r.p_joined_at instanceof Date ? r.p_joined_at.toISOString() : r.p_joined_at,
+          leftAt: r.p_left_at instanceof Date ? r.p_left_at.toISOString() : r.p_left_at,
+          disconnected: r.p_disconnected,
+          abandoned: r.p_abandoned,
+          stats: r.p_stats,
+        };
+        return m;
+      });
+      return {
+        items,
+        // Null unless a further row actually exists: a cursor on the last page sends the caller
+        // round again for nothing, and recomputeCareer loops on it.
+        nextCursor: rows.length > size ? page[page.length - 1].match_id : null,
+      };
+    },
+  };
+
   const preAuthConsent = {
+    /**
+     * A new decision RESETS migrated_at. Leaving it set — which this adapter used to do — is a
+     * receipt claiming the NEW decision has already been carried onto an account, when what was
+     * migrated was the old one. A consent record that is not true is worse than none.
+     */
     async put(row, txh) {
       const { rows } = await q(txh,
         `insert into pre_auth_consent
@@ -356,6 +667,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
            policy_version = excluded.policy_version,
            decided_at = excluded.decided_at,
            expires_at = excluded.expires_at,
+           migrated_at = null,
            updated_at = now()
          returning *`,
         [row.clientSessionId, row.telemetryPersonal, row.policyVersion, row.decidedAt ?? null, row.expiresAt]);
@@ -393,7 +705,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
      * single-relay deployment and must not be relied on for more.
      */
     async claimUnpublished(limit = 100, txh) {
-      const lock = handleOf(txh) ? 'for update skip locked' : '';
+      const lock = inTransaction(txh) ? 'for update skip locked' : '';
       const { rows } = await q(txh,
         `select * from events_outbox
           where published_at is null and dead_lettered_at is null
@@ -467,7 +779,9 @@ export async function createPostgresStore(config = {}, deps = {}) {
          on conflict (key, actor_id) do nothing
          returning *`,
         [row.key, row.actorId, row.requestHash, row.responseStatus ?? null,
-          row.responseBody ?? null, row.expiresAt]);
+          row.responseBody === null || row.responseBody === undefined
+            ? null : JSON.stringify(row.responseBody),
+          row.expiresAt]);
       if (rows[0]) return mapRow(rows[0]);
       const cur = await idempotency.get(row.key, row.actorId, txh);
       if (cur && cur.requestHash !== row.requestHash) {
@@ -490,19 +804,38 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return mapRow(rows[0]);
     },
 
+    /** Same patch semantics as profiles: a present key sets, including to null; absent leaves. */
     async set(key, patch, txh) {
+      const p = patch ?? {};
+      for (const k of Object.keys(p)) {
+        if (!['enabled', 'rollout', 'isKillSwitch', 'updatedBy'].includes(k)) {
+          throw new ApiError('VALIDATION_FAILED', `Unknown column for feature_flags: ${k}`, {
+            details: { table: 'feature_flags', column: k },
+          });
+        }
+      }
+      // enabled and is_kill_switch are NOT NULL: 'present and null' is not an operation.
+      for (const k of ['enabled', 'isKillSwitch']) {
+        if (Object.hasOwn(p, k) && typeof p[k] !== 'boolean') {
+          throw new ApiError('VALIDATION_FAILED', `feature_flags.${k} must be a boolean.`, {
+            details: { table: 'feature_flags', column: k },
+          });
+        }
+      }
       const { rows } = await q(txh,
         `insert into feature_flags (flag_key, enabled, rollout, is_kill_switch, updated_by)
          values ($1, coalesce($2::boolean, false), $3::jsonb, coalesce($4::boolean, false), $5)
          on conflict (flag_key) do update set
-           enabled = coalesce($2::boolean, feature_flags.enabled),
-           rollout = coalesce($3::jsonb, feature_flags.rollout),
-           is_kill_switch = coalesce($4::boolean, feature_flags.is_kill_switch),
-           updated_by = coalesce($5, feature_flags.updated_by),
+           enabled        = case when $6::boolean then $2::boolean else feature_flags.enabled end,
+           rollout        = case when $7::boolean then $3::jsonb   else feature_flags.rollout end,
+           is_kill_switch = case when $8::boolean then $4::boolean else feature_flags.is_kill_switch end,
+           updated_by     = case when $9::boolean then $5          else feature_flags.updated_by end,
            updated_at = now()
          returning *`,
-        [key, patch?.enabled ?? null, patch?.rollout ?? null,
-          patch?.isKillSwitch ?? null, patch?.updatedBy ?? null]);
+        [key, p.enabled ?? null, p.rollout == null ? null : JSON.stringify(p.rollout),
+          p.isKillSwitch ?? null, p.updatedBy ?? null,
+          Object.hasOwn(p, 'enabled'), Object.hasOwn(p, 'rollout'),
+          Object.hasOwn(p, 'isKillSwitch'), Object.hasOwn(p, 'updatedBy')]);
       return mapRow(rows[0]);
     },
   };
@@ -510,7 +843,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
   return {
     kind: 'postgres',
     tx,
-    accounts, sessions, refreshTokens, profiles, stats, weaponStats,
+    accounts, sessions, refreshTokens, profiles, stats, weaponStats, matches,
     preAuthConsent, outbox, audit, idempotency, flags,
     async health() {
       try {

@@ -24,11 +24,42 @@
  * Cost: a full state clone per write. Correct and O(state) is the right trade for an adapter
  * whose job is tests and local work; Postgres is what runs under load.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ApiError } from '../errors.js';
 import { ulid as defaultUlid } from '../ids.js';
+import {
+  STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
+  MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
+} from '../store.js';
 
 /** Handles are tagged so a handle from another store (or a stray object) fails loudly. */
 const TX = Symbol('overstrike.memtx');
+
+/**
+ * The state a handle refers to, held OUTSIDE the handle.
+ *
+ * When the handle carried `state` as an own property, holding a handle was holding the live
+ * Maps: `tx.state.audit.delete(id)` erased an audit row, and `tx.state.accounts.set(...)`
+ * forged one, both bypassing every check in this file. A WeakMap keyed by the handle is
+ * unreachable from the handle — unlike a symbol-keyed property, which
+ * `Object.getOwnPropertySymbols` hands straight back.
+ */
+const handleState = new WeakMap();
+
+/**
+ * Reentrancy tracking for `tx`. Async-local rather than a plain variable: a plain "am I in a
+ * transaction" flag cannot tell a NESTED call from a CONCURRENT unrelated one, and enrolling a
+ * concurrent caller into somebody else's transaction is worse than the deadlock it fixes.
+ */
+const txContext = new AsyncLocalStorage();
+
+/**
+ * Shared with the Postgres adapter (store.js): one answer to an unstorable argument.
+ * Here it matters twice over, because the state is published by cloning it — a value the clone
+ * algorithm refuses does not fail the write that introduced it, it fails every write AFTER it,
+ * forever. One bad `revokedReason` used to brick the store permanently.
+ */
+const assertCloneable = assertStorable;
 
 /**
  * Timestamps cross the interface as ISO strings in both adapters.
@@ -57,12 +88,24 @@ function emptyState() {
     profiles: new Map(),
     stats: new Map(),
     weaponStats: new Map(),
+    matches: new Map(),
+    matchParticipants: new Map(),
     outbox: new Map(),
     audit: new Map(),
     idempotency: new Map(),
     flags: new Map(),
   };
 }
+
+/**
+ * Column maps have a NULL prototype, and membership is tested with `Object.hasOwn`.
+ *
+ * With a normal object literal and `k in columns`, the prototype chain is part of the
+ * allow-list: `constructor`, `toString`, `valueOf`, `hasOwnProperty` and `__proto__` all pass
+ * as legal columns on accounts, profiles and feature_flags. That is not a cosmetic hole — the
+ * accepted key is then written into the row and, on Postgres, into a statement.
+ */
+const columns = (spec) => Object.assign(Object.create(null), spec);
 
 /**
  * Columns, with their defaults. Also the allow-list: a key not named here is rejected rather
@@ -72,7 +115,7 @@ function emptyState() {
  * `accounts` has no birthdate by design (db-schema.md §2) — the eligibility preflight
  * evaluates a date of birth and discards it. Trying to store one is an error here, on purpose.
  */
-const ACCOUNT_COLUMNS = {
+const ACCOUNT_COLUMNS = columns({
   accountId: undefined,
   status: 'active',
   emailHash: null,
@@ -97,7 +140,7 @@ const ACCOUNT_COLUMNS = {
   createdAt: null,
   updatedAt: null,
   deletedAt: null,
-};
+});
 
 const ACCOUNT_TIMESTAMPS = [
   'nameChangedAt',
@@ -105,7 +148,7 @@ const ACCOUNT_TIMESTAMPS = [
   'createdAt', 'updatedAt', 'deletedAt',
 ];
 
-const SESSION_COLUMNS = {
+const SESSION_COLUMNS = columns({
   sessionId: undefined,
   accountId: undefined,
   deviceLabel: null,
@@ -116,9 +159,9 @@ const SESSION_COLUMNS = {
   revokedAt: null,
   revokedReason: null,
   refreshFamilyId: undefined,
-};
+});
 
-const REFRESH_COLUMNS = {
+const REFRESH_COLUMNS = columns({
   tokenId: undefined,
   familyId: undefined,
   accountId: undefined,
@@ -126,9 +169,9 @@ const REFRESH_COLUMNS = {
   issuedAt: null,
   expiresAt: undefined,
   usedAt: null,
-};
+});
 
-const OUTBOX_COLUMNS = {
+const OUTBOX_COLUMNS = columns({
   eventId: undefined,
   eventType: undefined,
   eventVersion: 1,
@@ -147,9 +190,9 @@ const OUTBOX_COLUMNS = {
   attempts: 0,
   lastError: null,
   deadLetteredAt: null,
-};
+});
 
-const AUDIT_COLUMNS = {
+const AUDIT_COLUMNS = columns({
   auditId: undefined,
   actorKind: undefined,
   actorId: null,
@@ -162,9 +205,9 @@ const AUDIT_COLUMNS = {
   afterSummary: null,
   correlationId: null,
   createdAt: null,
-};
+});
 
-const IDEMPOTENCY_COLUMNS = {
+const IDEMPOTENCY_COLUMNS = columns({
   key: undefined,
   actorId: undefined,
   requestHash: undefined,
@@ -172,19 +215,33 @@ const IDEMPOTENCY_COLUMNS = {
   responseBody: null,
   createdAt: null,
   expiresAt: null,
-};
+});
 
-/** Career counters. Anything not listed is not a stat, and a typo must not be swallowed. */
-const STAT_COUNTERS = [
-  'kills', 'deaths', 'assists', 'suicides', 'teamKills', 'headshots',
-  'shotsFired', 'shotsHit', 'damageDealt', 'plants', 'defuses',
-  'matches', 'wins', 'losses', 'draws', 'roundsPlayed', 'timePlayedSec',
-];
-const WEAPON_COUNTERS = ['shots', 'hits', 'kills', 'headshots'];
+/**
+ * Profiles and flags are PATCH surfaces, so their allow-list is the set of columns a patch may
+ * carry — not the set of columns the table has. account_id is identity, and created_at and
+ * updated_at belong to the 0001 trigger; a patch that could set updated_at is a clock the
+ * caller writes, and that is exactly where the two adapters used to disagree.
+ */
+const PROFILE_COLUMNS = columns({
+  roamingSettings: null,
+  // Migration 0010. The one-time import of the offline progression blob (profile/migration.js).
+  // It has a column because the module writes it; without one, memory rejected the write and
+  // Postgres discarded it silently, which is the worse of the two failures.
+  legacyImport: null,
+  settingsVersion: 1,
+});
 
-function assertKnown(row, columns, table) {
+const FLAG_COLUMNS = columns({
+  enabled: false,
+  rollout: null,
+  isKillSwitch: false,
+  updatedBy: null,
+});
+
+function assertKnown(row, cols, table) {
   for (const k of Object.keys(row)) {
-    if (!(k in columns)) {
+    if (!Object.hasOwn(cols, k)) {
       throw new ApiError('VALIDATION_FAILED', `Unknown column for ${table}: ${k}`, {
         details: { table, column: k },
       });
@@ -193,10 +250,10 @@ function assertKnown(row, columns, table) {
 }
 
 /** Apply defaults, enforce not-null, reject unknown columns. One place, every table. */
-function materialise(row, columns, table) {
-  assertKnown(row, columns, table);
+function materialise(row, cols, table) {
+  assertKnown(row, cols, table);
   const out = {};
-  for (const [col, dflt] of Object.entries(columns)) {
+  for (const [col, dflt] of Object.entries(cols)) {
     const given = row[col];
     if (given === undefined) {
       if (dflt === undefined) {
@@ -215,6 +272,9 @@ function materialise(row, columns, table) {
 export function createMemoryStore(config = {}, deps = {}) {
   const nowIso = () => toIso(deps.now ? deps.now() : new Date());
   const newId = deps.ulid ?? defaultUlid;
+
+  /** Identity of THIS store, so a handle from another instance is rejected rather than used. */
+  const storeTag = Symbol('overstrike.memstore');
 
   let live = emptyState();
   let closed = false;
@@ -239,15 +299,36 @@ export function createMemoryStore(config = {}, deps = {}) {
   function stateFor(tx) {
     if (tx === undefined || tx === null) return null;
     if (!tx[TX]) throw new ApiError('INTERNAL_ERROR', 'Not a transaction handle from this store.');
-    if (tx.done) throw new ApiError('INTERNAL_ERROR', 'Transaction handle used after the transaction ended.');
-    return tx.state;
+    const entry = handleState.get(tx);
+    // A handle from another store instance carries the tag but not an entry in THIS store's
+    // map, which is the case a shared symbol tag alone would let through.
+    if (!entry || entry.store !== storeTag) {
+      throw new ApiError('INTERNAL_ERROR', 'Not a transaction handle from this store.');
+    }
+    if (entry.done) throw new ApiError('INTERNAL_ERROR', 'Transaction handle used after the transaction ended.');
+    return entry.state;
+  }
+
+  /**
+   * The state a call should act on: the explicit handle, else the transaction ambient on the
+   * async call stack, else the live state.
+   *
+   * The ambient case exists because omitting the handle inside `tx(fn)` used to take a lock
+   * the caller was already holding — the same permanent hang as a nested `tx`. Enrolling is
+   * both the non-hanging answer and the one that matches what the caller obviously meant.
+   */
+  function target(txh) {
+    const explicit = stateFor(txh);
+    if (explicit) return explicit;
+    const ambient = txContext.getStore();
+    if (ambient && ambient.store === storeTag && !ambient.done) return ambient.state;
+    return null;
   }
 
   /** Reads need no lock: nothing awaits between lookup and return, so nothing can interleave. */
   function read(tx, fn) {
     assertOpen();
-    const st = stateFor(tx);
-    return Promise.resolve(fn(st ?? live));
+    return Promise.resolve(fn(target(tx) ?? live));
   }
 
   /**
@@ -256,7 +337,7 @@ export function createMemoryStore(config = {}, deps = {}) {
    */
   function write(tx, fn) {
     assertOpen();
-    const st = stateFor(tx);
+    const st = target(tx);
     if (st) return Promise.resolve(fn(st));   // already inside a transaction; it holds the lock
     return withLock(() => {
       const working = structuredClone(live);
@@ -266,19 +347,35 @@ export function createMemoryStore(config = {}, deps = {}) {
     });
   }
 
+  /**
+   * `tx(fn)` — one transaction, and reentrant calls join it rather than deadlocking.
+   *
+   * A nested `store.tx` used to queue behind a lock its own caller was holding, so it never
+   * ran, the outer call never returned, and `close()` — which drains the queue — waited on it
+   * forever. The process hung with no error anywhere.
+   *
+   * A nested call now runs against the OUTER handle. There are no savepoints, so an inner
+   * failure the outer swallows leaves the inner's writes in the outer transaction: catching
+   * inside a transaction and committing anyway means committing what the inner wrote.
+   */
   async function tx(fn) {
     assertOpen();
+    const outer = txContext.getStore();
+    if (outer && outer.store === storeTag) return fn(outer.handle);
+
     return withLock(async () => {
       const working = structuredClone(live);
-      const handle = { [TX]: true, state: working, done: false };
+      const handle = Object.freeze({ [TX]: true });
+      const entry = { store: storeTag, state: working, done: false, handle };
+      handleState.set(handle, entry);
       try {
-        const out = await fn(handle);
+        const out = await txContext.run(entry, () => fn(handle));
         // Commit is one assignment. A reader can see the state before or after, never during.
         live = working;
         return out;
       } finally {
         // Rollback needs no undo log: the clone is simply never published.
-        handle.done = true;
+        entry.done = true;
       }
     });
   }
@@ -292,6 +389,7 @@ export function createMemoryStore(config = {}, deps = {}) {
 
   const accounts = {
     create(row, txh) {
+      assertCloneable(row, 'accounts row');
       return write(txh, (st) => {
         const rec = materialise(
           { accountId: row.accountId ?? newId(), ...row },
@@ -343,11 +441,12 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
 
     update(accountId, patch, txh) {
+      assertCloneable(patch, 'accounts patch');
       return write(txh, (st) => {
         const cur = st.accounts.get(accountId);
         if (!cur) throw new ApiError('NOT_FOUND', 'No such account.', { details: { accountId } });
         assertKnown(patch, ACCOUNT_COLUMNS, 'accounts');
-        if ('accountId' in patch && patch.accountId !== accountId) {
+        if (Object.hasOwn(patch, 'accountId') && patch.accountId !== accountId) {
           throw new ApiError('VALIDATION_FAILED', 'accountId is immutable.');
         }
         const next = { ...cur, ...patch, accountId, createdAt: cur.createdAt };
@@ -375,6 +474,7 @@ export function createMemoryStore(config = {}, deps = {}) {
 
   const sessions = {
     create(row, txh) {
+      assertCloneable(row, 'sessions row');
       return write(txh, (st) => {
         const rec = materialise(
           { sessionId: row.sessionId ?? newId(), ...row },
@@ -403,7 +503,13 @@ export function createMemoryStore(config = {}, deps = {}) {
         .map(clone));
     },
 
+    /**
+     * Revoking a session that does not exist is NOT_FOUND on both adapters. Postgres used to
+     * be silent, which meant a typo'd session id and a successful revocation were the same
+     * outcome — and the caller was a security path.
+     */
     revoke(sessionId, reason, at, txh) {
+      assertCloneable(reason, 'sessions.revokedReason');
       return write(txh, (st) => {
         const s = st.sessions.get(sessionId);
         if (!s) throw new ApiError('NOT_FOUND', 'No such session.', { details: { sessionId } });
@@ -415,6 +521,7 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
 
     revokeAllForAccount(accountId, reason, at, txh) {
+      assertCloneable(reason, 'sessions.revokedReason');
       return write(txh, (st) => {
         const ts = toIso(at) ?? nowIso();
         let n = 0;
@@ -430,6 +537,7 @@ export function createMemoryStore(config = {}, deps = {}) {
 
     /** Refresh-token reuse revokes the whole family, not just the replayed token (auth.md §5). */
     revokeFamily(familyId, reason, at, txh) {
+      assertCloneable(reason, 'sessions.revokedReason');
       return write(txh, (st) => {
         const ts = toIso(at) ?? nowIso();
         let n = 0;
@@ -449,6 +557,7 @@ export function createMemoryStore(config = {}, deps = {}) {
 
   const refreshTokens = {
     create(row, txh) {
+      assertCloneable(row, 'refresh_tokens row');
       return write(txh, (st) => {
         const rec = materialise(
           { tokenId: row.tokenId ?? newId(), ...row },
@@ -485,22 +594,70 @@ export function createMemoryStore(config = {}, deps = {}) {
   };
 
   const profiles = {
+    /**
+     * Patch semantics, decided once for both adapters: a key PRESENT in the patch sets the
+     * column, including to null; a key that is absent leaves it alone.
+     *
+     * Postgres used to `coalesce` every field, so a null meant "leave it" and a roaming
+     * settings blob could never be cleared — the delete-my-settings path silently did nothing,
+     * while memory cleared it. One of the two adapters had to be wrong, and it was the one
+     * that could not express the operation.
+     */
     upsert(accountId, patch, txh) {
+      assertCloneable(patch, 'profiles patch');
       return write(txh, (st) => {
         requireAccount(st, accountId, 'profiles');
         const cur = st.profiles.get(accountId);
         const next = {
           accountId,
           roamingSettings: cur?.roamingSettings ?? null,
+          legacyImport: cur?.legacyImport ?? null,
           settingsVersion: cur?.settingsVersion ?? 1,
           createdAt: cur?.createdAt ?? nowIso(),
           updatedAt: nowIso(),
         };
+        assertKnown(patch ?? {}, PROFILE_COLUMNS, 'profiles');
         for (const k of Object.keys(patch ?? {})) {
-          if (!(k in next)) throw new ApiError('VALIDATION_FAILED', `Unknown column for profiles: ${k}`);
-          if (k === 'accountId' || k === 'createdAt') continue;
+          if (k === 'settingsVersion' && !Number.isInteger(patch[k])) {
+            throw new ApiError('VALIDATION_FAILED', 'profiles.settingsVersion must be an integer.', {
+              details: { table: 'profiles', column: 'settingsVersion' },
+            });
+          }
           next[k] = patch[k];
         }
+        st.profiles.set(accountId, next);
+        return clone(next);
+      });
+    },
+
+    /**
+     * Compare-and-set on `settingsVersion`.  http-api.md §11.2.
+     *
+     * `upsert` cannot express If-Match: the caller reads a version, decides, then writes, and
+     * between those two steps another writer can land. Both writers then believe they won and
+     * one rebind is silently gone — the exact loss §11.2 exists to prevent. The comparison has
+     * to happen at the write, in the same step that performs it.
+     *
+     * Returns null when the expected version no longer holds, so the caller raises CONFLICT
+     * with the current state rather than guessing why.
+     */
+    upsertIfVersion(accountId, expectedVersion, patch, txh) {
+      assertCloneable(patch, 'profiles patch');
+      return write(txh, (st) => {
+        requireAccount(st, accountId, 'profiles');
+        const cur = st.profiles.get(accountId);
+        const actual = cur?.settingsVersion ?? 1;
+        if (actual !== expectedVersion) return null;
+        assertKnown(patch ?? {}, PROFILE_COLUMNS, 'profiles');
+        const next = {
+          accountId,
+          roamingSettings: cur?.roamingSettings ?? null,
+          legacyImport: cur?.legacyImport ?? null,
+          settingsVersion: actual,
+          createdAt: cur?.createdAt ?? nowIso(),
+          updatedAt: nowIso(),
+        };
+        for (const k of Object.keys(patch ?? {})) next[k] = patch[k];
         st.profiles.set(accountId, next);
         return clone(next);
       });
@@ -528,16 +685,9 @@ export function createMemoryStore(config = {}, deps = {}) {
      * overwrote would make replaying a match result destroy every earlier match.
      */
     applyDelta(accountId, mode, statDefinitionVersion, delta, txh) {
+      assertCounterDelta(delta, STAT_COUNTERS, STAT_DELTA_LIMITS, 'player_stats');
       return write(txh, (st) => {
         requireAccount(st, accountId, 'player_stats');
-        for (const k of Object.keys(delta ?? {})) {
-          if (!STAT_COUNTERS.includes(k)) {
-            throw new ApiError('VALIDATION_FAILED', `Unknown stat counter: ${k}`, { details: { counter: k } });
-          }
-          if (!Number.isInteger(delta[k])) {
-            throw new ApiError('VALIDATION_FAILED', `Stat delta ${k} must be an integer.`);
-          }
-        }
         const k = key(accountId, mode, statDefinitionVersion);
         const row = st.stats.get(k) ?? zeroStats(accountId, mode, statDefinitionVersion);
         for (const c of STAT_COUNTERS) row[c] += delta?.[c] ?? 0;
@@ -556,13 +706,9 @@ export function createMemoryStore(config = {}, deps = {}) {
 
   const weaponStats = {
     applyDelta(accountId, mode, weaponId, statDefinitionVersion, delta, txh) {
+      assertCounterDelta(delta, WEAPON_COUNTERS, WEAPON_DELTA_LIMITS, 'player_weapon_stats');
       return write(txh, (st) => {
         requireAccount(st, accountId, 'player_weapon_stats');
-        for (const k of Object.keys(delta ?? {})) {
-          if (!WEAPON_COUNTERS.includes(k)) {
-            throw new ApiError('VALIDATION_FAILED', `Unknown weapon counter: ${k}`, { details: { counter: k } });
-          }
-        }
         // stat_definition_version is part of the key here for the same reason it is in
         // player_stats: a definition change must not rewrite historical per-weapon accuracy.
         const k = key(accountId, mode, weaponId, statDefinitionVersion);
@@ -585,17 +731,103 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
   };
 
-  const preAuthConsent = {
-    put(row, txh) {
+  /**
+   * Matches and their participants.  match-result.md §4, §4.3; migration 0004.
+   *
+   * Two tables behind one method because a match row without its participants is a match
+   * nobody played, and the two must land together or the career recompute in §6 reads a hole.
+   */
+  const CONSENT_COLUMNS = columns({
+    clientSessionId: undefined, telemetryPersonal: undefined, policyVersion: undefined,
+    decidedAt: null, expiresAt: undefined,
+  });
+
+  const matches = {
+    /**
+     * Written once per match, immutable thereafter (§4). A second record for the same match id
+     * is CONFLICT rather than an overwrite: §5.5 makes a second, different truth for a
+     * finalised match a bug or an attack, and overwriting would erase the first one either way.
+     */
+    record(result, txh) {
+      assertCloneable(result, 'match result');
+      const { match, participants } = normaliseMatchResult(result);
       return write(txh, (st) => {
-        const allowed = {
-          clientSessionId: undefined, telemetryPersonal: undefined, policyVersion: undefined,
-          decidedAt: null, expiresAt: undefined, migratedAt: null,
+        if (st.matches.has(match.matchId)) {
+          throw new ApiError('CONFLICT', 'That match already has a result.', {
+            details: { matchId: match.matchId },
+          });
+        }
+        const rec = {};
+        for (const c of MATCH_COLUMNS) rec[c] = match[c] ?? null;
+        for (const c of ['startedAt', 'endedAt']) rec[c] = toIso(rec[c]);
+        rec.recordedAt = nowIso();
+        st.matches.set(rec.matchId, rec);
+        for (const p of participants) {
+          requireAccount(st, p.accountId, 'match_participants');
+          const prec = { ...p, joinedAt: toIso(p.joinedAt), leftAt: toIso(p.leftAt) };
+          st.matchParticipants.set(key(p.matchId, p.accountId), prec);
+        }
+        return { matchId: rec.matchId, participants: participants.length };
+      });
+    },
+
+    /**
+     * History, newest first, cursor-paginated.
+     *
+     * Ordered by match id descending rather than ended_at: match ids are ULIDs assigned at
+     * allocation (0004), so they are already chronological, they are unique, and they are not
+     * null on a match that never ended. Ordering on ended_at would put every live match in one
+     * undifferentiated null bucket and make the cursor ambiguous exactly there.
+     *
+     * The cursor is the last id of the previous page — an offset would skip or repeat rows as
+     * matches are inserted between requests.
+     */
+    listForAccount(accountId, { limit = 25, cursor = null } = {}, txh) {
+      return read(txh, (st) => {
+        const size = Math.max(1, Math.min(Number(limit) || 25, 200));
+        const rows = [];
+        for (const p of st.matchParticipants.values()) {
+          if (p.accountId !== accountId) continue;
+          if (cursor !== null && cursor !== undefined && !(p.matchId < cursor)) continue;
+          const m = st.matches.get(p.matchId);
+          if (!m) continue;
+          rows.push({ m, p });
+        }
+        rows.sort((a, b) => (a.m.matchId < b.m.matchId ? 1 : -1));
+        const page = rows.slice(0, size);
+        const items = page.map(({ m, p }) => clone({
+          ...m,
+          status: toHistoryMatchStatus(m.status),
+          participant: {
+            team: p.team, joinedAt: p.joinedAt, leftAt: p.leftAt,
+            disconnected: p.disconnected, abandoned: p.abandoned,
+            stats: p.stats,
+          },
+        }));
+        return {
+          items,
+          // Null only when the page was not full: a next cursor on a short page sends the
+          // caller round again for nothing, and `recomputeCareer` loops on it.
+          nextCursor: rows.length > size ? page[page.length - 1].m.matchId : null,
         };
-        const rec = materialise(row, allowed, 'pre_auth_consent');
+      });
+    },
+  };
+
+  const preAuthConsent = {
+    /**
+     * A new decision RESETS migrated_at on both adapters. Postgres used to leave it set, so a
+     * client that changed its mind after signup kept a receipt claiming the new decision had
+     * already been carried onto an account — which is a consent record that is not true.
+     * `migratedAt` is therefore not a column a caller may write; only markMigrated sets it.
+     */
+    put(row, txh) {
+      assertCloneable(row, 'pre_auth_consent row');
+      return write(txh, (st) => {
+        const rec = materialise(row, CONSENT_COLUMNS, 'pre_auth_consent');
         rec.decidedAt = toIso(rec.decidedAt) ?? nowIso();
         rec.expiresAt = toIso(rec.expiresAt);
-        rec.migratedAt = toIso(rec.migratedAt);
+        rec.migratedAt = null;
         // Last decision wins: the same signed-out client changing its mind is the normal path.
         st.preAuthConsent.set(rec.clientSessionId, rec);
         return clone(rec);
@@ -621,6 +853,7 @@ export function createMemoryStore(config = {}, deps = {}) {
      * without one it is still correct, just no longer atomic with anything.
      */
     insert(event, txh) {
+      assertCloneable(event, 'events_outbox row');
       return write(txh, (st) => {
         const rec = materialise(
           { eventId: event.eventId ?? newId(), ...event },
@@ -663,6 +896,7 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
 
     recordFailure(eventId, error, txh) {
+      // `error` is stringified below, so it needs no clone check; the id list does not.
       return write(txh, (st) => {
         const e = st.outbox.get(eventId);
         if (!e) throw new ApiError('NOT_FOUND', 'No such outbox event.', { details: { eventId } });
@@ -687,6 +921,7 @@ export function createMemoryStore(config = {}, deps = {}) {
    */
   const audit = {
     insert(row, txh) {
+      assertCloneable(row, 'audit_log row');
       return write(txh, (st) => {
         const rec = materialise({ auditId: row.auditId ?? newId(), ...row }, AUDIT_COLUMNS, 'audit_log');
         rec.createdAt = toIso(rec.createdAt) ?? nowIso();
@@ -722,6 +957,7 @@ export function createMemoryStore(config = {}, deps = {}) {
      * silently overwritten, or a retry of request A can return the response to request B.
      */
     put(row, txh) {
+      assertCloneable(row, 'idempotency_keys row');
       return write(txh, (st) => {
         const rec = materialise(row, IDEMPOTENCY_COLUMNS, 'idempotency_keys');
         rec.createdAt = toIso(rec.createdAt) ?? nowIso();
@@ -751,7 +987,9 @@ export function createMemoryStore(config = {}, deps = {}) {
       return read(txh, (st) => clone(st.flags.get(k) ?? null));
     },
 
+    /** Same patch semantics as profiles: a present key sets, including to null; absent leaves. */
     set(k, patch, txh) {
+      assertCloneable(patch, 'feature_flags patch');
       return write(txh, (st) => {
         const cur = st.flags.get(k);
         const next = {
@@ -763,9 +1001,15 @@ export function createMemoryStore(config = {}, deps = {}) {
           createdAt: cur?.createdAt ?? nowIso(),
           updatedAt: nowIso(),
         };
+        assertKnown(patch ?? {}, FLAG_COLUMNS, 'feature_flags');
         for (const f of Object.keys(patch ?? {})) {
-          if (!(f in next)) throw new ApiError('VALIDATION_FAILED', `Unknown column for feature_flags: ${f}`);
-          if (f === 'flagKey' || f === 'createdAt') continue;
+          // enabled and is_kill_switch are NOT NULL. A null would mean "off" on Postgres by
+          // way of a coalesce, and null here — two adapters, two answers to one patch.
+          if ((f === 'enabled' || f === 'isKillSwitch') && typeof patch[f] !== 'boolean') {
+            throw new ApiError('VALIDATION_FAILED', `feature_flags.${f} must be a boolean.`, {
+              details: { table: 'feature_flags', column: f },
+            });
+          }
           next[f] = patch[f];
         }
         st.flags.set(k, next);
@@ -777,7 +1021,7 @@ export function createMemoryStore(config = {}, deps = {}) {
   return {
     kind: 'memory',
     tx,
-    accounts, sessions, refreshTokens, profiles, stats, weaponStats,
+    accounts, sessions, refreshTokens, profiles, stats, weaponStats, matches,
     preAuthConsent, outbox, audit, idempotency, flags,
     async health() {
       return closed ? { ok: false, detail: 'closed' } : { ok: true, detail: 'memory' };

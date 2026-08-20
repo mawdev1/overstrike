@@ -14,8 +14,13 @@
  *
  *   node platform/test/storetest.mjs
  */
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { createMemoryStore } from '../src/core/store/memory.js';
-import { loadMigrations, planMigrations, runMigrations } from '../src/core/migrate.js';
+import { createPostgresStore } from '../src/core/store/postgres.js';
+import {
+  loadMigrations, planMigrations, runMigrations, MIGRATIONS_DIR,
+} from '../src/core/migrate.js';
 import { ulid } from '../src/core/ids.js';
 
 let failures = 0;
@@ -31,6 +36,16 @@ async function throwsCode(name, code, fn) {
   } catch (err) {
     if (err?.code === code) ok(name);
     else bad(name, `expected ${code}, got ${err?.code ?? err?.message ?? err}`);
+  }
+}
+
+/** The other half of a refusal test: the same call shape must succeed when it should. */
+async function expectOk(name, fn) {
+  try {
+    await fn();
+    ok(name);
+  } catch (err) {
+    bad(name, `threw ${err?.code ?? ''} ${err?.message ?? err}`);
   }
 }
 
@@ -497,6 +512,335 @@ async function testInterface(store, tag) {
     JSON.stringify(flag2));
 }
 
+/** Resolve, or report the hang. A deadlocked call otherwise looks like a test suite that stopped. */
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not settle in ${ms}ms`)), ms); }),
+  ]);
+}
+
+/** A minimal §4.2 TerminalResult for two accounts, with everything both tables require. */
+function newResult(matchId, players, overrides = {}) {
+  return {
+    matchId,
+    status: 'completed',
+    mode: 'bomb',
+    mapId: 'the-square',
+    mapVersion: '1.0.0',
+    region: 'yyz',
+    rulesetVersion: 'bomb-1.0.0',
+    statDefinitionVersion: '1.0.0',
+    serverBuild: 'storetest',
+    terminationReason: 'completed',
+    outcomeReason: 'elimination',
+    invalidationReason: null,
+    winnerTeam: 'alpha',
+    rulesSnapshot: { roundsToWin: 7, maxRounds: 12 },
+    teamScores: { alpha: 7, bravo: 5 },
+    rounds: [{ index: 0, winner: 'alpha', reason: 'elimination' }],
+    evidenceRef: `ev_${matchId}`,
+    startedAt: iso(-600e3),
+    endedAt: iso(),
+    players,
+    ...overrides,
+  };
+}
+
+function newPlayer(accountId, team, overrides = {}) {
+  return {
+    accountId, team, displayName: `p_${accountId.slice(-4)}`,
+    kills: 10, deaths: 4, assists: 2, suicides: 0, teamKills: 0,
+    headshots: 3, shotsFired: 90, shotsHit: 30, damageDealt: 1400,
+    plants: 1, defuses: 0, roundsPlayed: 12, timePlayedSec: 600, score: 1200,
+    disconnected: false, abandoned: false,
+    joinedAt: iso(-600e3), leftAt: null,
+    weapons: { ar_default: { shots: 90, hits: 30, kills: 8, headshots: 3 } },
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// 7. store.matches — the surface three routed endpoints already call
+// ---------------------------------------------------------------------------------------
+async function testMatches(store, tag) {
+  console.log(`\n[${tag}] matches`);
+
+  check('the adapter exposes store.matches', !!store.matches
+    && typeof store.matches.record === 'function'
+    && typeof store.matches.listForAccount === 'function',
+    'profile/stats.js calls matches.record and matches.listForAccount; without them every '
+    + 'result submission and every history request is a 500');
+
+  const a = newAccount();
+  const b = newAccount();
+  const outsider = newAccount();
+  for (const acct of [a, b, outsider]) await store.accounts.create(acct);
+
+  const base = ulid();
+  const ids = [1, 2, 3].map((i) => `${base}-${i}`);       // ordered by construction
+  for (const [i, matchId] of ids.entries()) {
+    await store.matches.record(newResult(matchId, [
+      newPlayer(a.accountId, 'alpha', { kills: 10 + i }),
+      newPlayer(b.accountId, 'bravo', { kills: 1 }),
+    ]));
+  }
+
+  const first = await store.matches.listForAccount(a.accountId, { limit: 2 });
+  check('history is newest first',
+    first.items.length === 2 && first.items[0].matchId === ids[2] && first.items[1].matchId === ids[1],
+    first.items.map((m) => m.matchId).join(', '));
+  check('a full page hands back a cursor', first.nextCursor === ids[1], `cursor=${first.nextCursor}`);
+
+  const second = await store.matches.listForAccount(a.accountId, { limit: 2, cursor: first.nextCursor });
+  check('the cursor continues where the page ended, without repeating',
+    second.items.length === 1 && second.items[0].matchId === ids[0],
+    second.items.map((m) => m.matchId).join(', '));
+  // A cursor on the last page sends recomputeCareer round the loop forever.
+  check('the last page has no cursor', second.nextCursor === null, `cursor=${second.nextCursor}`);
+
+  const item = first.items[0];
+  check('a history item carries the §4.3 fields the history endpoint reads',
+    item.status === 'completed' && item.mode === 'bomb' && item.mapId === 'the-square'
+      && item.mapVersion === '1.0.0' && item.winnerTeam === 'alpha'
+      && item.teamScores.alpha === 7 && item.endedAt !== null
+      && item.statDefinitionVersion === '1.0.0',
+    JSON.stringify(item).slice(0, 300));
+  check('a history item carries the participant the career recompute reads',
+    item.participant?.team === 'alpha' && item.participant.stats.kills === 12
+      && item.participant.stats.weapons.ar_default.kills === 8,
+    JSON.stringify(item.participant).slice(0, 300));
+
+  // CONTROL: the rows are per account. If listForAccount ignored its argument, the outsider
+  // would see all three matches and every assertion above would still pass.
+  const none = await store.matches.listForAccount(outsider.accountId, { limit: 10 });
+  check('control: an account that played nothing has no history',
+    none.items.length === 0 && none.nextCursor === null, `${none.items.length} items`);
+  const opponent = await store.matches.listForAccount(b.accountId, { limit: 10 });
+  check('control: the opponent sees the same matches from their own side',
+    opponent.items.length === 3 && opponent.items[0].participant.team === 'bravo',
+    JSON.stringify(opponent.items[0]?.participant?.team));
+
+  // §4: written once, immutable thereafter. §5.5: a second, different truth is a bug or an attack.
+  await throwsCode('re-recording a match is refused', 'CONFLICT',
+    () => store.matches.record(newResult(ids[0], [newPlayer(a.accountId, 'alpha')])));
+
+  // §4.3 pending: an allocated match is history too, and its outcome fields are null.
+  const pendingId = `${base}-0`;
+  await store.matches.record(newResult(pendingId, [newPlayer(a.accountId, 'alpha')], {
+    status: 'pending', winnerTeam: null, endedAt: null, outcomeReason: null, terminationReason: null,
+  }));
+  const withPending = await store.matches.listForAccount(a.accountId, { limit: 10 });
+  const pendingItem = withPending.items.find((m) => m.matchId === pendingId);
+  check('a non-terminal match reads back as pending (§4.3)',
+    pendingItem?.status === 'pending' && pendingItem.winnerTeam === null,
+    JSON.stringify(pendingItem?.status));
+
+  await throwsCode('a result with no region is refused', 'VALIDATION_FAILED',
+    () => store.matches.record({ ...newResult(ulid(), []), region: undefined }));
+  await throwsCode('a result with an unknown winner team is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newResult(ulid(), [], { winnerTeam: 'charlie' })));
+  await throwsCode('a participant that is not an account is refused', 'NOT_FOUND',
+    () => store.matches.record(newResult(ulid(), [newPlayer(ulid(), 'alpha')])));
+
+  // The match row and its participants land together or not at all: a match row with no
+  // participants is a match nobody played, and the §6 recompute reads a hole where a career was.
+  const atomicId = ulid();
+  await store.matches.record(newResult(atomicId, [
+    newPlayer(a.accountId, 'alpha'), newPlayer(ulid(), 'bravo'),
+  ])).catch(() => {});
+  const after = await store.matches.listForAccount(a.accountId, { limit: 50 });
+  check('a result whose participant fails leaves no match row behind',
+    !after.items.some((m) => m.matchId === atomicId),
+    'the match row committed without its participants');
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. Conformance: the rules both adapters must answer identically.
+// ---------------------------------------------------------------------------------------
+async function testConformance(store, tag) {
+  console.log(`\n[${tag}] conformance`);
+
+  const acct = newAccount();
+  await store.accounts.create(acct);
+
+  // --- unknown-column rejection must not walk the prototype chain -----------------------
+  // `k in columns` accepted every Object.prototype member as a legal column name.
+  for (const evil of ['constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+    await throwsCode(`accounts rejects the inherited key ${evil}`, 'VALIDATION_FAILED',
+      () => store.accounts.update(acct.accountId, { [evil]: 'owned' }));
+    await throwsCode(`profiles rejects the inherited key ${evil}`, 'VALIDATION_FAILED',
+      () => store.profiles.upsert(acct.accountId, { [evil]: 'owned' }));
+  }
+  await throwsCode('feature_flags rejects the inherited key __proto__', 'VALIDATION_FAILED',
+    () => store.flags.set(`test.${ulid().slice(-6).toLowerCase()}`, JSON.parse('{"__proto__": {"x": 1}}')));
+  // CONTROL: a real column on each of the three still works, so the four refusals above are
+  // about the key and not about the method refusing everything.
+  const statusPatched = await store.accounts.update(acct.accountId, { status: 'restricted' });
+  check('control: a real account column is still accepted', statusPatched.status === 'restricted',
+    JSON.stringify(statusPatched.status));
+
+  // --- nested tx must not deadlock ------------------------------------------------------
+  // A nested tx used to queue behind a lock its own caller held: it never ran, the outer call
+  // never returned, and close() waited on the queue forever.
+  const nested = newAccount();
+  const nestedOut = await withTimeout(store.tx(async (tx) => {
+    await store.accounts.create(nested, tx);
+    return store.tx(async (inner) => (await store.accounts.byId(nested.accountId, inner)) !== null);
+  }), 4000, 'a nested store.tx').catch((err) => err);
+  check('a nested tx runs instead of deadlocking', nestedOut === true,
+    nestedOut instanceof Error ? nestedOut.message : `returned ${nestedOut}`);
+  check('control: the nested tx committed through the outer one',
+    (await store.accounts.byId(nested.accountId)) !== null, 'the outer commit lost the write');
+
+  // The same hang by the other route: a write inside tx() that forgets the handle.
+  const ambient = newAccount();
+  await withTimeout(store.tx(async () => { await store.accounts.create(ambient); }),
+    4000, 'an unenrolled write inside tx').catch((err) => bad('an unenrolled write inside tx does not hang', err.message));
+  check('a write inside tx() without the handle joins that transaction',
+    (await store.accounts.byId(ambient.accountId)) !== null, 'the write vanished');
+  const ambientRolled = newAccount();
+  await store.tx(async () => {
+    await store.accounts.create(ambientRolled);
+    throw new Error('storetest: roll back the ambient write');
+  }).catch(() => {});
+  check('control: an unenrolled write inside tx rolls back with it',
+    (await store.accounts.byId(ambientRolled.accountId)) === null,
+    'it committed outside the transaction it was written inside');
+
+  // --- the tx handle must not be the state ---------------------------------------------
+  let escaped = null;
+  await store.tx(async (tx) => { escaped = tx; });
+  check('the tx handle exposes no state and no client',
+    escaped.state === undefined && escaped.client === undefined
+      && Object.keys(escaped).length === 0,
+    `handle own keys: ${Object.keys(escaped).join(', ')}`);
+  // CONTROL: the handle is genuinely a working handle, so "it exposes nothing" is not because
+  // the store hands back an inert object.
+  let live = null;
+  await store.tx(async (tx) => { live = (await store.accounts.byId(acct.accountId, tx)) !== null; });
+  check('control: a handle still works for a real call', live === true, 'the handle read nothing');
+
+  // Forging through the handle is what the property allowed: tx.state.audit.delete(id).
+  const auditRow = await store.audit.insert({
+    actorKind: 'system', actorId: 'storetest', action: 'conformance.probe',
+    subjectKind: 'account', subjectId: acct.accountId, reasonCode: 'TEST',
+  });
+  let forged = false;
+  try {
+    await store.tx(async (tx) => {
+      for (const s of Object.getOwnPropertySymbols(tx)) {
+        const v = tx[s];
+        if (v && typeof v.audit?.delete === 'function') { v.audit.delete(auditRow.auditId); forged = true; }
+      }
+      for (const k of Object.keys(tx)) {
+        const v = tx[k];
+        if (v && typeof v.audit?.delete === 'function') { v.audit.delete(auditRow.auditId); forged = true; }
+      }
+    });
+  } catch { /* a frozen handle may refuse outright, which is also a pass */ }
+  check('no audit row is reachable through a tx handle', !forged
+    && (await store.audit.list({ subjectId: acct.accountId })).some((r) => r.auditId === auditRow.auditId),
+    'an audit row was deleted through the transaction handle');
+
+  // --- an unstorable value must not brick the store ------------------------------------
+  const familyId = ulid();
+  const session = await store.sessions.create({
+    sessionId: ulid(), accountId: acct.accountId, refreshFamilyId: familyId, ipClass: 'ca-on',
+  });
+  await throwsCode('a revoke reason that cannot be stored is refused', 'VALIDATION_FAILED',
+    () => store.sessions.revoke(session.sessionId, Symbol('why')));
+  await throwsCode('an audit summary that cannot be stored is refused', 'VALIDATION_FAILED',
+    () => store.audit.insert({
+      actorKind: 'system', action: 'conformance.probe', subjectKind: 'account',
+      subjectId: acct.accountId, reasonCode: 'TEST', afterSummary: { fn: () => 1 },
+    }));
+  // CONTROL, and the whole point: every later write used to fail forever after one of those.
+  const afterBad = newAccount();
+  await expectOk('the store still writes after rejecting an unstorable value',
+    () => store.accounts.create(afterBad));
+  await expectOk('control: a normal revoke still works afterwards',
+    () => store.sessions.revoke(session.sessionId, 'conformance'));
+  check('the revoke that was refused left no trace',
+    (await store.sessions.byId(session.sessionId)).revokedReason === 'conformance',
+    'the rejected reason was stored anyway');
+
+  // --- one behaviour per method, both adapters ------------------------------------------
+  await throwsCode('revoking a session that does not exist is NOT_FOUND', 'NOT_FOUND',
+    () => store.sessions.revoke(ulid(), 'conformance'));
+
+  const patched = await store.accounts.update(acct.accountId,
+    { status: 'active', updatedAt: '1999-01-01T00:00:00.000Z' });
+  check('a patch cannot set updatedAt on accounts',
+    patched.updatedAt !== '1999-01-01T00:00:00.000Z', `updatedAt=${patched.updatedAt}`);
+  await throwsCode('a patch cannot set updatedAt on profiles', 'VALIDATION_FAILED',
+    () => store.profiles.upsert(acct.accountId, { updatedAt: '1999-01-01T00:00:00.000Z' }));
+
+  await store.profiles.upsert(acct.accountId, { roamingSettings: { sens: 2.5 }, settingsVersion: 4 });
+  const untouched = await store.profiles.upsert(acct.accountId, { settingsVersion: 5 });
+  check('control: a key absent from the patch leaves its column alone',
+    untouched.roamingSettings?.sens === 2.5 && untouched.settingsVersion === 5,
+    JSON.stringify(untouched));
+  const cleared = await store.profiles.upsert(acct.accountId, { roamingSettings: null });
+  check('a null in the patch clears the column',
+    cleared.roamingSettings === null && cleared.settingsVersion === 5,
+    JSON.stringify(cleared));
+
+  // legacy_import: profile/migration.js writes it. Memory used to reject it as an unknown
+  // column and Postgres discarded it silently, so the import re-ran on every request.
+  const record = {
+    source: 'localStorage:overstrike.progress.v1', verified: false,
+    importedAt: iso(), data: { schema: 1, xp: 4200, lifetime: { kills: 9 }, weapons: {}, challenges: [] },
+  };
+  const imported = await store.profiles.upsert(acct.accountId, { legacyImport: record });
+  check('legacyImport round-trips through the profile',
+    imported.legacyImport?.data?.xp === 4200 && imported.legacyImport.verified === false,
+    JSON.stringify(imported.legacyImport));
+  check('control: reading the profile back still has it',
+    (await store.profiles.byAccountId(acct.accountId)).legacyImport?.data?.lifetime?.kills === 9,
+    'the import did not survive the round trip');
+  await throwsCode('control: a profile column that does not exist is still refused', 'VALIDATION_FAILED',
+    () => store.profiles.upsert(acct.accountId, { legacyimport: record }));
+
+  // A new consent decision resets the migration receipt.
+  const consentId = ulid();
+  const consentRow = {
+    clientSessionId: consentId, telemetryPersonal: false,
+    policyVersion: 1, decidedAt: iso(), expiresAt: iso(30 * 86400e3),
+  };
+  await store.preAuthConsent.put(consentRow);
+  await store.preAuthConsent.markMigrated(consentId, iso());
+  check('control: markMigrated sets the receipt',
+    (await store.preAuthConsent.get(consentId)).migratedAt !== null, 'migratedAt is still null');
+  await store.preAuthConsent.put({ ...consentRow, telemetryPersonal: true, decidedAt: iso() });
+  const redecided = await store.preAuthConsent.get(consentId);
+  check('a new consent decision resets migratedAt',
+    redecided.migratedAt === null && redecided.telemetryPersonal === true,
+    JSON.stringify(redecided));
+
+  // --- counter deltas are bounded -------------------------------------------------------
+  await throwsCode('an absurd negative stat delta is refused', 'VALIDATION_FAILED',
+    () => store.stats.applyDelta(acct.accountId, 'tdm', 'v1', { kills: -1_000_000 }));
+  await throwsCode('an absurd positive stat delta is refused', 'VALIDATION_FAILED',
+    () => store.stats.applyDelta(acct.accountId, 'tdm', 'v1', { damageDealt: 1e12 }));
+  await throwsCode('a fractional stat delta is refused', 'VALIDATION_FAILED',
+    () => store.stats.applyDelta(acct.accountId, 'tdm', 'v1', { kills: 1.5 }));
+  await throwsCode('an absurd weapon delta is refused', 'VALIDATION_FAILED',
+    () => store.weaponStats.applyDelta(acct.accountId, 'tdm', 'ar_default', 'v1', { shots: -5_000_000 }));
+  // CONTROL: a plausible match, and the negative delta that reverses an invalidated one, are
+  // both still accepted — a bound that rejects everything would pass all four checks above.
+  const plausible = await store.stats.applyDelta(acct.accountId, 'tdm', 'v1',
+    { kills: 30, deaths: 25, damageDealt: 4200, matches: 1, timePlayedSec: 1800 });
+  check('control: a plausible match delta is accepted', plausible.kills === 30, JSON.stringify(plausible));
+  const reversed = await store.stats.applyDelta(acct.accountId, 'tdm', 'v1',
+    { kills: -30, deaths: -25, damageDealt: -4200, matches: -1, timePlayedSec: -1800 });
+  check('control: the reversing negative delta is accepted',
+    reversed.kills === 0 && reversed.matches === 0, JSON.stringify(reversed));
+  check('the refused deltas changed nothing', reversed.damageDealt === 0,
+    `damageDealt=${reversed.damageDealt}`);
+}
+
 async function runSuite(store, tag) {
   await testRollback(store, tag);
   await testOutboxAtomicity(store, tag);
@@ -505,6 +849,8 @@ async function runSuite(store, tag) {
   await testConfusables(store, tag);
   await testStats(store, tag);
   await testInterface(store, tag);
+  await testMatches(store, tag);
+  await testConformance(store, tag);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -568,13 +914,193 @@ console.log('\n=========== MIGRATIONS ===========');
     () => planMigrations(files, [...asApplied(files), { version: 9999, name: 'future', checksum: 'x' }]));
 }
 
+// ---------------------------------------------------------------------------------------
+// The Postgres adapter's statement building, proved without a database.
+//
+// A fake pool records the SQL instead of running it, so the injection below is checked on
+// every run rather than only on the machines that have a database. That matters: the bug was
+// reachable from any endpoint that forwards a JSON body into a patch.
+// ---------------------------------------------------------------------------------------
+console.log('\n=========== POSTGRES — statement building ===========');
+{
+  const spyPool = () => {
+    const queries = [];
+    const client = {
+      queries,
+      async query(sql, params) {
+        queries.push({ sql, params });
+        return { rows: [{ account_id: 'VIC2', status: 'active' }], rowCount: 1 };
+      },
+      release() {},
+      on() {},
+      async connect() { return client; },
+      async end() {},
+    };
+    return client;
+  };
+
+  const pool = spyPool();
+  const pgStore = await createPostgresStore(
+    { databaseUrl: 'postgres://storetest/fake' },
+    { pool, pg: { Pool: function FakePool() { throw new Error('storetest: the fake pool was bypassed'); } } });
+
+  // The proof case, verbatim: the KEY is the payload. `toSnake` lower-cases capitals and
+  // leaves quotes and commas alone, so pasting it into `set ${col} = $1` executed all of it.
+  const injection = "status = 'banned', roles = '{admin}', password_hash = 'x', display_name";
+  await throwsCode('an account patch KEY cannot carry SQL', 'VALIDATION_FAILED',
+    () => pgStore.accounts.update('VIC2', { [injection]: 'OWNED' }));
+  check('no statement containing the injected clauses was issued',
+    !pool.queries.some((q) => /banned|\{admin\}/.test(q.sql)),
+    pool.queries.map((q) => q.sql).join(' | '));
+
+  await throwsCode('an insert KEY cannot carry SQL either', 'VALIDATION_FAILED',
+    () => pgStore.audit.insert({
+      actorKind: 'system', action: 'probe', subjectKind: 'account', subjectId: 'VIC2',
+      reasonCode: 'TEST', ["reason_code = 'CLEAN', actor_id"]: 'OWNED',
+    }));
+  await throwsCode('an inherited key is not a column of any table', 'VALIDATION_FAILED',
+    () => pgStore.accounts.update('VIC2', { constructor: 'OWNED' }));
+
+  // CONTROL: a legitimate patch still builds a parameterised statement. Without this, an
+  // adapter that refused every update would pass all three refusals above.
+  pool.queries.length = 0;
+  await pgStore.accounts.update('VIC2', { status: 'banned', displayName: 'Legit' });
+  const [issued] = pool.queries;
+  check('control: a real patch becomes a parameterised UPDATE',
+    /^update accounts set status = \$1, display_name = \$2 where account_id = \$3/.test(issued.sql)
+      && issued.params[0] === 'banned' && issued.params[2] === 'VIC2',
+    issued.sql);
+
+  // The relay's claim must still take the row lock when it is inside a transaction — that is
+  // what the reentrancy rework touched, and losing it means N workers publish the same event N
+  // times (event-envelope.md §4).
+  pool.queries.length = 0;
+  await pgStore.tx((tx) => pgStore.outbox.claimUnpublished(10, tx));
+  check('claimUnpublished still locks inside a transaction',
+    pool.queries.some((q) => /for update skip locked/.test(q.sql)),
+    pool.queries.map((q) => q.sql).join(' | '));
+  pool.queries.length = 0;
+  await pgStore.outbox.claimUnpublished(10);
+  check('control: outside a transaction it does not',
+    !pool.queries.some((q) => /for update skip locked/.test(q.sql)),
+    pool.queries.map((q) => q.sql).join(' | '));
+
+  // Reentrancy: a nested tx must not take a second connection and must not issue a second
+  // BEGIN — two connections cannot be one transaction, and they can deadlock on each other.
+  pool.queries.length = 0;
+  await withTimeout(pgStore.tx(async () => {
+    await pgStore.tx(async (inner) => pgStore.accounts.byId('VIC2', inner));
+  }), 4000, 'a nested postgres tx').catch((err) => bad('a nested postgres tx does not hang', err.message));
+  check('a nested postgres tx issues one begin and one commit',
+    pool.queries.filter((q) => q.sql === 'begin').length === 1
+      && pool.queries.filter((q) => q.sql === 'commit').length === 1,
+    pool.queries.map((q) => q.sql).join(' | '));
+
+  await pgStore.close();
+}
+
+// ---------------------------------------------------------------------------------------
+// Migration content that a database-less run can still hold to account.
+// ---------------------------------------------------------------------------------------
+console.log('\n=========== MIGRATIONS — content ===========');
+{
+  const read = (f) => readFile(join(MIGRATIONS_DIR, f), 'utf8');
+  const files = (await loadMigrations()).map((f) => f.filename);
+
+  // 0007's grant block was gated on `if exists (... 'overstrike_app')` and that role exists
+  // nowhere, so the whole block was a no-op: the connecting role kept UPDATE, DELETE and
+  // TRUNCATE, and an owner can `alter table audit_log disable trigger all` and then delete.
+  const roleFile = files.find((f) => /audit_append_only_role/.test(f));
+  check('a migration exists that creates the audit role', !!roleFile,
+    'audit_log is append-only only by convention while the app role does not exist');
+  const roleSql = roleFile ? await read(roleFile) : '';
+  check('it creates overstrike_app rather than skipping when absent',
+    /create role overstrike_app/i.test(roleSql), 'the role is still only checked for');
+  check('it revokes the mutating privileges from PUBLIC as well as the role',
+    /revoke all on audit_log from public/i.test(roleSql), 'a PUBLIC grant would survive');
+  check('it fails loudly if the role still holds UPDATE or DELETE afterwards',
+    /raise exception/i.test(roleSql) && /has_table_privilege/i.test(roleSql),
+    'the migration asserts nothing, so it can silently do nothing again');
+  check('it states that DATABASE_URL must be a non-owner role',
+    /NOT the owner/i.test(roleSql), 'the deployment requirement is not written down anywhere');
+  // CONTROL: the grep is capable of failing. 0007 is the file that did NOT do this.
+  const old = await read('0007_audit_append_only.sql');
+  check('control: the superseded 0007 does not create the role',
+    !/create role overstrike_app/i.test(old),
+    '0007 already created it, so the checks above prove nothing');
+
+  // The relay polls `where published_at is null and dead_lettered_at is null order by
+  // occurred_at, event_id limit N`. An index on (published_at) where published_at is null
+  // carries no ordering and excludes no dead letters: EXPLAIN shows a top-N heapsort over
+  // every unpublished row, on every poll.
+  const idxFile = files.find((f) => /outbox_relay_index/.test(f));
+  check('a migration exists that indexes the relay query', !!idxFile, 'the poll still heapsorts');
+  const idxSql = idxFile ? await read(idxFile) : '';
+  check('the new index is on the ORDER BY key under the full predicate',
+    /\(occurred_at, event_id\)/.test(idxSql)
+      && /where published_at is null and dead_lettered_at is null/.test(idxSql),
+    idxSql);
+  check('the index that cannot serve the query is dropped',
+    /drop index if exists events_outbox_unpublished_idx/.test(idxSql),
+    'both indexes remain, and every outbox write pays for the dead one');
+
+  const legacyFile = files.find((f) => /legacy_import/.test(f));
+  check('a migration adds profiles.legacy_import', !!legacyFile,
+    'profile/migration.js writes a column that does not exist');
+  check('it is jsonb', /legacy_import jsonb/.test(legacyFile ? await read(legacyFile) : ''), '');
+}
+
+// ---------------------------------------------------------------------------------------
+// The migration runner refuses what its own doc used to invite.
+// ---------------------------------------------------------------------------------------
+console.log('\n=========== MIGRATIONS — runner arguments ===========');
+{
+  // A Pool runs each statement on whichever connection is free, so pg_advisory_lock would be
+  // taken on one session and unlocked on another, and begin/commit would land on different
+  // connections than the DDL between them. Invisible on a one-connection pool; catastrophic
+  // on a real one.
+  const fakePool = {
+    totalCount: 3, idleCount: 3, waitingCount: 0,
+    async query() { return { rows: [] }; },
+    async connect() { return { query: async () => ({ rows: [] }), release() {} }; },
+  };
+  let refused = null;
+  try {
+    await runMigrations({ client: fakePool });
+    bad('a Pool is refused as a migration client', 'it was accepted');
+  } catch (err) {
+    refused = err.message;
+    check('a Pool is refused as a migration client', /Pool was passed/.test(err.message), err.message);
+  }
+  check('the refusal says what to pass instead', /pool\.connect\(\)/.test(refused ?? ''), refused ?? '');
+
+  // CONTROL: a dedicated connection is accepted — the check is about the pool, not about
+  // refusing every client. This one answers enough to complete a run with nothing pending.
+  // It reports every migration as already applied, so the run has nothing to execute and the
+  // assertion is about the argument check rather than about fake DDL.
+  const files = await loadMigrations();
+  const fakeClient = {
+    async query(sql) {
+      if (/from schema_migrations/i.test(sql)) {
+        return { rows: files.map((f) => ({ version: f.version, name: f.name, checksum: f.checksum, applied_at: null, duration_ms: 0 })) };
+      }
+      return { rows: [{}] };
+    },
+  };
+  await expectOk('control: a dedicated client is accepted',
+    () => runMigrations({ client: fakeClient }));
+
+  check('runMigrations has a named entry point for a deploy step',
+    typeof (await import('../src/core/migrate.js')).migrateCli === 'function',
+    'nothing exports a callable migration entry point');
+}
+
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
   console.log('\n=========== STORE — postgres ===========');
   console.log('  skip DATABASE_URL is not set; the Postgres adapter was not exercised');
 } else {
   console.log('\n=========== STORE — postgres ===========');
-  const { createPostgresStore } = await import('../src/core/store/postgres.js');
   let pgStore = null;
   try {
     const migrated = await runMigrations({ databaseUrl });
@@ -613,6 +1139,48 @@ if (!databaseUrl) {
           check(`a direct ${name} on audit_log is refused`, /append-only/.test(err.message), err.message);
         }
       }
+
+      // The trigger is bypassable by the table owner (`alter table … disable trigger all`), so
+      // the grant is the control that actually holds. 0007's grant block was a no-op because
+      // the role it named did not exist.
+      const { rows: roleRows } = await raw.query(
+        "select 1 from pg_roles where rolname = 'overstrike_app'");
+      check('the application role exists after migrating', roleRows.length === 1,
+        'overstrike_app is still absent, so the grant block is still a no-op');
+      const { rows: [priv] } = await raw.query(
+        `select has_table_privilege('overstrike_app', 'audit_log', 'INSERT') as ins,
+                has_table_privilege('overstrike_app', 'audit_log', 'SELECT') as sel,
+                has_table_privilege('overstrike_app', 'audit_log', 'UPDATE') as upd,
+                has_table_privilege('overstrike_app', 'audit_log', 'DELETE') as del,
+                has_table_privilege('overstrike_app', 'audit_log', 'TRUNCATE') as trunc`);
+      check('the application role cannot UPDATE, DELETE or TRUNCATE audit_log',
+        priv.upd === false && priv.del === false && priv.trunc === false,
+        JSON.stringify(priv));
+      // CONTROL: it holds the privileges it is supposed to. A role with nothing at all would
+      // satisfy the assertion above and break the application.
+      check('control: the application role can still INSERT and SELECT',
+        priv.ins === true && priv.sel === true, JSON.stringify(priv));
+
+      const { rows: idx } = await raw.query(
+        "select indexname, indexdef from pg_indexes where tablename = 'events_outbox'");
+      const relay = idx.find((r) => r.indexname === 'events_outbox_relay_idx');
+      check('the relay index exists', !!relay, idx.map((r) => r.indexname).join(', '));
+      check('the relay index orders by occurred_at, event_id under the full predicate',
+        /occurred_at, event_id/.test(relay?.indexdef ?? '')
+          && /published_at IS NULL.*and.*dead_lettered_at IS NULL/is.test(relay?.indexdef ?? ''),
+        relay?.indexdef ?? '');
+      check('control: the index that could not serve the query is gone',
+        !idx.some((r) => r.indexname === 'events_outbox_unpublished_idx'),
+        'both indexes are present; every outbox write pays for the dead one');
+
+      // Printed, not asserted: on a nearly empty table the planner correctly prefers a seq
+      // scan whatever indexes exist, so an assertion here would fail for the right reason and
+      // teach the next reader to delete it. The index definition above is the checkable claim.
+      const { rows: plan } = await raw.query(
+        `explain select * from events_outbox
+           where published_at is null and dead_lettered_at is null
+           order by occurred_at, event_id limit 100`);
+      console.log(`  note relay poll plan: ${plan.map((r) => r['QUERY PLAN']).join(' / ')}`);
     } finally {
       await raw.end();
     }
