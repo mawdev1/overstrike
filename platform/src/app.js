@@ -43,17 +43,18 @@ export async function buildApp(config, overrides = {}) {
   const router = new Router();
   const health = createHealth({ deps });
 
-  // §9's read/write/room/report classes had no call site: the limiter was constructed,
-  // janitored, and never consulted, so /v1/profile/me was unlimited. Applied as route
-  // middleware so a new endpoint inherits it by declaring a class rather than remembering to.
-  deps.rateLimit = (className) => async (ctx) => {
-    const subject = ctx.actor?.accountId || ctx.ip || 'anonymous';
-    const verdict = ctx.deps.rateLimiter.check(className, subject);
-    if (!verdict.allowed) {
-      throw new ApiError('RATE_LIMITED', 'Too many requests. Try again shortly.',
-        { retryAfterMs: verdict.retryAfterMs });
-    }
-  };
+  // §9's read/write/room/report classes are enforced in `core/http.js`, derived from the
+  // method, for every client route.
+  //
+  // This is where `deps.rateLimit(className)` used to be: a factory returning middleware, with
+  // a comment saying it was "applied as route middleware so a new endpoint inherits it". It had
+  // ZERO call sites. The limiter was constructed here, its janitor started here, and no route
+  // ever consulted it, so every read and write in the platform was uncapped against a contract
+  // that states a number for each — while the comment described the wiring as finished.
+  //
+  // It is gone rather than wired up, because the shape was the problem. An opt-in that each
+  // new endpoint must remember is one a new endpoint will forget, and an unlimited route is
+  // indistinguishable from a working one until it is abused.
 
   router.get('/v1/health', async () => health.live(), { requireBuild: false });
   router.get('/v1/health/ready', async (ctx) => {

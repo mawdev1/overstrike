@@ -158,6 +158,28 @@ export const isWellFormedBuild = (b) => typeof b === 'string' && b !== '' && BUI
  * comparison asserted against the copy, leaving this original unguarded and free to drift.
  * One implementation, one call site per consumer, one test target.
  */
+/**
+ * The §9 rate-limit class a route falls in, or null for the ones the table exempts.
+ *
+ * §9 assigns by method — Read 120/min for GET, Write 30/min for POST/PATCH/PUT/DELETE — so
+ * that is what this derives. A route overrides with `rateLimitClass: 'room'` (or `'report'`)
+ * when the table names it specifically, and opts out with `rateLimitClass: null`.
+ *
+ * Two exemptions, both from §9's own table:
+ *
+ *   - **Service endpoints are "Uncapped, mTLS-gated"**. They are the `requireBuild: false`
+ *     routes — a match server is not a client build. Capping the result submitter at 30/min
+ *     would drop match results on a busy shard, which is the opposite of the intent.
+ *   - **Auth routes carry their own class** and enforce it in `modules/auth/ratelimit.js`,
+ *     which keys IP *and* account as §9 requires. Charging them `write` as well would debit
+ *     two buckets for one request and make the stricter number a lie.
+ */
+export function rateLimitClassFor(route, method) {
+  if (Object.hasOwn(route.opts, 'rateLimitClass')) return route.opts.rateLimitClass;
+  if (route.opts.requireBuild === false) return null;
+  return method === 'GET' || method === 'HEAD' ? 'read' : 'write';
+}
+
 export function buildBelowFloor(build, floor) {
   const a = String(build).split('.').map(Number);
   const b = String(floor).split('.').map(Number);
@@ -321,6 +343,32 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
       ctxRef = ctx;
 
       for (const mw of hit.route.opts.middleware || []) await mw(ctx);
+
+      // §9's read/write/room/report classes, applied HERE rather than per module.
+      //
+      // They had no call site at all. `app.js` built the limiter, started its janitor, defined
+      // `deps.rateLimit(className)` — and nothing ever called it, so every GET and every PATCH
+      // in the platform was uncapped against a contract that states a number for each. The
+      // comment above that definition described the wiring as done.
+      //
+      // Per module was how it stayed undone: an opt-in that every new endpoint must remember
+      // is an opt-in that a new endpoint will forget, and the failure is silent because an
+      // unlimited endpoint behaves exactly like a working one until someone abuses it. §9
+      // assigns classes by METHOD, so deriving it here means a route is limited by existing.
+      //
+      // AFTER the middleware, deliberately: `ctx.actor` is what the account-keyed classes
+      // subject on, and it is null until the auth middleware has run.
+      const limitClass = rateLimitClassFor(hit.route, req.method);
+      if (limitClass && deps.rateLimiter) {
+        // An unauthenticated caller on an account-keyed class keys on IP. Falling back to a
+        // single shared bucket would let one anonymous caller exhaust the class for everyone.
+        const subject = ctx.actor?.accountId || ctx.ip || 'anonymous';
+        const verdict = deps.rateLimiter.check(limitClass, subject);
+        if (!verdict.allowed) {
+          throw new ApiError('RATE_LIMITED', 'Too many requests. Try again shortly.',
+            { retryAfterMs: verdict.retryAfterMs });
+        }
+      }
 
       const result = await hit.route.handler(ctx);
       if (result && result.__raw) {

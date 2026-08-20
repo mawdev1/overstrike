@@ -399,20 +399,52 @@ await withApp(async ({ call }) => {
 });
 
 // ── 5. rate limiting is actually consulted ────────────────────────────────────────────
-await withApp(async ({ app }) => {
-  section('rate limiter wiring');
-  check(typeof app.deps.rateLimit === 'function',
-    'the composition root exposes a rate-limit middleware factory',
-    'the limiter was previously constructed, janitored, and never consulted');
-  const mw = app.deps.rateLimit('read');
-  const ctx = { actor: null, ip: '203.0.113.9', deps: app.deps };
-  let refusedAt = 0;
-  for (let i = 1; i <= 200; i++) {
-    try { await mw(ctx); } catch { refusedAt = i; break; }
+//
+// This section was named "rate limiting is actually consulted" and did not test that.
+//
+// It asserted `typeof app.deps.rateLimit === 'function'`, then BUILT the middleware itself and
+// called it in a loop. Both checks passed for two years' worth of review rounds while
+// `deps.rateLimit` had zero call sites anywhere in `platform/src` — every read and write in
+// the platform was uncapped. A test that constructs the thing under test and drives it by hand
+// proves the thing exists, which was never in doubt; it cannot prove a route reaches it.
+//
+// So the limit is now asserted the only way that distinguishes those: over a socket, against a
+// real route, counting what the server actually answers.
+await withApp(async ({ call }) => {
+  section('rate limiting is consulted BY ROUTES, not merely constructed');
+
+  // §9 read: 120/min per account, keyed on IP for an unauthenticated caller. GET
+  // /v1/onboarding/terms is a plain client GET — no auth, no service exemption.
+  let firstRefusal = 0;
+  let refusedBody = null;
+  for (let i = 1; i <= 130; i++) {
+    const res = await call('GET', '/v1/onboarding/terms');
+    if (res.status === 429) { firstRefusal = i; refusedBody = res.body; break; }
+    if (res.status !== 200) { firstRefusal = -i; refusedBody = res.body; break; }
   }
-  check(refusedAt > 0 && refusedAt <= 121,
-    'the read class refuses past its stated limit',
-    `refused at attempt ${refusedAt}`);
+  check(firstRefusal === 121,
+    'the 121st read in a minute is refused, exactly as §9 states',
+    `first non-200 at attempt ${firstRefusal}: ${JSON.stringify(refusedBody)}`);
+  check(refusedBody?.error?.code === 'RATE_LIMITED',
+    'refusal is the contracted code, not a generic 4xx',
+    JSON.stringify(refusedBody?.error));
+  check(typeof refusedBody?.error?.retryAfterMs === 'number' && refusedBody.error.retryAfterMs > 0,
+    '§9: the refusal carries retryAfterMs so a client knows when to return',
+    JSON.stringify(refusedBody?.error?.retryAfterMs));
+});
+
+await withApp(async ({ call }) => {
+  section('the §9 exemptions are exemptions, not oversights');
+
+  // "Service: Uncapped, mTLS-gated". Capping the match-result submitter would drop results on
+  // a busy shard — so the exemption is load-bearing, and a regression that silently capped it
+  // would look like flaky match reporting rather than a rate limit.
+  let stillServing = true;
+  for (let i = 1; i <= 140; i++) {
+    const res = await call('GET', '/v1/health');
+    if (res.status !== 200) { stillServing = false; break; }
+  }
+  check(stillServing, '140 service/health calls are not rate limited', 'a capped health check fails a load balancer');
 });
 
 // ── 6. health, and the contract's dependency name ─────────────────────────────────────

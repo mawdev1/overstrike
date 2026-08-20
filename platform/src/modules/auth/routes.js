@@ -181,19 +181,30 @@ export function createAuthRoutes({ service, sessions, limiter }) {
     const A = { middleware: [requireAuth] };
     const O = { middleware: [optionalAuth] };
 
+    /**
+     * §9's Auth class, enforced by this module rather than by the generic method-derived one.
+     *
+     * `core/http.js` charges every client route a `read` or `write` budget. These five are the
+     * ones §9 names for the Auth class instead — 10/min per IP AND 5/min per account, two
+     * buckets, which `modules/auth/ratelimit.js` already implements. Letting the generic class
+     * apply as well would debit `write` for the same request and make whichever number is
+     * stricter a fiction. The rest of this module's routes are ordinary reads and writes.
+     */
+    const AUTH_CLASS = { rateLimitClass: null };
+
     router.post('/v1/onboarding/eligibility', handlers.eligibility);
     router.get('/v1/onboarding/consent', handlers.getConsent, O);
     router.put('/v1/onboarding/consent', handlers.putConsent, O);
 
-    router.post('/v1/auth/signup', handlers.signup);
-    router.post('/v1/auth/signin', handlers.signin);
-    router.post('/v1/auth/refresh', handlers.refresh);
+    router.post('/v1/auth/signup', handlers.signup, AUTH_CLASS);
+    router.post('/v1/auth/signin', handlers.signin, AUTH_CLASS);
+    router.post('/v1/auth/refresh', handlers.refresh, AUTH_CLASS);
     router.post('/v1/auth/signout', handlers.signout, A);
     router.post('/v1/auth/signout-all', handlers.signoutAll, A);
     router.get('/v1/auth/sessions', handlers.listSessions, A);
     router.delete('/v1/auth/sessions/:id', handlers.revokeSession, A);
-    router.post('/v1/auth/recovery/start', handlers.recoveryStart);
-    router.post('/v1/auth/recovery/complete', handlers.recoveryComplete);
+    router.post('/v1/auth/recovery/start', handlers.recoveryStart, AUTH_CLASS);
+    router.post('/v1/auth/recovery/complete', handlers.recoveryComplete, AUTH_CLASS);
 
     router.post('/v1/onboarding/verify/resend', handlers.verifyResend, A);
     router.post('/v1/onboarding/verify/complete', handlers.verifyComplete, A);
