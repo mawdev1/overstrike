@@ -665,17 +665,21 @@ function playerRow(accountId, team, over = {}) {
   expect(afterAbort.totals.losses === 1 && afterAbort.totals.matches === 2,
     'an aborted match with a winner counts W/L', JSON.stringify(afterAbort.totals));
 
-  // Aborted no-contest: stats and a match played, but no W/L/D.
+  // Aborted no-contest: NOT aggregated at all. match-result.md §4.0's matrix reads
+  // "Not counted" and bomb-rules §9 says such a match is "recorded but not aggregated" — the
+  // record exists, the career does not move. This check previously asserted the opposite and
+  // passed, which is worse than no check: it defended the behaviour the contract forbids.
+  const beforeNoContest = await mod.stats.getCareer(ACCOUNT, 'tdm');
   await mod.stats.applyMatchResult({
     actor: service,
     result: matchResult({ matchId: 'M4', status: 'aborted', winnerTeam: null,
       outcomeReason: 'no-contest', players: [playerRow(ACCOUNT, 'alpha', { kills: 1, deaths: 1 })] }),
   });
   const afterNoContest = await mod.stats.getCareer(ACCOUNT, 'tdm');
-  expect(afterNoContest.totals.matches === 3
-      && afterNoContest.totals.wins + afterNoContest.totals.losses + afterNoContest.totals.draws === 2,
-    'a no-contest abort counts a match played with no W/L/D',
-    JSON.stringify(afterNoContest.totals));
+  expect(afterNoContest.totals.matches === beforeNoContest.totals.matches
+      && afterNoContest.totals.kills === beforeNoContest.totals.kills,
+    'a no-contest abort is NOT aggregated at all (§4.0: Not counted)',
+    `${JSON.stringify(beforeNoContest.totals)} -> ${JSON.stringify(afterNoContest.totals)}`);
 
   // A bomb draw, to prove draws exist and modes are separate.
   await mod.stats.applyMatchResult({
@@ -693,6 +697,13 @@ function playerRow(accountId, team, over = {}) {
   for (const mode of ['tdm', 'bomb', 'all']) {
     const stored = await mod.stats.getCareer(ACCOUNT, mode);
     const recomputed = await mod.stats.recomputeCareer(ACCOUNT, mode);
+    // `all` is per-mode on BOTH sides (§11.5 forbids a cross-mode sum), so reconcile per mode.
+    if (mode === 'all') {
+      expect(JSON.stringify(stored.modes) === JSON.stringify(recomputed.modes),
+        'career recomputed from history equals stored totals (all, per-mode)',
+        `${JSON.stringify(stored.modes)}\n       vs ${JSON.stringify(recomputed.modes)}`);
+      continue;
+    }
     expect(JSON.stringify(stored.totals) === JSON.stringify(recomputed.totals),
       `career totals recomputed from history equal stored totals (${mode})`,
       `${JSON.stringify(stored.totals)}\n       vs ${JSON.stringify(recomputed.totals)}`);
@@ -1103,8 +1114,15 @@ console.log('\n§11.5 — mode=all is the default, and it must carry the weapon 
       outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }) });
 
   const all = await mod.stats.getCareer(ACCOUNT, 'all');
-  expect(all.weapons.ar_vector?.kills === 20,
-    'mode=all sums the per-weapon rows across every mode', JSON.stringify(all.weapons));
+  // This previously asserted that `all` SUMS weapon rows across modes — the precise thing
+  // §11.5 forbids ("does not sum across modes — a combined K/D over two rulesets with
+  // different death semantics is a number that means nothing"). The check passed and defended
+  // the violation.
+  expect(all.modes?.tdm?.weapons?.ar_vector?.kills === 10
+      && all.modes?.bomb?.weapons?.ar_vector?.kills === 10
+      && all.weapons === undefined && all.totals === undefined,
+    'mode=all returns PER-MODE weapon rows and never a cross-mode sum',
+    JSON.stringify(all));
   const tdm = await mod.stats.getCareer(ACCOUNT, 'tdm');
   expect(tdm.weapons.ar_vector?.kills === 10,
     'CONTROL: a real mode filter still returns only that mode\'s weapon rows', JSON.stringify(tdm.weapons));
@@ -1112,9 +1130,10 @@ console.log('\n§11.5 — mode=all is the default, and it must carry the weapon 
   // The default view of the endpoint is the one that was permanently empty.
   const view = await mod.handlers.getStats(
     ctxFor(OTHER, { params: { accountId: ACCOUNT }, query: new URLSearchParams() }));
-  expect(Object.keys(view.weapons).length > 0 && view.mode === 'all',
-    'GET /v1/profile/:id/stats with no mode returns a populated weapons map',
-    JSON.stringify(view.weapons));
+  expect(Object.keys(view.modes?.tdm?.weapons || {}).length > 0
+      && Object.keys(view.modes?.bomb?.weapons || {}).length > 0,
+    'GET /v1/profile/:id/stats with no mode returns populated PER-MODE weapon maps',
+    JSON.stringify(view));
 }
 
 // ------------------------------------------------------------------ 14. binding vocabulary

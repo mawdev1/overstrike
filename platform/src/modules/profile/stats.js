@@ -387,13 +387,17 @@ export function careerDelta(player, result) {
     if (k === 'matches' || k === 'wins' || k === 'losses' || k === 'draws') continue;
     delta[k] = Number(player[k] || 0);
   }
-  delta.matches = 1;
   const outcome = resultFor(winnerTeam, player.team);
+  // §4.0's matrix reads "Not counted" for no-contest, and bomb-rules §9 says such a match is
+  // "recorded but not aggregated". An earlier comment here argued a no-contest was still a
+  // match played — that is a defensible design and it is not the one the contract states, and
+  // the contract is what the other lane builds against.
+  if (outcome === null) return null;
+
+  delta.matches = 1;
   if (outcome === 'win') delta.wins = 1;
   else if (outcome === 'loss') delta.losses = 1;
   else if (outcome === 'draw') delta.draws = 1;
-  // outcome === null (no-contest) counts as a match played with no W/L/D, because the stats are
-  // real and the outcome is not.
   return delta;
 }
 
@@ -426,7 +430,7 @@ function stableStringify(value) {
 
 export const resultHash = (result) => createHash('sha256').update(stableStringify(result)).digest('hex');
 
-export function createStatsService({ store, clock = Date }) {
+export function createStatsService({ store, clock = Date, outbox = null }) {
   /**
    * Apply one terminal result. SERVICE ONLY (§5.1) — this is the single door career numbers
    * come through, and it is closed to anything holding a player token.
@@ -436,7 +440,7 @@ export function createStatsService({ store, clock = Date }) {
    * with a different payload for a finalised match is a CONFLICT, because a match finalises
    * once and a second, different truth is a bug or an attack.
    */
-  async function applyMatchResult({ actor, result, idempotencyKey = null }) {
+  async function applyMatchResult({ actor, result, idempotencyKey = null, correlationId = null }) {
     if (!actor || actor.kind !== 'service') {
       throw new ApiError('AUTH_FORBIDDEN', 'Match results are service-submitted only.', {
         details: { reason: 'service-only' },
@@ -474,7 +478,7 @@ export function createStatsService({ store, clock = Date }) {
       // simply never reaches a career total.
       await store.matches.record(result, tx);
 
-      const applied = [];
+      const appliedTo = [];
       for (const player of result.players || []) {
         const delta = careerDelta(player, result);
         if (!delta) continue;
@@ -485,17 +489,47 @@ export function createStatsService({ store, clock = Date }) {
             kills: w.kills || 0, headshots: w.headshots || 0,
           }, tx);
         }
-        applied.push(player.accountId);
+        appliedTo.push(player.accountId);
       }
 
-      const appliedAt = new Date(clock.now()).toISOString();
-      const response = { matchId: result.matchId, status: result.status, applied, appliedAt };
+      const resultAppliedAt = new Date(clock.now()).toISOString();
+      // §5: the contract's response is `{ applied: bool }` — did this call apply, or was it a
+      // replay. An array of account ids answered a different question and broke every typed
+      // client, and it also leaked the roster to a caller that had not asked for it.
+      const response = {
+        matchId: result.matchId,
+        status: result.status,
+        applied: true,
+        resultAppliedAt,
+        appliedToCount: appliedTo.length,
+      };
+
+      // event-envelope.md §6 catalogues `match.result_applied` and nothing emitted it, so the
+      // one transition that changes a career left no durable trace. Emitted in THIS
+      // transaction: a career applied with no event explaining it is the exact state the
+      // outbox pattern exists to make impossible.
+      if (outbox) {
+        await outbox.emitIn(tx, {
+          correlationId: correlationId || result.matchId,
+          actor: { kind: 'service', id: RESULT_ACTOR, role: 'service' },
+        }, {
+          type: 'match.result_applied',
+          subject: { kind: 'match', id: result.matchId },
+          payload: {
+            status: result.status,
+            outcomeReason: result.outcomeReason ?? null,
+            winnerTeam: result.winnerTeam ?? null,
+            accountsAffected: appliedTo.length,
+            resultAppliedAt,
+          },
+        });
+      }
       // Same transaction as the write above: a crash between them would leave a career applied
       // with nothing recording that it was, and the retry would apply it a second time.
       await store.idempotency.put({
         key, actorId: RESULT_ACTOR, requestHash,
         responseStatus: 200, responseBody: response,
-        createdAt: appliedAt,
+        createdAt: resultAppliedAt,
         expiresAt: new Date(clock.now() + IDEMPOTENCY_TTL_MS).toISOString(),
       }, tx);
       return response;
@@ -503,21 +537,18 @@ export function createStatsService({ store, clock = Date }) {
   }
 
   /** §11.5: counters only. No K/D, no accuracy, no win rate in the response. */
-  async function getCareer(accountId, mode = 'all', sdv = STAT_DEFINITION_VERSION) {
+  async function getCareerForMode(accountId, mode, sdv) {
     const rows = await store.stats.listForAccount(accountId);
     const totals = emptyTotals();
     for (const row of rows) {
       if (row.statDefinitionVersion !== sdv) continue;
-      if (mode !== 'all' && row.mode !== mode) continue;
+      if (row.mode !== mode) continue;
       addTotals(totals, row);
     }
     const weapons = {};
-    // `all` is this endpoint's DEFAULT, and it is not a mode. Passing it down as a mode filter
-    // matched no row, so every per-weapon number on the default career view was empty.
-    const modeFilter = mode === 'all' ? undefined : mode;
-    for (const w of await store.weaponStats.listForAccount(accountId, modeFilter)) {
+    for (const w of await store.weaponStats.listForAccount(accountId, mode)) {
       if (w.statDefinitionVersion !== sdv) continue;
-      if (mode !== 'all' && w.mode !== mode) continue;
+      if (w.mode !== mode) continue;
       const into = (weapons[w.weaponId] ||= { shots: 0, hits: 0, kills: 0, headshots: 0 });
       for (const k of WEAPON_KEYS) into[k] += w[k] || 0;
     }
@@ -525,10 +556,44 @@ export function createStatsService({ store, clock = Date }) {
   }
 
   /**
+   * `mode=all` returns PER-MODE objects, never a flat sum.  http-api.md §11.5.
+   *
+   * The contract is explicit that it "does not sum across modes — a combined K/D over two
+   * rulesets with different death semantics is a number that means nothing". This returned a
+   * single merged `totals`, which is precisely that number, and it is the default shape of the
+   * career endpoint so it was the one most clients would have consumed.
+   */
+  async function getCareer(accountId, mode = 'all', sdv = STAT_DEFINITION_VERSION) {
+    if (mode === 'all') {
+      const [tdm, bomb] = await Promise.all([
+        getCareerForMode(accountId, 'tdm', sdv),
+        getCareerForMode(accountId, 'bomb', sdv),
+      ]);
+      return { accountId, statDefinitionVersion: sdv, modes: { tdm, bomb } };
+    }
+    return getCareerForMode(accountId, mode, sdv);
+  }
+
+  /**
    * §6: rebuild the career from match history alone. The reconciliation check — if this
    * disagrees with `getCareer`, an application was partial and the stored total is wrong.
    */
   async function recomputeCareer(accountId, mode = 'all', sdv = STAT_DEFINITION_VERSION) {
+    // §6's reconciliation compares this against `getCareer`, so the two must return the SAME
+    // shape for the same argument. When `getCareer('all')` became per-mode and this did not,
+    // the check compared a nested object against a flat one and could never agree — a
+    // reconciliation that cannot pass is a reconciliation that proves nothing.
+    if (mode === 'all') {
+      const [tdm, bomb] = await Promise.all([
+        recomputeCareer(accountId, 'tdm', sdv),
+        recomputeCareer(accountId, 'bomb', sdv),
+      ]);
+      return { accountId, statDefinitionVersion: sdv, modes: { tdm, bomb } };
+    }
+    return recomputeForMode(accountId, mode, sdv);
+  }
+
+  async function recomputeForMode(accountId, mode, sdv) {
     const totals = emptyTotals();
     const weapons = {};
     let cursor = null;

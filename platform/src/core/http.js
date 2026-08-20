@@ -140,9 +140,22 @@ async function readJson(req) {
  * `'1.10.0' < '1.2.0'` is true as strings, which locks out every client past 1.9.x — the
  * kind of comparison that looks obviously fine and ships a total outage.
  */
+const BUILD_RE = /^\d+(\.\d+)*$/;
+
+/** A build string the contract recognises: dot-separated integers, nothing else. */
+export const isWellFormedBuild = (b) => typeof b === 'string' && b !== '' && BUILD_RE.test(b);
+
+/**
+ * Compare two build strings numerically.
+ *
+ * Two traps, both hit. `'1.10.0' < '1.2.0'` is true as STRINGS, which locks out every client
+ * past 1.9.x. And `parseInt('2garbage')` is 2, so a malformed build sailed past floor 2 —
+ * the comparison happily read a prefix and ignored the rest. Format is validated by the
+ * caller before this runs, so anything reaching here is already dot-separated integers.
+ */
 function buildBelowFloor(build, floor) {
-  const a = String(build).split('.').map((n) => parseInt(n, 10));
-  const b = String(floor).split('.').map((n) => parseInt(n, 10));
+  const a = String(build).split('.').map(Number);
+  const b = String(floor).split('.').map(Number);
   const len = Math.max(a.length, b.length);
   for (let i = 0; i < len; i++) {
     const x = Number.isInteger(a[i]) ? a[i] : 0;
@@ -254,7 +267,10 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
       // has to fail closed or it is not a floor.
       if (hit.route.opts.requireBuild !== false && config.minClientBuild) {
         const build = req.headers['x-client-build'];
-        if (typeof build !== 'string' || build === '') {
+        // A build we cannot parse is not a build we can compare, and treating it as passing
+        // is the fail-open we already fixed once for the absent header. `2garbage` reached
+        // business logic through a numeric prefix.
+        if (!isWellFormedBuild(build)) {
           throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
             { details: { reason: 'build' } });
         }

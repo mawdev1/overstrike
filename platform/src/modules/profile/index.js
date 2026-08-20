@@ -35,10 +35,13 @@ export function createProfileModule({
   // Presence has no column and sanctions have no store accessor yet (profile.js). They are
   // injected when a service for them exists rather than read from fields no schema declares.
   readPresence = null, readActiveSanctions = null,
+  // The result-application transition emits `match.result_applied` through the shared outbox,
+  // so a career change is traceable like every other state change.
+  outbox = null,
 }) {
   const profiles = createProfileService({ store, clock, readPresence, readActiveSanctions });
   const settings = createSettingsService({ store, clock });
-  const stats = createStatsService({ store, clock });
+  const stats = createStatsService({ store, clock, outbox });
   const migration = createMigrationService({ store, clock });
 
   const handlers = {

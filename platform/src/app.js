@@ -227,6 +227,9 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
   if (profile) {
     deps.profile = (profile.default || profile.createProfileModule)({
       store: deps.store, clock: Date, logger, config,
+      // The result-application transition emits `match.result_applied` through the SAME outbox
+      // everything else uses, so a career change is traceable like any other state change.
+      outbox: deps.events?.outbox,
     });
     // Profile routes take the auth middleware from the wiring rather than importing it, so
     // the module stays testable without an auth module present.

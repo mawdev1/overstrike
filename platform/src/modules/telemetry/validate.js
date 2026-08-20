@@ -126,7 +126,26 @@ export function enforcePreconsentRules(body, { requestCorrelationId, seenCorrela
     if (spec.privacyClass === 'personal') personalPresent = true;
   });
 
-  if (indices.length === 0) return { preconsentIndices: [] };
+  // §3.5.1 applies to EVERY internal-only batch, not only to batches that happen to contain a
+  // `funnel.preconsent` event. Gating on that one event's presence meant an ordinary
+  // internal-only batch — client.fps, client.net_health — could carry a clientSessionId and a
+  // receipt, and be stored with account linkage. "Internal" is a promise about linkage, and it
+  // was only kept when a particular event name showed up.
+  if (indices.length === 0) {
+    if (!personalPresent) {
+      if (body.clientSessionId !== undefined && body.clientSessionId !== null) {
+        throw new ApiError('VALIDATION_FAILED',
+          'An internal-only batch must omit clientSessionId.',
+          { details: { rule: 'internal_only_client_session' } });
+      }
+      if (body.consentReceipt !== undefined && body.consentReceipt !== null) {
+        throw new ApiError('VALIDATION_FAILED',
+          'An internal-only batch must omit consentReceipt.',
+          { details: { rule: 'internal_only_receipt' } });
+      }
+    }
+    return { preconsentIndices: [] };
+  }
 
   // Rule: a batch containing funnel.preconsent carries no personal-class events. The two never
   // travel together, because arriving together is itself the correlation.

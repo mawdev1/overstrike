@@ -317,13 +317,25 @@ console.log('\n§3.5.1 funnel.preconsent is unlinked, enforceably');
     }),
     'preconsent_receipt');
 
-  // CONTROL: a batch of INTERNAL non-preconsent events may legitimately carry a
-  // clientSessionId, so the rejections above are the §3.5.1 rule and not a blanket ban.
+  // This control previously asserted that an ordinary INTERNAL batch may carry a
+  // clientSessionId. That contradicts §3.5, which says the field "is present only when the
+  // batch contains at least one personal-class event" — so an internal-only batch must omit
+  // it, whether or not a funnel.preconsent event happens to be present. The test was asserting
+  // the linkage the class exists to prevent, and a passing test that contradicts its contract
+  // is worse than a missing one: it defends the defect.
+  await refuses('an internal-only batch may NOT carry a clientSessionId',
+    () => service.ingest({
+      body: batch([ev('client.fps', { p50: 60, p01: 40, windowSec: 30 }, clock)], { clientSessionId: ulid() }),
+      actor: null, correlationId: ulid(),
+    }),
+    'internal_only_client_session');
+
+  // CONTROL: the same events with no linkage are accepted, so the rule is not a blanket ban.
   const control = await service.ingest({
-    body: batch([ev('client.fps', { p50: 60, p01: 40, windowSec: 30 }, clock)], { clientSessionId: ulid() }),
+    body: batch([ev('client.fps', { p50: 60, p01: 40, windowSec: 30 }, clock)]),
     actor: null, correlationId: ulid(),
   });
-  assert('CONTROL: an ordinary internal batch may carry a clientSessionId', control.accepted === 1,
+  assert('CONTROL: an unlinked internal batch is accepted', control.accepted === 1,
     JSON.stringify(control.rejections));
 }
 

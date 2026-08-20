@@ -81,7 +81,10 @@ export const REGISTRY = new Map(Object.entries({
     version: 1, privacyClass: 'personal', retentionClass: 'standard',
     fields: {
       completed: boolF(),
-      mode: enumF(['tdm', 'ffa', 'ctf', 'search']),
+      // The Alpha mode freeze is TDM and Bomb (bomb-rules.md 1, modes.js). ffa/ctf/search
+      // are from a mode set this project deliberately does not ship, so the registry was
+      // rejecting the only two modes that exist and accepting three that do not.
+      mode: enumF(['tdm', 'bomb']),
       timeToFirstMatchSec: numF(0, 86400),
     },
   },
