@@ -110,6 +110,21 @@ export function validatePrivacyPatch(raw) {
  */
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  // KNOWN LIVE SURVIVOR (scripts/mutatetest.mjs), deliberately not claimed equivalent.
+  //
+  // Deleting this line makes the serialiser non-injective: an array and an object with the same
+  // numeric keys both render as `{"0":…,"1":…}`, so two different §8 payloads share one
+  // `requestHash` and the second is answered with the first's stored response instead of
+  // IDEMPOTENCY_KEY_REUSED. That is the same hole `resultHash` had in profile/stats.js, where it
+  // IS reachable and is now tested.
+  //
+  // It is not tested HERE because no patch that reaches `patchRequestHash` can contain an array:
+  // the hash is only ever taken of a payload that then executes and is stored, `patchProfile`
+  // accepts exactly `displayName` and `privacy`, and `validatePrivacyPatch` has already refused
+  // a non-object `privacy` by this point. That makes the mutant unreachable today — which is a
+  // statement about two validators upstream, not about this function, so it is recorded as a
+  // survivor rather than dressed up as an equivalent mutant. Widen the accepted patch set and
+  // this line needs a test, not a re-reading of this comment.
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
   const keys = Object.keys(value).sort();
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;

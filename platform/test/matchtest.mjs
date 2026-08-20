@@ -223,6 +223,30 @@ await withApp(async ({ app, call }) => {
   expect(wrongToken.status === 403,
     'a wrong service token is refused', `${wrongToken.status} ${wrongToken.code}`);
 
+  /**
+   * The PATH is authoritative over the body, and a disagreement is refused rather than resolved.
+   *
+   * Resolving it in favour of the path — which is what the handler does with the `matchId` it
+   * passes down — would finalise the match named in the URL from a payload assembled for another
+   * one, and do it under an idempotency key derived from the URL's id, so the retry of THAT
+   * request would not deduplicate against the original. Two matches, one result, and no replay
+   * protection on either.
+   */
+  const otherId = ulid();
+  const mismatched = await call('POST', `/v1/matches/${otherId}/result`, r1, asService);
+  expect(mismatched.status === 400 && mismatched.code === 'VALIDATION_FAILED',
+    'a result whose body names a different match than the path is refused',
+    `${mismatched.status} ${mismatched.code} ${mismatched.text}`);
+  expect((mismatched.body?.error?.details?.fields || [])
+    .some((f) => (f.path ?? f.key) === 'matchId' && f.rule === 'path-mismatch'
+      && f.expected === otherId && f.got === m1),
+    '  …naming matchId, the path-mismatch rule, and both ids',
+    JSON.stringify(mismatched.body?.error?.details?.fields));
+  const notCreated = await call('GET', `/v1/matches/${otherId}`, undefined, p1.auth);
+  expect(notCreated.status === 404,
+    '  …and the match named in the PATH was not finalised from the other match\'s payload',
+    notCreated.text);
+
   // CONTROL: the same payload with the service token applies. Without this the three refusals
   // above are equally consistent with an endpoint that refuses everything.
   const applied = await call('POST', `/v1/matches/${m1}/result`, r1, asService);
@@ -381,9 +405,36 @@ await withApp(async ({ app, call }) => {
   const stranger = await call('GET', `/v1/matches/${m1}`, undefined, p3.auth);
   expect(stranger.status === 200,
     'a non-participant may read a match whose players all publish their careers', stranger.text);
-  expect((stranger.body?.rounds || []).every((r) => !r.plant || r.plant.accountId === null),
-    '§4.1: objective ACTORS are withheld from a non-participant',
-    JSON.stringify(stranger.body?.rounds));
+
+  /**
+   * §4.1's objective actors, on a match that HAS objectives.
+   *
+   * This used to be asserted against `m1` — a TDM result whose `rounds` is `[]` — so the
+   * `.every()` below ran over nothing and was true for a projection that withheld nothing at
+   * all. `bombId` is the bomb match submitted above with two fully-formed rounds, each with a
+   * plant and a defuse by p1, so the assertion now has something to be false about. The count
+   * is asserted first for exactly that reason: an empty array must not read as a pass.
+   */
+  const strangerBomb = await call('GET', `/v1/matches/${bombId}`, undefined, p3.auth);
+  const partBomb = await call('GET', `/v1/matches/${bombId}`, undefined, p1.auth);
+  expect(strangerBomb.status === 200 && Array.isArray(strangerBomb.body?.rounds)
+      && strangerBomb.body.rounds.length === 2,
+    'a stranger reading a public bomb match gets both rounds', strangerBomb.text);
+  expect(strangerBomb.body.rounds.every((r) => r.plant?.accountId === null
+      && r.defuse?.accountId === null),
+    '§4.1: the plant and defuse ACTORS are nulled for a non-participant',
+    JSON.stringify(strangerBomb.body.rounds.map((r) => [r.plant?.accountId, r.defuse?.accountId])));
+  expect(strangerBomb.body.rounds.every((r, i) => r.index === i && r.reason === 'defuse'
+      && r.plant?.site === 'A' && typeof r.defuse?.at === 'string'),
+    '  …and nothing else about the round is: index, reason, site and timing all survive',
+    JSON.stringify(strangerBomb.body.rounds));
+  // CONTROL: the participant sees the same two rounds WITH the actors, so the nulling above is
+  // the privacy rule and not a projection that has stopped carrying objective actors at all.
+  expect(partBomb.status === 200 && partBomb.body.rounds.length === 2
+      && partBomb.body.rounds.every((r) => r.plant?.accountId === p1.accountId
+        && r.defuse?.accountId === p1.accountId),
+    'CONTROL: a participant reads the same rounds WITH the plant and defuse actors',
+    JSON.stringify(partBomb.body?.rounds));
 
   // A match with a player who hides their career is invisible to strangers — as a 404, because
   // a 403 would confirm the match exists, which is the fact privacy is refusing to disclose.
@@ -408,6 +459,79 @@ await withApp(async ({ app, call }) => {
     { viewer: { kind: 'service', id: 'match-server' }, correlationId: 'c' });
   expect(typeof asServiceView.evidenceRef === 'string' && asServiceView.evidenceRef.length > 0,
     'CONTROL: a service viewer receives evidenceRef', JSON.stringify(asServiceView.evidenceRef));
+
+  /**
+   * §4.2 FAIL-CLOSED: no viewer is a refusal, not an anonymous read.
+   *
+   * `m1` is the case that makes this checkable: p1 and p2 both publish their careers, which the
+   * `stranger` 200 above proves, so the privacy loop at the bottom of `accessFor` would ALLOW
+   * the read. The only thing standing between a caller that forgot to pass a viewer and the
+   * whole record — roster, per-player counters, timings — is the "not a string" refusal above
+   * that loop. Deleting it returned the full terminal projection for `viewer: null`, and the
+   * only assertion in the tree that mentioned a missing viewer was written against a match
+   * whose participants were private, so the privacy loop refused it anyway and the assertion
+   * passed either way.
+   *
+   * Driven through the service rather than the route: the route always has an authenticated
+   * actor, so this is an INTERNAL caller's mistake and the service is where it has to be caught.
+   */
+  const refuseViewer = async (viewer, label) => {
+    let code = null;
+    let leaked = null;
+    try { leaked = await app.deps.profile.stats.getMatch(m1, { viewer, correlationId: 'c' }); }
+    catch (err) { code = err.code; }
+    expect(code === 'NOT_FOUND', label,
+      leaked ? `returned a ${leaked.status} record for ${Object.keys(leaked).length} keys` : `code=${code}`);
+  };
+  await refuseViewer(null, 'a getMatch with viewer: null is NOT_FOUND — even when every participant is public');
+  await refuseViewer(undefined, 'a getMatch with no viewer option at all is NOT_FOUND');
+  await refuseViewer({}, 'an actor object carrying no accountId is NOT_FOUND, not an anonymous read');
+  await refuseViewer({ kind: 'user', accountId: null }, 'an actor whose accountId is null is NOT_FOUND');
+  await refuseViewer('', 'an empty-string viewer is NOT_FOUND');
+  // CONTROL: the same match, same call, with a real non-participant id — 200. The five refusals
+  // above are therefore about the VIEWER and not about a service method that refuses everyone.
+  const strangerDirect = await app.deps.profile.stats.getMatch(m1,
+    { viewer: { kind: 'user', accountId: p3.accountId }, correlationId: 'c' });
+  expect(strangerDirect.status === 'completed' && strangerDirect.evidenceRef === null,
+    'CONTROL: a real non-participant id reads the same match, without evidenceRef',
+    JSON.stringify({ s: strangerDirect.status, e: strangerDirect.evidenceRef }));
+
+  /**
+   * §4.2 FAIL-CLOSED: a match with NO ROSTER has nobody to authorise against.
+   *
+   * A row is created at allocation and the participants land with it; a row whose roster has not
+   * landed names nobody, so "every participant publishes" is vacuously true and the privacy loop
+   * allows the read. Deleting the empty-roster refusal handed a stranger the pending projection
+   * — id, mode, map, map version and timings — for a match they have no relationship to, which
+   * is precisely the probe oracle the 404 exists to deny.
+   */
+  const orphanId = ulid();
+  await app.deps.store.matches.record({
+    matchId: orphanId, status: 'allocated', mode: 'tdm', mapId: 'the-square',
+    mapVersion: '1.0.0', region: 'yyz', rulesSnapshot: { ...TDM_RULES }, players: [],
+  });
+  const orphanRow = await app.deps.store.matches.byId(orphanId);
+  expect(Array.isArray(orphanRow?.participants) && orphanRow.participants.length === 0,
+    'setup: the allocated row exists and its roster really is empty',
+    JSON.stringify(orphanRow?.participants));
+  const orphanStranger = await call('GET', `/v1/matches/${orphanId}`, undefined, p3.auth);
+  expect(orphanStranger.status === 404 && orphanStranger.code === 'NOT_FOUND',
+    'a match with an empty roster is NOT_FOUND for a stranger — nobody is there to authorise it',
+    `${orphanStranger.status} ${orphanStranger.text}`);
+  // CONTROL: the SAME allocated shape with one participant is readable by that participant, so
+  // the refusal is about the empty roster and not about allocated rows being unreadable.
+  const peopledId = ulid();
+  await app.deps.store.matches.record({
+    matchId: peopledId, status: 'allocated', mode: 'tdm', mapId: 'the-square',
+    mapVersion: '1.0.0', region: 'yyz', rulesSnapshot: { ...TDM_RULES },
+    // p2, not p3: §7.1's control below asserts that p3 holds NO match, and seating them in an
+    // allocated one here would make that control pass for the wrong reason — or fail.
+    players: [{ accountId: p2.accountId, team: 'alpha' }],
+  });
+  const peopled = await call('GET', `/v1/matches/${peopledId}`, undefined, p2.auth);
+  expect(peopled.status === 200 && peopled.body?.status === 'pending',
+    'CONTROL: the same allocated shape WITH a participant is readable by that participant',
+    peopled.text);
 
   // ── 7. §4.2/§4.4 the non-terminal states ──────────────────────────────────────────────
   section('§4.2 — allocated, live, and ended-but-queued are all `pending`, distinguishably');

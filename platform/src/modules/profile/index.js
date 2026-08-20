@@ -182,6 +182,14 @@ export function createProfileModule({
       // 204 is the contract's "no held match". `undefined` is how core/http.js writes one, and
       // an empty 200 body would make "not in a match" indistinguishable from a truncated
       // response.
+      //
+      // EQUIVALENT MUTANT, measured. `activeMatchFor` returns either `null` or an object, and
+      // core/http.js writes 204 for BOTH (`result === undefined || result === null`), so
+      // deleting this line and returning the `null` straight through produces the same response.
+      // Verified over real HTTP with both versions of this file: a signed-in player holding no
+      // match got `204`, an empty body and an identical header set from each. Kept because it
+      // says which of the two nulls this is — "no held match" rather than "the handler returned
+      // nothing" — and because the equivalence is a property of core/http.js, not of this line.
       if (!held) return undefined;
       return held;
     },

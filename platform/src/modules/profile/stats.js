@@ -226,6 +226,29 @@ export function resolveMatchStats({ roster, events = [], assistWindowTicks = 320
           if (contributor === attackerId) continue;
           if (ev.tick - at > assistWindowTicks) continue;
           const c = get(contributor);
+          // EQUIVALENT MUTANTS, measured — the next two lines are not untested, they are
+          // undeletable-without-effect, and no test can distinguish them from their absence.
+          //
+          //  - `if (!c) continue;` — the ONLY writer to `st.contributors` is the `damage` case
+          //    above, which runs after `get(ev.attacker)` has already returned a row, so every
+          //    key in this map is a rostered id and `get(contributor)` is never null here.
+          //  - `if (st.assisted.has(contributor)) continue;` — `assisted` is written in exactly
+          //    two places: this loop (which clears `contributors` on the way out), and the
+          //    same-tick trade path above, which always `break`s and so never reaches this loop.
+          //    Between one execution of this loop and the next, the only thing that can put an
+          //    id back into `contributors` is more damage, and the only thing that can un-set
+          //    `deadAtTick` so a later kill gets here at all is `resetLife`, which clears
+          //    `assisted` too. So the set is always empty of anyone still in the map.
+          //
+          // Verified by deleting each line in turn and running base and mutant side by side over
+          // 50,000 randomly generated event logs (2–15 events; shot/damage/kill/respawn/
+          // roundStart/disconnect/plant/defuse; attacker, victim, owner and actor drawn from a
+          // pool that includes off-roster ids, `null`, `undefined` and `''`; every `source`;
+          // assist windows of 40, 320 and 1,000,000 ticks), comparing the full resolved row set:
+          // 50,000/50,000 identical for both lines, twice. The same fuzz distinguishes the four
+          // neighbouring guards (lines 142/155/157/169) on 30–55% of logs, so it is the lines
+          // that are equivalent, not the fuzz that is blind. Kept because the invariants above
+          // are properties of two other code paths, and either could change.
           if (!c) continue;
           if (st.assisted.has(contributor)) continue;
           c.assists += 1;
@@ -618,6 +641,16 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
     const weapons = {};
     for (const w of await store.weaponStats.listForAccount(accountId, mode)) {
       if (w.statDefinitionVersion !== sdv) continue;
+      // EQUIVALENT MUTANT, measured. `weaponStats.listForAccount(accountId, mode)` already
+      // filters on mode in BOTH adapters — `store/memory.js` with `mode === undefined || r.mode
+      // === mode`, `store/postgres.js` with `where mode = $2` — and `mode` is always a concrete
+      // 'tdm'|'bomb' here, because `getCareer` splits 'all' into two calls before this runs. So
+      // this line never sees a row it can drop. Verified by deleting it and driving base and
+      // mutant over two independent real memory stores through 29 comparisons (careers per mode
+      // and for 'all', recompute, history, match detail for four viewer classes) with weapon
+      // rows present in both modes and under two stat-definition versions: 29/29 identical. The
+      // same 29 comparisons catch the sibling line above it, which is the service's own filter
+      // because no adapter takes an `sdv` argument. Kept as the belt to the adapter's braces.
       if (w.mode !== mode) continue;
       const into = (weapons[w.weaponId] ||= { shots: 0, hits: 0, kills: 0, headshots: 0 });
       for (const k of WEAPON_KEYS) into[k] += w[k] || 0;
@@ -677,6 +710,16 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
         if ((item.statDefinitionVersion || STAT_DEFINITION_VERSION) !== sdv) continue;
         if (mode !== 'all' && item.mode !== mode) continue;
         const p = item.participant;
+        // EQUIVALENT MUTANT, measured. Both adapters build this page by starting FROM
+        // `match_participants` and joining `matches` onto it — `store/memory.js` iterates
+        // `st.matchParticipants` and skips a row whose match is missing, `store/postgres.js`
+        // does `from match_participants p join matches m on m.match_id = p.match_id` — so an
+        // item without a `participant` is not a row either of them can produce. Verified by
+        // deleting this line and running base and mutant over two independent real memory
+        // stores through the same 29 comparisons as the guard in `getCareerForMode` above
+        // (careers, recompute for each mode and for 'all', history, match detail): 29/29
+        // identical. Kept because "the join always populates it" is a fact about two other
+        // files, and a LEFT JOIN added to either would land the hole here.
         if (!p) continue;
         const delta = careerDelta({ ...p.stats, team: p.team }, item);
         if (!delta) continue;
@@ -842,6 +885,15 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
    * from the wrong clock would be worse than the extra request.
    */
   async function activeMatchFor(accountId) {
+    // EQUIVALENT MUTANT, measured. Deleting this changes no answer: an account id that is not a
+    // usable string matches no `match_participants` row in either adapter, `page.items` comes
+    // back empty, `held` is undefined and the line below returns null anyway. Verified by
+    // deleting it and calling base and mutant over two independent real memory stores with
+    // `null`, `undefined`, `''`, `0`, `123`, `{}`, `{ accountId }`, `[]`, `true` and `NaN`, plus
+    // a real id with and without a held match — 29/29 comparisons identical, the ten bad ids
+    // among them. Kept because "returns null" and "asks the database about `[object Object]`
+    // and then returns null" are the same answer for very different reasons, and only the first
+    // stays true when the store is Postgres and the column is `text`.
     if (typeof accountId !== 'string' || !accountId) return null;
     const page = await store.matches.listForAccount(accountId, { limit: PAGE_LIMIT_MAX, cursor: null });
     const held = page.items.find((m) => m.status === 'pending');

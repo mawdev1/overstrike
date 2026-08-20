@@ -22,8 +22,9 @@ import { loadConfig } from '../src/core/config.js';
 import { normalizePrivacy, validatePrivacyPatch } from '../src/modules/profile/profile.js';
 import {
   resolveMatchStats, careerDelta, timePlayedSec, emptyTotals, addTotals, deriveRatios,
-  CAREER_KEYS, idempotencyKeyFor, STAT_DEFINITION_VERSION,
+  CAREER_KEYS, idempotencyKeyFor, resultHash, STAT_DEFINITION_VERSION,
 } from '../src/modules/profile/stats.js';
+import { validateRoamingSettings } from '../src/modules/profile/settings.js';
 import { parseSettingsInventory } from '../src/modules/profile/settingsVocabularyParser.js';
 import { VOCABULARY } from '../src/modules/profile/vocabulary.generated.js';
 
@@ -413,6 +414,239 @@ console.log('\nRoaming settings — If-Match, scope, and range');
   const res = await mod.handlers.getSettings(ctxFor(ACCOUNT));
   expect(res.headers.ETag === '"5"' && res.body.version === 5,
     'GET settings returns an ETag matching the row version', JSON.stringify(res.headers));
+
+  /**
+   * Every handler reads the account id from the AUTHENTICATED ACTOR, never from the path or the
+   * body, and refuses when there is none.
+   *
+   * Over HTTP the auth middleware puts the actor there, so this refusal only ever fires for a
+   * request that reached a handler without one — a route mounted without `mw`, or a handler
+   * called directly. That is precisely the mistake worth failing loudly on: without it,
+   * `ctx.actor?.accountId` is `undefined` and the handler goes to the store with it, which for
+   * `getOwnProfile` is a 404 for "not signed in" and for `getSettings` is a 200 carrying the
+   * documented DEFAULTS to an unauthenticated caller.
+   */
+  for (const [name, handler] of [
+    ['getOwnProfile', mod.handlers.getOwnProfile],
+    ['getSettings', mod.handlers.getSettings],
+    ['getStats', mod.handlers.getStats],
+    ['getActiveMatch', mod.handlers.getActiveMatch],
+  ]) {
+    await expectCode(() => handler(ctxFor(null, { params: { accountId: ACCOUNT } })),
+      'AUTH_REQUIRED', `${name} with no authenticated actor is AUTH_REQUIRED`);
+  }
+  // CONTROL: the same handler with an actor answers, so the four refusals are about the missing
+  // actor and not about handlers that have stopped working.
+  const signedIn = await expectNoThrow(() => mod.handlers.getOwnProfile(ctxFor(ACCOUNT)),
+    'control: the same handler with an authenticated actor answers');
+  expect(signedIn?.accountId === ACCOUNT,
+    'control: and it answers for the ACTOR, not for anything in the path',
+    JSON.stringify(signedIn?.accountId));
+
+  /**
+   * §11.5's `mode` is a closed set. An unknown one is REFUSED rather than passed to the store:
+   * `mode=ctf` reaching `getCareer` matches no stat row, so the player is told they have a
+   * career of zeroes in a mode that does not exist — a 200 for a request that was wrong.
+   */
+  for (const mode of ['ctf', 'ALL', 'tdm,bomb']) {
+    const err = await expectCode(
+      () => mod.handlers.getStats(ctxFor(ACCOUNT, {
+        params: { accountId: ACCOUNT }, query: new URLSearchParams(`mode=${mode}`),
+      })),
+      'VALIDATION_FAILED', `mode=${JSON.stringify(mode)} is refused as an unknown mode`);
+    expect(err?.details?.fields?.[0]?.key === 'mode' && err?.details?.fields?.[0]?.reason === 'enum',
+      `  …naming mode and the enum rule`, JSON.stringify(err?.details));
+  }
+  // CONTROL: each member of the set answers.
+  for (const mode of ['tdm', 'bomb', 'all']) {
+    const got = await expectNoThrow(() => mod.handlers.getStats(ctxFor(ACCOUNT, {
+      params: { accountId: ACCOUNT }, query: new URLSearchParams(`mode=${mode}`),
+    })), `control: mode=${mode} is answered`);
+    expect(got?.accountId === ACCOUNT,
+      `control: and the ${mode} career is for the subject asked for`, JSON.stringify(got?.accountId));
+  }
+}
+
+// --------------------------------------------------- 2a. each rejection names its own rule
+
+/**
+ * §11.9's rejections, one rule at a time.
+ *
+ * The block above proves the settings service refuses malformed writes. It does NOT prove which
+ * rule refused them, and for a validator that is nearly the whole question: a family of
+ * assertions that all say `VALIDATION_FAILED` is satisfied by ONE surviving check, and the rest
+ * of the validator can be deleted line by line without a single test going red. Deleting the
+ * boolean type check, the number type check, the colour check, the keybind-shape checks and the
+ * reserved-code check left every assertion in this file green — and three of those five do not
+ * merely mis-report, they ACCEPT: `fov: "100"` compared as a string, satisfied the range and the
+ * step, and was stored as a string; `crosshairColor: "red"` was stored; `Escape` was bound to
+ * crouch.
+ *
+ * So each rejection below is asserted as an exact `(key, reason)` pair, and each is paired with
+ * the accepted value of the same setting.
+ */
+console.log('\ndesign/settings-inventory.md §11.9 — every rejection names its own key and rule');
+
+{
+  /** Exactly one error, on exactly that key, for exactly that reason — nothing weaker. */
+  const onlyError = (values, key, reason, label, extra = () => true) => {
+    const { errors } = validateRoamingSettings(values);
+    const hit = errors.length === 1 && errors[0].key === key && errors[0].reason === reason
+      && extra(errors[0]);
+    expect(hit, label, JSON.stringify(errors));
+  };
+  const accepts = (values, label) => {
+    const { errors } = validateRoamingSettings(values);
+    expect(errors.length === 0, label, JSON.stringify(errors));
+  };
+
+  // `values` itself must be a plain object. Each of the three non-objects fails differently
+  // without the guard: `null` throws, `[]` validates clean, a string validates its characters.
+  for (const [bad, label] of [[null, 'null'], [[], 'an array'], ['fov=100', 'a string'], [7, 'a number']]) {
+    onlyError(bad, 'values', 'type', `a values payload that is ${label} is refused on 'values' itself`,
+      (e) => e.expected === 'object');
+  }
+
+  onlyError({ invertY: 'yes' }, 'invertY', 'type',
+    'a boolean setting given a string is a TYPE error on that key', (e) => e.expected === 'boolean');
+  onlyError({ invertY: 1 }, 'invertY', 'type', 'a boolean setting given 1 is a type error too');
+  accepts({ invertY: true }, 'control: the same boolean setting given a boolean is accepted');
+
+  // The number check is the one with teeth: without it `"100"` is compared with `<` and `>`
+  // against the range, coerces, passes the step, and is stored — a string in a numeric column.
+  onlyError({ fov: '100' }, 'fov', 'type',
+    'a numeric setting sent as a STRING is a type error, not a value inside the range',
+    (e) => e.expected === 'number');
+  onlyError({ fov: Number.NaN }, 'fov', 'type', 'NaN is a type error, not an off-step value');
+  onlyError({ fov: Number.POSITIVE_INFINITY }, 'fov', 'type', 'Infinity is a type error, not a range error');
+  onlyError({ fov: 200 }, 'fov', 'range', 'an in-type value outside the range is a RANGE error',
+    (e) => e.min === 60 && e.max === 120 && e.got === 200);
+  onlyError({ fov: 85.5 }, 'fov', 'step', 'an in-range value off the step is a STEP error',
+    (e) => e.step === 1 && e.got === 85.5);
+  accepts({ fov: 85 }, 'control: the same setting on-step and in-range is accepted');
+
+  onlyError({ crosshairStyle: 'sparkle' }, 'crosshairStyle', 'enum',
+    'a value outside an enum is an ENUM error carrying the allowed set',
+    (e) => Array.isArray(e.allowed) && e.allowed.includes('dot') && e.got === 'sparkle');
+  accepts({ crosshairStyle: 'dot' }, 'control: an enum member is accepted');
+
+  onlyError({ crosshairColor: 'red' }, 'crosshairColor', 'color',
+    'a colour that is not #RRGGBB is a COLOUR error', (e) => e.got === 'red');
+  onlyError({ crosshairColor: '#GGGGGG' }, 'crosshairColor', 'color',
+    'six non-hex characters behind a # is still a colour error');
+  onlyError({ crosshairColor: '#8EF7C' }, 'crosshairColor', 'color',
+    'a five-digit hex colour is a colour error');
+  onlyError({ crosshairColor: 0x8EF7C4 }, 'crosshairColor', 'color',
+    'a colour sent as a number is a colour error');
+  accepts({ crosshairColor: '#8ef7c4' }, 'control: a lower-case #RRGGBB colour is accepted');
+
+  // ── keybinds ────────────────────────────────────────────────────────────────────────
+  onlyError({ keybinds: [] }, 'keybinds', 'type',
+    'a keybinds ARRAY is refused — an empty one otherwise validates clean and is stored',
+    (e) => e.expected === 'object');
+  onlyError({ keybinds: null }, 'keybinds', 'type', 'a null keybinds is refused, not dereferenced');
+  onlyError({ keybinds: 'KeyC' }, 'keybinds', 'type', 'a keybinds string is refused');
+  onlyError({ keybinds: { crouch: [] } }, 'keybinds.crouch', 'type',
+    'a bind ENTRY that is an array is refused on that action',
+    (e) => e.expected === '{primary, secondary?}');
+
+  onlyError({ keybinds: { crouch: { primary: 'KeyC', tertiary: 'KeyX' } } },
+    'keybinds.crouch.tertiary', 'unknown-field',
+    'an unknown slot on a bind entry is refused, naming the slot');
+  onlyError({ keybinds: { crouch: { secondary: 'KeyC' } } },
+    'keybinds.crouch.primary', 'required',
+    'a bind entry with no primary is refused — a secondary alone is a binding nobody can press');
+  onlyError({ keybinds: { crouch: { primary: 'Escape' } } },
+    'keybinds.crouch.primary', 'reserved-code',
+    'binding a RESERVED browser code is refused as reserved, not merely as invalid',
+    (e) => e.got === 'Escape');
+  onlyError({ keybinds: { crouch: { primary: 'F12' } } },
+    'keybinds.crouch.primary', 'reserved-code', 'F12 is reserved too');
+  onlyError({ keybinds: { crouch: { secondary: 'MetaLeft', primary: 'KeyC' } } },
+    'keybinds.crouch.secondary', 'reserved-code', 'and the SECONDARY slot is checked as well');
+  onlyError({ keybinds: { crouch: { primary: 'KeyQQ' } } },
+    'keybinds.crouch.primary', 'invalid-code',
+    'a code outside the wire vocabulary is INVALID, which is a different answer from reserved');
+  accepts({ keybinds: { crouch: { primary: 'KeyC', secondary: null } } },
+    'control: a well-formed bind with an unbound secondary is accepted');
+  accepts({ keybinds: {} }, 'control: an empty keybinds object is accepted');
+
+  /**
+   * `onStep` short-circuits when the spec carries no step increment. The inventory's number rows
+   * all declare one today, so this is reached through the `vocab` parameter the validator takes
+   * for exactly this reason — the alternative is that a continuous setting added to the
+   * inventory tomorrow rejects EVERY value, because `(value - min) / 0` is Infinity and the
+   * comparison against its own rounding is false for all of them.
+   */
+  const continuousVocab = {
+    roam: { smoothing: { kind: 'number', min: 0, max: 1, step: 0, default: 0.5 } },
+    keybinds: Object.create(null), scopes: {},
+  };
+  const continuous = validateRoamingSettings({ smoothing: 0.37194 }, continuousVocab);
+  expect(continuous.errors.length === 0,
+    'a number spec with no step increment accepts any in-range value, rather than rejecting all',
+    JSON.stringify(continuous.errors));
+  const stillRanged = validateRoamingSettings({ smoothing: 4 }, continuousVocab);
+  expect(stillRanged.errors.length === 1 && stillRanged.errors[0].reason === 'range',
+    'control: and the RANGE on that same spec is still enforced',
+    JSON.stringify(stillRanged.errors));
+}
+
+{
+  /**
+   * The two service-level refusals that run before the validator, each of which had a test
+   * asserting only that something was thrown.
+   */
+  const store = makeStore();
+  seed(store);
+  const mod = moduleWith(store);
+
+  // An If-Match header that is present but EMPTY (or all whitespace) is the absent case, not the
+  // malformed one: there is no version in it to compare, so the answer is §11.2's
+  // `if-match-required` CONFLICT and not a 400 telling the client its header is unreadable.
+  for (const header of ['', '   ', '\t']) {
+    const err = await expectCode(
+      () => mod.settings.replace(ACCOUNT, { schemaVersion: 1, values: { fov: 100 } }, header),
+      'CONFLICT', `an If-Match of ${JSON.stringify(header)} is the required-header refusal`);
+    expect(err?.details?.reason === 'if-match-required',
+      `  …and it says so: reason is if-match-required, not malformed`,
+      JSON.stringify(err?.details));
+  }
+  // CONTROL: a header that was sent and cannot be read is the OTHER answer, so the two cases
+  // stay distinguishable to the client that has to decide what to do next.
+  const malformed = await expectCode(
+    () => mod.settings.replace(ACCOUNT, { schemaVersion: 1, values: { fov: 100 } }, 'banana'),
+    'VALIDATION_FAILED', 'control: a non-empty unreadable If-Match is VALIDATION_FAILED');
+  expect(malformed?.details?.fields?.[0]?.key === 'If-Match'
+      && malformed?.details?.fields?.[0]?.reason === 'malformed',
+    '  …naming the header and calling it malformed', JSON.stringify(malformed?.details));
+
+  // The schema version is checked AFTER If-Match and BEFORE the values, and it is a refusal:
+  // without it a payload declaring a schema this build has never seen is validated against V1's
+  // vocabulary and stored as if it were V1.
+  const wrongSchema = await expectCode(
+    () => mod.settings.replace(ACCOUNT, { schemaVersion: 2, values: { fov: 100 } }, '"1"'),
+    'VALIDATION_FAILED', 'a settings write declaring an unsupported schemaVersion is refused');
+  expect(wrongSchema?.details?.fields?.[0]?.key === 'schemaVersion'
+      && wrongSchema?.details?.fields?.[0]?.reason === 'unsupported'
+      && wrongSchema?.details?.fields?.[0]?.expected === 1,
+    '  …naming schemaVersion, the rule, and the version this build supports',
+    JSON.stringify(wrongSchema?.details));
+  await expectCode(
+    () => mod.settings.replace(ACCOUNT, { schemaVersion: undefined, values: { fov: 100 } }, '"1"'),
+    'VALIDATION_FAILED', 'a settings write with no schemaVersion at all is refused');
+  const untouched = await mod.settings.read(ACCOUNT);
+  expect(untouched.version === 1 && untouched.values.fov !== 100,
+    'and none of the refused writes advanced the version or stored a value',
+    JSON.stringify({ v: untouched.version, fov: untouched.values.fov }));
+
+  // CONTROL: the same values with the supported schema version go through.
+  const good = await expectNoThrow(
+    () => mod.settings.replace(ACCOUNT, { schemaVersion: 1, values: { fov: 100 } }, '"1"'),
+    'control: the same write declaring schemaVersion 1 is accepted');
+  expect(good?.version === 2 && good?.values.fov === 100,
+    'control: and it advanced the version and stored the value',
+    JSON.stringify({ v: good?.version, fov: good?.values.fov }));
 }
 
 // ------------------------------------------------------------------ 3. privacy
@@ -675,6 +909,177 @@ const byId = (rows, id) => rows.find((r) => r.accountId === id);
     'damage excludes overkill past 0 health and excludes team damage', String(a.damageDealt));
 }
 
+{
+  /**
+   * §3's per-weapon breakdown is keyed BY WEAPON, and not every event has one: a fall, a world
+   * kill, a killstreak resolving without hardware and a melee all arrive with no `weaponId`.
+   * Those produce no weapon row — not a row under the key `undefined`, which is what an absent
+   * id becomes when it is used as an object key, and which `weaponStats.applyDelta` would then
+   * write to `weapon_stats` as a weapon nobody can name or ever remove.
+   */
+  const unattributed = resolveMatchStats({ roster, events: [
+    { type: 'shot', tick: 1, actor: 'A', hit: true },
+    { type: 'kill', tick: 2, attacker: 'A', victim: 'V', source: 'weapon', headshot: true },
+  ] });
+  const a = byId(unattributed, 'A');
+  expect(Object.keys(a.weapons).length === 0,
+    'an event with no weaponId adds no weapon row — and never one called "undefined"',
+    JSON.stringify(Object.keys(a.weapons)));
+  expect(a.shotsFired === 1 && a.shotsHit === 1 && a.kills === 1 && a.headshots === 1,
+    '  …while the player-level counters for the same events are unaffected',
+    JSON.stringify({ s: a.shotsFired, h: a.shotsHit, k: a.kills, hs: a.headshots }));
+
+  // CONTROL: the identical events WITH a weapon id do produce exactly one breakdown, so the
+  // emptiness above is about the missing id and not about a resolver that has stopped
+  // attributing weapons at all.
+  const attributed = resolveMatchStats({ roster, events: [
+    { type: 'shot', tick: 1, actor: 'A', weaponId: 'ar_vector', hit: true },
+    { type: 'kill', tick: 2, attacker: 'A', victim: 'V', source: 'weapon', weaponId: 'ar_vector', headshot: true },
+  ] });
+  const w = byId(attributed, 'A').weapons;
+  expect(Object.keys(w).length === 1 && w.ar_vector.shots === 1 && w.ar_vector.hits === 1
+      && w.ar_vector.kills === 1 && w.ar_vector.headshots === 1,
+    'control: the same events with a weaponId produce exactly one breakdown, fully counted',
+    JSON.stringify(w));
+}
+
+{
+  /**
+   * Events naming somebody the ROSTER does not contain.
+   *
+   * A server event log is not a closed world: it names turrets, killstreak hardware, bots
+   * purged from the roster, and — for environment damage — no attacker at all. Every handler
+   * in the resolver therefore resolves an id through `get()` and stops if it cannot, and each
+   * of those four stops was unasserted: deleting any one of them left the suite green while it
+   * either credited a stat to a row that is not in the result or threw a TypeError on `null`.
+   *
+   * The assertion is the SPECIFIC number the contract gives — a counter that stays 0 and a
+   * weapon breakdown that is never created — not "it did not crash".
+   */
+  const ghostShooter = resolveMatchStats({ roster, events: [
+    { type: 'shot', tick: 1, actor: 'turret:1', weaponId: 'ar_vector', hit: true },
+  ] });
+  expect(ghostShooter.length === 3
+      && ghostShooter.every((r) => r.shotsFired === 0 && r.shotsHit === 0),
+    'a shot by somebody not on the roster is nobody\'s shot',
+    JSON.stringify(ghostShooter.map((r) => [r.accountId, r.shotsFired])));
+
+  const ghostVictimDamage = resolveMatchStats({ roster, events: [
+    { type: 'damage', tick: 1, attacker: 'A', victim: 'turret:1', amount: 80 },
+  ] });
+  expect(byId(ghostVictimDamage, 'A').damageDealt === 0,
+    'damage to something not on the roster is not damage dealt to a player',
+    String(byId(ghostVictimDamage, 'A').damageDealt));
+
+  // Environment damage: `attacker: null`. Nobody is credited, and — the part that matters for
+  // the assist ledger — it does not enter the victim's contributor list, so the next player to
+  // finish them off does not hand an assist to the environment.
+  const worldDamage = resolveMatchStats({ roster, events: [
+    { type: 'damage', tick: 1, attacker: null, victim: 'V', amount: 80 },
+    { type: 'kill', tick: 2, attacker: 'A', victim: 'V', source: 'weapon' },
+  ] });
+  expect(worldDamage.every((r) => r.damageDealt === 0),
+    'environment damage with no attacker is credited to nobody',
+    JSON.stringify(worldDamage.map((r) => [r.accountId, r.damageDealt])));
+  expect(worldDamage.every((r) => r.assists === 0) && byId(worldDamage, 'A').kills === 1,
+    'and it buys nobody an assist on the kill that follows',
+    JSON.stringify(worldDamage.map((r) => [r.accountId, r.assists])));
+
+  // Self-damage is the other half of the same guard: an attacker who is their own victim adds
+  // nothing to their own damageDealt and does not become their own assist contributor.
+  const selfDamage = resolveMatchStats({ roster, events: [
+    { type: 'damage', tick: 1, attacker: 'V', victim: 'V', amount: 40 },
+    { type: 'kill', tick: 2, attacker: 'A', victim: 'V', source: 'weapon' },
+  ] });
+  expect(byId(selfDamage, 'V').damageDealt === 0 && byId(selfDamage, 'V').assists === 0,
+    'self damage is neither damage dealt nor an assist on one\'s own death',
+    JSON.stringify({ d: byId(selfDamage, 'V').damageDealt, a: byId(selfDamage, 'V').assists }));
+
+  const ghostVictimKill = resolveMatchStats({ roster, events: [
+    { type: 'kill', tick: 1, attacker: 'A', victim: 'turret:1', source: 'weapon', weaponId: 'ar_vector' },
+  ] });
+  const killer = byId(ghostVictimKill, 'A');
+  expect(killer.kills === 0 && killer.weapons.ar_vector === undefined,
+    'destroying something that is not a rostered player is not a kill, and mints no weapon row',
+    JSON.stringify({ k: killer.kills, w: Object.keys(killer.weapons) }));
+
+  // CONTROL: the identical logs with rostered ids produce the stats the guards suppressed
+  // above, so none of the five is consistent with a resolver that has stopped counting.
+  const real = resolveMatchStats({ roster, events: [
+    { type: 'shot', tick: 1, actor: 'A', weaponId: 'ar_vector', hit: true },
+    { type: 'damage', tick: 1, attacker: 'A', victim: 'V', amount: 80 },
+    { type: 'kill', tick: 2, attacker: 'A', victim: 'V', source: 'weapon', weaponId: 'ar_vector' },
+  ] });
+  const realA = byId(real, 'A');
+  expect(realA.shotsFired === 1 && realA.damageDealt === 80 && realA.kills === 1
+      && realA.weapons.ar_vector.kills === 1,
+    'control: the same three events between rostered players count exactly once each',
+    JSON.stringify({ s: realA.shotsFired, d: realA.damageDealt, k: realA.kills }));
+}
+
+{
+  /**
+   * §3's assist WINDOW. Damage that is older than `assistWindowTicks` at the moment of the kill
+   * is not an assist — otherwise a player who chipped somebody at the start of the round is paid
+   * for a death two minutes later that they had nothing to do with.
+   *
+   * The pair below straddles the boundary at the default 320 ticks: 400 ticks earlier earns
+   * nothing, 320 ticks earlier (the boundary is `>`, so 320 is still inside) earns one.
+   */
+  const stale = resolveMatchStats({ roster, events: [
+    { type: 'damage', tick: 100, attacker: 'B', victim: 'V', amount: 60 },
+    { type: 'kill', tick: 500, attacker: 'A', victim: 'V', source: 'weapon' },
+  ] });
+  expect(byId(stale, 'B').assists === 0,
+    'damage 400 ticks before the kill is outside the assist window and earns nothing',
+    String(byId(stale, 'B').assists));
+  expect(byId(stale, 'A').kills === 1 && byId(stale, 'V').deaths === 1,
+    '  …while the kill and the death themselves are unaffected',
+    JSON.stringify({ k: byId(stale, 'A').kills, d: byId(stale, 'V').deaths }));
+
+  const inside = resolveMatchStats({ roster, events: [
+    { type: 'damage', tick: 180, attacker: 'B', victim: 'V', amount: 60 },
+    { type: 'kill', tick: 500, attacker: 'A', victim: 'V', source: 'weapon' },
+  ] });
+  expect(byId(inside, 'B').assists === 1,
+    'control: damage exactly 320 ticks before the kill is inside the window and earns one',
+    String(byId(inside, 'B').assists));
+
+  // And the window is the caller's parameter, not a constant: the same stale log with a wider
+  // window does award the assist, which is what proves the comparison reads the argument.
+  const widened = resolveMatchStats({ roster, assistWindowTicks: 400, events: [
+    { type: 'damage', tick: 100, attacker: 'B', victim: 'V', amount: 60 },
+    { type: 'kill', tick: 500, attacker: 'A', victim: 'V', source: 'weapon' },
+  ] });
+  expect(byId(widened, 'B').assists === 1,
+    'control: the same log with assistWindowTicks=400 does award the assist',
+    String(byId(widened, 'B').assists));
+}
+
+{
+  /**
+   * §3 `timePlayedSec`: seconds connected and in the match. The guard returns 0 rather than a
+   * number for the three inputs that have no answer — an unparseable timestamp, a missing one,
+   * and a `leftAt` before the `joinedAt`. Without it those produce `NaN` and `-600`, and a NaN
+   * or a negative reaching `applyDelta` corrupts a career total that nothing later recomputes
+   * back to sanity.
+   */
+  const span = { startedAt: '2026-08-19T00:00:00.000Z', endedAt: '2026-08-19T00:10:00.000Z' };
+  expect(timePlayedSec({ joinedAt: 'banana' }, span) === 0,
+    'an unparseable joinedAt is 0 seconds, not NaN',
+    String(timePlayedSec({ joinedAt: 'banana' }, span)));
+  expect(timePlayedSec({}, { startedAt: span.startedAt, endedAt: undefined }) === 0,
+    'a match with no endedAt is 0 seconds, not NaN',
+    String(timePlayedSec({}, { startedAt: span.startedAt, endedAt: undefined })));
+  expect(timePlayedSec({ joinedAt: span.endedAt, leftAt: span.startedAt }, span) === 0,
+    'a leftAt before the joinedAt is 0 seconds, never a negative time played',
+    String(timePlayedSec({ joinedAt: span.endedAt, leftAt: span.startedAt }, span)));
+  // CONTROL: the well-formed span still measures. (The `to === from` case is not asserted
+  // separately: `Math.round(0 / 1000)` is 0 either way, so it cannot distinguish anything.)
+  expect(timePlayedSec({ joinedAt: span.startedAt, leftAt: span.endedAt }, span) === 600,
+    'control: a well-formed join/leave pair is still measured', String(timePlayedSec({}, span)));
+}
+
 // ------------------------------------------------------------------ 5. career application
 
 console.log('\nCareer aggregation — service-only, recomputable, status-aware');
@@ -897,6 +1302,130 @@ console.log('\nResolved events feed the career unchanged');
     'careerDelta refuses to produce a delta for an invalidated match');
 }
 
+{
+  /**
+   * §4.1/§4.0: `matches`, `wins`, `losses` and `draws` are the LEDGER columns. They are derived
+   * from the match's `winnerTeam` and the player's team, and are never read off the submitted
+   * row — a row is a record of one match and cannot carry a career.
+   *
+   * `careerDelta` copies every other counter across verbatim, so the exclusion is one line, and
+   * deleting it leaked whichever ledger field the outcome did not overwrite: a WIN wrote
+   * `wins: 1` over the claim but carried the row's `losses: 3` and `draws: 2` straight into the
+   * career. Asserting all four is the point — asserting only `wins` passes on the mutant.
+   */
+  const claiming = { ...playerRow(ACCOUNT, 'alpha'), matches: 9, wins: 5, losses: 3, draws: 2 };
+  const won = careerDelta(claiming, { status: 'completed', winnerTeam: 'alpha' });
+  expect(won.matches === 1 && won.wins === 1 && won.losses === 0 && won.draws === 0,
+    'a win contributes exactly one match and one win, whatever ledger the row claims',
+    JSON.stringify({ m: won.matches, w: won.wins, l: won.losses, d: won.draws }));
+  const lost = careerDelta(claiming, { status: 'completed', winnerTeam: 'bravo' });
+  expect(lost.matches === 1 && lost.wins === 0 && lost.losses === 1 && lost.draws === 0,
+    'a loss contributes exactly one match and one loss, and no claimed wins',
+    JSON.stringify({ m: lost.matches, w: lost.wins, l: lost.losses, d: lost.draws }));
+  const drew = careerDelta(claiming,
+    { status: 'completed', winnerTeam: 'draw', outcomeReason: 'timer' });
+  expect(drew.matches === 1 && drew.wins === 0 && drew.losses === 0 && drew.draws === 1,
+    'a draw contributes exactly one match and one draw, and no claimed wins or losses',
+    JSON.stringify({ m: drew.matches, w: drew.wins, l: drew.losses, d: drew.draws }));
+  // CONTROL: the non-ledger counters on the SAME row are copied across untouched, so the
+  // exclusion above is about four named fields and not about a delta that has stopped copying.
+  expect(won.kills === 10 && won.deaths === 5 && won.timePlayedSec === 600,
+    'control: every non-ledger counter is copied from the row verbatim',
+    JSON.stringify({ k: won.kills, d: won.deaths, t: won.timePlayedSec }));
+}
+
+{
+  /**
+   * §5.5 rests entirely on `resultHash`: two submissions for one match are "the same truth"
+   * if and only if their hashes agree. The serialiser therefore has to be INJECTIVE over the
+   * shapes a result can take, and the array branch is what keeps it so — without it an array
+   * is serialised through the object branch as `{"0":…,"1":…}`, which is byte-for-byte what an
+   * object with those numeric keys produces. Two different payloads then hash the same, and the
+   * second one is accepted as a replay of the first instead of refused as a second truth.
+   */
+  const asArray = resultHash({ roster: ['A', 'B'] });
+  const asIndexObject = resultHash({ roster: { 0: 'A', 1: 'B' } });
+  expect(asArray !== asIndexObject,
+    'a roster ARRAY and an object with the same indices do not hash alike',
+    `${asArray.slice(0, 12)} vs ${asIndexObject.slice(0, 12)}`);
+  const roundsArray = resultHash({ rounds: [{ index: 0, winner: 'alpha' }] });
+  const roundsObject = resultHash({ rounds: { 0: { index: 0, winner: 'alpha' } } });
+  expect(roundsArray !== roundsObject,
+    'and the same holds nested, where §4.1\'s arrays actually live',
+    `${roundsArray.slice(0, 12)} vs ${roundsObject.slice(0, 12)}`);
+  // CONTROL: the hash is still stable under re-serialisation — key order must not change it,
+  // or every retry from a different worker would look like a second, different truth.
+  expect(resultHash({ a: 1, b: [2, 3] }) === resultHash({ b: [2, 3], a: 1 }),
+    'control: key order does not change the hash');
+  expect(resultHash({ roster: ['A', 'B'] }) !== resultHash({ roster: ['B', 'A'] }),
+    'control: element ORDER does change it — a reordered roster is a different result');
+}
+
+{
+  /**
+   * The two things `applyMatchResult` must establish before it touches the store, and the one
+   * thing `getCareer` must establish before it adds a row to a total.
+   */
+  const store = makeStore();
+  seed(store);
+  const mod = moduleWith(store);
+  const service = { kind: 'service', serviceId: 'match-server' };
+
+  // A submission with NO RESULT AT ALL is a VALIDATION_FAILED, not a TypeError. The idempotency
+  // key is derived from `result.matchId` on the line below the guard, so without it a null body
+  // dereferences null and the caller gets a 500 for a request it could have been told to fix —
+  // and a 500 on the result endpoint is a match server that will retry the same broken payload.
+  await expectCode(() => mod.stats.applyMatchResult({ actor: service, result: null }),
+    'VALIDATION_FAILED', 'a submission with a null result is a VALIDATION_FAILED, not a crash');
+  await expectCode(() => mod.stats.applyMatchResult({ actor: service }),
+    'VALIDATION_FAILED', 'a submission with no result at all is a VALIDATION_FAILED, not a crash');
+  expect(store._matches.length === 0 && store._idem.size === 0,
+    'and neither of them recorded a match or burned an idempotency key',
+    JSON.stringify({ m: store._matches.length, i: store._idem.size }));
+
+  // CONTROL: the well-formed submission goes through the same door.
+  await expectNoThrow(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: matchResult({ matchId: 'SDV1', status: 'completed', winnerTeam: 'alpha',
+      outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }),
+  }), 'control: a complete result from the same service actor applies');
+
+  /**
+   * §3/§11.5: a career total is the sum of the rows for ONE stat definition version. The
+   * version is what makes a counter comparable to itself over time — when the definition of a
+   * headshot changes, the old rows stay on disk under the old version and are not summed into
+   * the new career, because a total that mixes two definitions is a number with no meaning and
+   * no way to be recomputed back.
+   *
+   * `stats.listForAccount` and `weaponStats.listForAccount` both hand back every version they
+   * hold (db-schema.md §3), so the filter is the service's, and these are the assertions that
+   * hold it: a fat 1.5.0 row is written directly beside the 1.0.0 one and must not show up.
+   */
+  await store.stats.applyDelta(ACCOUNT, 'tdm', '1.5.0', { ...emptyTotals(), kills: 777, matches: 9 });
+  await store.weaponStats.applyDelta(ACCOUNT, 'tdm', 'ar_vector', '1.5.0',
+    { shots: 55, hits: 55, kills: 55, headshots: 55 });
+
+  const career = await mod.stats.getCareer(ACCOUNT, 'tdm');
+  expect(career.statDefinitionVersion === STAT_DEFINITION_VERSION,
+    'the career answers for the current stat definition version',
+    String(career.statDefinitionVersion));
+  expect(career.totals.kills === 10 && career.totals.matches === 1,
+    'a row written under another stat definition version is not summed into the career',
+    JSON.stringify({ kills: career.totals.kills, matches: career.totals.matches }));
+  expect(career.weapons.ar_vector.kills === 10 && career.weapons.ar_vector.shots === 100,
+    'and neither is a weapon row written under another version',
+    JSON.stringify(career.weapons.ar_vector));
+
+  // CONTROL: ask for 1.5.0 and the fat row is exactly what comes back, so the two assertions
+  // above are about the version filter and not about rows that were never stored.
+  const legacy = await mod.stats.getCareer(ACCOUNT, 'tdm', '1.5.0');
+  expect(legacy.totals.kills === 777 && legacy.totals.matches === 9,
+    'control: the 1.5.0 career is the 1.5.0 row, read by asking for that version',
+    JSON.stringify({ kills: legacy.totals.kills, matches: legacy.totals.matches }));
+  expect(legacy.weapons.ar_vector.kills === 55,
+    'control: and its weapon breakdown likewise', JSON.stringify(legacy.weapons.ar_vector));
+}
+
 // ------------------------------------------------------------------ 7. migration
 
 console.log('\nProgression migration — one-time, unverified, non-authoritative');
@@ -949,6 +1478,46 @@ console.log('\nProgression migration — one-time, unverified, non-authoritative
   expect(junk.data.lifetime.kills === 0 && junk.data.lifetime.deaths === 0 && junk.data.xp === 0,
     'control: a hostile blob coerces to zeros instead of throwing or storing garbage',
     JSON.stringify(junk.data.lifetime));
+  // A weapon row that is not an object is DROPPED, not coerced into an all-zero weapon: `null`
+  // would be dereferenced key by key, and `7` would silently mint `{ kills: 0, … }` for a
+  // weapon the player never fired. The surviving key proves the loop kept going.
+  expect(Object.keys(junk.data.weapons).length === 0,
+    'a weapons entry that is not an object is dropped rather than dereferenced or zero-filled',
+    JSON.stringify(junk.data.weapons));
+  // A THIRD account: `OTHER` has already imported, and a second import returns the first.
+  const THIRD = '01JPROFILEACCOUNT0000000CD';
+  store._accounts.set(THIRD, {
+    accountId: THIRD, status: 'active', displayName: 'Third', displayNameFolded: 'third',
+    createdAt: '2026-01-03T00:00:00.000Z', nameChangedAt: null,
+    privacy: { presenceVisibility: 'nobody', statsVisibility: 'nobody' },
+  });
+  const mixedWeapons = await mod.migration.importLegacyProgression(THIRD, {
+    weapons: { ar_vector: { kills: 3 }, smg_hush: null, lmg_ox: 7, dmr_pin: 'nope' },
+  });
+  expect(Object.keys(mixedWeapons.data.weapons).join(',') === 'ar_vector'
+      && mixedWeapons.data.weapons.ar_vector.kills === 3,
+    'control: the well-formed weapon beside them survives, so the drop is per-row',
+    JSON.stringify(mixedWeapons.data.weapons));
+
+  // An account that is not there — or is deleted — cannot import anything. Without the check
+  // the import writes a `profiles` row for an account id nothing else in the platform knows,
+  // and a deleted player's progression comes back on top of the erasure.
+  await expectCode(() => mod.migration.importLegacyProgression('01JNOSUCHACCOUNT000000000A', { xp: 1 }),
+    'NOT_FOUND', 'a progression import for an account that does not exist is NOT_FOUND');
+  const gone = '01JDELETEDACCOUNT0000000CC';
+  store._accounts.set(gone, {
+    accountId: gone, status: 'deleted', displayName: null, displayNameFolded: null,
+    createdAt: '2026-01-01T00:00:00.000Z', deletedAt: '2026-06-01T00:00:00.000Z',
+  });
+  await expectCode(() => mod.migration.importLegacyProgression(gone, { xp: 1 }),
+    'NOT_FOUND', 'a progression import for a DELETED account is NOT_FOUND, not a resurrection');
+  // CONTROL: the same blob for a live account is accepted, so the two refusals are about the
+  // account and not about an import path that has stopped accepting anything.
+  const live = await expectNoThrow(
+    () => mod.migration.importLegacyProgression(ACCOUNT, { xp: 1 }),
+    'control: the same import for a live account is accepted');
+  expect(live?.verified === false, 'control: and it is still flagged unverified',
+    JSON.stringify(live?.verified));
 }
 
 // ------------------------------------------------------------------ 8. idempotency (§5)
@@ -1374,7 +1943,102 @@ console.log('\nPrivacy fails CLOSED — an unrecognised visibility hides, never 
   // CONTROL: the same call for a subject who really did choose `everyone` returns counters.
   const shown = await mod.handlers.getStats(
     ctxFor(OTHER, { params: { accountId: ACCOUNT }, query: new URLSearchParams() }));
-  expect(shown.totals !== null, 'CONTROL: an explicit everyone still returns counters');
+  // `shown.totals !== null` was the assertion here, and it passed for a response that carries no
+  // `totals` key at all — `undefined !== null` — which is exactly what `mode=all` returns, since
+  // its counters live under `modes.tdm` / `modes.bomb`. It would have gone on passing if the
+  // visible projection had stopped returning counters entirely. The counters are named.
+  const visibleTdm = shown.modes?.tdm?.totals;
+  expect(visibleTdm !== null && typeof visibleTdm === 'object'
+      && CAREER_KEYS.every((k) => typeof visibleTdm[k] === 'number'),
+    'CONTROL: an explicit everyone returns real per-mode counters, one number per career key',
+    JSON.stringify(shown));
+  expect(shown.modes?.bomb?.totals && typeof shown.modes.bomb.totals.matches === 'number',
+    'CONTROL: and the other mode is counters too, not a null stand-in',
+    JSON.stringify(shown.modes?.bomb?.totals));
+}
+
+// ------------------------------------------- 12a. the patch surface's own refusals
+
+console.log('\nhttp-api.md §4/§11.8 — PATCH /profile/me identifies its caller and its change');
+
+{
+  const store = makeStore();
+  seed(store);
+  const mod = moduleWith(store);
+
+  /**
+   * §4's `privacy` is an OBJECT of two enum members. A patch whose `privacy` is not an object is
+   * refused on `privacy` itself — each of the four shapes below fails a different way without
+   * the check: `null` is dereferenced, `[]` validates clean and merges nothing while answering
+   * 200 to a player who thinks they just changed their visibility, and a string is walked
+   * character by character.
+   */
+  for (const [bad, label] of [[null, 'null'], [[], 'an array'], ['everyone', 'a string'], [3, 'a number']]) {
+    const { errors } = validatePrivacyPatch(bad);
+    expect(errors.length === 1 && errors[0].key === 'privacy' && errors[0].reason === 'type'
+        && errors[0].expected === 'object',
+      `a privacy patch that is ${label} is a type error on 'privacy' itself`, JSON.stringify(errors));
+  }
+  // CONTROL: the object form validates and yields the patch to merge.
+  const goodPatch = validatePrivacyPatch({ statsVisibility: 'everyone' });
+  expect(goodPatch.errors.length === 0 && goodPatch.value.statsVisibility === 'everyone',
+    'control: an object of documented members validates and is returned as the merge patch',
+    JSON.stringify(goodPatch));
+
+  /**
+   * Every patch is performed AS somebody, and that somebody comes from the authenticated actor.
+   * An actor object with no `accountId`, and a caller that passed nothing at all, are both
+   * AUTH_REQUIRED — not a store lookup for `undefined`, which answers NOT_FOUND and tells a
+   * signed-out client that the account it never named does not exist.
+   */
+  for (const [who, label] of [
+    [{ kind: 'user' }, 'an actor object carrying no accountId'],
+    [{ kind: 'user', accountId: null }, 'an actor whose accountId is null'],
+    [{ kind: 'user', accountId: '' }, 'an actor whose accountId is empty'],
+    [null, 'a null actor'],
+    [undefined, 'no actor at all'],
+    ['', 'an empty account id'],
+  ]) {
+    await expectCode(() => mod.profiles.patchProfile(who, { privacy: { statsVisibility: 'everyone' } }),
+      'AUTH_REQUIRED', `a PATCH by ${label} is AUTH_REQUIRED`);
+  }
+  // CONTROL: both accepted actor forms — the full actor and the bare account id internal
+  // callers hold — go through, so the six refusals are about identity and not about a patch
+  // surface that refuses everyone.
+  const byActor = await expectNoThrow(
+    () => mod.profiles.patchProfile({ kind: 'user', accountId: ACCOUNT },
+      { privacy: { statsVisibility: 'nobody' } }),
+    'control: a full actor object with an accountId may patch');
+  expect(byActor?.privacy.statsVisibility === 'nobody',
+    'control: and the change landed', JSON.stringify(byActor?.privacy));
+  const byId = await expectNoThrow(
+    () => mod.profiles.patchProfile(ACCOUNT, { privacy: { statsVisibility: 'everyone' } }),
+    'control: a bare account id may patch too');
+  expect(byId?.privacy.statsVisibility === 'everyone',
+    'control: and that change landed as well', JSON.stringify(byId?.privacy));
+
+  /**
+   * A patch that names no writable field is refused rather than answered 200. `{}` and
+   * `{ privacy: undefined }` are the two ways a client builds one by accident, and both used to
+   * run to completion: no branch executed, the current profile came back, and the client learned
+   * its no-op request had succeeded — including, with an `Idempotency-Key`, burning that key on
+   * a request that did nothing.
+   */
+  for (const [empty, label] of [[{}, 'an empty patch'], [undefined, 'no patch at all']]) {
+    const err = await expectCode(() => mod.profiles.patchProfile(ACCOUNT, empty),
+      'VALIDATION_FAILED', `${label} is refused as having nothing to change`);
+    expect(err?.details?.fields?.[0]?.reason === 'required',
+      `  …and says a field is required`, JSON.stringify(err?.details));
+  }
+  // CONTROL: a patch naming one writable field is accepted — the refusal is about the empty
+  // body, not about a `privacy`-only patch being rejected for lacking a displayName.
+  const onlyPrivacy = await expectNoThrow(
+    () => mod.profiles.patchProfile(ACCOUNT, { privacy: { presenceVisibility: 'friends' } }),
+    'control: a patch naming only privacy is accepted');
+  expect(onlyPrivacy?.privacy.presenceVisibility === 'friends'
+      && onlyPrivacy?.privacy.statsVisibility === 'everyone',
+    'control: and it is a PARTIAL patch — the field it did not name is unchanged',
+    JSON.stringify(onlyPrivacy?.privacy));
 }
 
 // ------------------------------------------------------------------ 13. mode=all weapons
