@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.8.0 |
+| **Version** | 1.9.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -45,7 +45,7 @@ its own.
 
 | Event | Measures |
 |---|---|
-| `flow.step` | Each first-run step from `consent` onward, with its outcome — the spine of the funnel |
+| `flow.step` | Each first-run step from **`signup`** onward, with its outcome — the spine of the funnel |
 | `funnel.preconsent` | Landing, eligibility, **and the consent screen itself**, as unlinked internal counts. The only lawful measurement of the steps that precede a decision |
 | `session.first_match` | Time to first match and whether it completed |
 | `lobby.abandoned` | Left before launch, with the last state reached |
@@ -302,7 +302,8 @@ Every telemetry stream declares both, matching `event-envelope.md` §7.
 
 | Stream | Privacy | Retention |
 |---|---|---|
-| Funnel/KPI | personal | standard (13 mo) |
+| Funnel/KPI (`flow.step` onward) | personal | standard (13 mo) |
+| Pre-consent funnel (`funnel.preconsent`) | **internal** | **short (30 d)** |
 | Client health | internal | short (30 d) |
 | Capacity/network/sim | internal | standard |
 | Anti-cheat signals | sensitive | audit (7 y) |

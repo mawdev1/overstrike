@@ -32,6 +32,77 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — `http-api.md` 1.9.0, `telemetry.md` 1.9.0 (additive) — REQ-CC-042 contradictions closed
+
+**Version collision, recorded because it happened.** This amendment and the display-name
+preflight below were written concurrently and both claimed `http-api.md` 1.8.0. The other
+landed first, so this one is 1.9.0. Two amendments silently sharing a version is precisely
+what this file exists to make visible, and it is only visible because both were written down.
+
+Five stale projections that survived the 1.7 canonical rewrite, each located with a file:line
+by an implementing agent rather than by reading. Same failure mode as every earlier round: the
+canonical section was corrected and a duplicate copy elsewhere was not — and a duplicate that
+disagrees is worse than no duplicate, because both look authoritative.
+
+- `telemetry.md` §3.1 said personal `flow.step` runs "from `consent` onward". It begins at
+  **`signup`**, matching the registry, §3.5 and `http-api.md` §3a.5. `consent` belongs to
+  `funnel.preconsent`.
+- `http-api.md` §3a.3 said the receipt is "replayed on every telemetry batch". It is replayed on
+  batches carrying **personal** events; §3.5 and §11 already said so and this line contradicted
+  them.
+- `consent` was typed as the literal `true` in three places, so a recorded **decline** had no
+  member of the union — the one answer we most need to store could not serialise. Now `bool`.
+- `consentReceipt` was appended as a second object after a closed success body. It is a key
+  **inside** the signup/signin success object, which is what the service returns.
+- One `Funnel/KPI | personal` retention row covered `funnel.preconsent`. Preconsent now has its
+  own row — **internal, short (30 d)** — because §5 requires every stream to declare both
+  classes and an internal-unlinked event was inheriting a personal one.
+
+All additive: no shipped field changed shape or meaning. Typing `consent.telemetryPersonal` as
+`bool` widens a union that could not previously express a decline, which the implementation was
+already capable of producing.
+
+## 2026-08-20 — `http-api.md` 1.8.0 (additive) — display-name preflight, resume step, full coverage matrix
+
+Three amendments, all additive, all raised by the H1.1 stub review. **No shipped shape changed
+meaning**: every field named below is new, and nothing that existed was renamed, retyped, or
+given a different sense.
+
+**1. `POST /v1/auth/display-name/check` — new §3b (`REQ-CC-046`).** P1 B3 and the frozen
+`design/first-run-flow.md` §3 both require debounced live availability with policy feedback, and
+this API exposed only mutation-time `NAME_TAKEN` / `NAME_POLICY_VIOLATION`. The display-name
+screen was therefore unbuildable without the client reproducing the ruleset — the one thing that
+section forbids. One rate-limited endpoint, an exact `{ available, policy }` body, server-side
+normalisation, and four properties written down because each is load-bearing: policy is evaluated
+before existence, a taken name reveals nothing about who holds it, nothing is reserved, and
+signup/rename stay authoritative and may still lose the race. Cooldown is deliberately **not**
+answered here — it is account state, not a property of the candidate, and it already rides in
+§4 `flags.nameChangeAvailableAt`.
+
+**2. `flags.setupNextStep` in §4 (`REQ-CC-045`).** `first-run-flow.md` says the shell "resumes at
+the first incomplete account-policy step returned by the platform" and no response returned one,
+so a returning half-onboarded player could only find the step by provoking a 403 from a gameplay
+route it had no reason to call. §11's "anything not stated is forbidden" meant an implementation
+could not simply add it either. It is a routing hint; the `errors.md` gate codes remain what
+actually enforces the order.
+
+**3. §11.11.1 — the route × variant matrix (`REQ-CC-045`).** §11.11 owned 13 of the 27 routes
+`design/shell-ia.md` declares and named no variant for any of them, so 14 routes and every
+loading/empty/error/offline/policy state had no owning scenario. The new matrix gives every cell
+either a runnable scenario, a lobby timeline, or an `n/a` with its reason, and
+`platform/test/stubtest.mjs` parses it: a row with no owner fails the build rather than being
+discovered as a missing screen.
+
+**§9 gains one row** for the name-check class. It is separate from the Auth class deliberately:
+the check is public and unauthenticated, and sharing a bucket with sign-in would let name checks
+exhaust the limit sign-in depends on.
+
+**Two things this amendment does NOT do, recorded so they are not mistaken for done.**
+`net-facade.md` §8 names eight generic timelines and none of the Bomb-visibility,
+outcome-matrix or spectator-policy-phase rows an earlier response to `REQ-CC-045` claimed were
+already there; the stub implements them and declares them as extras, but naming them in §8 is a
+further additive amendment. And `realtime-lobby.md` §10's catalogue is unchanged.
+
 ## 2026-08-20 — `telemetry.md` 1.8.0 (additive) — internal records carry no identity
 
 **Provenance defect, recorded because it was mine.** §3.5.0 landed in commit `9c439c8` with no

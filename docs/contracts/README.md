@@ -34,7 +34,7 @@ buildable — a single open question does not freeze a whole document.
 
 | # | Contract | Status | Covers |
 |---|---|---|---|
-| 1 | [`http-api.md`](http-api.md) | FROZEN | Platform REST surface for P1–P4 |
+| 1 | [`http-api.md`](http-api.md) | FROZEN 1.9.0 | Platform REST surface for P1–P4 |
 | 2 | [`errors.md`](errors.md) | FROZEN | Error envelope and the closed error-code enumeration |
 | 3 | [`auth.md`](auth.md) | FROZEN | Tokens, sessions, revocation, recovery |
 | 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN | Lobby WebSocket: presence, roster, teams, ready, launch |
@@ -45,7 +45,7 @@ buildable — a single open question does not freeze a whole document.
 | 9 | [`map-data.md`](map-data.md) | FROZEN | What `level.js` must export for the server to consume |
 | 10 | [`bomb-rules.md`](bomb-rules.md) | FROZEN | The Bomb ruleset |
 | 11 | [`db-schema.md`](db-schema.md) | FROZEN | Initial PostgreSQL schema |
-| 12 | [`telemetry.md`](telemetry.md) | FROZEN 1.8.0 | Client and server telemetry, privacy and retention classes |
+| 12 | [`telemetry.md`](telemetry.md) | FROZEN 1.9.0 | Client and server telemetry, privacy and retention classes |
 | 13 | [`feature-flags.md`](feature-flags.md) | FROZEN | Flag naming, evaluation, defaults, kill switches |
 
 **All 13 contracts are FROZEN at 1.7.0** (2026-08-20), on the human owner's instruction to

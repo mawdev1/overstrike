@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.7.0 |
+| **Version** | 1.9.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -41,6 +41,7 @@ service token — never reachable from a browser).
 | DELETE | `/v1/auth/sessions/:id` | A | Revoke one; effective immediately, not at next expiry |
 | POST | `/v1/auth/recovery/start` | P | Always 202, whether or not the account exists |
 | POST | `/v1/auth/recovery/complete` | P | Consumes a single-use token; revokes all sessions |
+| POST | `/v1/auth/display-name/check` | P | **Added by REQ-CC-046.** Availability preflight. Rate limited. Advisory — see §3b |
 
 **`/v1/auth/sessions` returns an IP *class* (country/region), not a raw address.** A session
 list is readable by anyone who has the account, including someone who just stole it; handing
@@ -149,11 +150,11 @@ profile — neither is a decision about analytics.
 ```http
 GET /v1/onboarding/consent    auth OPTIONAL   ?clientSessionId=01J…
 PUT /v1/onboarding/consent    auth OPTIONAL
-{ "telemetryPersonal": true, "policyVersion": 1, "clientSessionId": "01J…" }
+{ "telemetryPersonal": bool, "policyVersion": int, "clientSessionId": "01J…" }
 
-→ { "telemetryPersonal": true, "policyVersion": 1, "decidedAt": "…",
+→ { "telemetryPersonal": bool, "policyVersion": int, "decidedAt": "…",
     "subject": "account|client-session",
-    "receipt": "opaque-signed-token",      // replayed on every telemetry batch
+    "receipt": "opaque-signed-token",      // replayed on batches carrying PERSONAL events (§3.5)
     "correlationId": "…" }
 ```
 
@@ -222,6 +223,56 @@ being able to diagnose a crash.
   SameSite=Lax; Path=/v1/auth` — stated because §11.1 described rotation on refresh without
   ever saying where the first cookie comes from.
 
+## 3b. Display-name availability — a preflight, not a reservation (REQ-CC-046)
+
+`design/first-run-flow.md` §3 requires debounced live availability and policy feedback while the
+player types, and the only authoritative answer this API had was the mutation: you discovered a
+name was taken by trying to create the account with it. The screen was unbuildable, and the
+alternative — reproducing the ruleset client-side — is the one thing that section forbids.
+
+```http
+POST /v1/auth/display-name/check      P   (a bearer token is accepted and changes nothing)
+{ "displayName": "Nova Prime" }
+
+200 → { "available": true,  "policy": null, "correlationId": "…" }                  // free
+200 → { "available": false, "policy": null, "correlationId": "…" }                  // taken
+200 → { "available": false, "policy": { "rule": "impersonation" }, "correlationId": "…" }
+400 → VALIDATION_FAILED        // `displayName` absent or not a string
+429 → RATE_LIMITED             // with `retryAfterMs`; see §9
+503 → SERVICE_UNAVAILABLE      // the check is down; the field stays usable
+```
+
+**The body is exactly `{ available, policy, correlationId }`.** `policy` is object-or-null and
+never absent: `null` means no rule refused the candidate. When a rule did, it is
+`{ "rule": … }` from the closed set `length · charset · reserved · impersonation · profanity ·
+confusable` — the id of the rule that refused, and nothing else. The ruleset itself is never
+published, or the next attempt simply routes around it, which is the same reason §3a.1 withholds
+`minimumAge`.
+
+**Normalisation is the server's.** The client sends the raw candidate. The server applies NFKC,
+trims outer whitespace, collapses internal runs to one space, and case-folds for the uniqueness
+comparison; the verdict describes that normalised form. A client that normalised first would hold
+a second copy of the rule, and the two would disagree the first time either changed.
+
+**Policy is evaluated before existence.** A name that fails policy answers with the rule whether
+or not it is also taken — otherwise the endpoint becomes a directory of which reserved names are
+in use.
+
+**The enumeration boundary.** A taken name answers `available: false` with `policy: null` and
+nothing more. No account id, no display of the holder, no distinguishable shape, and no separate
+code: `taken` and `free` differ in one boolean. A session list already refuses to hand over a raw
+IP for the same reason — this endpoint is public, and public plus enumerable is a scraped user
+directory.
+
+**It is advisory and reserves nothing.** `POST /v1/auth/signup` and `PATCH /v1/profile/me` remain
+the only authority. A name that checks free can be taken between the check and the submit, so the
+client MUST still handle `NAME_TAKEN` and `NAME_POLICY_VIOLATION` on the mutation. A preflight
+that reserved the name would let anyone hold the whole namespace by typing in a box.
+
+**Cooldown is not reported here.** `NAME_CHANGE_COOLDOWN` is a property of the *account*, not of
+the candidate, and it is already `flags.nameChangeAvailableAt` in §4. Answering it from a public
+endpoint keyed by a name would leak account state to whoever guessed the name.
+
 ## 4. Profile and stats
 
 | Method | Path | Auth | Notes |
@@ -243,12 +294,27 @@ being able to diagnose a crash.
                "statsVisibility": "everyone|nobody" },
   // Object-or-null, never absent. null = undecided (§3a.3). Projected from the typed
   // columns in db-schema.md §2, which are the source of truth — not from `privacy`.
-  "consent": { "telemetryPersonal": true, "policyVersion": 1, "decidedAt": "…" } | null,
+  "consent": { "telemetryPersonal": bool, "policyVersion": int, "decidedAt": "…" } | null,
   "moderation": { "status": "clear|restricted|banned", "activeSanctions": [] },
-  "flags": { "nameChangeAvailableAt": "…" },
+  // `setupNextStep` added by REQ-CC-045. The first incomplete account-policy step, or null.
+  "flags": { "nameChangeAvailableAt": "…" | null,
+             "setupNextStep": "eligibility|consent|display-name|verify|terms|essential-settings" | null },
   "correlationId": "…"
 }
 ```
+
+**`flags.setupNextStep` (REQ-CC-045).** `design/first-run-flow.md` says the shell "resumes at the
+first incomplete account-policy step returned by the platform", and nothing in this contract
+returned one — so a returning half-onboarded player could only discover the step by provoking a
+403 from a gameplay route it had no reason to call. §11 says anything not stated is forbidden, so
+the field could not simply be added by an implementation either.
+
+It is the first incomplete step of the §3a approved order, or `null` when setup is complete. It
+rides in `flags` because signup, signin and `GET /v1/profile/me` all embed this object, which
+makes the first authenticated response the client already makes the one that answers the
+question. It is a *hint for routing*, not an authorisation: the gate codes in `errors.md`
+(`AUTH_VERIFICATION_REQUIRED`, `AUTH_TERMS_ACCEPTANCE_REQUIRED`) remain what actually enforces
+the order, and a client that ignores this field is refused exactly as before.
 
 **Client settings that must roam** are stored here. Machine-specific ones (resolution,
 graphics quality, audio device) stay local — roaming a monitor resolution to a different
@@ -406,11 +472,17 @@ endpoint from P8 onward.
 | Read | 120/min per account | GET |
 | Write | 30/min per account | POST/PATCH/PUT/DELETE |
 | Room actions | 20/min per account | join/leave/team/ready |
+| Name check | 20/min per client session, 60/min per IP | `POST /v1/auth/display-name/check` (§3b) |
 | Reports | 10/hour per account | reports |
 | Service | Uncapped, mTLS-gated | S endpoints |
 
 Exceeded → `RATE_LIMITED` or `AUTH_RATE_LIMITED` with `retryAfterMs`. Limits are enforced at
 the edge **and** in the service — the edge can be bypassed.
+
+The name-check class is sized for a **debounced** field: at a 400 ms debounce a player cannot
+reach 20/min by typing, while a per-keystroke implementation will, which is the intended
+feedback. It is a separate class because it is public and unauthenticated — putting it in the
+Auth class would let name checks exhaust the same bucket sign-in needs.
 
 ## 10. Pagination
 
@@ -658,8 +730,9 @@ left to inference.
 //   dateOfBirth is NOT sent here — see §3a.1; it never leaves the preflight
 // POST /v1/auth/signin   { "email", "password" }
 201/200 → { "accessToken", "expiresAt", "session": { "sessionId", "deviceLabel", "createdAt" },
-            "profile": { /* §4 GET /profile/me */ }, "correlationId" }
-  signup AND signin return { "consentReceipt": "…"|null }   ← account-scoped; null = undecided
+            "profile": { /* §4 GET /profile/me */ },
+            "consentReceipt": "…"|null,          ← account-scoped; null = undecided
+            "correlationId" }
   errors: VALIDATION_FAILED · AUTH_INVALID_CREDENTIALS · AUTH_RATE_LIMITED ·
           NAME_TAKEN · NAME_POLICY_VIOLATION · AUTH_ELIGIBILITY_DENIED ·
           ELIGIBILITY_RECEIPT_INVALID
@@ -855,6 +928,70 @@ names** (`design/shell-ia.md` route hierarchy):
 
 A CX acceptance row with no owning scenario is a gap in this table, not in the UI — file a
 `REQ-CC` and it gets a scenario.
+
+#### 11.11.1 Route × variant — the complete matrix (REQ-CC-045)
+
+The table above owns **13** of the **27** addressable routes in `design/shell-ia.md`, and names
+no variant for any of them. So `/auth/recover`, `/onboarding/display-name`,
+`/onboarding/essential-settings`, `/play/rooms/:roomId`, `/room/:roomId/roster`,
+`/room/:roomId/loadout`, `/room/:roomId/chat`, `/career/modes`, `/career/weapons`,
+`/career/matches`, `/career/matches/:matchId`, `/settings/:category`, `/sessions`,
+`/match/loading` and `/system/:condition` had no owning scenario at all, and none of the 13 said
+which of the five required variants — loading, empty, recoverable error, offline/stale,
+terminal/policy — each owner served. A coverage map that cannot be diffed against the screen
+inventory is a claim, not coverage.
+
+Every cell is a **runnable** owner: an HTTP scenario from §11.10, a `lobby:` timeline from
+`realtime-lobby.md` §10, or `n/a` for a state that cannot truthfully occur for that screen
+(`shell-ia.md`: "`Not applicable` means the state cannot truthfully occur"). The reasons are
+listed under the table, and `platform/test/stubtest.mjs` parses this matrix, requires an owner or
+a reason for every cell, and runs the request sequence behind each one. **A row here with no
+owner fails the build.**
+
+| Route | loading | empty | error | offline | policy |
+|---|---|---|---|---|---|
+| `/welcome` | `slow` | n/a | `system-maintenance` | `offline` | `unsupported-client` |
+| `/auth/sign-in` | `slow` | n/a | `signin-invalid-credentials` | `offline` | `signin-incomplete-setup` |
+| `/auth/create-account` | `slow` | n/a | `onboarding-receipt-invalid` | `offline` | `onboarding-eligibility-denied` |
+| `/auth/recover` | `slow` | n/a | `recovery-token-invalid` | `offline` | `recovery-token-expired` |
+| `/onboarding/eligibility` | `slow` | n/a | `default` | `offline` | `onboarding-eligibility-denied` |
+| `/onboarding/consent` | `slow` | `onboarding-happy` | `onboarding-happy` | `offline` | `onboarding-consent-declined` |
+| `/onboarding/display-name` | `slow` | n/a | `name-check-unavailable` | `offline` | `name-policy-violation` |
+| `/onboarding/verify` | `slow` | n/a | `onboarding-verify-invalid` | `offline` | `onboarding-verify-expired` |
+| `/onboarding/terms` | `slow` | n/a | `onboarding-terms-conflict` | `offline` | `signin-incomplete-setup` |
+| `/onboarding/essential-settings` | `slow` | `default` | `default` | `offline` | n/a |
+| `/play/rooms` | `slow` | `browser-empty` | `browser-unreachable` | `offline` | `system-maintenance` |
+| `/play/rooms/:roomId` | `slow` | `default` | `browser-unreachable` | `offline` | `room-full` |
+| `/room/:roomId` | `lobby:disconnect-resync` | `default` | `room-password` | `offline` | `sanctioned` |
+| `/room/:roomId/roster` | `lobby:player-joins-mid` | `default` | `lobby:team-full` | `offline` | `lobby:kicked` |
+| `/room/:roomId/loadout` | `slow` | n/a | `default` | `offline` | `room-in-progress` |
+| `/room/:roomId/chat` | `lobby:disconnect-resync` | n/a | `lobby:chat-flood` | `offline` | `lobby:sanctioned` |
+| `/career/overview` | `slow` | `history-empty` | `career-unavailable` | `offline` | `privacy-filtered` |
+| `/career/modes` | `slow` | `history-empty` | `career-unavailable` | `offline` | `privacy-filtered` |
+| `/career/weapons` | `slow` | `history-empty` | `career-unavailable` | `offline` | `privacy-filtered` |
+| `/career/matches` | `slow` | `history-empty` | `career-unavailable` | `offline` | `history-mixed` |
+| `/career/matches/:matchId` | `result-pending-live` | n/a | `match-not-found` | `offline` | `result-invalidated` |
+| `/settings/:category` | `slow` | `default` | `default` | `offline` | `settings-conflict` |
+| `/sessions` | `slow` | `sessions-current-only` | `default` | `offline` | `default` |
+| `/match/loading` | `lobby:happy-path` | n/a | `lobby:allocation-failed` | `offline` | `lobby:handoff-version-mismatch` |
+| `/match/reconnect` | `match-active-reconnect` | `match-active-none` | `lobby:reconnect-grace-exhausted` | `offline` | `match-active-grace-expired` |
+| `/results/:matchId` | `result-pending-queued` | n/a | `career-unavailable` | `offline` | `result-aborted-nocontest` |
+| `/system/:condition` | `slow` | n/a | `system-maintenance` | `offline` | `unsupported-client` |
+
+Why each `n/a` is not a missing fixture:
+
+- **A form has no empty state.** `/auth/sign-in`, `/auth/create-account`, `/auth/recover`,
+  `/onboarding/eligibility`, `/onboarding/display-name` and `/onboarding/verify` are inputs
+  awaiting a submission; a form with no request outstanding is the initial state, not a server
+  response.
+- **`/welcome`** is static content — there is no collection to be empty.
+- **`/onboarding/terms`** always has a current version; an absent one is an outage, not empty.
+- **`/onboarding/essential-settings`** has no terminal state: every control it shows has a later
+  home in `/settings/:category`, so there is nothing to refuse.
+- **`/room/:roomId/loadout`** always has a current selection, and **`/room/:roomId/chat`** with no
+  history is a normal welcome payload rather than a distinct screen.
+- **`/career/matches/:matchId`, `/results/:matchId`, `/match/loading`, `/system/:condition`** are
+  each reached with an identifier or a condition: the record is found or it is not.
 
 ## 12. Stub mode
 
