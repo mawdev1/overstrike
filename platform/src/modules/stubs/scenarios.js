@@ -262,6 +262,26 @@ export const SCENARIOS = {
     },
   },
 
+  /**
+   * The four refusals the §12 room set cannot reach, as SEEDED STATE rather than overrides.
+   *
+   * `room-full` and `room-in-progress` above throw their code from a route override, which is
+   * the right fixture for the browser screen — it is about the message, not about how the
+   * server decided. This one is the other half: the rooms are real session state, so the
+   * refusals come out of `rooms.js` deciding them in the documented order. That is what makes
+   * `ROOM_FULL` from `assertJoinable`, `ROOM_CLOSED`, `TEAM_FULL` and a second `POST /launch`
+   * reachable at all — see `fixtures.js`, REFUSAL_ROOM_IDS, for why the three §12 rooms cannot
+   * produce any of them.
+   */
+  'room-refusals': {
+    note: 'Closed, full, team full, and already under way — each decided by the room, not canned.',
+    init(state) {
+      for (const kind of fx.REFUSAL_ROOM_KINDS) {
+        state.rooms[fx.REFUSAL_ROOM_IDS[kind]] = fx.refusalRoom(kind);
+      }
+    },
+  },
+
   'room-password': {
     note: 'Prompt, then accept any non-empty password on the second attempt.',
     routes: {
@@ -366,6 +386,22 @@ export const SCENARIOS = {
       'GET /v1/matches/:matchId': terminal({
         status: 'invalidated', outcomeReason: 'no-contest', winnerTeam: null,
         invalidationReason: 'cheat-detected', teamScores: { alpha: 5, bravo: 2 },
+      }),
+    },
+  },
+
+  /**
+   * A completed TDM match, which is the only way the mode-dependent halves of a result are
+   * observable: `rulesSnapshot` carries a `killLimit` and nulls every round field, and `rounds`
+   * is EMPTY because TDM has no rounds to list. Every other result fixture is Bomb, so a
+   * results screen built against them would render a round list that TDM never sends.
+   */
+  'result-tdm-completed': {
+    note: 'completed / elimination / alpha, in TDM: kill limit reached, and no rounds at all.',
+    routes: {
+      'GET /v1/matches/:matchId': terminal({
+        status: 'completed', outcomeReason: 'elimination', winnerTeam: 'alpha',
+        mode: 'tdm', teamScores: { alpha: 75, bravo: 61 },
       }),
     },
   },
@@ -652,4 +688,8 @@ export const EXTRA_SCENARIOS = {
   'active-lobby-resync': 'active-lobby discovery and resync after reload (REQ-CC-045)',
   'name-check-rate-limited': '/onboarding/display-name check rate-limited (REQ-CC-046)',
   'name-check-unavailable': '/onboarding/display-name check unavailable (REQ-CC-046)',
+
+  // The refusals and the result shape the §12 fixture set cannot express at all.
+  'room-refusals': '/room/:roomId — ROOM_CLOSED, ROOM_FULL, TEAM_FULL and a second launch, decided by the room',
+  'result-tdm-completed': '/results/:matchId — the TDM half of the result union: kill limit, no rounds',
 };

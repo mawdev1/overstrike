@@ -87,6 +87,16 @@ const setReady = (ready) => ({ method: 'POST', path: `/v1/rooms/${ROOM}/ready`, 
 const setLoadout = { method: 'POST', path: `/v1/rooms/${ROOM}/loadout`, body: { primaryIdx: 2, secondaryIdx: 1 } };
 const lobbyTicket = { method: 'POST', path: `/v1/rooms/${ROOM}/reconnect-ticket`, body: {} };
 
+/**
+ * The four seeded refusal rooms (`fixtures.js`, REFUSAL_ROOM_IDS), addressed directly — which
+ * is how a room link is followed, and the only way to reach a room outside `GET /v1/rooms`.
+ */
+const refusal = (kind, suffix, body = {}) => ({
+  method: suffix ? 'POST' : 'GET',
+  path: `/v1/rooms/${fx.REFUSAL_ROOM_IDS[kind]}${suffix ? `/${suffix}` : ''}`,
+  body,
+});
+
 const activeMatch = { method: 'GET', path: '/v1/matches/active' };
 const matchTicket = { method: 'POST', path: `/v1/matches/${MATCH}/reconnect-ticket`, body: {} };
 const matchDetail = { method: 'GET', path: `/v1/matches/${MATCH}` };
@@ -157,6 +167,11 @@ export const SCENARIO_PROBES = {
   'room-full': [signin, roomDetail, join()],
   'room-in-progress': [signin, roomDetail, join()],
   'room-password': [signin, join(), join('any-password')],
+  'room-refusals': [signin,
+    refusal('closing'), refusal('closing', 'join'),
+    refusal('full'), refusal('full', 'join'),
+    refusal('teamFull'), refusal('teamFull', 'team', { team: 'bravo' }),
+    refusal('liveOwned'), refusal('liveOwned', 'launch')],
   'match-active-none': [signin, activeMatch],
   'match-active-reconnect': [signin, activeMatch, matchTicket],
   'match-active-grace-expired': [signin, activeMatch, matchTicket],
@@ -166,6 +181,7 @@ export const SCENARIO_PROBES = {
   'result-aborted-nocontest': [signin, matchDetail],
   'result-invalidated': [signin, matchDetail],
   'result-draw': [signin, matchDetail],
+  'result-tdm-completed': [signin, matchDetail],
   'history-mixed': [signin, history],
   'history-empty': [signin, statsAll, history],
   'privacy-filtered': [signin, publicProfile],

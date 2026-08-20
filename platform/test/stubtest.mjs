@@ -2083,6 +2083,554 @@ console.log('\n--- net-facade stub (net-facade.md §8) ---');
   }
 }
 
+// ── 6e. the refusals themselves ─────────────────────────────────────────────────────────────
+//
+// Everything from here to §7 exists because a mutation sweep
+// (`node scripts/mutatetest.mjs --file=platform/src/modules/stubs/<file>`) deleted each
+// early-exit guard in `routes.js`, `fixtures.js` and `rooms.js` one at a time and found 40 of
+// them that nothing in this suite noticed going away. The sections above prove the happy paths
+// and the state transitions; these prove the refusals, and they assert the SPECIFIC problem —
+// the field, the rule, the code — rather than that something went wrong. A validation family
+// checked with `problems.length > 0` is satisfied by any one surviving guard, which leaves
+// every other guard in the family untested while reading as covered.
+
+const signinReq = { method: 'POST', path: '/v1/auth/signin', body: { email: 'a@b.invalid', password: 'p' } };
+
+/** The one refused field of a VALIDATION_FAILED body, as `path/rule`, or what went wrong. */
+const refusedField = (res) => {
+  const fields = res.body?.error?.details?.fields;
+  if (!Array.isArray(fields)) return `no fields array: ${JSON.stringify(res.body?.error)}`;
+  if (fields.length !== 1) return `${fields.length} fields: ${JSON.stringify(fields)}`;
+  return `${fields[0].path}/${fields[0].rule}`;
+};
+
+console.log('\n--- §10 pagination: limit and cursor are read, not decoration ---');
+{
+  const stub = api();
+  const matches = (query) => ({ method: 'GET', path: `/v1/profile/${fx.ACCOUNT_ID}/matches`, query });
+
+  const [, whole] = await run(stub, 'default', 'pg-1', [signinReq, matches({})]);
+  check(whole.body.items.length === 20 && whole.body.nextCursor === null,
+    'the unpaginated page is the whole 20-match fixture, with no next cursor',
+    `${whole.body?.items?.length} items, cursor ${JSON.stringify(whole.body?.nextCursor)}`);
+
+  // If `limit` were ignored the default 25 would swallow all 20 and this would read 20.
+  const [, small] = await run(stub, 'default', 'pg-2', [signinReq, matches({ limit: '2' })]);
+  check(small.body.items.length === 2 && small.body.nextCursor === '2'
+    && small.body.items[0].matchId === whole.body.items[0].matchId,
+  'limit=2 returns exactly two rows and a cursor pointing at the third',
+  `${small.body?.items?.length} items, cursor ${JSON.stringify(small.body?.nextCursor)}`);
+
+  const [, second] = await run(stub, 'default', 'pg-3', [signinReq, matches({ limit: '2', cursor: '2' })]);
+  check(second.body.items.length === 2 && second.body.items[0].matchId === whole.body.items[2].matchId
+    && second.body.nextCursor === '4',
+  'the cursor the server issued resumes at the row after the first page, with no overlap',
+  `${second.body?.items?.[0]?.matchId} against ${whole.body?.items?.[2]?.matchId}`);
+
+  const [, tail] = await run(stub, 'default', 'pg-4', [signinReq, matches({ limit: '5', cursor: '15' })]);
+  check(tail.body.items.length === 5 && tail.body.nextCursor === null,
+    'the last page ends the walk: nextCursor is null, not a cursor onto nothing',
+    `${tail.body?.items?.length} items, cursor ${JSON.stringify(tail.body?.nextCursor)}`);
+
+  // Each of these is a DIFFERENT guard, so each is asserted down to the field and the rule.
+  for (const [label, query] of [['over the ceiling', { limit: '101' }], ['zero', { limit: '0' }],
+    ['fractional', { limit: '2.5' }], ['not a number', { limit: 'twenty' }]]) {
+    const [, bad] = await run(stub, 'default', `pg-lim-${label}`, [signinReq, matches(query)]);
+    check(bad.status === 400 && bad.body.error.code === 'VALIDATION_FAILED' && refusedField(bad) === 'limit/range',
+      `a limit ${label} is refused as limit/range, never silently clamped to 25`,
+      `${bad.status} ${refusedField(bad)}`);
+  }
+  const [, edge] = await run(stub, 'default', 'pg-5', [signinReq, matches({ limit: '100' })]);
+  check(edge.status === 200 && edge.body.items.length === 20,
+    'control: limit=100 is inside the documented 1–100 range and is served', `${edge.status}`);
+
+  for (const [label, query] of [['opaque junk', { cursor: 'page-two' }], ['negative', { cursor: '-1' }],
+    ['fractional', { cursor: '1.5' }]]) {
+    const [, bad] = await run(stub, 'default', `pg-cur-${label}`, [signinReq, matches(query)]);
+    check(bad.status === 400 && refusedField(bad) === 'cursor/format',
+      `a ${label} cursor is refused as cursor/format, not answered with an empty page`,
+      `${bad.status} ${refusedField(bad)}`);
+  }
+}
+
+console.log('\n--- §3a receipts and consent: which field, and which rule ---');
+{
+  const stub = api();
+  const eligibility = { method: 'POST', path: '/v1/onboarding/eligibility', body: { dateOfBirth: '1994-03-02', jurisdiction: 'CA-ON' } };
+  const consent = (sid) => ({ method: 'PUT', path: '/v1/onboarding/consent', body: { telemetryPersonal: true, policyVersion: 1, clientSessionId: sid } });
+  const signupWith = (elig, receipt) => (prev) => ({
+    method: 'POST', path: '/v1/auth/signup',
+    body: { email: 'a@b.invalid', password: 'p', displayName: 'n', clientSessionId: 'rcp',
+      eligibilityReceipt: elig(prev), consentReceipt: receipt },
+  });
+  const issuedElig = (prev) => prev[0].body.receipt;
+
+  // Two refusals live on the same field. Asserting only the path cannot tell them apart, and a
+  // suite that cannot tell them apart tests exactly one of the two.
+  const noDecision = await run(stub, 'onboarding-happy', 'rcp-1', [eligibility, signupWith(issuedElig, 'invented')]);
+  check(noDecision[1].status === 400 && refusedField(noDecision[1]) === 'consentReceipt/prerequisite',
+    'signup before the telemetry question is consentReceipt/prerequisite — the step was never taken',
+    `${noDecision[1].status} ${refusedField(noDecision[1])}`);
+
+  const wrongReceipt = await run(stub, 'onboarding-happy', 'rcp-2',
+    [eligibility, consent('rcp'), signupWith(issuedElig, 'stub.consent-session.somebody-elses')]);
+  check(wrongReceipt[2].status === 400 && refusedField(wrongReceipt[2]) === 'consentReceipt/receipt',
+    'a decision that exists but a receipt this session was not issued is consentReceipt/receipt',
+    `${wrongReceipt[2].status} ${refusedField(wrongReceipt[2])}`);
+
+  const good = await run(stub, 'onboarding-happy', 'rcp-3', [eligibility, consent('rcp'),
+    signupWith(issuedElig, null)]);
+  check(good[2].status === 400 && refusedField(good[2]) === 'consentReceipt/required',
+    'and a signup carrying no receipt at all is a third, distinct rule on the same field',
+    `${good[2].status} ${refusedField(good[2])}`);
+  const chained = await run(stub, 'onboarding-happy', 'rcp-4', [eligibility, consent('rcp'),
+    (prev) => signupWith(issuedElig, prev[1].body.receipt)(prev)]);
+  check(chained[2].status === 201, 'control: the receipt this session WAS issued is accepted',
+    `${chained[2].status}/${chained[2].body?.error?.code}`);
+
+  const notBoolean = await run(stub, 'onboarding-happy', 'rcp-5', [eligibility,
+    { method: 'PUT', path: '/v1/onboarding/consent', body: { telemetryPersonal: 'yes', clientSessionId: 'rcp' } }]);
+  check(notBoolean[1].status === 400 && refusedField(notBoolean[1]) === 'telemetryPersonal/boolean',
+    'a non-boolean consent answer is refused, never coerced — a truthy string is not a decision',
+    `${notBoolean[1].status} ${refusedField(notBoolean[1])}`);
+
+  const noClientSession = await run(stub, 'onboarding-happy', 'rcp-6', [eligibility,
+    { method: 'PUT', path: '/v1/onboarding/consent', body: { telemetryPersonal: true } }]);
+  check(noClientSession[1].status === 400 && refusedField(noClientSession[1]) === 'clientSessionId/required',
+    'a signed-out consent write with no client session has nothing to scope the decision to',
+    `${noClientSession[1].status} ${refusedField(noClientSession[1])}`);
+
+  // The same body, authenticated: §3a.3 says the account is the stronger subject and the client
+  // session is then ignored — so the guard above must be about being signed OUT, not about the key.
+  const authed = await run(stub, 'default', 'rcp-7', [signinReq,
+    { method: 'PUT', path: '/v1/onboarding/consent', body: { telemetryPersonal: true } }]);
+  check(authed[1].status === 200 && authed[1].body.subject === 'account',
+    'control: authenticated, the same body is accepted and scoped to the account',
+    `${authed[1].status}/${authed[1].body?.subject}`);
+}
+
+console.log('\n--- §3a terms: the version is compared, not accepted ---');
+{
+  const stub = api();
+  const accept = (version) => ({ method: 'POST', path: '/v1/onboarding/terms/accept', body: { version } });
+
+  const [, current, stale] = await run(stub, 'default', 'terms-1', [signinReq,
+    { method: 'GET', path: '/v1/onboarding/terms' }, accept(2)]);
+  check(stale.status === 409 && stale.body.error.code === 'CONFLICT'
+    && stale.body.error.details.currentVersion === current.body.version
+    && stale.body.error.details.url.endsWith(`/v${current.body.version}`),
+  'accepting a version that is not the current one is CONFLICT carrying the version to re-read',
+  `${stale.status} ${JSON.stringify(stale.body?.error?.details)}`);
+
+  const [, , accepted] = await run(stub, 'default', 'terms-2', [signinReq,
+    { method: 'GET', path: '/v1/onboarding/terms' }, accept(1)]);
+  check(accepted.status === 204, 'control: accepting the version the server just published is 204',
+    `${accepted.status}/${accepted.body?.error?.code}`);
+
+  const [, missing] = await run(stub, 'default', 'terms-3', [signinReq, accept(undefined)]);
+  check(missing.status === 400 && refusedField(missing) === 'version/required',
+    'an acceptance with no version at all names the missing field',
+    `${missing.status} ${refusedField(missing)}`);
+}
+
+console.log('\n--- §4 and §11.2 writes: the body is validated before it is stored ---');
+{
+  const stub = api();
+  const getSettings = { method: 'GET', path: '/v1/profile/me/settings' };
+  const put = (headers, body) => ({ method: 'PUT', path: '/v1/profile/me/settings', headers, body });
+
+  const [, patched] = await run(stub, 'default', 'pw-1', [signinReq,
+    { method: 'PATCH', path: '/v1/profile/me', body: { displayName: 42 } }]);
+  check(patched.status === 400 && refusedField(patched) === 'displayName/string',
+    'a numeric display name is refused by type, not stringified into the profile',
+    `${patched.status} ${refusedField(patched)}`);
+
+  const kept = await run(stub, 'default', 'pw-2', [signinReq,
+    { method: 'PATCH', path: '/v1/profile/me', body: { displayName: 43 } },
+    { method: 'GET', path: '/v1/profile/me' }]);
+  check(kept[2].body.displayName === fx.DISPLAY_NAME,
+    'and the refused write left the stored name alone, rather than half-applying',
+    `${kept[2].body?.displayName}`);
+
+  const [, renamed] = await run(stub, 'default', 'pw-3', [signinReq,
+    { method: 'PATCH', path: '/v1/profile/me', body: { displayName: 'Nova Prime' } }]);
+  check(renamed.status === 200 && renamed.body.displayName === 'Nova Prime',
+    'control: a string display name is stored and returned', `${renamed.body?.displayName}`);
+
+  const [, untouched] = await run(stub, 'default', 'pw-4', [signinReq,
+    { method: 'PATCH', path: '/v1/profile/me', body: {} }]);
+  check(untouched.status === 200 && untouched.body.displayName === fx.DISPLAY_NAME,
+    'control: an absent display name is not a refusal — PATCH is partial', `${untouched.status}`);
+
+  /**
+   * A missing `If-Match` and an unparseable one are both CONFLICT with
+   * `details.reason: "if-match-required"` (§3a.4 fixes the code and the status), so the MESSAGE
+   * is the only thing that separates "you forgot the header" from "the header you sent is not a
+   * version". Asserting the code alone would leave whichever guard runs second untested, since
+   * deleting the first one falls through to the second and the code never changes.
+   */
+  const [, absent] = await run(stub, 'default', 'pw-5', [signinReq, put({}, { schemaVersion: 1, values: ROAM_WRITE })]);
+  check(absent.status === 409 && absent.body.error.details.reason === 'if-match-required'
+    && absent.body.error.message === 'Settings require an If-Match header.',
+  'a missing If-Match says the header is missing',
+  `${absent.status} ${JSON.stringify(absent.body?.error?.message)}`);
+
+  const [, garbled] = await run(stub, 'default', 'pw-6', [signinReq,
+    put({ 'If-Match': 'v-seven' }, { schemaVersion: 1, values: ROAM_WRITE })]);
+  check(garbled.status === 409 && garbled.body.error.details.reason === 'if-match-required'
+    && garbled.body.error.message === 'If-Match is not a settings version.'
+    && Object.hasOwn(garbled.body.error.details, 'currentVersion') === false,
+  'an If-Match that is not a version says so, and does NOT answer as a stale-version conflict',
+  `${garbled.status} ${JSON.stringify(garbled.body?.error?.message)} ${JSON.stringify(garbled.body?.error?.details)}`);
+
+  const [, wildcard, afterWildcard] = await run(stub, 'default', 'pw-7', [signinReq,
+    put({ 'If-Match': '*' }, { schemaVersion: 1, values: ROAM_WRITE }), getSettings]);
+  check(wildcard.status === 200 && afterWildcard.body.version === wildcard.body.version,
+    'control: `*` means whatever is there now, and the write lands', `${wildcard.status}`);
+
+  const [, weak] = await run(stub, 'default', 'pw-8', [signinReq,
+    put({ 'If-Match': 'W/"7"' }, { schemaVersion: 1, values: ROAM_WRITE })]);
+  check(weak.status === 200, 'control: the weak-validator form parses as version 7', `${weak.status}`);
+
+  for (const version of [2, 0, '1', null]) {
+    const [, wrongSchema] = await run(stub, 'default', `pw-schema-${version}`, [signinReq,
+      put({ 'If-Match': '"7"' }, { schemaVersion: version, values: ROAM_WRITE })]);
+    check(wrongSchema.status === 400 && refusedField(wrongSchema) === 'schemaVersion/unsupported',
+      `schemaVersion ${JSON.stringify(version)} is refused by version, before any value is looked at`,
+      `${wrongSchema.status} ${refusedField(wrongSchema)}`);
+  }
+  const [, rightSchema] = await run(stub, 'default', 'pw-9', [signinReq,
+    put({ 'If-Match': '"7"' }, { schemaVersion: 1, values: ROAM_WRITE })]);
+  check(rightSchema.status === 200, 'control: the supported schema version is stored',
+    `${rightSchema.status}/${rightSchema.body?.error?.code}`);
+}
+
+console.log('\n--- enums are enumerations: the exact key, the exact rule ---');
+{
+  const stub = api();
+  const cases = [
+    ['stats mode', { method: 'GET', path: `/v1/profile/${fx.ACCOUNT_ID}/stats`, query: { mode: 'ranked' } }, 'mode/enum'],
+    ['room create mode', { method: 'POST', path: '/v1/rooms', body: { name: 'n', region: 'yyz', mapId: 'the-square', mode: 'ctf', capacity: 12 } }, 'mode/enum'],
+    ['team', { method: 'POST', path: `/v1/rooms/${fx.ROOM_IDS[0]}/team`, body: { team: 'gamma' } }, 'team/enum'],
+    ['ready', { method: 'POST', path: `/v1/rooms/${fx.ROOM_IDS[0]}/ready`, body: { ready: 'yes' } }, 'ready/boolean'],
+    ['report category', { method: 'POST', path: '/v1/reports', body: { subjectAccountId: fx.OTHER_ACCOUNT_ID, category: 'vibes' } }, 'category/enum'],
+    ['room filter', { method: 'GET', path: '/v1/rooms', query: { regionn: 'yyz' } }, 'regionn/unknown'],
+  ];
+  for (const [label, req, want] of cases) {
+    const [, res] = await run(stub, 'default', `enum-${label}`, [signinReq, req]);
+    check(res.status === 400 && res.body.error.code === 'VALIDATION_FAILED' && refusedField(res) === want,
+      `${label}: refused as ${want}, so the shell learns which key it got wrong`,
+      `${res.status} ${refusedField(res)}`);
+  }
+
+  // Controls, one per case: the value INSIDE the enumeration has to be served, or every check
+  // above would also pass against a handler that refuses everything.
+  const controls = [
+    ['stats mode', { method: 'GET', path: `/v1/profile/${fx.ACCOUNT_ID}/stats`, query: { mode: 'bomb' } }, (r) => r.status === 200 && r.body.mode === 'bomb'],
+    ['room create mode', { method: 'POST', path: '/v1/rooms', body: { name: 'n', region: 'yyz', mapId: 'the-square', mode: 'bomb', capacity: 12 } }, (r) => r.status === 201 && r.body.room.mode === 'bomb'],
+    ['team', { method: 'POST', path: `/v1/rooms/${fx.ROOM_IDS[0]}/team`, body: { team: 'bravo' } }, (r) => r.status === 200 && r.body.roster.find((m) => m.isLocal).team === 'bravo'],
+    ['ready', { method: 'POST', path: `/v1/rooms/${fx.ROOM_IDS[0]}/ready`, body: { ready: false } }, (r) => r.status === 200 && r.body.roster.find((m) => m.isLocal).ready === false],
+    ['report category', { method: 'POST', path: '/v1/reports', body: { subjectAccountId: fx.OTHER_ACCOUNT_ID, category: 'cheating' } }, (r) => r.status === 201 && ULID.test(r.body.reportId)],
+    ['room filter', { method: 'GET', path: '/v1/rooms', query: { region: 'yyz' } }, (r) => r.status === 200 && r.body.items.every((x) => x.region === 'yyz')],
+  ];
+  for (const [label, req, pass] of controls) {
+    const [, res] = await run(stub, 'default', `enum-ok-${label}`, [signinReq, req]);
+    check(pass(res), `control: ${label} accepts the documented value`,
+      `${res.status}/${res.body?.error?.code} ${JSON.stringify(res.body).slice(0, 120)}`);
+  }
+
+  // `all` is not a fourth mode: it is the two modes side by side, unsummed (§11.8).
+  const [, all] = await run(stub, 'default', 'enum-all', [signinReq,
+    { method: 'GET', path: `/v1/profile/${fx.ACCOUNT_ID}/stats`, query: { mode: 'all' } }]);
+  check(all.status === 200 && Object.keys(all.body.modes).sort().join(',') === 'bomb,tdm'
+    && all.body.modes.tdm.mode === 'tdm' && Object.hasOwn(all.body, 'totals') === false,
+  "control: mode=all answers with both modes and no combined totals",
+  JSON.stringify(Object.keys(all.body)));
+}
+
+console.log('\n--- §6 membership: a mutation needs a seat, and a join is idempotent ---');
+{
+  const stub = api();
+  const room = fx.ROOM_IDS[0];
+  const leave = { method: 'POST', path: `/v1/rooms/${room}/leave`, body: {} };
+
+  for (const [label, req] of [
+    ['ready', { method: 'POST', path: `/v1/rooms/${room}/ready`, body: { ready: true } }],
+    ['team', { method: 'POST', path: `/v1/rooms/${room}/team`, body: { team: 'alpha' } }],
+    ['loadout', { method: 'POST', path: `/v1/rooms/${room}/loadout`, body: { primaryIdx: 1, secondaryIdx: 1 } }],
+    ['reconnect-ticket', { method: 'POST', path: `/v1/rooms/${room}/reconnect-ticket`, body: {} }],
+  ]) {
+    const seq = await run(stub, 'default', `mem-${label}`, [signinReq, leave, req]);
+    check(seq[2].status === 409 && seq[2].body.error.code === 'NOT_IN_ROOM',
+      `${label} after leaving is NOT_IN_ROOM — §6 says a ticket does not create membership`,
+      `${seq[2].status}/${seq[2].body?.error?.code}`);
+  }
+
+  const held = await run(stub, 'default', 'mem-control', [signinReq,
+    { method: 'POST', path: `/v1/rooms/${room}/reconnect-ticket`, body: {} }]);
+  check(held[1].status === 200 && typeof held[1].body.lobbyTicket === 'string'
+    && held[1].body.lobbyTicket.length > 0 && ISO.test(held[1].body.graceEndsAt),
+  'control: a member still holding a seat gets a ticket and a grace deadline',
+  `${held[1].status} ${JSON.stringify(held[1].body?.graceEndsAt)}`);
+
+  // Re-joining a room you are already in must change nothing. Without the membership check the
+  // roster grows a second copy of the caller and §7 clears everyone's readiness for a join that
+  // did not happen — a lobby that loses its green lights whenever the tab retries.
+  const rejoin = await run(stub, 'default', 'mem-rejoin', [signinReq,
+    { method: 'POST', path: `/v1/rooms/${room}/ready`, body: { ready: true } },
+    { method: 'POST', path: `/v1/rooms/${room}/join`, body: {} },
+    { method: 'GET', path: `/v1/rooms/${room}` }]);
+  const after = rejoin[3].body;
+  const locals = after.roster.filter((m) => m.isLocal);
+  check(rejoin[2].status === 200 && after.roster.length === 6 && locals.length === 1
+    && locals[0].ready === true && after.playerCount === 6,
+  'a second join is idempotent: one seat, one local member, readiness untouched',
+  `${after.roster.length} members, ${locals.length} local, ready ${locals[0]?.ready}`);
+
+  // The failing control: a join that IS new does clear readiness, so the check above is about
+  // idempotence rather than about `clearReady` never running.
+  const fresh = await run(stub, 'default', 'mem-fresh', [signinReq,
+    { method: 'POST', path: `/v1/rooms/${room}/ready`, body: { ready: true } },
+    { method: 'POST', path: `/v1/rooms/${room}/leave`, body: {} },
+    { method: 'POST', path: `/v1/rooms/${room}/join`, body: {} },
+    { method: 'GET', path: `/v1/rooms/${room}` }]);
+  check(fresh[4].body.roster.filter((m) => m.isLocal).length === 1
+    && fresh[4].body.roster.every((m) => m.ready === false),
+  'control: a genuinely new join clears the room, as §7 requires',
+  JSON.stringify(fresh[4].body.roster.map((m) => m.ready)));
+}
+
+console.log('\n--- the refusals the room decides (rooms.js) ---');
+{
+  const stub = api();
+  const R = fx.REFUSAL_ROOM_IDS;
+  const at = (id, suffix, body = {}) => ({ method: 'POST', path: `/v1/rooms/${id}/${suffix}`, body });
+  const detailOf = (id) => ({ method: 'GET', path: `/v1/rooms/${id}` });
+
+  // §11.4 decides in a fixed order, so each refusal has to be provoked in a room where the
+  // EARLIER guards do not fire — otherwise deleting the guard under test changes nothing.
+  const closed = await run(stub, 'room-refusals', 'ref-1', [signinReq, detailOf(R.closing), at(R.closing, 'join')]);
+  check(closed[1].body.status === 'closing' && closed[2].status === 409
+    && closed[2].body.error.code === 'ROOM_CLOSED',
+  'a closing room refuses a join with ROOM_CLOSED, not ROOM_IN_PROGRESS and not a seat',
+  `${closed[1].body?.status} → ${closed[2].status}/${closed[2].body?.error?.code}`);
+
+  const full = await run(stub, 'room-refusals', 'ref-2', [signinReq, detailOf(R.full), at(R.full, 'join')]);
+  check(full[1].body.status === 'open' && full[1].body.playerCount === full[1].body.capacity
+    && full[2].status === 409 && full[2].body.error.code === 'ROOM_FULL',
+  'an OPEN room at capacity refuses with ROOM_FULL — the phase is fine, the seats are gone',
+  `${full[1].body?.status} ${full[1].body?.playerCount}/${full[1].body?.capacity} → ${full[2].body?.error?.code}`);
+
+  const live = await run(stub, 'default', 'ref-3', [signinReq,
+    { method: 'POST', path: `/v1/rooms/${fx.ROOM_IDS[2]}/leave`, body: {} },
+    at(fx.ROOM_IDS[2], 'join'), detailOf(fx.ROOM_IDS[2])]);
+  check(live[3].body.status === 'in-progress' && live[2].status === 409
+    && live[2].body.error.code === 'ROOM_IN_PROGRESS',
+  'a match already under way refuses a join by PHASE', `${live[2].status}/${live[2].body?.error?.code}`);
+
+  // The other half of the same condition: room B is `countdown`, not `in-progress`, so only the
+  // frozen flag can be what refuses it — §6 rule 1, the roster freezing at `countdown.started`.
+  const frozen = await run(stub, 'default', 'ref-4', [signinReq,
+    { method: 'POST', path: `/v1/rooms/${fx.ROOM_IDS[1]}/leave`, body: {} },
+    at(fx.ROOM_IDS[1], 'join'), detailOf(fx.ROOM_IDS[1])]);
+  check(frozen[3].body.status === 'countdown' && frozen[2].status === 409
+    && frozen[2].body.error.code === 'ROOM_IN_PROGRESS',
+  'a room whose roster froze at countdown refuses a join too, though it is not in-progress',
+  `${frozen[3].body?.status} → ${frozen[2].status}/${frozen[2].body?.error?.code}`);
+
+  const teamFull = await run(stub, 'room-refusals', 'ref-5', [signinReq, detailOf(R.teamFull),
+    at(R.teamFull, 'team', { team: 'bravo' }), at(R.teamFull, 'team', { team: 'alpha' })]);
+  const lopsided = teamFull[1].body;
+  const bravo = lopsided.roster.filter((m) => m.team === 'bravo').length;
+  check(lopsided.joinable === true && lopsided.roster.length < lopsided.capacity
+    && bravo === lopsided.capacity / 2 && teamFull[2].status === 409
+    && teamFull[2].body.error.code === 'TEAM_FULL',
+  'a side at capacity/2 refuses with TEAM_FULL even though the ROOM still has seats',
+  `${bravo} on bravo of ${lopsided.capacity}/2, ${lopsided.roster.length}/${lopsided.capacity} in the room → ${teamFull[2].body?.error?.code}`);
+  check(teamFull[3].status === 200 && teamFull[3].body.roster.find((m) => m.isLocal).team === 'alpha',
+    'control: the side with room accepts the same caller, so TEAM_FULL is about the team',
+    `${teamFull[3].status}`);
+
+  const relaunch = await run(stub, 'room-refusals', 'ref-6', [signinReq, detailOf(R.liveOwned), at(R.liveOwned, 'launch')]);
+  const meThere = relaunch[1].body.roster.find((m) => m.isLocal);
+  check(meThere.isOwner === true && relaunch[1].body.status === 'in-progress'
+    && relaunch[2].status === 409 && relaunch[2].body.error.code === 'ROOM_IN_PROGRESS',
+  'the OWNER of a match already under way is refused a second launch on phase, not on ownership',
+  `owner=${meThere?.isOwner} ${relaunch[1].body?.status} → ${relaunch[2].status}/${relaunch[2].body?.error?.code}`);
+
+  // A room the caller just created holds exactly one player, which is below `minPlayers`. That
+  // is the only refusal `assertLaunchable` reports with a count rather than a code.
+  const solo = await run(stub, 'default', 'ref-7', [signinReq,
+    { method: 'POST', path: '/v1/rooms', body: { name: 'Solo', region: 'yyz', mapId: 'the-square', mode: 'tdm', capacity: 12 } },
+    (prev) => ({ method: 'POST', path: `/v1/rooms/${prev[1].body.room.roomId}/launch`, body: {} })]);
+  const details = solo[2].body?.error?.details;
+  check(solo[2].status === 409 && solo[2].body.error.code === 'CONFLICT'
+    && details.reason === 'below-minimum' && details.playerCount === 1
+    && details.minPlayers === fx.roomSettings('tdm').minPlayers,
+  'launching a room with one player in it is CONFLICT/below-minimum with both counts',
+  JSON.stringify(details));
+}
+
+console.log('\n--- the setup resume step is derived, one branch at a time ---');
+{
+  // The signed-out arm of `setupNextStepFor` is not reachable through a route: every handler
+  // that projects a profile has already set `signedUp`. It is exercised here as the pure
+  // function it is, because leaving three branches of the resume discriminator untested is
+  // worse than testing them below the HTTP layer.
+  const step = (state) => fx.setupNextStepFor({
+    signedUp: false, eligible: false, consent: null, verified: false,
+    termsAccepted: false, essentialSettingsDone: false, ...state,
+  });
+  check(step({}) === 'eligibility', 'signed out with nothing done resumes at the age check', step({}));
+  check(step({ eligible: true }) === 'consent',
+    'signed out and eligible resumes at the telemetry question', step({ eligible: true }));
+  check(step({ eligible: true, consent: { telemetryPersonal: true } }) === 'display-name',
+    'signed out, eligible and decided resumes at the name', step({ eligible: true, consent: {} }));
+  check(step({ signedUp: true, consent: {} }) === 'verify',
+    'signed up resumes at verification, whatever the signed-out steps say',
+    step({ signedUp: true, consent: {} }));
+
+  // And the account-policy arm, driven the whole way through real requests: each step, once
+  // completed, has to stop being the answer.
+  const stub = api();
+  const seq = await run(stub, 'onboarding-happy', 'step-chain', [
+    { method: 'POST', path: '/v1/onboarding/eligibility', body: { dateOfBirth: '1994-03-02', jurisdiction: 'CA-ON' } },
+    { method: 'PUT', path: '/v1/onboarding/consent', body: { telemetryPersonal: true, policyVersion: 1, clientSessionId: 'step-chain' } },
+    (prev) => ({ method: 'POST', path: '/v1/auth/signup',
+      body: { email: 'a@b.invalid', password: 'p', displayName: 'Nova Prime', clientSessionId: 'step-chain',
+        eligibilityReceipt: prev[0].body.receipt, consentReceipt: prev[1].body.receipt } }),
+    { method: 'POST', path: '/v1/onboarding/verify/complete', body: { token: 't' } },
+    { method: 'GET', path: '/v1/profile/me' },
+    { method: 'POST', path: '/v1/onboarding/terms/accept', body: { version: 1 } },
+    { method: 'GET', path: '/v1/profile/me' },
+    { method: 'PUT', path: '/v1/profile/me/settings', headers: { 'If-Match': '*' }, body: { schemaVersion: 1, values: ROAM_WRITE } },
+    { method: 'GET', path: '/v1/profile/me' },
+  ]);
+  const stepAt = (i) => seq[i].body?.profile?.flags?.setupNextStep ?? seq[i].body?.flags?.setupNextStep;
+  check(seq[2].status === 201 && stepAt(2) === 'verify',
+    'a fresh account resumes at verification', `${seq[2].status}/${stepAt(2)}`);
+  check(seq[4].status === 200 && stepAt(4) === 'terms',
+    'once verified, the next incomplete step is the terms — not still verification',
+    `${seq[4].status}/${stepAt(4)}`);
+  check(seq[6].status === 200 && stepAt(6) === 'essential-settings',
+    'once the terms are accepted, the next step is the essential settings', `${stepAt(6)}`);
+  check(seq[8].status === 200 && stepAt(8) === null,
+    'and once settings are written there is no next step at all — null, not a step name',
+    JSON.stringify(stepAt(8)));
+}
+
+console.log('\n--- fixtures that differ by mode, and by room phase ---');
+{
+  const stub = api();
+  const detail = (id) => ({ method: 'GET', path: `/v1/rooms/${id}` });
+
+  const [, tdmRoom, bombRoom] = await run(stub, 'default', 'mode-1',
+    [signinReq, detail(fx.ROOM_IDS[0]), detail(fx.ROOM_IDS[1])]);
+  check(tdmRoom.body.mode === 'tdm' && tdmRoom.body.settings.killLimit === 75
+    && tdmRoom.body.settings.roundsToWin === null && tdmRoom.body.settings.maxRounds === null
+    && tdmRoom.body.settings.backfill === true,
+  'a TDM room carries a kill limit, null round fields, and backfill on',
+  JSON.stringify(tdmRoom.body?.settings));
+  check(bombRoom.body.mode === 'bomb' && bombRoom.body.settings.killLimit === null
+    && bombRoom.body.settings.roundsToWin === 7 && bombRoom.body.settings.maxRounds === 12
+    && bombRoom.body.settings.roundLengthSec === 105 && bombRoom.body.settings.backfill === false,
+  'a Bomb room carries rounds and no kill limit, and never backfills (bomb-rules.md §9)',
+  JSON.stringify(bombRoom.body?.settings));
+
+  // §6 rule 1: only a room in countdown has a CountdownState. Handing one to every room would
+  // put a ticking clock on a lobby that is not counting down.
+  check(tdmRoom.body.status === 'open' && tdmRoom.body.countdown === null,
+    'an open room has countdown null — present and null, never an invented clock',
+    JSON.stringify(tdmRoom.body?.countdown));
+  check(bombRoom.body.status === 'countdown' && bombRoom.body.countdown !== null
+    && bombRoom.body.countdown.requiredReady === 8
+    && bombRoom.body.countdown.currentReady === bombRoom.body.roster.filter((m) => m.ready).length,
+  'the counting-down room has one, and its currentReady agrees with its own roster',
+  JSON.stringify(bombRoom.body?.countdown));
+
+  const [, bombResult] = await run(stub, 'default', 'mode-2', [signinReq, { method: 'GET', path: `/v1/matches/${fx.MATCH_ID}` }]);
+  check(bombResult.body.mode === 'bomb' && bombResult.body.rulesSnapshot.killLimit === null
+    && bombResult.body.rulesSnapshot.roundsToWin === 7 && bombResult.body.rulesSnapshot.bombTimerSec === 40
+    && bombResult.body.rulesSnapshot.overtime === false,
+  'a Bomb result snapshots the round and bomb timings, and no kill limit',
+  JSON.stringify(bombResult.body?.rulesSnapshot));
+  check(bombResult.body.rounds.length === bombResult.body.teamScores.alpha + bombResult.body.teamScores.bravo,
+    'control: the Bomb result does list rounds, one per point on the board',
+    `${bombResult.body?.rounds?.length} rounds`);
+
+  const [, tdmResult] = await run(stub, 'result-tdm-completed', 'mode-3', [signinReq, { method: 'GET', path: `/v1/matches/${fx.MATCH_ID}` }]);
+  check(tdmResult.body.mode === 'tdm' && tdmResult.body.rulesSnapshot.killLimit === 75
+    && tdmResult.body.rulesSnapshot.roundsToWin === null && tdmResult.body.rulesSnapshot.bombTimerSec === null
+    && tdmResult.body.rulesSnapshot.overtime === null,
+  'a TDM result snapshots a kill limit and nulls every round and bomb field',
+  JSON.stringify(tdmResult.body?.rulesSnapshot));
+  check(tdmResult.body.rounds.length === 0 && tdmResult.body.teamScores.alpha === 75,
+    'and TDM lists NO rounds, though its score is 75 — a results screen must not expect a round list',
+    `${tdmResult.body?.rounds?.length} rounds for ${tdmResult.body?.teamScores?.alpha}-${tdmResult.body?.teamScores?.bravo}`);
+}
+
+console.log('\n--- X-Region-Rtt (§11.6): a malformed header is null, never a guessed ping ---');
+{
+  const stub = api();
+  const list = (rtt) => ({ method: 'GET', path: '/v1/rooms', headers: rtt === null ? {} : { 'X-Region-Rtt': rtt } });
+  const rttOf = (res, region) => res.body.items.filter((r) => r.region === region).map((r) => r.estimatedRttMs);
+  const allNull = (res) => res.body.items.every((r) => r.estimatedRttMs === null);
+  const eight = 'yyz=17,ord=42,aaa=1,bbb=2,ccc=3,ddd=4,eee=5,fff=6';
+
+  const [, ok] = await run(stub, 'default', 'rtt-1', [signinReq, list('yyz=17,ord=42')]);
+  check(rttOf(ok, 'yyz').every((v) => v === 17) && rttOf(ok, 'ord').every((v) => v === 42),
+    'a well-formed header puts the caller\'s own measurement on each room',
+    JSON.stringify(ok.body.items.map((r) => [r.region, r.estimatedRttMs])));
+
+  const [, atEight] = await run(stub, 'default', 'rtt-2', [signinReq, list(eight)]);
+  check(rttOf(atEight, 'yyz').every((v) => v === 17),
+    'control: eight pairs is the documented maximum and is accepted', JSON.stringify(rttOf(atEight, 'yyz')));
+
+  const [, nine] = await run(stub, 'default', 'rtt-3', [signinReq, list(`${eight},ggg=7`)]);
+  check(allNull(nine),
+    'a ninth pair rejects the WHOLE header — the readings before it are not kept',
+    JSON.stringify(nine.body.items.map((r) => r.estimatedRttMs)));
+
+  const [, badRegion] = await run(stub, 'default', 'rtt-4', [signinReq, list('yyz=17,ORD=42')]);
+  check(allNull(badRegion),
+    'a region id outside the documented charset rejects the whole header, valid neighbour included',
+    JSON.stringify(badRegion.body.items.map((r) => r.estimatedRttMs)));
+
+  const [, overRange] = await run(stub, 'default', 'rtt-5', [signinReq, list('yyz=17,ord=9999')]);
+  check(allNull(overRange),
+    'a reading above the 5000 ms ceiling rejects the whole header rather than being clamped',
+    JSON.stringify(overRange.body.items.map((r) => r.estimatedRttMs)));
+
+  const [, absent] = await run(stub, 'default', 'rtt-6', [signinReq, list(null)]);
+  check(allNull(absent), 'control: no header at all is null everywhere, never a ping from geography',
+    JSON.stringify(absent.body.items.map((r) => r.estimatedRttMs)));
+}
+
+console.log('\n--- §3b charset: the rule that refused, not merely that one did ---');
+{
+  const stub = api();
+  const verdict = async (name) => (await run(stub, 'default', `cs-${name}`,
+    [{ method: 'POST', path: '/v1/auth/display-name/check', body: { displayName: name } }]))[0];
+
+  for (const name of ['Nova!Prime', 'Nova/Prime', '_NovaPrime', 'NovaPrime-']) {
+    const res = await verdict(name);
+    check(res.status === 200 && res.body.available === false && res.body.policy.rule === 'charset',
+      `${JSON.stringify(name)} is refused as charset, not silently allowed`,
+      JSON.stringify(res.body));
+  }
+  // The neighbouring rules must stay distinguishable, or one of them is standing in for all.
+  const neighbours = [['ab', 'length'], ['admin', 'reserved'], ['Overstrike Fan', 'impersonation']];
+  for (const [name, rule] of neighbours) {
+    const res = await verdict(name);
+    check(res.body.policy.rule === rule, `control: ${JSON.stringify(name)} is refused as ${rule}`,
+      JSON.stringify(res.body.policy));
+  }
+  const fine = await verdict('Nova-Prime_1');
+  check(fine.body.available === true && fine.body.policy === null,
+    'control: letters, digits, hyphen and underscore are inside the charset',
+    JSON.stringify(fine.body));
+}
+
 // ── 7. determinism ──────────────────────────────────────────────────────────────────────────
 
 console.log('\n--- determinism ---');

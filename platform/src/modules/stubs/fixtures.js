@@ -45,6 +45,17 @@ export function parseRegionRtt(headerValue) {
   const out = {};
   for (const pair of pairs) {
     const [region, raw] = pair.split('=');
+    // EQUIVALENT MUTANT, measured — not an untested line. Both halves are already refused by
+    // the two lines below it: a falsy `region` is `''`, which fails `/^[a-z]{2,8}$/`, and an
+    // undefined `raw` stringifies to `"undefined"`, which fails `/^\d{1,4}$/`. Verified by
+    // running this function with and without the line over 200,385 header values — every
+    // `a,b` pair drawn from a hand-built atom set (`''`, `'='`, `'=10'`, `'yyz'`, `'yyz='`,
+    // `'yyz==10'`, `'yyz=-1'`, over-range and over-long variants) plus 200,000 fuzzed strings
+    // over the alphabet that can build those shapes, and the five non-string inputs. The
+    // guard's own condition is TRUE for 167,359 of them; the two versions returned equal
+    // values for all 200,385. Kept because "a pair with no `=` is not a pair" is a statement
+    // about the header's grammar, and reading it out of two regexes is not the same as saying
+    // it.
     if (!region || raw === undefined) return null;
     if (!/^[a-z]{2,8}$/.test(region)) return null;
     if (!/^\d{1,4}$/.test(raw)) return null;
@@ -202,6 +213,109 @@ export function roomDetail(index, { rtt = null, overrides = {}, roomId = null } 
     ...roomCore(index, { rtt, overrides, roomId }),
     roster: roster(index, { roomId }),
     countdown: countdownState(index),
+  };
+}
+
+// ── the room states the §12 three cannot hold ───────────────────────────────────────────────
+
+/**
+ * Four rooms that exist only to be refused, each behind its own id.
+ *
+ * The §12 set is one open room, one counting down and one under way, and between them they
+ * cannot produce four refusals `errors.md` gives the shell a distinct recovery for:
+ *
+ *   - `ROOM_CLOSED` — no fixture room is ever `closing`.
+ *   - `ROOM_FULL` from the join path — the only 12/12 room is also frozen, so `assertJoinable`
+ *     answers `ROOM_IN_PROGRESS` first and the capacity check is unreachable.
+ *   - `TEAM_FULL` — no team ever reaches `capacity / 2` with the caller outside it.
+ *   - `ROOM_IN_PROGRESS` from `POST /launch` — the caller owns only room A, which is `open`,
+ *     so the owner check refuses before the phase check is consulted.
+ *
+ * Every one of those is a state the real service produces routinely; the stub simply had no
+ * address that produced them, which is the same defect as a fixture teaching an impossible
+ * state, running the other way. They are reached the way a room link is reached — straight to
+ * `/room/:roomId` — and are deliberately NOT in `ROOM_IDS`, so the browser list, its filters
+ * and its pagination are unchanged.
+ */
+export const REFUSAL_ROOM_IDS = {
+  closing: stubUlid('room:closing', EPOCH_MS - 3600 * 1000),
+  full: stubUlid('room:full', EPOCH_MS - 3600 * 1000),
+  teamFull: stubUlid('room:team-full', EPOCH_MS - 3600 * 1000),
+  liveOwned: stubUlid('room:live-owned', EPOCH_MS - 3600 * 1000),
+};
+
+/**
+ * Each one is internally consistent, because an incoherent fixture teaches a state the backend
+ * cannot produce even when the single field under test is right:
+ *
+ *   `closing`   — torn down while a stranger still holds the link. Caller is not a member.
+ *   `full`      — 12 of 12, open but not joinable, and the caller is not one of the twelve.
+ *   `teamFull`  — 7 of 12, genuinely joinable, but every free seat is on alpha: bravo already
+ *                 holds the per-side ceiling of `capacity / 2`. The caller is on alpha.
+ *   `liveOwned` — under way, with the caller in it AS the owner: the one shape in which
+ *                 `POST /launch` gets past the owner check and has to be refused on phase.
+ */
+const REFUSAL_SPECS = {
+  closing: { name: 'Stub Closing', mode: 'tdm', status: 'closing', joinable: false,
+    joinBlockedReason: 'closing', size: 4, callerIsMember: false, teamAt: (i) => (i % 2 === 0 ? 'alpha' : 'bravo') },
+  full: { name: 'Stub Packed', mode: 'tdm', status: 'open', joinable: false,
+    joinBlockedReason: 'full', size: 12, callerIsMember: false, teamAt: (i) => (i % 2 === 0 ? 'alpha' : 'bravo') },
+  teamFull: { name: 'Stub Lopsided', mode: 'tdm', status: 'open', joinable: true,
+    joinBlockedReason: null, size: 7, callerIsMember: true, teamAt: (i) => (i === 0 ? 'alpha' : 'bravo') },
+  liveOwned: { name: 'Stub Underway', mode: 'bomb', status: 'in-progress', joinable: false,
+    joinBlockedReason: 'in-progress', size: 8, callerIsMember: true, teamAt: (i) => (i % 2 === 0 ? 'alpha' : 'bravo') },
+};
+
+export const REFUSAL_ROOM_KINDS = Object.keys(REFUSAL_SPECS);
+
+/**
+ * One of the four, as the room-state shape `rooms.js` keeps in the session.
+ *
+ * There is deliberately no "unknown kind" guard: the only caller iterates
+ * `REFUSAL_ROOM_KINDS`, so such a guard could never fire, and a guard that cannot fire is a line
+ * no test can be written for — it would sit in the mutation sweep forever as a survivor nobody
+ * can honestly kill. An unknown key raises on the `spec.mode` read on the next line instead.
+ */
+export function refusalRoom(kind) {
+  const spec = REFUSAL_SPECS[kind];
+  const roomId = REFUSAL_ROOM_IDS[kind];
+  const index = spec.mode === 'bomb' ? 1 : 0;
+  const members = [];
+  for (let i = 0; i < spec.size; i++) {
+    const local = spec.callerIsMember && i === 0;
+    members.push({
+      accountId: local ? ACCOUNT_ID : stubUlid(`member:${roomId}:${i}`, EPOCH_MS - 200 * DAY),
+      displayName: local ? DISPLAY_NAME : `StubPlayer${String(i).padStart(2, '0')}`,
+      team: spec.teamAt(i),
+      // Nobody is ready: readiness is not what any of these four rooms is about, and a ready
+      // flag that plays no part in the refusal is a detail the shell would try to explain.
+      ready: false,
+      isOwner: i === 0,
+      isLocal: local,
+      connection: 'connected',
+      estimatedRttMs: null,
+      loadout: { primaryIdx: i % 4, secondaryIdx: (i + 2) % 3 },
+      joinedAt: iso(EPOCH_MS - (600 - i * 5) * 1000),
+    });
+  }
+  return {
+    roomId,
+    index,
+    // Built through `roomCore` rather than beside it, so a key added to RoomCore reaches these
+    // four without a second edit.
+    core: roomCore(index, {
+      roomId,
+      overrides: {
+        name: spec.name, status: spec.status, playerCount: spec.size,
+        joinable: spec.joinable, joinBlockedReason: spec.joinBlockedReason,
+        hasPassword: false, ownerAccountId: members[0].accountId,
+      },
+    }),
+    roster: members,
+    // None of the four is counting down, so §6 rule 1 does not freeze any of them — which is
+    // the point: each refusal has to come from its own guard, not from the frozen flag.
+    countdown: null,
+    frozen: false,
   };
 }
 

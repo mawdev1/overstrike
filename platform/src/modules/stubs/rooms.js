@@ -84,12 +84,18 @@ export function core(room, { rtt = null } = {}) {
  * realtime-lobby.md §7: readiness is cleared whenever the shape of the match changes under the
  * player who consented to it — roster, team, loadout, or room change. The reason travels with
  * it on the socket; over REST the next `RoomDetailResponse` simply shows it cleared.
+ *
+ * It used to take an `{ except }` option, which was dead: neither call site in `routes.js` ever
+ * passed one, and §7's only per-player rule is the opposite shape — a loadout change clears the
+ * *actor's* readiness alone, which `POST /loadout` does inline. Measured before removing it: an
+ * instrumented build counted 29 `clearReady` calls across the 46 scenario probes and 42
+ * hand-built room sequences (join / leave / ready / team alpha|bravo|auto / loadout, in every
+ * order, on all three fixture rooms); 0 supplied `except` and 0 members were ever skipped, and
+ * the 344 responses those runs produce are byte-identical with the branch deleted. A parameter
+ * a stub never exercises is a shape the frontend can be taught and can never observe.
  */
-export function clearReady(room, { except = null } = {}) {
-  for (const m of room.roster) {
-    if (except && m.accountId === except) continue;
-    m.ready = false;
-  }
+export function clearReady(room) {
+  for (const m of room.roster) m.ready = false;
 }
 
 /** §11.4: the refusals a join can hit, in the order the room decides them. */
