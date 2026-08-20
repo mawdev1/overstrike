@@ -186,7 +186,10 @@ if (files.includes(pv.watch)) {
   const bumped = diff
     .split('\n')
     .some((l) => l.startsWith('+') && !l.startsWith('+++') && l.includes(pv.constantName));
-  if (!bumped) {
+  // An empty diff means the file did not change *in the range being examined* — which is the
+  // normal case when --files names an already-committed path. There is nothing to version, so
+  // demanding a bump would be a false failure rather than a caught violation.
+  if (diff.trim() !== '' && !bumped) {
     problems.push(
       `${pv.watch} changed but ${pv.constantName} was not bumped. Build Plan §0.6: every wire\n`
       + `        change bumps the version, and incompatible clients must be rejected at handshake\n`
