@@ -216,17 +216,40 @@ export function createAuthService(deps) {
   // ------------------------------------------------------------------- onboarding: consent
 
   /** Auth-optional. Signed in, the account is the subject; signed out, the client session is. */
+  /**
+   * The consent decision, and — separately — the policy version a decision would be made UNDER.
+   *
+   * `policyVersion` is the version the player DECIDED under, and it is null while undecided.
+   * That is correct and it left a client unable to act: `PUT /v1/onboarding/consent` requires
+   * `policyVersion`, and nothing in the API told the caller which version was in force. The
+   * deployed shell disabled both consent buttons because it had no version to submit, so
+   * onboarding stopped dead at step 2 with no error and nothing to click.
+   *
+   * `currentPolicyVersion` is that missing fact. It is always present, never null, and is
+   * deliberately a SEPARATE key rather than a fallback value in `policyVersion` — filling the
+   * decided field with the current version would claim a decision that has not been made, and
+   * `decidedAt: null` beside `policyVersion: 1` is a contradiction a reader has to unpick.
+   *
+   * A stale decision is now legible too: `policyVersion < currentPolicyVersion` with a
+   * non-null `decidedAt` means "decided, under an older policy", which is exactly when a
+   * client should re-ask.
+   */
   async function getConsent({ actor = null, clientSessionId = null }) {
+    const currentPolicyVersion = config.consentPolicyVersion;
     if (actor) {
       const account = await store.accounts.byId(actor.accountId);
       if (!account) throw new ApiError('NOT_FOUND', 'No such account.');
       if (account.consentTelemetry == null) {
-        return { telemetryPersonal: null, policyVersion: null, decidedAt: null, subject: 'account', receipt: null };
+        return {
+          telemetryPersonal: null, policyVersion: null, decidedAt: null,
+          currentPolicyVersion, subject: 'account', receipt: null,
+        };
       }
       return {
         telemetryPersonal: account.consentTelemetry,
         policyVersion: account.consentPolicyVer,
         decidedAt: account.consentDecidedAt,
+        currentPolicyVersion,
         subject: 'account',
         receipt: accountConsentReceipt(account),
       };
@@ -234,12 +257,16 @@ export function createAuthService(deps) {
     requireString(clientSessionId, 'clientSessionId');
     const row = await store.preAuthConsent.get(clientSessionId);
     if (!row || row.migratedAt) {
-      return { telemetryPersonal: null, policyVersion: null, decidedAt: null, subject: 'client-session', receipt: null };
+      return {
+        telemetryPersonal: null, policyVersion: null, decidedAt: null,
+        currentPolicyVersion, subject: 'client-session', receipt: null,
+      };
     }
     return {
       telemetryPersonal: row.telemetryPersonal,
       policyVersion: row.policyVersion,
       decidedAt: row.decidedAt,
+      currentPolicyVersion,
       subject: 'client-session',
       receipt: receipts.issueConsent({
         subject: 'client-session', subjectId: clientSessionId,

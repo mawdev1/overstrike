@@ -2,6 +2,27 @@
 
 Every contract amendment lands here. Newest at the top.
 
+## 2026-08-20 — `http-api.md` 1.11.0 (additive) — `currentPolicyVersion` on consent
+
+`PUT /v1/onboarding/consent` requires `policyVersion` in its body, and no endpoint published
+which version was in force. `GET` returned only the DECIDED version, which is null before a
+decision — so a client that had never consented could not construct a valid PUT.
+
+This was not theoretical. The first deployed onboarding flow disabled both privacy buttons
+because the shell had no version to submit, and a player reached step 2 of 7 with nothing
+clickable and no error message. The API was complete enough to test and not complete enough
+to use.
+
+`currentPolicyVersion` is always present and never null. It is a separate key from
+`policyVersion` on purpose: reusing the decided field would assert a decision that had not been
+made, and `decidedAt: null` beside `policyVersion: 1` contradicts itself.
+
+Additive: no existing key changed shape or meaning.
+
+The lesson is about where contract holes hide. Every review round read this section; the gap
+was not a wrong statement but a missing one, and a missing statement reads like nothing at all
+until someone tries to complete the flow.
+
 ## Amendment types
 
 | Type | When | Requires |

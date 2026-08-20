@@ -143,6 +143,36 @@ await withApp(async ({ app }) => {
 // ── 2. the onboarding chain, end to end, over HTTP ─────────────────────────────────────
 await withApp(async ({ call }) => {
   section('onboarding chain over HTTP');
+
+  // A CLIENT THAT HAS NEVER CONSENTED CAN CONSTRUCT A VALID PUT.
+  //
+  // This is the whole flow's first cliff and it was missing. PUT requires `policyVersion`, GET
+  // returned only the DECIDED version (null before a decision), and nothing published the
+  // version in force — so the deployed shell disabled both privacy buttons and onboarding
+  // stopped at step 2 of 7 with nothing to click and no error. Driven exactly as a signed-out
+  // client drives it: GET first, then PUT using only what the GET returned.
+  const undecided = await call('GET', `/v1/onboarding/consent?clientSessionId=${SID}`);
+  check(undecided.status === 200, 'a signed-out client may read consent state', String(undecided.status));
+  check(Number.isInteger(undecided.body?.currentPolicyVersion),
+    'GET publishes currentPolicyVersion as an integer, so a first-time PUT is constructible',
+    JSON.stringify(undecided.body));
+  check(undecided.body?.policyVersion === null && undecided.body?.decidedAt === null,
+    'and the DECIDED version stays null — an undecided player has not agreed to anything',
+    JSON.stringify(undecided.body));
+
+  const blind = await call('PUT', '/v1/onboarding/consent', {
+    telemetryPersonal: true,
+    policyVersion: undecided.body?.currentPolicyVersion,   // ONLY what the GET gave us
+    clientSessionId: SID,
+  });
+  check(blind.status === 200 && typeof blind.body?.receipt === 'string',
+    'a PUT built from nothing but the GET response is accepted',
+    `${blind.status} ${JSON.stringify(blind.body?.error)}`);
+  check(blind.body?.policyVersion === undecided.body?.currentPolicyVersion
+    && typeof blind.body?.decidedAt === 'string',
+    'after deciding, policyVersion is the version decided under and decidedAt is set',
+    JSON.stringify(blind.body));
+
   const { elig, consent, signup } = await onboard(call, { sid: SID });
 
   check(elig.status === 200, 'eligibility returns 200', JSON.stringify(elig.body));

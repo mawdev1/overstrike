@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.10.0 |
+| **Version** | 1.11.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -153,10 +153,26 @@ PUT /v1/onboarding/consent    auth OPTIONAL
 { "telemetryPersonal": bool, "policyVersion": int, "clientSessionId": "01J…" }
 
 → { "telemetryPersonal": bool, "policyVersion": int, "decidedAt": "…",
+    "currentPolicyVersion": int,           // ALWAYS present, never null — the version in force
     "subject": "account|client-session",
     "receipt": "opaque-signed-token",      // replayed on batches carrying PERSONAL events (§3.5)
     "correlationId": "…" }
 ```
+
+**`policyVersion` and `currentPolicyVersion` are different facts.** `policyVersion` is the
+version the player DECIDED under and is `null` while undecided; `currentPolicyVersion` is the
+version in force and is always an integer.
+
+Both are needed because `PUT` requires `policyVersion` in its body, and before this key existed
+nothing in the API told a caller which version to send. A signed-out client had no declared way
+to obtain it — the deployed shell disabled both consent buttons for exactly that reason, so
+onboarding stopped at the privacy step with nothing to click and no error to report.
+
+They are separate keys rather than one field that falls back, because filling the decided field
+with the current version claims a decision nobody made, and `decidedAt: null` beside
+`policyVersion: 1` is a contradiction the reader has to unpick. It also makes staleness legible:
+a non-null `decidedAt` with `policyVersion < currentPolicyVersion` means "decided, under an
+older policy" — precisely when a client should ask again.
 
 `clientSessionId` is **required when signed out** and ignored when authenticated — the account
 is the stronger subject. The response carries a signed `receipt`, without which the server

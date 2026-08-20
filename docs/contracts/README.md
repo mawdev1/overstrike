@@ -34,7 +34,7 @@ buildable — a single open question does not freeze a whole document.
 
 | # | Contract | Status | Covers |
 |---|---|---|---|
-| 1 | [`http-api.md`](http-api.md) | FROZEN 1.10.0 | Platform REST surface for P1–P4 |
+| 1 | [`http-api.md`](http-api.md) | FROZEN 1.11.0 | Platform REST surface for P1–P4 |
 | 2 | [`errors.md`](errors.md) | FROZEN 1.6.0 | Error envelope and the closed error-code enumeration |
 | 3 | [`auth.md`](auth.md) | FROZEN | Tokens, sessions, revocation, recovery |
 | 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN | Lobby WebSocket: presence, roster, teams, ready, launch |
