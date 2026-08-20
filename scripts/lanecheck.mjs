@@ -20,6 +20,7 @@
  *
  * Usage:
  *   node scripts/lanecheck.mjs                 # staged + unstaged vs HEAD
+ *   node scripts/lanecheck.mjs --staged        # exactly what `git commit` would record
  *   node scripts/lanecheck.mjs --base=master   # every change since a base ref (CI)
  *   node scripts/lanecheck.mjs --files=a,b,c    # explicit list, for testing the guard
  *   node scripts/lanecheck.mjs --expect-fail    # invert the exit code (self-test)
@@ -53,6 +54,14 @@ const git = (...args) => {
 function changedFiles() {
   const explicit = arg('files');
   if (explicit) return explicit.split(',').map((s) => s.trim()).filter(Boolean);
+
+  // --staged is the mode that would have caught commit 9c439c8. A broad `git add docs/` swept
+  // in five Codex-owned files, and I then ran this guard on a hand-typed SUBSET and treated
+  // that as verification. Checking the index removes the step where a human chooses what to
+  // check, which is the step that failed.
+  if (flag('staged')) {
+    return git('diff', '--name-only', '--cached').split('\n').filter(Boolean);
+  }
 
   const base = arg('base');
   if (base) {

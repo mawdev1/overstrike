@@ -32,6 +32,27 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — `telemetry.md` 1.8.0 (additive) — internal records carry no identity
+
+**Provenance defect, recorded because it was mine.** §3.5.0 landed in commit `9c439c8` with no
+version bump and no entry here — an amendment to a FROZEN contract, made one commit after I
+wrote the rule that every amendment lands in this file. "An amendment that skips this file did
+not happen"; this one nearly did.
+
+The change itself (`REQ-CC-055`): the contract asserted both that `internal` carries no personal
+data and that `accountId` is bearer-derived, without saying which events the second applied to,
+so an authenticated `client.fps` was stored linked to an account and still labelled internal.
+
+§3.5.0 now states one rule: an internal-class record is persisted with `accountId: null` and
+`clientSessionId: null` even when the request is authenticated, retaining only the request
+correlation id. Additive — no shipped field changed shape or meaning; a field that was
+sometimes populated is now always null, which no consumer can have depended on without
+depending on the leak.
+
+Reclassifying crash and performance events as `personal` was the alternative and was rejected:
+it would put ordinary crash reporting behind consent, so a player who declines analytics also
+stops us diagnosing the crash that lost them the match.
+
 ## 2026-08-20 — ALL 13 CONTRACTS FROZEN at 1.7.0
 
 Frozen on the human owner's explicit instruction not to wait for a further review round
