@@ -12,6 +12,7 @@
     "lanecheck": "node scripts/lanecheck.mjs",
     "lanecheck:staged": "node scripts/lanecheck.mjs --staged",
     "platformtest": "node scripts/platformtest.mjs",
+    "pgtest": "node scripts/pgtest.mjs",
     "uishell": "node scripts/uishell.mjs",
     "smoke": "node scripts/smoke.mjs",
     "perf": "node scripts/perf.mjs",
