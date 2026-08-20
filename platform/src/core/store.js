@@ -105,6 +105,7 @@ import { ApiError } from './errors.js';
  *   list(filter, tx) -> row[]
  *
  * @property {object} idempotency
+ *   acquire(key, actorId, tx) -> void   // serialise this key for the transaction
  *   get(key, actorId, tx) -> row|null
  *   put(row, tx) -> row
  *
@@ -546,11 +547,19 @@ export function normaliseMatchResult(result) {
       });
     }
     seen.add(player.accountId);
+    // `joined_at` is NOT NULL with a `default now()` (0004). Passing an explicit null
+    // DEFEATS the default and violates the constraint, so an ALLOCATED match — which has no
+    // startedAt yet, by definition — could not record its roster on Postgres while succeeding
+    // on memory. The lifecycle the transition table was added to support was broken on the
+    // only adapter that ships, and every test for it passed because they run on memory.
+    const joinedAt = player.joinedAt ?? match.startedAt ?? null;
     participants.push({
       matchId: match.matchId,
       accountId: player.accountId,
       team: player.team ?? null,
-      joinedAt: player.joinedAt ?? match.startedAt ?? null,
+      // Omitted entirely when unknown, so the column default applies on Postgres and the
+      // memory adapter stamps the same value.
+      ...(joinedAt === null ? {} : { joinedAt }),
       leftAt: player.leftAt ?? null,
       disconnected: !!player.disconnected,
       abandoned: !!player.abandoned,

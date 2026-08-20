@@ -150,7 +150,10 @@ export function createProfileModule({
       const rawLimit = ctx.query.get('limit');
       const limit = rawLimit === null ? undefined
         : (/^\d+$/.test(rawLimit) ? Number(rawLimit) : rawLimit);
-      return stats.history(subjectId, { limit, cursor: ctx.query.get('cursor') });
+      // `?cursor=` with no value is a UI that always appends the parameter, not a malformed
+      // cursor. Treat empty as absent rather than failing page one with VALIDATION_FAILED.
+      const rawCursor = ctx.query.get('cursor');
+      return stats.history(subjectId, { limit, cursor: rawCursor || undefined });
     },
 
     async importProgression(ctx) {

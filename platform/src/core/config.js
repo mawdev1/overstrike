@@ -8,7 +8,10 @@
 import { ApiError } from './errors.js';
 
 const SPEC = {
-  port:            { env: 'PLATFORM_PORT', type: 'int', default: 8090, min: 1, max: 65535 },
+  // 0 is legitimate and means "let the OS assign a free port" — the standard way a test binds
+  // without racing another. A min of 1 rejected it, which is strictness that forbids a correct
+  // value rather than a wrong one.
+  port:            { env: 'PLATFORM_PORT', type: 'int', default: 8090, min: 0, max: 65535 },
   logLevel:        { env: 'PLATFORM_LOG_LEVEL', type: 'enum', values: ['debug', 'info', 'warn', 'error'], default: 'info' },
   databaseUrl:     { env: 'DATABASE_URL', type: 'string', default: null },
   storage:         { env: 'PLATFORM_STORAGE', type: 'enum', values: ['memory', 'postgres'], default: 'memory' },

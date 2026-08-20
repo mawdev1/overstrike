@@ -21,6 +21,7 @@
 import { Router } from '../../core/http.js';
 import { ApiError, toApiError } from '../../core/errors.js';
 import { createClock, DEFAULT_STEP_MS } from './clock.js';
+import { checkAuthClass, checkClientBuild } from './gates.js';
 import { stubUlid } from './ids.js';
 import { ROUTES } from './routes.js';
 import { SCENARIOS, SCENARIO_NAMES, initialState } from './scenarios.js';
@@ -51,6 +52,7 @@ function buildRouter() {
     router.add(route.method, route.path, route.handler, {
       pattern: `${route.method} ${route.path}`,
       auth: route.auth,
+      requireBuild: route.requireBuild !== false,
     });
   }
   return router;
@@ -69,7 +71,12 @@ const lowerHeaders = (headers) => {
  * test, from a service worker in the browser, or from a node server, and none of those has to
  * exist for the scenarios to be exercised.
  */
-export function createStubApi({ config = {}, flags = { [STUB_FLAG]: true }, env = process.env } = {}) {
+export function createStubApi({
+  config = {}, flags = { [STUB_FLAG]: true }, env = process.env,
+  // Injectable so a suite can prove the delay is *requested* without spending the wall-clock
+  // time on every check. The default is a real sleep, because the default has to be the truth.
+  sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+} = {}) {
   assertStubAllowed({ config, flags, env });
   const router = buildRouter();
   const sessions = new Map();          // `${scenario}::${clientSessionId}` -> { state, clock }
@@ -145,19 +152,45 @@ export function createStubApi({ config = {}, flags = { [STUB_FLAG]: true }, env 
       if (outBody && !outBody.error) outBody = { ...outBody, correlationId };
       if (status === 204) outBody = null;
       const out = { status, headers: outHeaders, body: outBody, scenario: scenarioName, correlationId };
-      // `slow` is a timing behaviour, surfaced rather than slept: the transport applies it, so
-      // a test suite is not 2 s slower per request to prove a spinner exists.
-      if (scenario.delayMs) out.delayMs = scenario.delayMs;
+      if (!scenario.delayMs) return out;
+      // `slow` used to return `delayMs` as metadata and nothing applied it — the mounted path
+      // in app.js hands the response straight to the writer, so the scenario whose entire
+      // subject is a 2 s wait answered instantly. The delay is real now.
+      //
+      // The response is a plain object AND a thenable: `res.transport`/`res.status` still read
+      // synchronously (app.js branches on them before it returns), while any consumer that
+      // awaits it — including `return res` from app.js's async preRoute, and core/http.js's
+      // `await mw(...)` — waits the scenario's delay first. A sleep inside `handle` itself
+      // would have to be synchronous, and a synchronous sleep in a server blocks every other
+      // request while proving that one is slow.
+      out.delayMs = scenario.delayMs;
+      out.then = (resolve, reject) => sleep(scenario.delayMs).then(() => {
+        const settled = { ...out };
+        delete settled.then;          // or awaiting the result would recurse forever
+        resolve(settled);
+      }, reject);
       return out;
     };
 
     try {
       if (!hit) throw new ApiError('NOT_FOUND', 'No such endpoint.');
+      // The two checks the stub used to skip by intercepting before routing (§1, §2). Build
+      // first: an unsupported client is unsupported whether or not it is signed in, and 426
+      // before 401 is the order core/http.js applies.
+      checkClientBuild(headers, {
+        requireBuild: hit.route.opts.requireBuild,
+        minClientBuild: config.minClientBuild ?? null,
+      });
+      const credential = checkAuthClass(headers, hit.route.opts.auth, {
+        serviceToken: config.serviceToken ?? null,
+      });
       const ctx = {
         method,
         path,
         pattern: hit.route.opts.pattern,
         auth: hit.route.opts.auth,
+        authenticated: credential.authenticated,
+        token: credential.token,
         params: hit.params,
         query,
         headers,
@@ -197,6 +230,6 @@ export function createStubApi({ config = {}, flags = { [STUB_FLAG]: true }, env 
   };
 }
 
-export { SCENARIOS, SCENARIO_NAMES } from './scenarios.js';
+export { SCENARIOS, SCENARIO_NAMES, EXTRA_SCENARIOS } from './scenarios.js';
 export { createLobbyStub, LOBBY_SCENARIOS, LOBBY_SCENARIO_NAMES } from './lobby.js';
 export { COVERAGE_MAP } from './coverage.js';

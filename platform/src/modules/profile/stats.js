@@ -460,6 +460,10 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
     return store.tx(async (tx) => {
       // Read INSIDE the transaction. Checking outside it is a read-then-write race, and the
       // two racers are precisely the duplicate submissions this check exists to collapse.
+      // Serialise on the key BEFORE reading it. Without this every concurrent submission
+      // reads `prior = null` and proceeds, and §5.4's "return the stored response" becomes a
+      // primary-key collision reported as §5.5's different-payload CONFLICT.
+      if (store.idempotency.acquire) await store.idempotency.acquire(key, RESULT_ACTOR, tx);
       const prior = await store.idempotency.get(key, RESULT_ACTOR, tx);
       if (prior) {
         if (prior.requestHash !== requestHash) {

@@ -42,12 +42,19 @@ export function initialState(scenarioName) {
     authCalls: 0,
     tokenGeneration: 1,
     tokenIssuedAt: null,
+    // Every access token this session was issued. The auth gate accepts the shape; this is what
+    // makes "the token you were given" checkable when a scenario needs it.
+    issuedTokens: [],
     eligible: false,
+    eligibilityReceipt: null,
     signedUp: decided,
+    displayName: fx.DISPLAY_NAME,
     verified: decided,
     verifyResends: 0,
     termsVersion: 1,
     termsAccepted: decided,
+    essentialSettingsDone: decided,
+    recoveryStarted: false,
     consentMigrated: false,
     consent: decided
       ? {
@@ -61,7 +68,17 @@ export function initialState(scenarioName) {
       }
       : null,
     moderation: null,
-    settingsVersion: 7,
+    // §11.2: settings are a versioned document that round-trips, not four fixed values. The
+    // seed is the ROAM vocabulary's own defaults, so a client reading them sees the real key set.
+    settings: {
+      version: 7,
+      values: fx.roamingSettings(),
+      updatedAt: iso(EPOCH_MS - 3600 * 1000),
+    },
+    settingsBumped: false,
+    revokedSessions: [],
+    rooms: {},
+    activeRoomId: null,
     emptyCareer: false,
     privacyFiltered: false,
     polls: 0,
@@ -89,6 +106,26 @@ const terminal = (opts) => (ctx) => ({
   body: fx.terminalResult(ctx.params.matchId, opts),
 });
 
+/**
+ * The gates that stand between a signed-up account and a match, in the approved order.
+ *
+ * Onboarding routes stay open, or the player would be locked out of the very steps that clear
+ * the gate. The codes are the ones `errors.md` routes to those screens, so the shell branches on
+ * the same value it will branch on in production.
+ */
+function setupGate(ctx) {
+  if (!ctx.state.signedUp || !isGameplay(ctx.path)) return null;
+  if (!ctx.state.verified) {
+    throwErr('AUTH_VERIFICATION_REQUIRED', 'Verify your email to continue.', { details: { channel: 'email' } });
+  }
+  if (!ctx.state.termsAccepted) {
+    throwErr('AUTH_TERMS_ACCEPTANCE_REQUIRED', 'Accept the updated terms to continue.', {
+      details: { version: ctx.state.termsVersion },
+    });
+  }
+  return null;
+}
+
 /** Patch the room shape a detail response returns, without restating the whole thing. */
 const patchedRoom = (overrides) => (ctx, base) => {
   const res = base(ctx);
@@ -105,20 +142,8 @@ export const SCENARIOS = {
   'onboarding-happy': {
     note: 'eligibility → consent → signup (migrates the receipt) → verify → terms → shell.',
     // The gates are the point: until verification and terms are cleared, the routes that lead
-    // to a match answer with the code errors.md routes to those screens. Onboarding routes stay
-    // open, or the player would be locked out of the very steps that clear the gate.
-    pre(ctx) {
-      if (!ctx.state.signedUp || !isGameplay(ctx.path)) return null;
-      if (!ctx.state.verified) {
-        throwErr('AUTH_VERIFICATION_REQUIRED', 'Verify your email to continue.', { details: { channel: 'email' } });
-      }
-      if (!ctx.state.termsAccepted) {
-        throwErr('AUTH_TERMS_ACCEPTANCE_REQUIRED', 'Accept the updated terms to continue.', {
-          details: { version: ctx.state.termsVersion },
-        });
-      }
-      return null;
-    },
+    // to a match answer with the code errors.md routes to those screens.
+    pre: setupGate,
   },
 
   'onboarding-eligibility-denied': {
@@ -442,6 +467,152 @@ export const SCENARIOS = {
     note: 'Transport-layer failure on every request: no status, no body, no envelope.',
     transport: 'fail',
   },
+
+  // ── REQ-CC-045: the routes §11.11 never mapped ────────────────────────────────────────────
+  //
+  // `design/shell-ia.md` declares 24 leaf routes; §11.11 owns 13 of them, so `/auth/recover`,
+  // `/onboarding/display-name`, `/onboarding/essential-settings`, `/career/weapons`,
+  // `/settings/:category`, `/sessions` and `/system/:condition` had no scenario at all — the
+  // frontend lane had nothing to build those screens against, and no state fixture for their
+  // loading, empty, error, offline and policy variants. These are additive: every §11.10
+  // scenario above is untouched, and `coverage.js` records which route state each one serves.
+
+  'signin-invalid-credentials': {
+    note: 'Neutral refusal. Never says which of identifier or secret was wrong.',
+    routes: {
+      'POST /v1/auth/signin': () => throwErr('AUTH_INVALID_CREDENTIALS',
+        'That email and password do not match an account.'),
+    },
+  },
+
+  'signin-incomplete-setup': {
+    note: 'Signed in mid-onboarding: the profile names the first incomplete step (verify).',
+    init(state) {
+      state.signedUp = true;
+      state.verified = false;
+      state.termsAccepted = false;
+      state.essentialSettingsDone = false;
+    },
+    pre: setupGate,
+  },
+
+  'recovery-token-invalid': {
+    note: 'Recovery link bad, used, or superseded — restart recovery, never verification.',
+    routes: {
+      'POST /v1/auth/recovery/complete': () => throwErr('AUTH_RECOVERY_TOKEN_INVALID',
+        'That reset link is not valid any more.'),
+    },
+  },
+
+  'recovery-token-expired': {
+    note: 'Past its 30-minute TTL. Same obligation, different code, so the copy can differ.',
+    routes: {
+      'POST /v1/auth/recovery/complete': () => throwErr('AUTH_RECOVERY_TOKEN_EXPIRED',
+        'That reset link has expired.'),
+    },
+  },
+
+  'name-policy-violation': {
+    note: 'The display-name refusal that is NOT "taken": 422 with the rule that failed.',
+    routes: {
+      // The client never reproduces the ruleset (design/first-run-flow.md §3); it shows the
+      // reason the server names.
+      'POST /v1/auth/signup': () => throwErr('NAME_POLICY_VIOLATION',
+        'That name is not allowed.', { details: { rule: 'impersonation' } }),
+      'PATCH /v1/profile/me': () => throwErr('NAME_POLICY_VIOLATION',
+        'That name is not allowed.', { details: { rule: 'impersonation' } }),
+    },
+  },
+
+  'settings-conflict': {
+    note: 'Another device wrote first: 409 with currentVersion and values, then the retry wins.',
+    routes: {
+      'PUT /v1/profile/me/settings': (ctx, base) => {
+        // The version moves UNDER a correct If-Match exactly once, which is what two tabs
+        // racing looks like. The second attempt, carrying the ETag from the 409, succeeds.
+        if (!ctx.state.settingsBumped) {
+          ctx.state.settingsBumped = true;
+          ctx.state.settings.version++;
+        }
+        return base(ctx);
+      },
+    },
+  },
+
+  'match-not-found': {
+    note: 'A match id that is not yours, or never existed. Indistinguishable, deliberately.',
+    routes: {
+      'GET /v1/matches/:matchId': () => throwErr('NOT_FOUND', 'That match is not available.'),
+    },
+  },
+
+  'career-unavailable': {
+    note: 'Career reads down, everything else fine — the recoverable error a career screen shows.',
+    pre(ctx) {
+      if (ctx.path.startsWith('/v1/profile/') && ctx.path !== '/v1/profile/me') {
+        throwErr('SERVICE_UNAVAILABLE', 'Career data is temporarily unavailable.', { retryAfterMs: 5000 });
+      }
+      return null;
+    },
+  },
+
+  'sessions-current-only': {
+    note: 'The empty state for the sessions screen: one device, and it is this one.',
+    init(state) {
+      // Not an empty list — a session list without the caller's own session would mean the
+      // caller is not signed in, which is a different screen.
+      state.revokedSessions = [fx.OTHER_SESSION_ID];
+    },
+  },
+
+  'system-maintenance': {
+    note: 'Planned outage on every route: MAINTENANCE with details.until, and no retry storm.',
+    pre(ctx) {
+      throwErr('MAINTENANCE', 'OVERSTRIKE is down for scheduled maintenance.', {
+        details: { until: ctx.clock.fromEpoch(45 * 60 * 1000) },
+      });
+    },
+  },
+
+  'unsupported-client': {
+    note: 'A well-formed build below the floor: 426, upgrade only, never retried.',
+    // Distinct from the gate refusal in gates.js, which catches an absent or malformed header.
+    // This is the floor itself, which is the branch a shipped client actually hits.
+    pre(ctx) {
+      if (ctx.path.startsWith('/v1/health')) return null;
+      throwErr('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
+        { details: { reason: 'build' } });
+    },
+  },
+
+  'active-lobby-resync': {
+    note: 'Reload while in a room: no held match, presence names the room, ticket resyncs it.',
+    init(state) {
+      // design/first-run-flow.md: "Active lobby membership → Lobby resync screen, then
+      // authoritative room". The room id survives only on the server, which is the point.
+      state.activeRoomId = fx.ROOM_IDS[0];
+    },
+  },
 };
 
 export const SCENARIO_NAMES = Object.keys(SCENARIOS);
+
+/**
+ * Scenarios this layer adds beyond the §11.10 table, each with the route state it exists to
+ * serve. `stubtest.mjs` requires every extra to be declared here, so the registry can grow with
+ * REQ-CC-045 without becoming a place where undocumented fixtures accumulate.
+ */
+export const EXTRA_SCENARIOS = {
+  'signin-invalid-credentials': '/auth/sign-in recoverable error (REQ-CC-045)',
+  'signin-incomplete-setup': '/auth/sign-in resume at the first incomplete step (REQ-CC-045)',
+  'recovery-token-invalid': '/auth/recover recoverable error (REQ-CC-045)',
+  'recovery-token-expired': '/auth/recover terminal state (REQ-CC-045)',
+  'name-policy-violation': '/onboarding/display-name policy refusal (REQ-CC-045)',
+  'settings-conflict': '/settings/:category and /onboarding/essential-settings conflict (REQ-CC-045)',
+  'match-not-found': '/career/matches/:matchId not found (REQ-CC-045)',
+  'career-unavailable': '/career/* recoverable error (REQ-CC-045)',
+  'sessions-current-only': '/sessions empty state (REQ-CC-045)',
+  'system-maintenance': '/system/:condition maintenance (REQ-CC-045)',
+  'unsupported-client': '/system/:condition update required (REQ-CC-045)',
+  'active-lobby-resync': 'active-lobby discovery and resync after reload (REQ-CC-045)',
+};

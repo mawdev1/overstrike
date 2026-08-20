@@ -12,6 +12,9 @@
  */
 import { EPOCH_MS, iso } from './clock.js';
 import { stubUlid, stubToken } from './ids.js';
+// The stub validates roaming settings with the platform's own validator rather than a second
+// copy of the rules: two validators is two places for the vocabulary to drift.
+import { defaultRoamingValues } from '../profile/settings.js';
 
 const DAY = 24 * 3600 * 1000;
 
@@ -156,15 +159,42 @@ export function roster(index, { count = null, roomId = null } = {}) {
   return out;
 }
 
+/**
+ * The caller, as a roster member who has just joined a room they were not already in.
+ *
+ * `unassigned` rather than a guessed side: §11.4 says `preferredTeam` is a preference and the
+ * server assigns, so a fixture that silently picks alpha would be the stub inventing the one
+ * answer the client is told to wait for.
+ */
+export function joiningMember(roomId, position) {
+  return {
+    accountId: ACCOUNT_ID,
+    displayName: DISPLAY_NAME,
+    team: 'unassigned',
+    ready: false,
+    isOwner: false,
+    isLocal: true,
+    connection: 'connected',
+    estimatedRttMs: null,
+    loadout: { primaryIdx: 0, secondaryIdx: 0 },
+    joinedAt: iso(EPOCH_MS - (60 - position) * 1000),
+  };
+}
+
 export function countdownState(index) {
   if (ROOM_SPECS[index].status !== 'countdown') return null;
   return { endsAt: iso(EPOCH_MS + 20 * 1000), requiredReady: 8, currentReady: 8 };
 }
 
-/** Which fixture room a path parameter refers to. Unknown ids resolve to room A's shape. */
+/**
+ * Which fixture room a path parameter refers to, or `-1`.
+ *
+ * It used to answer `0` for anything unknown, so every mistyped, stale, or deleted room id
+ * returned room A wearing that id — the shell could never build the `ROOM_NOT_FOUND` path
+ * because the stub had no way to express it. `-1` is the caller's cue to raise it.
+ */
 export function roomIndexFor(roomId) {
-  const at = ROOM_IDS.indexOf(roomId);
-  return at === -1 ? 0 : at;
+  return ROOM_IDS.indexOf(roomId);
 }
 
 export function roomDetail(index, { rtt = null, overrides = {}, roomId = null } = {}) {
@@ -197,7 +227,9 @@ export function privacyDefaults() {
  * account predating the policy version carries. `correlationId` is added by the response
  * writer, not here, so the same object can be embedded in an auth response.
  */
-export function profileMe({ consent = undefined, moderation = null, displayName = DISPLAY_NAME } = {}) {
+export function profileMe({
+  consent = undefined, moderation = null, displayName = DISPLAY_NAME, setupNextStep = null,
+} = {}) {
   return {
     accountId: ACCOUNT_ID,
     displayName,
@@ -207,7 +239,56 @@ export function profileMe({ consent = undefined, moderation = null, displayName 
       ? { telemetryPersonal: true, policyVersion: 1, decidedAt: iso(EPOCH_MS - 400 * DAY) }
       : consent,
     moderation: moderation || { status: 'clear', activeSanctions: [] },
-    flags: { nameChangeAvailableAt: iso(EPOCH_MS + 30 * DAY) },
+    // `setupNextStep` is the resume discriminator design/first-run-flow.md requires: "the
+    // sign-in branch ... resumes at the first incomplete account-policy step returned by the
+    // platform", and "Session; profile incomplete → First incomplete account step". Nothing in
+    // the contract returned it, so a returning half-onboarded player could only discover the
+    // step by provoking a 403 from a gameplay route it had no reason to call. It rides in
+    // `flags` because signin and signup embed this exact object, which makes the first
+    // authenticated response the client already makes the one that answers the question.
+    // NOTE: additive against http-api.md §4 — see the CCR in the handover.
+    flags: { nameChangeAvailableAt: iso(EPOCH_MS + 30 * DAY), setupNextStep },
+  };
+}
+
+/**
+ * The first incomplete step of the approved order (§3a), or null when setup is complete.
+ *
+ * The order is the contract's, not a preference: eligibility precedes consent so an ineligible
+ * visitor is never asked to consent, and verification precedes terms because that is the order
+ * `errors.md` routes the two gate codes in.
+ */
+export function setupNextStepFor(state) {
+  if (!state.signedUp) {
+    if (!state.eligible) return 'eligibility';
+    if (!state.consent) return 'consent';
+    return 'display-name';
+  }
+  if (!state.consent) return 'consent';
+  if (!state.verified) return 'verify';
+  if (!state.termsAccepted) return 'terms';
+  if (!state.essentialSettingsDone) return 'essential-settings';
+  return null;
+}
+
+/**
+ * The caller's OWN public projection, `GET /v1/profile/:accountId` with your own id.
+ *
+ * This is the contracted discovery step for "am I still in a lobby?" after a reload:
+ * `design/first-run-flow.md` resumes an active lobby membership at a resync screen, and
+ * `presence.roomId` here is the only place the room id exists once `match.ready` and the socket
+ * are gone. `GET /v1/matches/active` answers the same question for a *match*; this answers it
+ * for a room, and between them a reloaded shell never has to reconstruct one from local state.
+ */
+export function selfProfile({ displayName = DISPLAY_NAME, statsVisible = true, activeRoomId = null } = {}) {
+  return {
+    accountId: ACCOUNT_ID,
+    displayName,
+    createdAt: iso(EPOCH_MS - 400 * DAY),
+    stats: statsVisible ? { ...statsTotals('tdm'), accountId: ACCOUNT_ID } : null,
+    presence: activeRoomId
+      ? { state: 'in-lobby', joinable: false, roomId: activeRoomId }
+      : { state: 'online', joinable: false, roomId: null },
   };
 }
 
@@ -494,12 +575,15 @@ export function clientFlags() {
   };
 }
 
+export const CURRENT_SESSION_ID = stubUlid('session:current', EPOCH_MS - 3600 * 1000);
+export const OTHER_SESSION_ID = stubUlid('session:other', EPOCH_MS - 10 * DAY);
+
 export function sessionsList() {
   return [
-    { sessionId: stubUlid('session:current', EPOCH_MS - 3600 * 1000), deviceLabel: 'Chrome on macOS',
+    { sessionId: CURRENT_SESSION_ID, deviceLabel: 'Chrome on macOS',
       userAgentClass: 'desktop-chrome', ipClass: 'CA-ON', createdAt: iso(EPOCH_MS - 3600 * 1000),
       lastSeenAt: iso(EPOCH_MS - 60 * 1000), isCurrent: true },
-    { sessionId: stubUlid('session:other', EPOCH_MS - 10 * DAY), deviceLabel: 'Firefox on Windows',
+    { sessionId: OTHER_SESSION_ID, deviceLabel: 'Firefox on Windows',
       userAgentClass: 'desktop-firefox', ipClass: 'CA-QC', createdAt: iso(EPOCH_MS - 10 * DAY),
       lastSeenAt: iso(EPOCH_MS - 2 * DAY), isCurrent: false },
   ];
@@ -516,20 +600,25 @@ export function presenceItems() {
 /**
  * Roaming settings values.
  *
- * `RoamingSettingsV1` is exactly the ROAM rows of `design/settings-inventory.md` (§11.9), which
- * is Codex-owned; the stub returns a small, valid subset rather than restating a table it does
- * not own — duplicating that table is precisely the drift §11.9 removed.
+ * `RoamingSettingsV1` is exactly the ROAM rows of `design/settings-inventory.md` (§11.9). The
+ * stub returned four hand-picked keys and three dotted binding ids (`move.forward`,
+ * `weapon.fire`) that appear in no vocabulary — the inventory's action ids are `forward` and
+ * `fire`, and `Mouse0` is not a code the validator accepts at all. A client built against that
+ * shape has to be rewritten to talk to the real endpoint, which is the exact failure the stub
+ * exists to prevent.
+ *
+ * So the defaults come from the SAME generated vocabulary the profile module validates against.
+ * Nothing here names a key, a range, or an enum member.
  */
 export function roamingSettings() {
   return {
-    sensitivity: 0.35,
-    adsSensitivity: 0.8,
-    fov: 95,
-    invertY: false,
+    ...defaultRoamingValues(),
+    // Three bindings rather than none, so a settings screen has a populated `keybinds` map to
+    // render — including the secondary slot, which a single action→code map cannot express.
     keybinds: {
-      'move.forward': { primary: 'KeyW', secondary: null },
-      'move.crouch': { primary: 'ControlLeft', secondary: 'KeyC' },
-      'weapon.fire': { primary: 'Mouse0', secondary: null },
+      forward: { primary: 'KeyW', secondary: null },
+      crouch: { primary: 'ControlLeft', secondary: 'KeyC' },
+      fire: { primary: 'Mouse1', secondary: null },
     },
   };
 }

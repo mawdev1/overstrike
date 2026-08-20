@@ -878,6 +878,24 @@ export async function createPostgresStore(config = {}, deps = {}) {
   };
 
   const idempotency = {
+    /**
+     * Serialise everything that shares one idempotency key, for the life of the transaction.
+     *
+     * `select … for update` cannot do this: the row does not exist yet on the first attempt,
+     * and a lock on no row is no lock. Ten concurrent identical submissions therefore all read
+     * `prior = null`, all proceeded, and nine collided on the matches primary key — so a
+     * correct retry got CONFLICT, whose contracted meaning (§5.5) is "already finalised with a
+     * DIFFERENT result". A retrying match server was told its own correct retry was a
+     * disagreement.
+     *
+     * An advisory lock is transaction-scoped and needs no row to exist. It is released at
+     * commit or rollback, so a crash cannot strand it.
+     */
+    async acquire(key, actorId, txh) {
+      if (!inTransaction(txh)) return;      // nothing to serialise against outside a tx
+      await q(txh, 'select pg_advisory_xact_lock(hashtextextended($1, 0))', [`${actorId}:${key}`]);
+    },
+
     async get(key, actorId, txh) {
       const { rows } = await q(txh,
         'select * from idempotency_keys where key = $1 and actor_id = $2', [key, actorId]);

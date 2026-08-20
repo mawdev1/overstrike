@@ -2,18 +2,24 @@
  * The stub route table — the base behaviour every scenario starts from.
  * contracts/http-api.md §3–§7 and §11.1–§11.9.
  *
- * These handlers are already stateful: `PUT /v1/onboarding/consent` records a decision that
+ * These handlers are stateful: `PUT /v1/onboarding/consent` records a decision that
  * `POST /v1/auth/signup` then migrates onto the account, terms acceptance compares versions,
- * and verification flips a flag that gates the gameplay routes. A scenario in `scenarios.js`
- * layers *faults and variants* on top of this; it does not reimplement the happy path, so there
- * is exactly one definition of what a correct response looks like.
+ * verification flips a flag that gates the gameplay routes, settings round-trip through a
+ * versioned store, and room mutations change the room the next `GET` returns. A scenario in
+ * `scenarios.js` layers *faults and variants* on top of this; it does not reimplement the happy
+ * path, so there is exactly one definition of what a correct response looks like.
  *
- * Auth class per row is `P`/`A`/`S` from §2. It is not enforced as authentication — the stub
- * has no tokens worth checking — but scenarios like `session-revoked` and `token-expiry` need
- * to know which requests an expired credential would have broken.
+ * **Prerequisites are enforced, not assumed.** The approved order in §3a is a sequence the
+ * client "cannot skip ahead or reorder", so signup refuses a receipt it never issued and consent
+ * refuses a visitor whose eligibility was never established. A fixture that accepts an invented
+ * receipt teaches the shell that the preceding screens are optional.
+ *
+ * Auth class per row is `P`/`A`/`S` from §2 and is ENFORCED in `gates.js` before a handler runs.
  */
 import { ApiError } from '../../core/errors.js';
+import { validateRoamingSettings, defaultRoamingValues, SCHEMA_VERSION } from '../profile/settings.js';
 import * as fx from './fixtures.js';
+import * as rooms from './rooms.js';
 import { stubToken, stubUlid } from './ids.js';
 
 const okBody = (body) => ({ status: 200, body });
@@ -22,6 +28,9 @@ const accepted = (body = {}) => ({ status: 202, body });
 const noContent = () => ({ status: 204, body: null });
 
 const CONSENT_POLICY_VERSION = 1;
+
+/** `If-Match: "7"` — quotes and the weak marker optional, `*` means "whatever is there now". */
+const IF_MATCH_RE = /^(?:W\/)?"?(\d+)"?$/;
 
 function validationFailed(fields) {
   return new ApiError('VALIDATION_FAILED', 'Some fields need attention.', {
@@ -66,21 +75,44 @@ function consentProjection(state) {
   };
 }
 
+/** The §4 profile object, with the setup discriminator derived from the session's own state. */
+function profileFor(state, overrides = {}) {
+  return fx.profileMe({
+    consent: consentProjection(state),
+    moderation: state.moderation,
+    displayName: state.displayName,
+    setupNextStep: fx.setupNextStepFor(state),
+    ...overrides,
+  });
+}
+
 function authPayload(ctx, { status }) {
   const { clock, state } = ctx;
+  const accessToken = stubToken('access', `access:${state.tokenGeneration}`);
+  state.issuedTokens.push(accessToken);
   const body = {
-    accessToken: stubToken('access', `access:${state.tokenGeneration}`),
+    accessToken,
     expiresAt: clock.plus(ctx.accessTokenTtlMs),
     session: {
       sessionId: stubUlid('session:current', clock.nowMs()),
       deviceLabel: 'Chrome on macOS',
       createdAt: clock.now(),
     },
-    profile: fx.profileMe({ consent: consentProjection(state), moderation: state.moderation }),
+    profile: profileFor(state),
     // §3a.3: signup AND signin return the account-scoped receipt; null means undecided.
     consentReceipt: state.consent ? state.consent.accountReceipt : null,
   };
   return { status, body };
+}
+
+/** The room this request names, or `ROOM_NOT_FOUND`. */
+const room = (ctx) => rooms.roomFor(ctx.state, ctx.params.id);
+
+/** §11.4 and §6: a mutation requires membership, and says so with the contracted code. */
+function requireMembership(r) {
+  const me = rooms.localMember(r);
+  if (!me) throw new ApiError('NOT_IN_ROOM', 'You are not in that room.');
+  return me;
 }
 
 export const ROUTES = [
@@ -89,13 +121,29 @@ export const ROUTES = [
     requireFields(ctx.body, ['email', 'password', 'displayName', 'eligibilityReceipt',
       'clientSessionId', 'consentReceipt']);
     const { state } = ctx;
-    // Migration (§3a.3): the signed-out decision becomes account-scoped and gets a new receipt.
-    if (state.consent) {
-      state.consent.subject = 'account';
-      state.consent.accountReceipt = stubToken('consent-account', `consent:account:${ctx.scenario}`);
-      state.consentMigrated = true;
+    // §3a: "The client may navigate back, but it cannot skip ahead or reorder these calls."
+    // The receipts are the evidence that the preceding screens actually happened, so they are
+    // compared against what this session was issued rather than merely being present.
+    if (!state.eligible) {
+      throw new ApiError('AUTH_ELIGIBILITY_REQUIRED', 'Complete the age check first.');
     }
+    if (ctx.body.eligibilityReceipt !== state.eligibilityReceipt) {
+      throw new ApiError('ELIGIBILITY_RECEIPT_INVALID', 'Your age check expired. Please start again.');
+    }
+    if (!state.consent) {
+      throw validationFailed([{ path: 'consentReceipt', rule: 'prerequisite',
+        message: 'Answer the telemetry question before creating an account.' }]);
+    }
+    if (ctx.body.consentReceipt !== state.consent.sessionReceipt) {
+      throw validationFailed([{ path: 'consentReceipt', rule: 'receipt',
+        message: 'That consent receipt was not issued to this client session.' }]);
+    }
+    // Migration (§3a.3): the signed-out decision becomes account-scoped and gets a new receipt.
+    state.consent.subject = 'account';
+    state.consent.accountReceipt = stubToken('consent-account', `consent:account:${ctx.scenario}`);
+    state.consentMigrated = true;
     state.signedUp = true;
+    state.displayName = ctx.body.displayName;
     state.tokenIssuedAt = ctx.clock.nowMs();
     return authPayload(ctx, { status: 201 });
   } },
@@ -112,8 +160,10 @@ export const ROUTES = [
   { method: 'POST', path: '/v1/auth/refresh', auth: 'P', handler(ctx) {
     ctx.state.tokenGeneration++;
     ctx.state.tokenIssuedAt = ctx.clock.nowMs();
+    const accessToken = stubToken('access', `access:${ctx.state.tokenGeneration}`);
+    ctx.state.issuedTokens.push(accessToken);
     return okBody({
-      accessToken: stubToken('access', `access:${ctx.state.tokenGeneration}`),
+      accessToken,
       expiresAt: ctx.clock.plus(ctx.accessTokenTtlMs),
       session: {
         sessionId: stubUlid('session:current', ctx.clock.nowMs()),
@@ -125,13 +175,26 @@ export const ROUTES = [
 
   { method: 'POST', path: '/v1/auth/signout', auth: 'A', handler: () => noContent() },
   { method: 'POST', path: '/v1/auth/signout-all', auth: 'A', handler: () => noContent() },
-  { method: 'GET', path: '/v1/auth/sessions', auth: 'A', handler: () => okBody({ sessions: fx.sessionsList() }) },
-  { method: 'DELETE', path: '/v1/auth/sessions/:id', auth: 'A', handler: () => noContent() },
+  { method: 'GET', path: '/v1/auth/sessions', auth: 'A', handler(ctx) {
+    const revoked = ctx.state.revokedSessions;
+    return okBody({ sessions: fx.sessionsList().filter((s) => !revoked.includes(s.sessionId)) });
+  } },
+  { method: 'DELETE', path: '/v1/auth/sessions/:id', auth: 'A', handler(ctx) {
+    // §11.8: NOT_FOUND is a documented outcome. Answering 204 for an id that was never a session
+    // tells the UI a revocation happened that did not.
+    const known = fx.sessionsList().some((s) => s.sessionId === ctx.params.id);
+    if (!known || ctx.state.revokedSessions.includes(ctx.params.id)) {
+      throw new ApiError('NOT_FOUND', 'That session no longer exists.');
+    }
+    ctx.state.revokedSessions.push(ctx.params.id);
+    return noContent();
+  } },
 
   // Always 202, whether or not the account exists — the response is the same either way, or it
   // becomes an account-existence oracle.
   { method: 'POST', path: '/v1/auth/recovery/start', auth: 'P', handler(ctx) {
     requireFields(ctx.body, ['email']);
+    ctx.state.recoveryStarted = true;
     return accepted();
   } },
   { method: 'POST', path: '/v1/auth/recovery/complete', auth: 'P', handler(ctx) {
@@ -143,9 +206,10 @@ export const ROUTES = [
   { method: 'POST', path: '/v1/onboarding/eligibility', auth: 'P', handler(ctx) {
     requireFields(ctx.body, ['dateOfBirth', 'jurisdiction']);
     ctx.state.eligible = true;
+    ctx.state.eligibilityReceipt = stubToken('eligibility', `eligibility:${ctx.scenario}`);
     return okBody({
       eligible: true,
-      receipt: stubToken('eligibility', `eligibility:${ctx.scenario}`),
+      receipt: ctx.state.eligibilityReceipt,
       expiresAt: ctx.clock.plus(30 * 60 * 1000),
       // §3a.1: `minimumAge` is deliberately absent. Publishing the number the gate tests
       // against is how the next attempt clears it.
@@ -174,11 +238,17 @@ export const ROUTES = [
     }
     // §3a.3: required when signed out, ignored when authenticated — the account is the
     // stronger subject.
-    const authenticated = Boolean(ctx.headers.authorization);
+    const authenticated = ctx.authenticated || state.signedUp;
     if (!authenticated && !body.clientSessionId) {
       throw validationFailed([{ path: 'clientSessionId', rule: 'required', message: 'Required while signed out.' }]);
     }
-    const subject = authenticated || state.signedUp ? 'account' : 'client-session';
+    // "Consent, asked ONLY of eligible visitors" (§3a): eligibility precedes consent so that a
+    // visitor who cannot give it is never asked. A signed-out consent write with no eligibility
+    // on record is a client that skipped the gate.
+    if (!authenticated && !state.eligible) {
+      throw new ApiError('AUTH_ELIGIBILITY_REQUIRED', 'Complete the age check first.');
+    }
+    const subject = authenticated ? 'account' : 'client-session';
     state.consent = {
       telemetryPersonal: body.telemetryPersonal,
       policyVersion: body.policyVersion ?? CONSENT_POLICY_VERSION,
@@ -233,53 +303,82 @@ export const ROUTES = [
 
   // ── §4 profile ────────────────────────────────────────────────────────────────────────────
   { method: 'GET', path: '/v1/profile/me', auth: 'A', handler(ctx) {
-    return okBody(fx.profileMe({ consent: consentProjection(ctx.state), moderation: ctx.state.moderation }));
+    return okBody(profileFor(ctx.state));
   } },
 
   { method: 'PATCH', path: '/v1/profile/me', auth: 'A', handler(ctx) {
     if (ctx.body.displayName !== undefined && typeof ctx.body.displayName !== 'string') {
       throw validationFailed([{ path: 'displayName', rule: 'string', message: 'Display name must be text.' }]);
     }
-    return okBody(fx.profileMe({
-      consent: consentProjection(ctx.state),
-      moderation: ctx.state.moderation,
-      displayName: ctx.body.displayName || undefined,
-    }));
+    if (ctx.body.displayName) ctx.state.displayName = ctx.body.displayName;
+    return okBody(profileFor(ctx.state));
   } },
 
+  /**
+   * §11.2. `values` round-trips: what a PUT stores is what the next GET returns, at a version
+   * that advanced by one, with the `ETag` the next `If-Match` has to carry. The previous handler
+   * ignored the body entirely and returned four fixed values, so a settings screen built against
+   * it could never discover that its writes did nothing.
+   */
   { method: 'GET', path: '/v1/profile/me/settings', auth: 'A', handler(ctx) {
+    const s = ctx.state.settings;
     return {
       status: 200,
-      headers: { ETag: `"${ctx.state.settingsVersion}"` },
+      headers: { ETag: `"${s.version}"` },
       body: {
-        schemaVersion: 1,
-        version: ctx.state.settingsVersion,
-        values: fx.roamingSettings(),
-        updatedAt: ctx.clock.fromEpoch(-3600 * 1000),
+        schemaVersion: SCHEMA_VERSION,
+        version: s.version,
+        values: s.values,
+        updatedAt: s.updatedAt,
       },
     };
   } },
 
   { method: 'PUT', path: '/v1/profile/me/settings', auth: 'A', handler(ctx) {
+    const s = ctx.state.settings;
     const ifMatch = ctx.headers['if-match'];
     // §3a.4: a missing `If-Match` is CONFLICT with a reason, never 428. One code, one status,
     // or the client cannot branch on status at all.
     if (!ifMatch) {
       throw new ApiError('CONFLICT', 'Settings require an If-Match header.', { details: { reason: 'if-match-required' } });
     }
-    const want = Number(String(ifMatch).replace(/"/g, ''));
-    if (want !== ctx.state.settingsVersion) {
+    const raw = String(ifMatch).trim();
+    const parsed = IF_MATCH_RE.test(raw) ? Number(raw.replace(/[W/"]/g, '')) : NaN;
+    const want = raw === '*' ? s.version : parsed;
+    if (Number.isNaN(want)) {
+      throw new ApiError('CONFLICT', 'If-Match is not a settings version.', { details: { reason: 'if-match-required' } });
+    }
+    if (want !== s.version) {
+      // The 409 returns the current server state so the UI can merge rather than re-fetch.
       throw new ApiError('CONFLICT', 'These settings changed on another device.', {
-        details: { currentVersion: ctx.state.settingsVersion, values: fx.roamingSettings() },
+        details: { currentVersion: s.version, values: s.values },
       });
     }
-    ctx.state.settingsVersion++;
-    return okBody({
-      schemaVersion: 1,
-      version: ctx.state.settingsVersion,
-      values: fx.roamingSettings(),
-      updatedAt: ctx.clock.now(),
-    });
+    if (ctx.body.schemaVersion !== SCHEMA_VERSION) {
+      throw validationFailed([{ path: 'schemaVersion', rule: 'unsupported',
+        message: `Settings schema version ${SCHEMA_VERSION} is the only one this build accepts.` }]);
+    }
+    // §11.9: a DEVICE, SESSION or PRACTICE key, or a value outside its range/step/enum, is
+    // REJECTED — never clamped, because a clamped setting is one the player did not choose and
+    // cannot see they did not get. Validated by the platform's generated validator, so the stub
+    // cannot accept a shape the real endpoint refuses.
+    const { errors } = validateRoamingSettings(ctx.body.values);
+    if (errors.length) {
+      throw validationFailed(errors.map((e) => ({ ...e, path: e.key, rule: e.reason, message: 'This setting was rejected.' })));
+    }
+    // Full replace: an absent ROAM key reverts to its documented default, or a reset-to-default
+    // would be unexpressible.
+    const merged = { ...defaultRoamingValues(), ...ctx.body.values };
+    merged.keybinds = ctx.body.values.keybinds ?? {};
+    s.values = merged;
+    s.version++;
+    s.updatedAt = ctx.clock.now();
+    ctx.state.essentialSettingsDone = true;
+    return {
+      status: 200,
+      headers: { ETag: `"${s.version}"` },
+      body: { schemaVersion: SCHEMA_VERSION, version: s.version, values: s.values, updatedAt: s.updatedAt },
+    };
   } },
 
   { method: 'GET', path: '/v1/profile/:accountId/stats', auth: 'A', handler(ctx) {
@@ -302,6 +401,16 @@ export const ROUTES = [
   } },
 
   { method: 'GET', path: '/v1/profile/:accountId', auth: 'A', handler(ctx) {
+    // The caller's own public projection is how a reloaded shell discovers it is still in a
+    // lobby (design/first-run-flow.md, "Active lobby membership → Lobby resync screen"):
+    // `presence.roomId` is the only contracted place that room id survives a reload.
+    if (ctx.params.accountId === fx.ACCOUNT_ID) {
+      return okBody(fx.selfProfile({
+        displayName: ctx.state.displayName,
+        statsVisible: !ctx.state.privacyFiltered,
+        activeRoomId: ctx.state.activeRoomId,
+      }));
+    }
     return okBody(fx.publicProfile({
       statsVisible: !ctx.state.privacyFiltered,
       presenceVisible: !ctx.state.privacyFiltered,
@@ -327,11 +436,11 @@ export const ROUTES = [
       }
     }
     const rtt = fx.parseRegionRtt(ctx.headers['x-region-rtt']);
-    let rooms = [0, 1, 2].map((i) => fx.roomCore(i, { rtt }));
-    if (ctx.query.region) rooms = rooms.filter((r) => r.region === ctx.query.region);
-    if (ctx.query.mode) rooms = rooms.filter((r) => r.mode === ctx.query.mode);
-    if (ctx.query.hasSpace === 'true') rooms = rooms.filter((r) => r.playerCount < r.capacity);
-    return okBody(paginate(rooms, ctx.query));
+    let list = fx.ROOM_IDS.map((id) => rooms.core(rooms.roomFor(ctx.state, id), { rtt }));
+    if (ctx.query.region) list = list.filter((r) => r.region === ctx.query.region);
+    if (ctx.query.mode) list = list.filter((r) => r.mode === ctx.query.mode);
+    if (ctx.query.hasSpace === 'true') list = list.filter((r) => r.playerCount < r.capacity);
+    return okBody(paginate(list, ctx.query));
   } },
 
   { method: 'POST', path: '/v1/rooms', auth: 'A', handler(ctx) {
@@ -342,8 +451,13 @@ export const ROUTES = [
     const roomId = stubUlid(`room:created:${ctx.scenario}`, ctx.clock.nowMs());
     const index = ctx.body.mode === 'bomb' ? 1 : 0;
     const res = fx.reservation(ctx.clock, `create:${ctx.scenario}`);
-    return created({
-      room: fx.roomCore(index, {
+    // Creating a room joins it (§11.3a), so the created room is adopted into session state and
+    // its id resolves on every later request — the previous handler minted an id that came back
+    // as room A's fixture on the next GET.
+    const createdRoom = rooms.adoptRoom(ctx.state, {
+      roomId,
+      index,
+      core: fx.roomCore(index, {
         roomId,
         overrides: {
           name: ctx.body.name, region: ctx.body.region, capacity: ctx.body.capacity,
@@ -353,36 +467,69 @@ export const ROUTES = [
       }),
       roster: fx.roster(index, { count: 1, roomId }),
       countdown: null,
+      frozen: false,
+    });
+    createdRoom.roster[0].isOwner = true;
+    ctx.state.activeRoomId = roomId;
+    return created({
+      room: rooms.core(createdRoom),
+      roster: createdRoom.roster.map((m) => ({ ...m })),
+      countdown: null,
       ...res,
     });
   } },
 
   { method: 'GET', path: '/v1/rooms/:id', auth: 'A', handler(ctx) {
     const rtt = fx.parseRegionRtt(ctx.headers['x-region-rtt']);
-    const index = fx.roomIndexFor(ctx.params.id);
-    return okBody(fx.roomDetail(index, { rtt, roomId: ctx.params.id }));
+    return okBody(rooms.detail(room(ctx), { rtt }));
   } },
 
   { method: 'POST', path: '/v1/rooms/:id/join', auth: 'A', handler(ctx) {
+    const r = room(ctx);
+    if (!rooms.localMember(r)) {
+      rooms.assertJoinable(r);
+      r.roster.push(fx.joiningMember(r.roomId, r.roster.length));
+      // §7: a join changes the shape of the match everyone else consented to.
+      rooms.clearReady(r);
+    }
+    ctx.state.activeRoomId = r.roomId;
     return okBody(fx.reservation(ctx.clock, `join:${ctx.scenario}`));
   } },
 
-  { method: 'POST', path: '/v1/rooms/:id/leave', auth: 'A', handler: () => noContent() },
+  { method: 'POST', path: '/v1/rooms/:id/leave', auth: 'A', handler(ctx) {
+    // Idempotent by nature: 204 even if not a member (§11.8).
+    const r = room(ctx);
+    r.roster = r.roster.filter((m) => !m.isLocal);
+    if (ctx.state.activeRoomId === r.roomId) ctx.state.activeRoomId = null;
+    return noContent();
+  } },
 
   { method: 'POST', path: '/v1/rooms/:id/team', auth: 'A', handler(ctx) {
     if (!['alpha', 'bravo', 'auto'].includes(ctx.body.team)) {
       throw validationFailed([{ path: 'team', rule: 'enum', message: 'team is alpha, bravo, or auto.' }]);
     }
-    const index = fx.roomIndexFor(ctx.params.id);
-    return okBody(fx.roomDetail(index, { roomId: ctx.params.id }));
+    const r = room(ctx);
+    const me = requireMembership(r);
+    if (r.frozen) throw new ApiError('TEAM_SWITCH_FORBIDDEN', 'The roster is locked for launch.');
+    // The server decides; `auto` is a preference, so it resolves to the smaller side.
+    const want = ctx.body.team === 'auto'
+      ? (r.roster.filter((m) => m.team === 'alpha').length
+        <= r.roster.filter((m) => m.team === 'bravo').length ? 'alpha' : 'bravo')
+      : ctx.body.team;
+    const already = r.roster.filter((m) => m.team === want && !m.isLocal).length;
+    if (already >= r.core.capacity / 2) throw new ApiError('TEAM_FULL', 'That team is full.');
+    me.team = want;
+    rooms.clearReady(r);          // §7: any team change clears readiness
+    return okBody(rooms.detail(r));
   } },
 
   { method: 'POST', path: '/v1/rooms/:id/ready', auth: 'A', handler(ctx) {
     if (typeof ctx.body.ready !== 'boolean') {
       throw validationFailed([{ path: 'ready', rule: 'boolean', message: 'ready must be true or false.' }]);
     }
-    const index = fx.roomIndexFor(ctx.params.id);
-    return okBody(fx.roomDetail(index, { roomId: ctx.params.id }));
+    const r = room(ctx);
+    requireMembership(r).ready = ctx.body.ready;
+    return okBody(rooms.detail(r));
   } },
 
   { method: 'POST', path: '/v1/rooms/:id/loadout', auth: 'A', handler(ctx) {
@@ -391,13 +538,26 @@ export const ROUTES = [
         || primaryIdx < 0 || primaryIdx > 5 || secondaryIdx < 0 || secondaryIdx > 3) {
       throw validationFailed([{ path: 'primaryIdx', rule: 'range', message: 'Index out of range for this ruleset.' }]);
     }
-    const index = fx.roomIndexFor(ctx.params.id);
-    return okBody(fx.roomDetail(index, { roomId: ctx.params.id }));
+    const r = room(ctx);
+    const me = requireMembership(r);
+    me.loadout = { primaryIdx, secondaryIdx };
+    me.ready = false;             // §7: the readying player changing loadout clears their ready
+    return okBody(rooms.detail(r));
   } },
 
-  { method: 'POST', path: '/v1/rooms/:id/launch', auth: 'A', handler: () => accepted() },
+  { method: 'POST', path: '/v1/rooms/:id/launch', auth: 'A', handler(ctx) {
+    const r = room(ctx);
+    requireMembership(r);
+    rooms.assertLaunchable(r);    // owner-only, and 409 unless every required player is ready
+    rooms.startCountdown(r, ctx.clock);
+    return accepted();
+  } },
 
   { method: 'POST', path: '/v1/rooms/:id/reconnect-ticket', auth: 'A', handler(ctx) {
+    const r = room(ctx);
+    // §6: "Requires an authenticated account that still holds a seat in the room. It does not
+    // create membership" — so a non-member gets a refusal, not a ticket into a room they left.
+    requireMembership(r);
     const res = fx.reservation(ctx.clock, `reconnect:${ctx.scenario}`);
     return okBody({
       lobbySocketUrl: res.lobbySocketUrl,
@@ -452,12 +612,15 @@ export const ROUTES = [
 
   { method: 'GET', path: '/v1/config/regions', auth: 'P', handler: () => okBody({ regions: fx.REGIONS }) },
 
-  { method: 'GET', path: '/v1/health', auth: 'P', handler: () => okBody({ ok: true }) },
-  { method: 'GET', path: '/v1/health/ready', auth: 'S', handler: () => okBody({ ok: true, dependencies: { db: 'up', flags: 'up' } }) },
+  // Build-exempt exactly as core/http.js exempts them: a liveness probe is not a game client
+  // and has no build to compare against a floor.
+  { method: 'GET', path: '/v1/health', auth: 'P', requireBuild: false, handler: () => okBody({ ok: true }) },
+  { method: 'GET', path: '/v1/health/ready', auth: 'S', requireBuild: false,
+    handler: () => okBody({ ok: true, dependencies: { db: 'up', flags: 'up' } }) },
 
   // `POST /v1/matches/:matchId/result` is deliberately ABSENT. It is service-only and never
   // browser-reachable (§7); stubbing it would put a route in the shell's reach whose entire
   // security property is that the shell cannot reach it.
 ];
 
-export { okBody, created, accepted, noContent, validationFailed, consentProjection };
+export { okBody, created, accepted, noContent, validationFailed, consentProjection, profileFor };

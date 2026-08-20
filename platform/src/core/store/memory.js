@@ -805,7 +805,10 @@ export function createMemoryStore(config = {}, deps = {}) {
           requireAccount(st, p.accountId, 'match_participants');
           const k = key(p.matchId, p.accountId);
           const before = st.matchParticipants.get(k);
-          const prec = { ...p, joinedAt: toIso(p.joinedAt), leftAt: toIso(p.leftAt) };
+          // Mirror the Postgres column default: `joined_at` is NOT NULL default now(), so an
+          // omitted value is stamped rather than stored null. Memory storing null here is the
+          // divergence that let the allocation path look healthy while Postgres rejected it.
+          const prec = { ...p, joinedAt: toIso(p.joinedAt) ?? nowIso(), leftAt: toIso(p.leftAt) };
           // (match_id, account_id) is the primary key: a finalise updates the allocation row
           // rather than inserting a second one, and joinedAt stays the moment they actually
           // joined rather than being restamped by the result.
@@ -959,11 +962,21 @@ export function createMemoryStore(config = {}, deps = {}) {
     async get(clientSessionId, txh) {
       const row = await read(txh, (st) => st.preAuthConsent.get(clientSessionId) ?? null);
       if (!row) return null;
-      if (row.expiresAt && Date.parse(row.expiresAt) <= consentNowMs()) {
-        await write(txh, (st) => { st.preAuthConsent.delete(clientSessionId); });
-        return null;
-      }
-      return clone(row);
+      if (!row.expiresAt || Date.parse(row.expiresAt) > consentNowMs()) return clone(row);
+
+      // Re-check INSIDE the write, against the row as it is now.
+      //
+      // Deleting by key alone destroyed a decision recorded between the read and the write: a
+      // GET interleaving with a PUT erased the player's just-recorded, legally significant
+      // answer. Postgres was safe only because its `delete … and expires_at <= $2`
+      // re-evaluates the predicate — this is the same guarantee, expressed the same way.
+      await write(txh, (st) => {
+        const cur = st.preAuthConsent.get(clientSessionId);
+        if (!cur) return;
+        if (!cur.expiresAt || Date.parse(cur.expiresAt) > consentNowMs()) return;   // refreshed
+        st.preAuthConsent.delete(clientSessionId);
+      });
+      return null;
     },
 
     markMigrated(clientSessionId, at, txh) {
@@ -1075,6 +1088,16 @@ export function createMemoryStore(config = {}, deps = {}) {
   };
 
   const idempotency = {
+    /**
+     * No-op, deliberately.
+     *
+     * This adapter serialises every transaction through one lock, so work sharing an
+     * idempotency key is already ordered. The method exists so the Postgres adapter — where
+     * an advisory lock is genuinely required — is called through the same interface, rather
+     * than the caller branching on which adapter it happens to hold.
+     */
+    async acquire() { /* transactions are globally serialised here */ },
+
     get(k, actorId, txh) {
       return read(txh, (st) => clone(st.idempotency.get(key(k, actorId)) ?? null));
     },

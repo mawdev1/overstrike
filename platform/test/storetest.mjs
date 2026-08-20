@@ -1444,10 +1444,18 @@ if (!databaseUrl) {
       // never sees, so the table has to refuse them itself.
       console.log('\n[postgres] the §4.0 outcome matrix is enforced by the table');
       const matchRow = (over) => {
+        // Every field 0013 requires on a TERMINAL row. The fixture used to carry only the
+        // four outcome columns 0012 constrained, so once completeness was enforced the
+        // control — "a matrix-satisfying row inserts directly" — was refused for a reason
+        // that had nothing to do with the matrix it was testing.
         const cols = {
-          match_id: ulid(), region: 'yyz', map_id: 'the-square', mode: 'bomb',
-          rules_snapshot: '{}', status: 'completed', termination_reason: 'completed',
+          match_id: ulid(), region: 'yyz', map_id: 'the-square', map_version: '1.0.0',
+          mode: 'bomb', rules_snapshot: '{}',
+          ruleset_version: 'bomb-1.0.0', stat_definition_version: '1.0.0', server_build: 'test',
+          team_scores: '{}', rounds: '[]', evidence_ref: 'ev-1',
+          status: 'completed', termination_reason: 'completed',
           outcome_reason: 'timer', winner_team: 'alpha', invalidation_reason: null,
+          started_at: new Date().toISOString(),
           ended_at: new Date().toISOString(), result_applied_at: null, ...over,
         };
         const keys = Object.keys(cols);

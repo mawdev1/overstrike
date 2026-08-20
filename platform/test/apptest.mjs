@@ -35,13 +35,18 @@ const silent = () => {
   return l;
 };
 
-let PORT = 8200;
-
+/**
+ * Bind port 0 and ask the OS what it gave us.
+ *
+ * Fixed ports made this suite collide with stubtest intermittently — one run red, the next
+ * green, with no code change between them. A flaky suite is worse than a failing one: it
+ * teaches everyone to re-run instead of to look.
+ */
 async function withApp(fn, envOverrides = {}) {
-  const port = PORT++;
-  const config = loadConfig({ PLATFORM_PORT: String(port), ...envOverrides });
+  const config = loadConfig({ PLATFORM_PORT: '0', ...envOverrides });
   const app = await buildApp(config, { logger: silent() });
-  await new Promise((r) => app.server.listen(port, r));
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  const port = app.server.address().port;
   const base = `http://127.0.0.1:${port}`;
 
   const call = async (method, path, body, headers = {}) => {
@@ -223,18 +228,37 @@ await withApp(async ({ call }) => {
   section('stub layer is mounted');
   // H1.1's blocker: the stub object existed and nothing could reach it, so there was no
   // address for the other lane to build against.
-  const empty = await call('GET', '/v1/rooms', undefined,
-    { 'x-stub-scenario': 'browser-empty', 'x-client-session-id': 'apptest-1' });
+  // `GET /v1/rooms` is an `A` row (§2), and the stub layer now enforces the same auth class
+  // production does — so the harness signs in through the stub first, exactly as a client
+  // would. It previously reached an authenticated endpoint with no credential at all.
+  const asClient = async (scenario, session) => {
+    const signin = await call('POST', '/v1/auth/signin', { email: 'a@b.invalid', password: 'p' },
+      { 'x-stub-scenario': scenario, 'x-client-session-id': session });
+    return call('GET', '/v1/rooms', undefined, {
+      'x-stub-scenario': scenario,
+      'x-client-session-id': session,
+      authorization: `Bearer ${signin.body?.accessToken}`,
+    });
+  };
+
+  const empty = await asClient('browser-empty', 'apptest-1');
   check(empty.status === 200 && Array.isArray(empty.body?.items) && empty.body.items.length === 0,
     'a stub scenario answers an endpoint the platform has not implemented yet',
     `${empty.status} ${empty.text?.slice(0, 60)}`);
   check(typeof empty.body?.correlationId === 'string',
     'a stub response still carries the correlation id');
 
-  const populated = await call('GET', '/v1/rooms', undefined,
-    { 'x-stub-scenario': 'default', 'x-client-session-id': 'apptest-2' });
+  const populated = await asClient('default', 'apptest-2');
   check(populated.body?.items?.length > 0,
     'control: a different scenario returns different data, so the layer is stateful');
+
+  // And the gate is real: the same request without a token is refused by the stub layer,
+  // exactly as production would refuse it.
+  const unauth = await call('GET', '/v1/rooms', undefined,
+    { 'x-stub-scenario': 'default', 'x-client-session-id': 'apptest-3' });
+  check(unauth.status === 401,
+    'the stub layer enforces the same auth class production does',
+    `${unauth.status} ${unauth.body?.error?.code}`);
 
   const real = await call('GET', '/v1/rooms');
   check(real.status === 404,
