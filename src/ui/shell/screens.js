@@ -398,7 +398,7 @@ const ESSENTIAL_SETTING_KEYS = Object.freeze([
  * The flag's contracted off-behaviour is "Browser hidden; direct room links still resolve"
  * (feature-flags.md §3.2). Hidden means not landed on, not shown disabled.
  */
-function homePath(isFeatureEnabled) {
+export function homePath(isFeatureEnabled) {
   return isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? '/welcome' : '/play/rooms';
 }
 

@@ -5,7 +5,7 @@ import { actionButton, element, shellLink } from './dom.js';
 import { getShellFixture, resolveShellFixture, SHELL_SCREEN_FIXTURES, SHELL_VARIANT_MATRIX } from './fixtures.js';
 import { createModalController } from './modal.js';
 import { createHistoryRouter, matchShellRoute, SHELL_ROUTES } from './router.js';
-import { renderShellScreen } from './screens.js';
+import { renderShellScreen, homePath } from './screens.js';
 
 export const SHELL_FEATURE_DEFAULTS = Object.freeze({
   'shell.diagnostics.panel': true,
@@ -122,10 +122,22 @@ function connectionSnapshot(client) {
   return null;
 }
 
-function nextSetupPath(result) {
+/**
+ * The next onboarding step, or where to go when there are none left.
+ *
+ * `step === null` means setup is COMPLETE, and this returned a hardcoded '/play/rooms' for that
+ * case. Callers are written `nextSetupPath(result) || homePath(...)`, so the fallback they were
+ * given could never run: a truthy '/play/rooms' short-circuits the `||`. With
+ * `shell.serverbrowser.enabled` off, every finished player was still routed to the browser's
+ * "Unavailable" card by the one branch that claimed to handle completion.
+ *
+ * It takes `isFeatureEnabled` so the completion destination is decided in ONE place rather than
+ * at four call sites that each have to remember.
+ */
+function nextSetupPath(result, isFeatureEnabled) {
   const data = unwrapResult(result);
   const step = data?.profile?.flags?.setupNextStep ?? data?.flags?.setupNextStep;
-  return step === null ? '/play/rooms' : SETUP_PATHS[step] || null;
+  return step === null ? homePath(isFeatureEnabled) : SETUP_PATHS[step] || null;
 }
 
 function errorVariant(error) {
@@ -615,8 +627,13 @@ export function mountAppShell({
   }
 
   async function resumeAfterAuth(result) {
-    const setupPath = nextSetupPath(result);
-    if (setupPath && setupPath !== '/play/rooms') {
+    // Where a signed-in player lands when nothing more specific applies. This was hardcoded to
+    // /play/rooms, so SIGNING IN with `shell.serverbrowser.enabled` off landed on the browser's
+    // own "Unavailable" card — the same dead end as the end of onboarding, reached by the other
+    // of the two doors into the shell. Fixing one and not the other is what made it look fixed.
+    const home = homePath(isFeatureEnabled);
+    const setupPath = nextSetupPath(result, isFeatureEnabled);
+    if (setupPath && setupPath !== home) {
       router.navigate(setupPath);
       return;
     }
@@ -645,7 +662,7 @@ export function mountAppShell({
       await loadRoute();
       return;
     }
-    router.navigate('/play/rooms');
+    router.navigate(home);
   }
 
   function clearSession() {
@@ -711,7 +728,7 @@ export function mountAppShell({
     acceptProfile,
     resumeAfterAuth,
     clearSession,
-    nextSetupPath,
+    nextSetupPath: (result) => nextSetupPath(result, isFeatureEnabled),
     updateDraft: (values) => Object.assign(draft, values),
     getDraft: () => ({ ...draft, password: undefined }),
     clearDraft: () => { for (const key of Object.keys(draft)) delete draft[key]; },
