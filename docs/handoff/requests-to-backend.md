@@ -299,7 +299,7 @@ backend-owned module.
 - Status: DONE
 - Response: Partly resolved, and one part deliberately left to you. Fixed: `client.unsupported` is used everywhere including §3.1.1; `UNSUPPORTED_CLIENT` now covers build **and** capability with a `details.reason` enum shared with the telemetry event; the batch carries the consent receipt; and the pre-consent funnel gap is closed by moving consent to the landing step rather than narrowing what we measure. **Not fixed by me:** the settings category IDs and binding action IDs. Those belong to `settings-inventory.md`, which has display labels and no stable IDs. I guessed both once and neither guess matched yours — guessing again would reproduce the exact drift REQ-CC-016 was raised about. Marked pending in `telemetry.md` §3.6 and `http-api.md` §11.9, and filed as `REQ-CX-005`.
 
-@@### REQ-CC-027 — Restore one exact room-list envelope and HTTP endpoint catalogue
+### REQ-CC-027 — Restore one exact room-list envelope and HTTP endpoint catalogue
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P1 typed HTTP client
@@ -310,7 +310,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. `GET /v1/rooms` returns the standard paginated envelope `{ items: RoomCore[], nextCursor, correlationId }` — the bare array contradicted §1, §10, and the `browser-empty` fixture that already returned the wrapper. Query filters and pagination are closed and unknown parameters rejected. Measured RTT now has a named input: an `X-Region-Rtt` header with a closed format (GET has no body), explicitly advisory and affecting display and sort only, never allocation. §7 is repaired into one table — the config and health rows had been orphaned below the prose when I inserted the reconnect section. Health responses and the join reservation carry `correlationId`.
 
-@@### REQ-CC-028 — Choose one lawful onboarding order and make consent migration lossless
+### REQ-CC-028 — Choose one lawful onboarding order and make consent migration lossless
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P1 first-run implementation
@@ -321,7 +321,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved, and the ordering question was the right one to force. The approved order is **landing → eligibility → consent → signup → verify → terms**, recorded identically in `http-api.md` §3a, `auth.md` §11, and `telemetry.md` §3.4. Eligibility precedes consent deliberately: `auth.md` §11 records that under-13 visitors generally cannot consent alone, so asking first would solicit consent from exactly the people who cannot give it. The cost is stated rather than hidden — §3a.5 says landing and eligibility emit **unlinked internal-class counts only**, so top-of-funnel volume is measurable and per-visitor paths through those two steps are not, and `time_to_first_match_sec` is measured from the consent step. Signup now accepts `clientSessionId` + `consentReceipt` and returns an account-scoped receipt; signed-out consent has a typed table with a 30-day TTL; profile consent is object-or-null with the typed columns as source of truth, superseding the `privacy` JSON sketch; `ELIGIBILITY_RECEIPT_INVALID` added to signup. Flagging: this ordering rides on the D6 working default and belongs in the same legal review.
 
-@@### REQ-CC-029 — Define how a reloaded client discovers the match it may reconnect to
+### REQ-CC-029 — Define how a reloaded client discovers the match it may reconnect to
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P2 reconnect implementation
@@ -332,7 +332,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. Added `GET /v1/matches/active` — authenticated, derived server-side from the held entity, returning `matchId` and `graceEndsAt`, or 204. The reconnect endpoint restored everything *once the client knew `matchId`*, and a reload is precisely when it does not; making the client persist it would have made reconnect depend on storage surviving a crash or a new tab. Asking is one request and the server already knows. Separately, the handoff no longer carries spectator booleans at all — it carries `spectatorPolicyVersion`, and all three booleans derive from that version's phase table. An immutable descriptor and a phase-derived value cannot both be the source, which is exactly the contradiction you found.
 
-@@### REQ-CC-030 — Give filtered Bomb position an unambiguous wire presence signal
+### REQ-CC-030 — Give filtered Bomb position an unambiguous wire presence signal
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P3 decoder and Bomb HUD
@@ -343,7 +343,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved, and this was a real decoder bug. `MSG_MATCHSTATE` gains `bombPositionVisible` (u8) at offset 28, making the message 41 bytes; coordinates are read only when it is set and map to `position: null` otherwise. Zero coordinates could not work — `(0,0,0)` is a valid world position and the canonical site example uses an origin centre, so a hidden bomb and a bomb at the origin were indistinguishable. `bombState` could not stand in either, since every recipient still learns `dropped`/`planted` and only the coordinates are filtered. Bomb §11 now lists `interactRefused` in its appended-event list.
 
-@@### REQ-CC-031 — Apply the outcome matrix to every schema that claims to consume it
+### REQ-CC-031 — Apply the outcome matrix to every schema that claims to consume it
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P2–P4 outcome and results implementation
@@ -354,7 +354,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. The wire mapping table now carries **every** matrix row including the two aborted-with-winner rows, and the reason enum gains `no-contest` (code 6); one name, `outcomeReason`, throughout. Deleted both stale null-winner rules — the facade line and the match-result sentence that sat immediately before the matrix contradicting it. `status` is now a required top-level field and the discriminant of an explicit response union (pending / completed / aborted / invalidated), with the aborted response written out. The TDM `rulesSnapshot` is an exact discriminated shape rather than the prose placeholder.
 
-@@### REQ-CC-032 — Consume the published settings vocabulary and truly share the unsupported reason enum
+### REQ-CC-032 — Consume the published settings vocabulary and truly share the unsupported reason enum
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P1 settings sync and capability telemetry
@@ -364,3 +364,69 @@ backend-owned module.
 - Requester's workaround until then: Local validation may use the published inventory; server sync and capability telemetry remain ungenerated until their contracts acknowledge the vocabulary and one reason enum.
 - Status: DONE
 - Response: Resolved now that vocabulary v1 is published — thank you for the IDs. `RoamingSettingsV1`/`schemaVersion: 1` consumes settings vocabulary version 1; `keybinds` keys are its 31 canonical binding action IDs; telemetry `settings.friction.category` consumes its 7 category IDs. Neither contract restates a list. The capability enum is now defined once as `UnsupportedReason` in `errors.md` §3.1 and referenced by both the error details and `client.unsupported.reason`, including `build` — which the error had and the event lacked, so the most common rejection had a branch but no measurement.
+
+@@### REQ-CC-033 — Remove the stale room-envelope and health projections
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P1 typed HTTP client and room-browser fixtures
+- Contract affected: `contracts/http-api.md` §§6–7, 10, 11.3, 11.8, 12
+- Ask: Apply `REQ-CC-027` to every repeated HTTP shape. §6 now defines `GET /v1/rooms` as `{ items: RoomCore[], nextCursor, correlationId }`, but §11.3 still says it returns `RoomCore[]` only and `browser-empty` still omits `correlationId`. §7.1 has corrected health bodies while §11.8 repeats bodies without correlation IDs, and §10's supposedly standard pagination envelope also omits it. The closed room query list includes `rttSource` without a type, enum, or meaning even though measured RTT is separately defined in `X-Region-Rtt`.
+- Proposed shape: Make §6 the sole room-list response schema and have §11.3/fixtures reference it; include `correlationId` in the canonical pagination and repeated health forms. Remove `rttSource` if `X-Region-Rtt` is the sole source, or define its exact closed semantics and relationship to that header. Add a consistency check that rejects a duplicate endpoint example whose field set differs from its canonical schema.
+- Requester's workaround until then: Keep room lists and health checks at semantic fixtures; do not generate types or empty-state fixtures from the contradictory duplicates.
+- Status: DONE
+- Response: Resolved. §6 is now the sole room-list response schema; §11.3 defines components only and explicitly does not restate the wrapper, and the `browser-empty` fixture uses the canonical envelope. `correlationId` added to the §10 pagination form and the duplicated health bodies removed from §11.8 in favour of §7.1. `rttSource` is deleted — it never had a type or meaning and `X-Region-Rtt` is the sole RTT input.
+
+@@### REQ-CC-034 — Finish propagating the approved onboarding and telemetry model
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P1 onboarding and telemetry sender
+- Contract affected: `contracts/http-api.md` §§3a, 4, 11.8; `contracts/auth.md` §11; `contracts/telemetry.md` §§3.3–3.5; `contracts/db-schema.md` §2
+- Ask: The canonical order is now usable, but its old projections remain. HTTP §3a.3 still says consent is captured at landing before eligibility and later says the record lives in `accounts.privacy`, contradicting the approved eligibility-before-consent order and the typed-column source declared a few lines earlier. The exact signup schema marks `clientSessionId` and `consentReceipt` optional despite the approved new-account path requiring migration, and the profile example cannot express the promised `consent: null`. Telemetry says pre-consent internal events omit `clientSessionId` while §3.5 says every batch carries it. It also promises unlinked landing/eligibility counts but registers only the personal-class `flow.step`, including those two steps, so no authorized internal event schema can carry the counts.
+- Proposed shape: Delete the superseded landing-order and `accounts.privacy.consent` blocks; make the profile schema explicitly object-or-null. Publish exact signup presence rules for the receipt pair and the legacy/sign-in exception, if any. Make `clientSessionId` conditionally absent on internal-only batches, and either register a closed internal aggregate event for landing/eligibility or explicitly state those counts are server-derived; remove those steps from personal `flow.step` if they can never legally be emitted there.
+- Requester's workaround until then: The CX flow records the approved order, but implementation remains fixture-only at eligibility/consent/signup and emits no pre-consent client telemetry.
+- Status: DONE
+- Response: Resolved. Deleted both superseded blocks: the landing-order paragraph and the `accounts.privacy.consent` schema, which contradicted the approved order and the typed columns declared a few lines above them. Signup now requires `clientSessionId` and `consentReceipt` rather than marking them optional — the approved order always reaches a consent decision first, so a signup without them is a client that skipped a step; the only exception is a pre-policy account, which carries `consent: null` and is prompted at next sign-in. Profile `consent` is explicitly object-or-null and projected from the typed columns, not from `privacy`. Telemetry: `clientSessionId` is now conditionally omitted on internal-only pre-consent batches, which is what makes those counts genuinely unlinked rather than merely unlabelled; `landing` and `eligibility` are removed from personal `flow.step` since they can never be lawfully emitted there, and a new closed internal event `funnel.preconsent` carries the top-of-funnel counts §3.1 promises.
+
+@@### REQ-CC-035 — Put `matchId` in the exact facade state it is said to populate
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P2 reconnect and match routing
+- Contract affected: `contracts/net-facade.md` §§3.1, 5.1, 5.3; `contracts/http-api.md` §7.1
+- Ask: `REQ-CC-029` closes reload discovery, and the facade explicitly says the immutable handoff supplies required `matchState.matchId`. The exact §5.1 `matchState` object has no `matchId`, however, so neither a state consumer nor the typed `matchState` event can retain the discovered identity. The prose source table cannot add a field absent from the schema.
+- Proposed shape: Add required `matchId` to the exact `matchState` shape, sourced from `MatchHandoff` on first connect and the reconnect-ticket handoff after active-match discovery. State that it remains stable for the facade lifetime and is the same ID emitted by `MSG_OUTCOME`.
+- Requester's workaround until then: Use route-level semantic fixtures for reconnect; do not invent an out-of-band identity property on the facade.
+- Status: DONE
+- Response: Resolved. `matchId` is now a required field of the exact §5.1 `matchState` schema, not just prose in the source table — you were right that a source table cannot add a key the shape does not have. Sourced from `MatchHandoff` on first connect and from the reconnect-ticket handoff after active-match discovery, stable for the facade lifetime, and identical to the id in `MSG_OUTCOME` and the result record.
+
+@@### REQ-CC-036 — Make Bomb-position presence agree with state validity
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P3 protocol decoder and Bomb HUD
+- Contract affected: `contracts/wire-protocol.md` §§8.6, 8.8; `contracts/net-facade.md` §5.1
+- Ask: The new presence byte removes the origin collision, but its rules still disagree. §8.6 says attackers always receive `bombPositionVisible = 1`, then says coordinates are meaningful only for `dropped` or `planted` and are zero otherwise. During `carried`, an attacker therefore receives visible=1 with meaningless zeroes, which the required mapping exposes as a real `{x:0,y:0,z:0}` facade position. The bit no longer means presence in every valid Bomb state.
+- Proposed shape: Define the bit as `position is meaningful and authorized`: it must be 0 unless state is `dropped` or `planted`, then visibility filtering decides whether it may be 1. A carried Bomb's location comes from the visible carrier entity; `bomb.position` remains null. Make the encoder invariant, decoder mapping, and facade null rule state this identically.
+- Requester's workaround until then: Decode Bomb position only in semantic fixtures that pair visibility with dropped/planted; do not trust the current carried-state bytes.
+- Status: DONE
+- Response: Resolved, and this was a real hole. The bit now means **"position is meaningful *and* authorised"** — two conditions, with the state check first: it is 0 unless `bombState` is `dropped` or `planted`, and only then does visibility filtering decide whether it may be 1. Previously attackers always got `visible = 1`, so during `carried` they received the flag set with meaningless zeroes, which the mapping then exposed as a real position at the world origin. A carried bomb's location is the carrier's — `bomb.carrierId` names a visible entity — so `bomb.position` is always null in that state. Encoder invariant, decoder mapping, and the facade null rule now say this identically.
+
+@@### REQ-CC-037 — Make every outcome projection consume the canonical matrix
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P2–P4 outcome, results, and career implementation
+- Contract affected: `contracts/wire-protocol.md` §8.9; `contracts/net-facade.md` §5.3; `contracts/match-result.md` §4; `contracts/bomb-rules.md` §9
+- Ask: `REQ-CC-031` fixed the matrix but not all named consumers. The full §4 result object still omits required discriminant `status`; the invalidated example is still a short record although the union says it is the full §4 record. Wire prose still says every aborted match has no winner immediately before rows that permit aborted winners. The facade's `matchEnded` payload still calls the match-level field `reason`, not the promised `outcomeReason`. Bomb §9 says both teams disconnecting invalidates the match, while the matrix says it is aborted/no-contest. These shapes cannot all serialize the same terminal event.
+- Proposed shape: Put required `status` into the full result schema and show exact completed, aborted, and invalidated variants without a contradictory short example. Replace the stale wire sentence, use `outcomeReason` in `matchEnded` while retaining round-level `reason` only for `roundEnded`, and make Bomb's both-teams-gone row `aborted`/`no-contest`. Validate every matrix row through wire → facade → full result → mode rule.
+- Requester's workaround until then: Keep abnormal outcomes as separate semantic fixtures and do not derive history or career effects from the facade event.
+- Status: DONE
+- Response: Resolved. `status` is a required field of the full §4 record and the discriminant of the union; the invalidated variant is now the full record rather than a contradictory short form. The stale wire sentence claiming every aborted match has no winner is deleted — the mapping table is the only statement of that rule. `matchEnded` uses `outcomeReason`, with `reason` retained for `roundEnded` only. Bomb §9's both-teams-gone row is now `aborted` / `no-contest` / null winner: invalidation is a review decision, not an outcome the server reaches on its own.
+
+@@### REQ-CC-038 — Correct the event-kind decoder boundary
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before protocol-v2 decoder implementation
+- Contract affected: `contracts/wire-protocol.md` §§8.7, 8.11
+- Ask: Event wire codes are zero-based indices into `EV_KINDS`, so the first invalid code is exactly `EV_KINDS.length`. The malformed-input rule skips only a kind greater than the length, leaving that first out-of-range value to pass the stated guard. This is an off-by-one at the decoder's untrusted-input boundary.
+- Proposed shape: Change the rule to `kind >= EV_KINDS.length`, and add boundary vectors for the final valid appended kind (`interactRefused`, currently 20) and the immediately following invalid code.
+- Requester's workaround until then: Treat any decoder fixture with `kind >= EV_KINDS.length` as malformed regardless of the current prose.
+- Status: DONE
+- Response: Resolved — and thank you, this was a genuine off-by-one at the untrusted-input boundary. Wire codes are zero-based indices, so the first invalid code is exactly `EV_KINDS.length`; `>` let that value through into `EV_KINDS[code]` and produced `undefined`. Now `>=`, with both boundary vectors required in decoder tests: the last valid appended kind (`interactRefused`, 20) and the first invalid (21). Every other bounds check in this contract is deliberate, which made this one worth catching rather than shrugging at.

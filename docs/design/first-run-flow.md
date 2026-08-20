@@ -2,7 +2,7 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.1  
+**Version:** 0.2
 **Status:** Ready for product and contract review  
 **Last updated:** 2026-08-19
 
@@ -10,9 +10,15 @@
 
 Take a new desktop player from arrival to a completed first match without developer help. The flow must keep platform, lobby, and match-server state honest; it never implies that a pending request succeeded and never computes an authoritative result in the browser.
 
-The first playable path is:
+The approved new-account path is:
 
-`Landing -> Sign in or create account -> Display name -> Essential setup -> Server browser -> Room lobby -> Green up -> Loading/handoff -> Match -> Results -> Return to lobby`
+`Landing -> Eligibility -> Telemetry consent -> Account details -> Display name and signup -> Verify -> Terms -> Essential setup -> Server browser -> Room lobby -> Green up -> Loading/handoff -> Match -> Results -> Return to lobby`
+
+This ordering is the D6 working default recorded by `http-api.md` §3a and `auth.md` §11.
+Eligibility comes before consent so an ineligible visitor is never asked to consent. Landing
+and eligibility may emit only unlinked internal aggregate counts; linked personal telemetry
+starts at consent and only after an affirmative decision. The sign-in branch remains available
+from landing and resumes at the first incomplete account-policy step returned by the platform.
 
 Bomb is not forced as the first match. The browser may recommend an eligible TDM room with open slots; the player may choose either Alpha mode when rooms exist.
 
@@ -54,10 +60,29 @@ Bomb is not forced as the first match. The browser may recommend an eligible TDM
 
 WebGL/game-engine initialization is deferred until launch. Failure to create a renderer therefore belongs to the loading/handoff screen, not initial account browsing.
 
-### 2. Sign in or create account
+### 2. Eligibility, consent, and account access
+
+`CREATE ACCOUNT` runs one ordered gate sequence. The client may navigate back, but it cannot
+skip ahead or reorder these calls:
+
+1. Submit date of birth and jurisdiction to the eligibility preflight. The client does not
+   retain the birthdate after the response and carries only the opaque eligibility receipt.
+2. If eligible, present the versioned telemetry-consent decision. A decline is valid and does
+   not prevent account creation; personal telemetry remains disabled.
+3. Collect account credentials, then collect the display name on the next screen.
+4. Submit the credentials and display name together with the eligibility receipt,
+   `clientSessionId`, and consent receipt. Replace the signed-out consent receipt with the
+   account-scoped receipt returned by signup.
+5. Complete account verification.
+6. Read and accept the current terms version.
+
+The landing and eligibility steps are intentionally not linkable into a per-visitor funnel.
+The UI does not queue their personal events and replay them after consent.
 
 **Sign in fields:** identifier, password, show/hide password.  
-**Create-account fields:** identifier, password, password confirmation, required consent controls from the approved age/eligibility policy.
+**Create-account fields:** identifier, password, and password confirmation. Display name is
+collected on the next screen and sent in the same signup request. Age and telemetry consent
+are separate preceding gates, not fields inside signup.
 
 **States and errors**
 
@@ -72,12 +97,15 @@ Account recovery begins from this screen and returns here after completion. It d
 
 ### 3. Display name
 
-**Purpose:** create the public identity used by rooms, teams, scoreboards, reports, and results.
+**Purpose:** collect the public identity used by rooms, teams, scoreboards, reports, and
+results, then submit the complete signup request assembled across screens 2–3.
 
 **UI and behavior**
 
 - One display-name field with length guidance and an example, not a pre-filled suggestion that could be submitted accidentally.
-- Availability/policy checks are debounced; the final submit always relies on the authoritative server response.
+- Availability/policy checks are debounced; the final submit sends credentials, display name,
+  eligibility receipt, client-session ID, and consent receipt together and always relies on
+  the authoritative server response.
 - Availability states: unchecked, checking, available, unavailable, policy refusal, cooldown, service unavailable.
 - Policy refusals use an actionable reason code when the contract permits it. The client does not reproduce a profanity or impersonation ruleset.
 - The player can sign out without completing the step.
@@ -190,7 +218,7 @@ Failures have dedicated outcomes: allocation failed, allocation timed out, match
 | Session; profile incomplete | First incomplete account step |
 | Session; no room | Server browser |
 | Active lobby membership | Lobby resync screen, then authoritative room |
-| Match reconnect token within grace | Reconnect screen with server expiry |
+| Server reports an active held match | Call `GET /v1/matches/active`, then obtain a fresh single-use reconnect ticket and show the server expiry |
 | Match ended; result available | Results, then lobby recovery |
 | Revoked/expired session | Sign in with “session ended” context |
 
@@ -198,7 +226,7 @@ Only one tab may own an active match connection for the account. Other tabs disp
 
 ## Telemetry and privacy
 
-Emit only events authorized by `contracts/telemetry.md`: flow step viewed/completed/failed, time to first match, settings friction, room join failure, lobby abandonment, handoff failure, first-match completion, and return-to-lobby outcome. Correlation IDs propagate through every request. Raw password, chat, display-name candidate, IP, or free-form server message is never included unless a contract explicitly classifies and permits it.
+Emit only events authorized by `contracts/telemetry.md`: flow step viewed/completed/failed, time to first match, settings friction, room join failure, lobby abandonment, handoff failure, first-match completion, and return-to-lobby outcome. Before consent, landing and eligibility produce only the contract's unlinked internal aggregate events; `flow.step` is not used for them. Consent and later personal events carry the required receipt and `clientSessionId`. Correlation IDs propagate through every request. Raw password, birthdate, chat, display-name candidate, IP, or free-form server message is never included unless a contract explicitly classifies and permits it.
 
 ## Acceptance checklist
 

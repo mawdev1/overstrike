@@ -4,7 +4,7 @@
 
 **Updated:** 2026-08-19
 **Phase:** P0 — Contract freeze
-**Overall:** BLOCKED AT G0A — fifth-pass graph audit found residual contradictions in all six 1.4.0 chains
+**Overall:** BLOCKED AT G0A — sixth-pass graph audit found five residual cross-file chains plus one protocol boundary defect in 1.5.0
 
 ---
 
@@ -15,7 +15,7 @@ decided D3/D5 values; the other four remain unchanged from the initial review pa
 
 | Deliverable | Status |
 |---|---|
-| `docs/design/first-run-flow.md` | READY FOR REVIEW |
+| `docs/design/first-run-flow.md` | READY FOR REVIEW; 0.2 records the approved eligibility → consent → signup sequence and reload discovery |
 | `docs/design/shell-ia.md` | READY FOR REVIEW; D5 capability gate incorporated |
 | `docs/design/square-artdirection.md` | READY FOR ART REVIEW; D3 envelope accepted |
 | `docs/design/hud-bomb.md` | READY FOR REVIEW; live implementation awaits wire/facade consistency |
@@ -119,19 +119,41 @@ but the remaining endpoints/sentinels/lifecycle unions are not yet lossless:
 and 31 binding-action IDs. Existing client action IDs were retained where available to avoid
 an unnecessary migration; presentation labels remain independently editable/localizable.
 
+## Sixth-pass amendment audit
+
+This pass reviewed the 1.5.0 amendments as connected schemas, then searched every affected
+file for older copies of the same response, state, or rule. The canonical changes close the
+fifth-pass defects, and the settings/unsupported-reason chain now passes. Five other chains
+still have stale projections, and the wire malformed-input table has an independent boundary
+error:
+
+| Chain | Amendment accepted | Residual blocker |
+|---|---|---|
+| Room state / HTTP | §6 now has the paginated room envelope, measured-RTT header, correlation ID, and repaired catalogue | §11.3 still declares a raw array; §11.8 and `browser-empty` omit correlation IDs; `rttSource` remains an undefined accepted query parameter. `REQ-CC-033` |
+| Onboarding / telemetry | Eligibility → consent → signup → verify → terms is approved; typed signed-out storage and receipt migration exist | Stale landing-first and `accounts.privacy` prose contradict the order/storage source; signup/profile exact schemas and telemetry batch/registry cannot represent the stated nullable and unlinked states. `REQ-CC-034` |
+| Match reconnect | Authenticated active-match discovery and versioned spectator-policy derivation close the reload loop | The facade says `MatchHandoff` supplies required `matchState.matchId`, but the exact state shape omits it. `REQ-CC-035` |
+| Bomb authority | The 41-byte state has a collision-free position-presence byte | Attackers are told the position is visible even in carried state, where the same section says coordinates are meaningless/zero, so the facade exposes a false origin position. `REQ-CC-036` |
+| Match outcome | Wire now encodes every matrix row and `no-contest`; the result union and TDM snapshot are substantially specified | The full record omits its required status; invalidated has incompatible short/full shapes; stale wire, facade field-name, and Bomb disconnect rules contradict the matrix. `REQ-CC-037` |
+| Protocol decoder | Appended event kinds and malformed-input policy are otherwise closed | The range guard uses `>` although valid indices stop at `length - 1`; code `EV_KINDS.length` falls through. `REQ-CC-038` |
+| Settings / capability | Vocabulary v1 is consumed without duplicating IDs; `UnsupportedReason` is defined once and includes `build` | **PASS.** No residual cross-file contradiction found in the amended chain. |
+
+The CX-owned first-run flow is now version 0.2 and matches the approved onboarding order. It
+also replaces the impossible persisted reconnect-token resume rule with authenticated active-
+match discovery followed by issuance of a fresh single-use ticket.
+
 ## Backend requests
 
-`REQ-CC-001` through `026` are marked `DONE` and retained as review history. The fifth pass
+`REQ-CC-001` through `032` are marked `DONE` and retained as review history. The sixth pass
 files six exact residual requests rather than reopening completed requests:
 
 | Request | Scope |
 |---|---|
-| `REQ-CC-027` | Canonical room-list envelope, correlation/RTT inputs, and valid HTTP catalogue |
-| `REQ-CC-028` | One approved onboarding order and lossless signed-out/account consent migration |
-| `REQ-CC-029` | Reload-safe active-match discovery and unambiguous dynamic policy ownership |
-| `REQ-CC-030` | Collision-free Bomb-position presence/visibility encoding |
-| `REQ-CC-031` | Apply the outcome matrix to wire, facade, result, and terminal HTTP unions |
-| `REQ-CC-032` | Consume settings vocabulary v1 and share one unsupported-client reason enum |
+| `REQ-CC-033` | Remove stale room/pagination/health projections and define the dangling RTT query |
+| `REQ-CC-034` | Propagate the approved onboarding order, storage source, nullable consent, and pre-consent telemetry rules |
+| `REQ-CC-035` | Add the handoff's required match identity to exact facade state |
+| `REQ-CC-036` | Make Bomb-position presence false whenever position bytes are not meaningful |
+| `REQ-CC-037` | Apply the outcome matrix to the full result, facade field, wire prose, and Bomb disconnect rule |
+| `REQ-CC-038` | Fix the zero-based event-kind decoder boundary and add edge vectors |
 
 No frontend implementation will infer an endpoint body, build a reducer from unspecified
 deltas, manufacture match outcomes, reconstruct an undefined server clock, or emit an
@@ -174,17 +196,19 @@ Measured on the current tree without modifying product source:
 - Fourth-pass graph audit: **complete** across the same six chains, including adjacent references.
 - Fourth-pass amendments (`REQ-CC-021`–`026`): **received and reviewed** at 1.4.0.
 - Fifth-pass graph audit: **complete** across the same six chains, including exact-state tests.
+- Fifth-pass amendments (`REQ-CC-027`–`032`): **received and reviewed** at 1.5.0.
+- Sixth-pass graph audit: **complete** across canonical schemas and their repeated projections.
 - `REQ-CX-005`: **ACCEPTED**; settings vocabulary v1 published in the CX inventory.
-- G0A: **NOT PASSED** — six residual cross-contract amendment groups remain (`REQ-CC-027`–`032`).
-- Product tests: not run; this pass changes CX-owned specifications/status/handoff and the
-  permitted response lines in `requests-to-frontend.md` only.
+- Settings/unsupported-reason chain: **PASSED** after `REQ-CC-032`.
+- G0A: **NOT PASSED** — six residual amendment groups remain (`REQ-CC-033`–`038`).
+- Product tests: not run; this pass changes only the CX-owned first-run specification,
+  frontend status, and requests-to-backend handoff.
 - Worktree: remains dirty with pre-existing mixed product changes; none were modified by this
   review and no commit was created.
 
 ## Next frontend action
 
-Re-review `REQ-CC-027` through `032` as end-to-end chains and amend the CX first-run sequence
-only after the consent-order/legal decision in `REQ-CC-028` is explicit. Sign off G0A only
-after every shared concept has one canonical source and every projection is lossless through
-transport, UI, and persistence. P1 implementation remains blocked until the affected
-contracts are frozen.
+Re-review `REQ-CC-033` through `038` as end-to-end chains. Sign off G0A only after every shared
+concept has one canonical source, repeated examples reference it without drift, and every
+projection is lossless through transport, UI, and persistence. P1 implementation remains
+blocked until the affected contracts are frozen.
