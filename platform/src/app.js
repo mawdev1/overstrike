@@ -50,7 +50,7 @@ export async function buildApp(config, overrides = {}) {
     return body.ok ? body : raw(503, body);
   }, { requireBuild: false });
 
-  const mounted = await mountModules({ deps, router, config, logger });
+  const mounted = await mountModules({ deps, router, config, logger, overrides });
   logger.info('modules.mounted', { mounted });
 
   // Assert the expected set rather than trusting the wiring. Without this, the stub check
@@ -70,7 +70,19 @@ export async function buildApp(config, overrides = {}) {
 }
 
 /** Order matters: events first, because auth and profile emit through its outbox. */
-async function mountModules({ deps, router, config, logger }) {
+/**
+ * The default telemetry sink.
+ *
+ * P1 has no warehouse, so accepted records go to the structured log where the data pipeline
+ * can pick them up later. Deliberately a real object rather than a no-op: a silently
+ * discarding sink is indistinguishable from a working one right up to the first question
+ * nobody can answer.
+ */
+function createLogSink(logger) {
+  return { write: async (records) => { for (const r of records) logger.info('telemetry.record', r); } };
+}
+
+async function mountModules({ deps, router, config, logger, overrides = {} }) {
   const mounted = [];
   const optional = config.env !== 'production';
 
@@ -123,7 +135,11 @@ async function mountModules({ deps, router, config, logger }) {
     // module ships its own so it can be tested alone, and here the auth one wins.
     const consent = deps.auth?.receipts?.consent
       || telemetry.createConsentReceipts({ secret: config.tokenSecret });
-    const service = telemetry.createTelemetryService({ store: deps.store, logger, consent, config });
+    // The service REQUIRES a sink and destructures it; building without one made every
+    // non-empty batch a 500. The suite passed a sink of its own, so nothing caught it —
+    // which is why wiring needs its own boot check, not just module tests.
+    const sink = overrides.telemetrySink || createLogSink(logger);
+    const service = telemetry.createTelemetryService({ store: deps.store, logger, consent, config, sink });
     telemetry.registerTelemetryRoutes(router, { service });
     deps.telemetry = { service, consent };
     mounted.push('telemetry');

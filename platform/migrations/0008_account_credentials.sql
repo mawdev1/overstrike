@@ -18,5 +18,11 @@ alter table accounts
 
 -- Every account has at least the player role. A row with an empty array would be an account
 -- that can do nothing, which is a bug rather than a state we ever mean.
-alter table accounts
-  add constraint accounts_roles_nonempty check (array_length(roles, 1) >= 1);
+-- Guarded so the whole file is replayable by hand, which the `if not exists` above already
+-- promised. A file that is half idempotent is the one an operator re-runs and breaks.
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'accounts_roles_nonempty') then
+    alter table accounts add constraint accounts_roles_nonempty check (array_length(roles, 1) >= 1);
+  end if;
+end $$;
