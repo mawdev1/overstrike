@@ -386,7 +386,23 @@ const ESSENTIAL_SETTING_KEYS = Object.freeze([
   'reduceMotion',
 ]);
 
-function renderEssentialSettings({ settings, actions }) {
+/**
+ * Where a player goes when they are done with a flow and have nowhere specific to be.
+ *
+ * `/play/rooms` was hardcoded at the end of onboarding, so completing signup with
+ * `shell.serverbrowser.enabled` off dropped the player onto the browser's own "Unavailable"
+ * card — a dead end whose only control was "Return to welcome". Three other call sites already
+ * made this decision correctly; these did not, which is the usual shape of a rule expressed by
+ * repetition instead of by a function.
+ *
+ * The flag's contracted off-behaviour is "Browser hidden; direct room links still resolve"
+ * (feature-flags.md §3.2). Hidden means not landed on, not shown disabled.
+ */
+function homePath(isFeatureEnabled) {
+  return isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? '/welcome' : '/play/rooms';
+}
+
+function renderEssentialSettings({ settings, actions, isFeatureEnabled }) {
   if (!settings?.getSnapshot || !settings?.set) return null;
   const form = element('form', { className: 'os-form' });
   const controls = new Map();
@@ -439,7 +455,7 @@ function renderEssentialSettings({ settings, actions }) {
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     try { await settings.sync?.(); } catch { /* The controller preserves explicit unsynced state. */ }
-    actions.navigate('/play/rooms');
+    actions.navigate(homePath(isFeatureEnabled));
   });
   return element('section', {}, [
     element('p', {}, 'Set the controls needed before your first match. Every choice can be changed later.'),
@@ -533,7 +549,7 @@ function renderPrivacySettings({ view, actions, session }) {
   return element('section', {}, [form, actionsRow([shellLink('Back to account', '/settings/profile')])]);
 }
 
-function renderSettingsHook({ route, view, actions, settings, session, essential = false, loadout = false }) {
+function renderSettingsHook({ route, view, actions, settings, session, isFeatureEnabled, essential = false, loadout = false }) {
   const host = element('section', { className: 'os-settings-hook', 'data-settings-hook': essential ? 'essential' : loadout ? 'loadout' : route.params.category });
   if (!essential && !loadout && route.params.category === 'profile') {
     host.append(renderProfileSettings({ route, view, actions, session }));
@@ -550,7 +566,7 @@ function renderSettingsHook({ route, view, actions, settings, session, essential
       category: route.params.category,
       roomId: route.params.roomId,
       state: view,
-      onComplete: (result) => actions.navigate(actions.nextSetupPath(result) || '/play/rooms'),
+      onComplete: (result) => actions.navigate(actions.nextSetupPath(result) || homePath(isFeatureEnabled)),
       onError: (error) => actions.setView({ variant: 'error', error }),
     });
     actions.registerCleanup(cleanup);
@@ -633,7 +649,7 @@ function renderRooms({ view }) {
   return element('section', {}, [element('div', { className: 'os-filter-bar' }, [search.wrapper, joinableLabel, reset]), resultStatus, grid]);
 }
 
-function renderRoomDetail({ view, actions }) {
+function renderRoomDetail({ view, actions, isFeatureEnabled }) {
   const room = view.data?.room || view.data || {};
   return element('section', {}, [
     definitionList([
@@ -650,7 +666,8 @@ function renderRoomDetail({ view, actions }) {
           if (confirmedId) actions.navigate(`/room/${encodeURIComponent(confirmedId)}`);
         },
       }), { className: 'os-button os-button--primary', disabled: !room.id || room.joinable === false }),
-      shellLink('Back to rooms', '/play/rooms', { className: 'os-button os-button--quiet' }),
+      shellLink(homePath(isFeatureEnabled) === '/welcome' ? 'Back to welcome' : 'Back to rooms',
+        homePath(isFeatureEnabled), { className: 'os-button os-button--quiet' }),
     ]),
   ]);
 }
@@ -677,7 +694,7 @@ function roomNavigation(roomId) {
   ]);
 }
 
-function renderLobby({ route, view, actions }) {
+function renderLobby({ route, view, actions, isFeatureEnabled }) {
   const room = view.data?.room || {};
   const members = view.data?.members || view.data?.roster || [];
   return element('section', {}, [
@@ -696,7 +713,7 @@ function renderLobby({ route, view, actions }) {
         onConfirm: () => actions.submit('leaveRoom', { roomId: route.params.roomId }, {
           onSuccess: () => {
             actions.recordLobbyAbandoned(view.data?.countdown ? 'countdown' : 'in-lobby');
-            actions.navigate('/play/rooms');
+            actions.navigate(homePath(isFeatureEnabled));
           },
         }),
       }), { className: 'os-button os-button--danger' }),
@@ -919,7 +936,7 @@ function renderMatchLoading({ view, actions, capabilities, isFeatureEnabled }) {
       }),
       data.retryAllowed ? actionButton('Retry handoff', () => actions.submit('getActiveMatch', {}, { onSuccess: actions.useResponse }), { className: 'os-button os-button--quiet' }) : null,
       shellLink(data.roomId ? 'Return to lobby' : isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? 'Return to welcome' : 'Return to rooms',
-        data.roomId ? `/room/${encodeURIComponent(data.roomId)}` : isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? '/welcome' : '/play/rooms',
+        data.roomId ? `/room/${encodeURIComponent(data.roomId)}` : homePath(isFeatureEnabled),
         { className: 'os-button os-button--quiet' }),
     ]),
   ]);
@@ -936,7 +953,7 @@ function renderReconnect({ view, actions, isFeatureEnabled }) {
       }), { className: 'os-button os-button--primary', disabled: data.retryAllowed === false }),
       data.returnAllowed ? shellLink(
         isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? 'Return to welcome' : 'Return to rooms',
-        isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? '/welcome' : '/play/rooms',
+        homePath(isFeatureEnabled),
         { className: 'os-button os-button--quiet' },
       ) : null,
     ]),
@@ -963,7 +980,7 @@ function renderResults({ view, isFeatureEnabled }) {
         ? shellLink('Return to lobby', `/room/${encodeURIComponent(result.roomId)}`, { className: 'os-button os-button--primary' })
         : shellLink(
           isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? 'Return to welcome' : 'Browse rooms',
-          isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? '/welcome' : '/play/rooms',
+          homePath(isFeatureEnabled),
           { className: 'os-button os-button--primary' },
         ),
       result.matchId ? shellLink('View match detail', `/career/matches/${encodeURIComponent(result.matchId)}`, { className: 'os-button os-button--quiet' }) : null,
