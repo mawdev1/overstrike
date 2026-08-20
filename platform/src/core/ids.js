@@ -35,6 +35,12 @@ function encodeRandom(bytes) {
  * ids created in one loop iteration sort arbitrarily among themselves.
  */
 export function ulid(nowMs = Date.now()) {
+  // A non-integer or out-of-range clock silently produced ids containing the literal string
+  // "undefined". Reachable through an injected deps.clock, and the result validates as false
+  // everywhere downstream — fail here instead, where the cause is obvious.
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > 281474976710655) {
+    throw new RangeError(`ulid: clock must be an integer in [0, 2^48), got ${nowMs}`);
+  }
   if (nowMs === lastMs && lastRandom) {
     const buf = Buffer.from(lastRandom);
     for (let i = buf.length - 1; i >= 0; i--) { if (buf[i]++ !== 255) break; }
@@ -46,5 +52,8 @@ export function ulid(nowMs = Date.now()) {
   return encodeTime(nowMs, 10) + encodeRandom(lastRandom);
 }
 
-const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+// The first character encodes the top 5 bits of a 48-bit timestamp, so canonically it is
+// 0-7; anything above that is a timestamp beyond year 10889. Without the anchor this is a
+// charset check wearing a validator's name, and it admits client-supplied junk.
+const ULID_RE = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 export const isUlid = (s) => typeof s === 'string' && ULID_RE.test(s);

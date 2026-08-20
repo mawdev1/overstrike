@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node src/index.js",
     "migrate": "node src/core/migrate.js",
-    "test": "node ../scripts/platformtest.mjs"
+    "test": "node ../scripts/platformtest.mjs",
+    "storetest": "node test/storetest.mjs"
   },
   "dependencies": {},
   "optionalDependencies": {

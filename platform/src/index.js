@@ -10,6 +10,18 @@
 import { loadConfig } from './core/config.js';
 import { buildApp } from './app.js';
 
+// Backstop. Every request path is already wrapped (core/http.js), but a bug anywhere else
+// must not take the process down silently — log it, then exit deliberately so the
+// orchestrator restarts a process we know is compromised rather than one we do not.
+process.on('unhandledRejection', (reason) => {
+  console.error(JSON.stringify({ level: 'error', event: 'unhandledRejection', reason: String(reason && reason.stack || reason) }));
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  console.error(JSON.stringify({ level: 'error', event: 'uncaughtException', reason: String(err && err.stack || err) }));
+  process.exit(1);
+});
+
 const config = loadConfig();
 const { server, deps } = await buildApp(config);
 

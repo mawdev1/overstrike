@@ -3,15 +3,21 @@
  *
  * Hand-rolled on `node:http`, no framework — the same call this repository already makes for
  * its wire protocol and its collision system. A router, a body reader, and a response writer
- * is roughly 200 lines; a framework is a dependency tree we would then own the security of.
+ * is roughly 250 lines; a framework is a dependency tree we would then own the security of.
  *
  * Everything a request needs is assembled here so handlers never touch raw node objects:
  * correlation id, auth context, parsed body, typed errors, and the response envelope.
+ *
+ * ── The rule this file exists to obey ────────────────────────────────────────────────────
+ * **Every statement that touches the request runs inside the try.** An earlier version parsed
+ * the URL one line above it, and `GET // HTTP/1.1` — twenty bytes, unauthenticated — threw
+ * `ERR_INVALID_URL` outside any catch, which in an async handler is an unhandled rejection,
+ * which Node exits on. One request killed the platform. Nothing here may sit outside the
+ * guard, including the response write and the log line.
  */
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { ApiError, toApiError } from './errors.js';
-import { ulid } from './ids.js';
+import { ulid, isUlid } from './ids.js';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -41,12 +47,39 @@ export class Router {
       for (let i = 0; i < parts.length; i++) {
         const seg = route.segments[i];
         if (seg.literal !== undefined) { if (seg.literal !== parts[i]) { ok = false; break; } }
-        else params[seg.param] = decodeURIComponent(parts[i]);
+        else {
+          // A malformed percent-escape is a CLIENT error. Letting URIError propagate turned
+          // `/v1/thing/%ZZ` into a 500 with a stack in the error log, reporting our fault for
+          // their typo.
+          let decoded;
+          try { decoded = decodeURIComponent(parts[i]); }
+          catch { throw new ApiError('VALIDATION_FAILED', 'Malformed path parameter.'); }
+          // Decoding happens after the split, so an encoded slash would smuggle a separator
+          // into a value the router promised was one segment.
+          if (decoded.includes('/')) throw new ApiError('VALIDATION_FAILED', 'Malformed path parameter.');
+          params[seg.param] = decoded;
+        }
       }
       if (ok) return { route, params };
     }
     return null;
   }
+}
+
+/**
+ * Parse the request target.
+ *
+ * `new URL(req.url, base)` treats a leading `//` as an authority, so `//evil.com/v1/health`
+ * routes as `/v1/health` — a front proxy matching the literal request line and this router
+ * would disagree about what was requested. Concatenating onto the origin instead makes the
+ * authority unreachable, and anything not starting with a single `/` is refused outright.
+ */
+function parseTarget(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.startsWith('/') || rawUrl.startsWith('//')) {
+    throw new ApiError('NOT_FOUND', 'No such endpoint.');
+  }
+  try { return new URL(`http://localhost${rawUrl}`); }
+  catch { throw new ApiError('NOT_FOUND', 'No such endpoint.'); }
 }
 
 /**
@@ -58,6 +91,8 @@ export class Router {
  */
 async function readJson(req) {
   if (req.method === 'GET' || req.method === 'DELETE') return {};
+
+  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -66,90 +101,183 @@ async function readJson(req) {
     chunks.push(chunk);
   }
   if (size === 0) return {};
-  const raw = Buffer.concat(chunks).toString('utf8');
-  try { return JSON.parse(raw); }
+
+  // §1 says JSON in, JSON out. Parsing `text/plain` as JSON accepts a shape the contract does
+  // not describe, and content-type confusion is a standing source of parser mismatches.
+  if (type && type !== 'application/json') {
+    throw new ApiError('VALIDATION_FAILED', 'Request body must be application/json.');
+  }
+
+  let parsed;
+  try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { throw new ApiError('VALIDATION_FAILED', 'Request body is not valid JSON.'); }
+
+  // `null`, `12345`, `"str"`, `true` and arrays are all valid JSON and none is a request body.
+  // Letting them through means the first property access in a handler is a TypeError, which
+  // `toApiError` reports as INTERNAL_ERROR — our fault, for their malformed input.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ApiError('VALIDATION_FAILED', 'Request body must be a JSON object.');
+  }
+  return parsed;
+}
+
+/**
+ * Compare two build strings numerically.
+ *
+ * `'1.10.0' < '1.2.0'` is true as strings, which locks out every client past 1.9.x — the
+ * kind of comparison that looks obviously fine and ships a total outage.
+ */
+function buildBelowFloor(build, floor) {
+  const a = String(build).split('.').map((n) => parseInt(n, 10));
+  const b = String(floor).split('.').map((n) => parseInt(n, 10));
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const x = Number.isInteger(a[i]) ? a[i] : 0;
+    const y = Number.isInteger(b[i]) ? b[i] : 0;
+    if (x !== y) return x < y;
+  }
+  return false;
 }
 
 /**
  * Build the app.
  *
- * `deps` is everything a handler may reach: db, config, clock, logger, and the domain
+ * `deps` is everything a handler may reach: store, config, clock, logger, and the domain
  * services. Handlers receive it explicitly rather than importing singletons, so a test can
  * substitute any of them without a module registry.
  */
 export function createApp({ router, deps, onRequestEnd = null }) {
   const { logger, config } = deps;
 
-  return createServer(async (req, res) => {
-    const startedAt = process.hrtime.bigint();
-    // §1: the client's id is echoed; if absent we mint one, because an error path that cannot
-    // produce a correlation id is a support ticket nobody can trace.
-    const correlationId = req.headers['x-correlation-id'] || ulid();
-    const url = new URL(req.url, 'http://localhost');
-    const ctx = {
-      correlationId,
-      method: req.method,
-      path: url.pathname,
-      query: url.searchParams,
-      headers: req.headers,
-      params: {},
-      body: {},
-      actor: null,          // filled by auth middleware when a token is present
-      deps,
-      ip: req.socket.remoteAddress || '',
-    };
+  return createServer((req, res) => {
+    // Deliberately not an async function: an async listener's rejection is an unhandled
+    // rejection. This wrapper owns the promise and can never leak one.
+    handle(req, res).catch((err) => {
+      try {
+        logger.error('request.unhandled', { cause: String(err && err.stack || err) });
+        if (!res.headersSent) { res.writeHead(500, { 'Content-Type': 'application/json' }); }
+        res.end('{"error":{"code":"INTERNAL_ERROR","message":"Something went wrong on our end."}}');
+      } catch { /* the socket is already gone; there is nothing left to say */ }
+    });
+  });
 
+  async function handle(req, res) {
+    const startedAt = process.hrtime.bigint();
+    let correlationId = ulid();
     let status = 500;
-    let payload;
+    let payload = null;
+    let extraHeaders = null;
+    let pathForLog = '-';
+    let ctxRef = null;
+
     try {
+      // §1: the client's id is echoed — but only if it IS one. An unvalidated header is
+      // reflected into a response header, a JSON body, and every log line this request
+      // writes, which lets a caller poison the trace support depends on, or make ten
+      // thousand requests share one id.
+      const supplied = req.headers['x-correlation-id'];
+      if (typeof supplied === 'string' && isUlid(supplied)) correlationId = supplied;
+      else if (supplied !== undefined) {
+        logger.warn('correlation.rejected', { correlationId, suppliedLength: String(supplied).length });
+      }
+
+      const url = parseTarget(req.url);
+      pathForLog = url.pathname;
+
       const hit = router.match(req.method, url.pathname);
       if (!hit) throw new ApiError('NOT_FOUND', 'No such endpoint.');
-      ctx.params = hit.params;
-      ctx.body = await readJson(req);
 
-      // Client build floor (§1). Checked before the handler so an unsupported client never
-      // reaches business logic that assumes a shape it does not send.
-      const build = req.headers['x-client-build'];
-      if (hit.route.opts.requireBuild !== false && config.minClientBuild && build
-          && build < config.minClientBuild) {
-        throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
-          { details: { reason: 'build' } });
+      // §1 says every request carries X-Client-Build. Skipping the check when it is absent
+      // means the floor is bypassed by omitting the header the contract requires — the check
+      // has to fail closed or it is not a floor.
+      if (hit.route.opts.requireBuild !== false && config.minClientBuild) {
+        const build = req.headers['x-client-build'];
+        if (typeof build !== 'string' || build === '') {
+          throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
+            { details: { reason: 'build' } });
+        }
+        if (buildBelowFloor(build, config.minClientBuild)) {
+          throw new ApiError('UNSUPPORTED_CLIENT', 'Please update the game to continue.',
+            { details: { reason: 'build' } });
+        }
       }
+
+      const ctx = {
+        correlationId,
+        method: req.method,
+        path: url.pathname,
+        query: url.searchParams,
+        headers: req.headers,
+        params: hit.params,
+        body: await readJson(req),
+        actor: null,          // filled by auth middleware when a token is present
+        deps,
+        ip: req.socket.remoteAddress || '',
+        // Set-Cookie is the one response header a handler legitimately needs and cannot
+        // express through a return value: auth §3 requires the refresh cookie to be set on
+        // signup/signin/refresh and CLEARED on signout, and a cookie that is assembled and
+        // never written is a session that silently does not persist.
+        cookies: [],
+      };
+      ctxRef = ctx;
 
       for (const mw of hit.route.opts.middleware || []) await mw(ctx);
 
       const result = await hit.route.handler(ctx);
-      if (result && result.__raw) { status = result.status; payload = result.body; }
-      else if (result === undefined || result === null) { status = 204; payload = null; }
-      else { status = 200; payload = { ...result, correlationId }; }
+      if (result && result.__raw) {
+        status = result.status;
+        extraHeaders = result.headers || null;
+        // §1: every success body carries the correlation id, including the ones a handler
+        // shaped itself.
+        payload = (result.body && typeof result.body === 'object' && !Array.isArray(result.body))
+          ? { ...result.body, correlationId }
+          : result.body;
+      } else if (result === undefined || result === null) {
+        status = 204; payload = null;
+      } else {
+        status = 200;
+        extraHeaders = result.__headers || null;
+        const body = result.__headers ? { ...result } : result;
+        delete body.__headers;
+        payload = { ...body, correlationId };
+      }
     } catch (err) {
       const apiErr = toApiError(err);
       status = apiErr.status;
       payload = apiErr.toEnvelope(correlationId);
+      extraHeaders = null;
       // The cause stays here. The response carries only the envelope.
       logger.error('request.failed', {
-        correlationId, code: apiErr.code, method: req.method, path: url.pathname,
-        status, cause: apiErr.cause ? String(apiErr.cause.stack || apiErr.cause) : null,
+        correlationId, code: apiErr.code, method: req.method, path: pathForLog, status,
+        cause: apiErr.cause ? String(apiErr.cause.stack || apiErr.cause) : null,
       });
     }
 
-    // §11.10: a 204 still carries the correlation id — it is the only place it can travel.
-    res.setHeader('X-Correlation-Id', correlationId);
-    if (status === 204 || payload === null) { res.writeHead(status); res.end(); }
-    else {
-      const body = JSON.stringify(payload);
-      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(body);
+    try {
+      // §3a.2: a 204 still carries the correlation id — it is the only place it can travel.
+      res.setHeader('X-Correlation-Id', correlationId);
+      if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
+      // Cookies survive the error path deliberately: signout must clear the refresh cookie
+      // even when the response it accompanies is a failure.
+      if (ctxRef && ctxRef.cookies && ctxRef.cookies.length) res.setHeader('Set-Cookie', ctxRef.cookies);
+      if (status === 204 || payload === null) { res.writeHead(status); res.end(); }
+      else {
+        res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(payload));
+      }
+    } catch (err) {
+      logger.error('response.write.failed', { correlationId, cause: String(err && err.message) });
+      try { res.destroy(); } catch { /* already gone */ }
     }
 
     const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
-    logger.info('request', { correlationId, method: req.method, path: url.pathname, status, ms });
-    if (onRequestEnd) onRequestEnd({ ctx, status, ms });
-  });
+    logger.info('request', { correlationId, method: req.method, path: pathForLog, status, ms });
+    if (onRequestEnd) { try { onRequestEnd({ status, ms, correlationId }); } catch { /* never fatal */ } }
+  }
 }
 
-/** Handlers return this when they need a status other than 200/204. */
-export const raw = (status, body) => ({ __raw: true, status, body });
+/** Handlers return this when they need a status, or headers, other than the default. */
+export const raw = (status, body, headers = null) => ({ __raw: true, status, body, headers });
 
-export { randomUUID };
+/** Attach response headers to an ordinary 200 result (an ETag, for instance). */
+export const withHeaders = (body, headers) => ({ ...body, __headers: headers });

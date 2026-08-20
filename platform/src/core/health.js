@@ -30,27 +30,25 @@ export function createHealth({ deps }) {
    * reports the failure.
    */
   async function ready() {
-    const checks = {};
-    let ok = true;
-
-    for (const [name, probe] of Object.entries(deps.healthProbes || {})) {
-      const t0 = Date.now();
+    const entries = Object.entries(deps.healthProbes || {});
+    // Probes run in PARALLEL. Sequentially, N sick dependencies cost N x 2 s and readiness
+    // itself exceeds a typical 5 s orchestrator timeout — the check becomes the outage.
+    const results = await Promise.all(entries.map(async ([name, probe]) => {
       try {
         const result = await withTimeout(probe(), 2000);
-        checks[name] = { status: result.ok ? 'up' : 'down', ms: Date.now() - t0 };
-        if (!result.ok) ok = false;
-      } catch (err) {
-        checks[name] = {
-          status: 'down',
-          ms: Date.now() - t0,
-          // Internal surface, service-authenticated: naming the failure is the point here,
-          // unlike the public endpoint.
-          detail: err && err.message === 'timeout' ? 'timeout' : 'error',
-        };
-        ok = false;
-      }
+        return [name, result && result.ok ? 'up' : 'down'];
+      } catch { return [name, 'down']; }
+    }));
+
+    const dependencies = {};
+    let ok = true;
+    for (const [name, status] of results) {
+      dependencies[name] = status;          // §7.1 fixes this as the string 'up'|'down'
+      if (status !== 'up') ok = false;
     }
-    return { ok, dependencies: checks, uptimeSec: Math.floor((Date.now() - startedAt) / 1000) };
+    // §11: anything not stated is forbidden, so no uptime field here. It lives on liveness,
+    // where the contract does not constrain the shape.
+    return { ok, dependencies };
   }
 
   return { live, ready };

@@ -57,6 +57,12 @@ accounts(
   status            text not null default 'active',   -- active|restricted|banned|deleted
   email_hash        text unique,          -- lookup only; the address itself lives with the auth provider
   display_name      text not null,
+  -- Credentials and authorisation. `password_hash` is null when identity is delegated to the
+  -- provider (D1, Supabase Auth); it exists so a self-hosted fallback does not need a schema
+  -- change, and so the column is never invented ad hoc at the write site.
+  password_hash     text,
+  roles             text[] not null default '{player}',
+  name_changed_at   timestamptz,
   display_name_folded text not null unique,  -- NFKC + case + confusable folding (auth.md §9)
   -- Onboarding state, typed rather than free JSON (REQ-CC-022). These gate access and
   -- carry legal weight; a jsonb blob cannot be constrained, indexed, or migrated safely.
@@ -105,6 +111,14 @@ also the cheapest possible answer to a deletion request about it.
 `consent_telemetry` is nullable because **null means undecided**, which is distinct from a
 recorded "no". An account predating the policy has no decision, and is treated as no consent
 until it makes one.
+
+`roles` is on the account rather than a join table because P1 has seven fixed roles and no
+role metadata; a join table would be three queries to answer a question one column answers.
+It becomes a table when roles gain scopes or expiry, not before.
+
+`name_changed_at` backs the 30-day cooldown in `auth.md` §9. Deriving it from
+`account_name_history` would work until the first account that has never renamed, which has no
+row to derive from.
 
 `display_name_folded` carries the uniqueness constraint, not `display_name`. Enforcing on the
 raw name lets `Ada` and `Аdа` (Cyrillic А) coexist, which is the cheapest impersonation attack
