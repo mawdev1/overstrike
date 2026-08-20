@@ -20,11 +20,13 @@
  */
 import { Router } from '../../core/http.js';
 import { ApiError, toApiError } from '../../core/errors.js';
-import { createClock, DEFAULT_STEP_MS } from './clock.js';
+import { isUlid } from '../../core/ids.js';
+import { createClock, DEFAULT_STEP_MS, EPOCH_MS } from './clock.js';
 import { checkAuthClass, checkClientBuild } from './gates.js';
 import { stubUlid } from './ids.js';
 import { ROUTES } from './routes.js';
 import { SCENARIOS, SCENARIO_NAMES, initialState } from './scenarios.js';
+import { createAccountState, isRevoked, sessionIdFor, tokenClaims } from './accounts.js';
 
 export const STUB_FLAG = 'platform.api.stub';
 
@@ -80,8 +82,22 @@ export function createStubApi({
   assertStubAllowed({ config, flags, env });
   const router = buildRouter();
   const sessions = new Map();          // `${scenario}::${clientSessionId}` -> { state, clock }
+  const accounts = new Map();          // `${scenario}::${accountKey}`      -> account state
 
-  const sessionFor = (scenarioName, key) => {
+  /**
+   * The account every tab of one signed-in player shares (accounts.js).
+   *
+   * Keyed by the scenario as well, so two scenarios never inherit each other's revocations, and
+   * created before the session state so a scenario's `init` can seed both.
+   */
+  const accountFor = (scenarioName, key) => {
+    const id = `${scenarioName}::${key}`;
+    let account = accounts.get(id);
+    if (!account) { account = createAccountState(); accounts.set(id, account); }
+    return account;
+  };
+
+  const sessionFor = (scenarioName, key, account) => {
     const id = `${scenarioName}::${key}`;
     let entry = sessions.get(id);
     if (!entry) {
@@ -90,7 +106,7 @@ export function createStubApi({
         state: initialState(scenarioName),
         clock: createClock(scenario.clockStepMs ?? DEFAULT_STEP_MS),
       };
-      if (scenario.init) scenario.init(entry.state);
+      if (scenario.init) scenario.init(entry.state, account);
       sessions.set(id, entry);
     }
     return entry;
@@ -111,7 +127,13 @@ export function createStubApi({
       const err = new ApiError('VALIDATION_FAILED', 'Unknown stub scenario.', {
         details: { fields: [{ path: 'X-Stub-Scenario', rule: 'enum', message: `Unknown scenario ${scenarioName}.` }] },
       });
-      return { status: err.status, headers: {}, body: err.toEnvelope('stub-no-correlation'), scenario: scenarioName };
+      // A real ULID even here: errors.md says the envelope always carries one, and a
+      // placeholder is the one id a client could never quote to support.
+      const id = stubUlid('corr:unknown-scenario', EPOCH_MS);
+      return {
+        status: err.status, headers: { 'X-Correlation-Id': id },
+        body: err.toEnvelope(id), scenario: scenarioName, correlationId: id,
+      };
     }
 
     // Header first, then the two places the contract already puts `clientSessionId` (§3a.3
@@ -120,7 +142,12 @@ export function createStubApi({
     // split one, which is why the header is the documented way to drive a scenario.
     const sessionKey = headers['x-client-session-id'] || query.clientSessionId
       || body.clientSessionId || 'stub-default-session';
-    const { state, clock } = sessionFor(scenarioName, sessionKey);
+    // Two tabs of one account declare themselves with `X-Stub-Account-Id`. Absent, a tab is its
+    // own account, so a replay is genuinely fresh — accounts.js explains why it is declared
+    // rather than inferred.
+    const accountKey = headers['x-stub-account-id'] || sessionKey;
+    const account = accountFor(scenarioName, accountKey);
+    const { state, clock } = sessionFor(scenarioName, sessionKey, account);
 
     // `offline` has no HTTP layer to answer with. Returning a synthetic 5xx would be a lie the
     // shell could not distinguish from a real one — a transport failure has no envelope.
@@ -132,10 +159,25 @@ export function createStubApi({
     clock.tick();
     state.requests++;
 
+    /**
+     * §1, and core/http.js does exactly this: the client's id is echoed **only if it is one**.
+     *
+     * The stub echoed the header unvalidated, so junk was reflected into a response header, the
+     * body and every log line — and, worse for the shell, it then disagreed with the id the
+     * mounted path put in the body, because core/http.js validates and regenerates. The same
+     * rule in both layers means one id per response wherever the client is pointed.
+     *
+     * `request.correlationId` is honoured first so the mounted path can hand in the id it has
+     * already derived (app.js does not pass it yet — see the handover note).
+     */
+    const supplied = headers['x-correlation-id'];
+    const echoed = (typeof request.correlationId === 'string' && isUlid(request.correlationId))
+      ? request.correlationId
+      : ((typeof supplied === 'string' && isUlid(supplied)) ? supplied : null);
     // Deterministic and NOT derived from the session key: two fresh sessions replaying one
-    // scenario must produce the same bytes, so the id can only depend on the scenario and the
-    // step within it.
-    const correlationId = headers['x-correlation-id']
+    // scenario must produce the same bytes, so a generated id can only depend on the scenario
+    // and the step within it. `stubUlid` shapes it so it passes core/ids.js `isUlid`.
+    const correlationId = echoed
       || stubUlid(`corr:${scenarioName}:${state.requests}`, clock.nowMs());
 
     const hit = router.match(method, path);
@@ -144,10 +186,27 @@ export function createStubApi({
     let extraHeaders = {};
 
     const respond = () => {
-      // §1 and errors.md §5: every response carries the correlation id, including the 204s —
-      // a body-less success is still an event someone has to trace, and the header is the only
-      // place the id can travel.
-      const outHeaders = { 'X-Correlation-Id': correlationId, ...extraHeaders };
+      /**
+       * §1 and errors.md §5: every response carries the correlation id, including the 204s —
+       * a body-less success is still an event someone has to trace, and the header is the only
+       * place the id can travel.
+       *
+       * The header is emitted when the id came from the request (both layers then echo the same
+       * value) or when there is no body to carry it. It is deliberately NOT emitted for a
+       * GENERATED id on a response that has a body: the mounted path rewrites the body with the
+       * platform's own id, and a header set here would override the platform's and disagree
+       * with the body beside it. One id per response matters more than which layer minted it,
+       * and `res.correlationId` always carries ours for an in-process driver.
+       */
+      const bodyless = status === 204 || payload === null;
+      // An error envelope carries the id INSIDE `error.correlationId` (errors.md §2), which the
+      // mounted path does not rewrite — so here the header has to be ours, or the id support is
+      // told to quote would not be the id in the header they are reading.
+      const isError = Boolean(payload && payload.error);
+      const outHeaders = {
+        ...((echoed || bodyless || isError) ? { 'X-Correlation-Id': correlationId } : {}),
+        ...extraHeaders,
+      };
       let outBody = payload;
       if (outBody && !outBody.error) outBody = { ...outBody, correlationId };
       if (status === 204) outBody = null;
@@ -183,6 +242,11 @@ export function createStubApi({
       });
       const credential = checkAuthClass(headers, hit.route.opts.auth, {
         serviceToken: config.serviceToken ?? null,
+        // A token is valid only if this layer minted it, and only while its session lives.
+        verify: (token) => {
+          const claims = tokenClaims(account, token);
+          return claims ? { ...claims, revoked: isRevoked(account, claims.sessionId) } : null;
+        },
       });
       const ctx = {
         method,
@@ -196,6 +260,11 @@ export function createStubApi({
         headers,
         body,
         state,
+        // Shared by every tab of this account: session list, revocations, issued tokens.
+        account,
+        // Which session in that list this tab IS, so `isCurrent` and "revoke the session I am
+        // holding" mean something rather than being a fixture constant.
+        sessionId: sessionIdFor(account, sessionKey),
         clock,
         scenario: scenarioName,
         correlationId,
@@ -223,7 +292,7 @@ export function createStubApi({
   return {
     handle,
     /** Drop all scenario state. A fresh session is the supported way to replay; this is for tests. */
-    reset() { sessions.clear(); },
+    reset() { sessions.clear(); accounts.clear(); },
     scenarioNames: SCENARIO_NAMES,
     hasScenario: (name) => Object.hasOwn(SCENARIOS, name),
     routePatterns: ROUTES.map((r) => `${r.method} ${r.path}`),
@@ -232,4 +301,8 @@ export function createStubApi({
 
 export { SCENARIOS, SCENARIO_NAMES, EXTRA_SCENARIOS } from './scenarios.js';
 export { createLobbyStub, LOBBY_SCENARIOS, LOBBY_SCENARIO_NAMES } from './lobby.js';
+export {
+  createNetFacadeStub, NET_FACADE_SCENARIOS, NET_FACADE_SCENARIO_NAMES, NET_FACADE_EXTRA,
+  spectatorPolicyFor, stubHandoff,
+} from './netfacade.js';
 export { COVERAGE_MAP } from './coverage.js';

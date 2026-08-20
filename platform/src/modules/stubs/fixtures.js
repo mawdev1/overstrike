@@ -589,6 +589,49 @@ export function sessionsList() {
   ];
 }
 
+// ── display-name availability (§3b, REQ-CC-046) ─────────────────────────────────────────────
+
+/** §9: the name-check class, so a debounced field cannot trip it but a per-keystroke one will. */
+export const NAME_CHECK_PER_MINUTE = 20;
+
+/**
+ * §3b normalisation: NFKC, outer whitespace trimmed, internal runs collapsed, case-folded for
+ * the uniqueness comparison.
+ *
+ * The client sends the raw candidate. Normalising client-side would put a second copy of the
+ * rule in the shell, and the two would disagree the first time the server's changed.
+ */
+export function normaliseDisplayName(raw) {
+  return String(raw).normalize('NFKC').trim().replace(/\s+/g, ' ');
+}
+
+const NAME_TAKEN_SET = new Set(['stubrunner', 'stubplayer01', 'taken']);
+/** Rule ids only. The words behind them are the server's business (§3b). */
+const NAME_RESERVED_SET = new Set(['admin', 'moderator', 'overstrike', 'staff']);
+
+/**
+ * The exact `{ available, policy }` verdict.
+ *
+ * Policy first, then existence: answering "taken" for a name policy would have refused anyway
+ * turns the endpoint into a directory of which reserved names are in use.
+ */
+export function displayNameVerdict(raw) {
+  const name = normaliseDisplayName(raw);
+  const folded = name.toLowerCase();
+  const refuse = (rule) => ({ available: false, policy: { rule } });
+  if (name.length < 3 || name.length > 20) return refuse('length');
+  // Letters, digits, one internal space, hyphen and underscore. The client is told the rule
+  // that failed, never the expression.
+  if (!/^[\p{L}\p{N}][\p{L}\p{N} _-]*[\p{L}\p{N}]$/u.test(name)) return refuse('charset');
+  if (NAME_RESERVED_SET.has(folded)) return refuse('reserved');
+  // Exact reserved words are handled above; a name that merely CONTAINS one is the
+  // impersonation case, which is a different rule and a different message.
+  if (/overstrike|admin|staff/.test(folded)) return refuse('impersonation');
+  // `policy: null` on a taken name, and never the holder: an available-to-you answer and a
+  // taken answer differ in one boolean and nothing else (the enumeration boundary).
+  return { available: !NAME_TAKEN_SET.has(folded), policy: null };
+}
+
 export function presenceItems() {
   return [
     { accountId: OTHER_ACCOUNT_ID, displayName: 'StubPlayer01', state: 'in-lobby', joinable: true, roomId: ROOM_IDS[0] },

@@ -866,6 +866,18 @@ sequence, same responses, every run.
 `clientSessionId` in the query or body, so supplying it on only some requests splits one
 timeline into two and the transitions never fire.
 
+**Two tabs of one account: `X-Stub-Account-Id` (REQ-CC-045).** Scenario state is per client
+session, which is right for a timeline and wrong for an account — so a session revoked in one tab
+stayed live in the other, `signout-all` signed out one tab, and cross-tab revocation, a designed
+`/sessions` state, was unreachable. Client sessions sending the same `X-Stub-Account-Id` share
+the account-scoped state: the session list, revocations, and which access tokens exist. Absent,
+a tab is its own account.
+
+It is declared rather than inferred because every scenario seeds the same fixture account, so the
+layer cannot tell two tabs from two replays by looking at the requests — and if it assumed
+*shared*, a replay would inherit the previous run's revocations and stop being byte-identical,
+which is the determinism this section requires.
+
 The table below is **32 scenarios**; three join refusals previously shared one row, which made
 the count read as 31 and is the kind of miscount a coverage test catches by enumerating rather
 than trusting prose.

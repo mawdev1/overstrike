@@ -272,6 +272,17 @@ export function createProfileService({
     // One transaction around read-decide-write: without it two retries that arrive together
     // both find no prior row and both execute, which is the duplicate the key exists to stop.
     return store.tx(async (tx) => {
+      // Serialise on the key BEFORE reading it — the same fix `applyMatchResult` needed.
+      //
+      // A transaction alone is not enough. `idempotency.get` takes no lock, and there is no row
+      // to lock on the first attempt anyway, so on Postgres ten concurrent retries of one key
+      // all read `prior = null` inside their own transactions and all execute. The rename then
+      // runs N times (N-1 of them answering NAME_CHANGE_COOLDOWN to a client that sent one
+      // request), and `idempotency.put`'s first-writer-wins turns the losers' correct retry
+      // into IDEMPOTENCY_KEY_REUSED. `acquire` is a transaction-scoped advisory lock on
+      // Postgres and a documented no-op on memory, where every transaction is already
+      // serialised — so the guard is expressed once, here, rather than per adapter.
+      if (store.idempotency.acquire) await store.idempotency.acquire(idempotencyKey, accountId, tx);
       const prior = await store.idempotency.get(idempotencyKey, accountId, tx);
       if (prior) {
         if (prior.requestHash !== requestHash) {

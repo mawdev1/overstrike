@@ -23,10 +23,19 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 
-const CONTAINER = 'overstrike-pgtest';
+/**
+ * Container name and port are PER RUN.
+ *
+ * They were fixed, and the script's first act is `docker rm -f <name>` — so two runs on one
+ * machine destroy each other's database mid-suite. The victim sees `ECONNREFUSED` from whichever
+ * suite happened to be executing, which reads as an adapter defect and is not one; the failing
+ * suite even moves between runs. Two agents working this repository at once is the normal case,
+ * so the fixed name was a reproducible way to manufacture flaky evidence.
+ */
+const CONTAINER = `overstrike-pgtest-${process.pid}`;
 const IMAGE = 'postgres:16-alpine';
 const PASSWORD = 'overstrike-test';
-const PORT = 55432;
+const PORT = 55000 + (process.pid % 4000);
 const URL = `postgres://postgres:${PASSWORD}@127.0.0.1:${PORT}/postgres`;
 
 const flag = (k) => process.argv.slice(2).includes(`--${k}`);
@@ -50,12 +59,31 @@ function removeContainer() {
 function waitForReady(timeoutMs = 60_000) {
   const started = Date.now();
   for (;;) {
-    const r = sh('docker', ['exec', CONTAINER, 'pg_isready', '-U', 'postgres', '-q']);
-    if (r.status === 0) return true;
+    if (sh('docker', ['exec', CONTAINER, 'pg_isready', '-U', 'postgres', '-q']).status === 0
+        && acceptsConnections()) return true;
     if (Date.now() - started > timeoutMs) return false;
     // Busy-wait in 250 ms slices without pulling in a sleep dependency.
     execFileSync(process.execPath, ['-e', 'setTimeout(()=>{},250)']);
   }
+}
+
+/**
+ * `pg_isready` is not the readiness this script needs.
+ *
+ * It answers on the container's UNIX socket, and the image's entrypoint runs initdb against a
+ * temporary server on that socket before restarting for real — so it reports ready while the
+ * published TCP port either refuses the connection or resets it mid-handshake. That is exactly
+ * what happened: `pgtest` started a container, declared it ready, and failed the migration step
+ * with `read ECONNRESET` before running a single assertion, which reads as a broken adapter
+ * rather than a harness that asked the wrong question.
+ *
+ * The honest probe is the connection the suite itself will make, over TCP, with a query on it.
+ */
+function acceptsConnections() {
+  const probe = "import pg from 'pg';"
+    + 'const c = new pg.Client(process.argv[1]);'
+    + "await c.connect(); await c.query('select 1'); await c.end();";
+  return sh(process.execPath, ['--input-type=module', '-e', probe, URL], { stdio: 'ignore' }).status === 0;
 }
 
 let startedByUs = false;

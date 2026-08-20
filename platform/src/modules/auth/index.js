@@ -32,11 +32,38 @@ export function createAuthModule(deps) {
   });
   const routes = createAuthRoutes({ service, sessions, limiter });
 
+  /**
+   * The pre-auth consent janitor.  http-api.md §3a.3.
+   *
+   * §3a.3 gives a signed-out consent decision a 30-day life. The adapters delete an expired row
+   * when someone reads it, and nobody reads most of them — so without a timer the rows that
+   * never come back are retained forever, which for a consent record is a retention breach
+   * rather than a stale cache entry. Hourly is far more often than a 30-day TTL needs and far
+   * less often than anything that would show up on the database.
+   *
+   * Unref'd, like the ephemeral sweep: a retention timer must never be the reason a process
+   * refuses to exit. Failures are logged and swallowed — a janitor that throws into a bare
+   * interval takes the process down with it, and the next tick would have retried anyway.
+   */
+  const consentSweepIntervalMs = deps.consentSweepIntervalMs ?? 3600_000;
+  const consentTimer = consentSweepIntervalMs > 0
+    ? setInterval(() => {
+      service.sweepPreAuthConsent().catch((err) => logger?.warn?.('consent.sweep.failed',
+        { message: err?.message ?? String(err) }));
+    }, consentSweepIntervalMs)
+    : null;
+  consentTimer?.unref?.();
+
   return {
     service, sessions, receipts, ephemeral, limiter, outbox, audit, routes,
     register: routes.register,
-    /** Releases the ephemeral sweep timer. Called by the composition root on shutdown. */
-    stop() { ephemeral.stop(); },
+    /** For a worker, an ops task, or a test that would rather not wait an hour. */
+    sweepPreAuthConsent: service.sweepPreAuthConsent,
+    /** Releases the module's background timers. Called by the composition root on shutdown. */
+    stop() {
+      ephemeral.stop();
+      if (consentTimer) clearInterval(consentTimer);
+    },
   };
 }
 

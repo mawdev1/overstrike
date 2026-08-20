@@ -103,6 +103,12 @@ const health = { method: 'GET', path: '/v1/health' };
 const regions = { method: 'GET', path: '/v1/config/regions' };
 
 const getSettings = { method: 'GET', path: '/v1/profile/me/settings' };
+const signoutAll = { method: 'POST', path: '/v1/auth/signout-all', body: {} };
+
+/** §3b: the preflight the display-name field fires while the player types. */
+const nameCheck = (displayName) => ({
+  method: 'POST', path: '/v1/auth/display-name/check', body: { displayName },
+});
 
 /** A settings write carrying the ETag the last settings response handed back. */
 const putSettings = (values) => (prev) => {
@@ -137,7 +143,7 @@ export const SCENARIO_PROBES = {
   // Signed-in scenarios start by signing in, because every `A` row now requires the credential
   // the contract says it requires — a probe that skipped it was only ever passing because the
   // stub was not checking.
-  'default': [health, regions, signin, listRooms, roomDetail, statsAll, history],
+  'default': [health, regions, signin, nameCheck('Nova Prime'), listRooms, roomDetail, statsAll, history],
   'onboarding-happy': [eligibility, consentAccept, signup, join(), verifyComplete, getTerms, acceptTerms(1), join()],
   'onboarding-eligibility-denied': [eligibility, signupUnbacked],
   'onboarding-consent-declined': [eligibility, consentDecline, signup],
@@ -164,7 +170,7 @@ export const SCENARIO_PROBES = {
   'history-empty': [signin, statsAll, history],
   'privacy-filtered': [signin, publicProfile],
   'sanctioned': [signin, profileMe, join()],
-  'name-taken': [signupUnbacked, signin, rename],
+  'name-taken': [nameCheck('StubRunner'), signupUnbacked, signin, rename],
   'session-revoked': [signin, profileMe, profileMe, profileMe],
   // Four authenticated calls at 10 virtual seconds each: the fourth is past the 30 s TTL, and
   // the refresh after it is what a single-flight refresh queue would issue.
@@ -177,7 +183,7 @@ export const SCENARIO_PROBES = {
   'signin-incomplete-setup': [signin, profileMe, join()],
   'recovery-token-invalid': [recoveryStart, recoveryComplete],
   'recovery-token-expired': [recoveryStart, recoveryComplete],
-  'name-policy-violation': [signupUnbacked, signin, rename],
+  'name-policy-violation': [nameCheck('Overstrike Staff'), signupUnbacked, signin, rename],
   'settings-conflict': [signin, getSettings, putSettings(ROAM_WRITE), putSettings(ROAM_WRITE)],
   'match-not-found': [signin, matchDetail],
   'career-unavailable': [signin, statsAll, history],
@@ -185,6 +191,10 @@ export const SCENARIO_PROBES = {
   'system-maintenance': [health, signin],
   'unsupported-client': [health, signin],
   'active-lobby-resync': [signin, activeMatch, selfProfile, roomDetail, lobbyTicket],
+
+  // REQ-CC-046 additions.
+  'name-check-rate-limited': [nameCheck('Nova Prime')],
+  'name-check-unavailable': [nameCheck('Nova Prime')],
 };
 
 /**
@@ -297,11 +307,15 @@ export const ROUTE_COVERAGE = {
     policy: served('onboarding-consent-declined', [eligibility, consentDecline, signup], 'ok'),
   },
   '/onboarding/display-name': {
-    loading: served('slow', [signin]),
+    // `checking` is not a sixth variant: it is this screen's loading state, and it is the
+    // §3b preflight in flight rather than the page (design/first-run-flow.md §3).
+    loading: served('slow', [nameCheck('Nova Prime')]),
     empty: na(NO_FORM_STATE),
-    error: served('name-taken', [signupUnbacked]),
-    offline: served('offline', [signin]),
-    policy: served('name-policy-violation', [signupUnbacked]),
+    error: served('name-check-unavailable', [nameCheck('Nova Prime')]),
+    offline: served('offline', [nameCheck('Nova Prime')]),
+    // A policy refusal is a 200 carrying the rule, not an HTTP error: the check reports, the
+    // mutation refuses. `name-policy-violation` serves both in one scenario.
+    policy: served('name-policy-violation', [nameCheck('Overstrike Staff')], 'ok'),
   },
   '/onboarding/verify': {
     loading: served('slow', [signin]),
@@ -415,7 +429,9 @@ export const ROUTE_COVERAGE = {
     empty: served('sessions-current-only', [signin, sessions]),
     error: served('default', [signin, revokeUnknownSession]),
     offline: served('offline', [sessions]),
-    policy: served('session-revoked', [signin, profileMe, profileMe, sessions]),
+    // `signout-all` revokes the caller's own session too (§3), so the very next authenticated
+    // read is AUTH_SESSION_REVOKED. That is the terminal state of this screen.
+    policy: served('default', [signin, signoutAll, sessions]),
   },
   '/match/loading': {
     loading: socket('happy-path'),

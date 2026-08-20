@@ -115,7 +115,7 @@ export function createAuthService(deps) {
    * is `profile.updated` because that is what the catalogue registers for a change to the
    * account projection; auth may not invent a type (event-envelope.md §6).
    */
-  async function updateAccountWithEvent(actor, patch, { action, capability = 'account:update', reasonCode, correlationId, summaryKeys, spec }) {
+  async function updateAccountWithEvent(actor, patch, { action, capability = 'account:update', reasonCode, correlationId, summaryKeys, spec, alsoInTransaction = null }) {
     const before = await store.accounts.byId(actor.accountId);
     if (!before) throw new ApiError('NOT_FOUND', 'No such account.');
     const { result } = await internalise(() => audit.recordWithEvent(
@@ -130,7 +130,15 @@ export function createAuthService(deps) {
         before, after: updated, summaryKeys,
       }),
       spec,
-      (tx) => store.accounts.update(actor.accountId, patch, tx),
+      // `alsoInTransaction` is for the row that has to commit WITH the account change and its
+      // event — the §9 name history is the case. A second transaction for it would commit a
+      // rename whose history insert then rolled back, which is precisely the rename an
+      // impersonation review would come looking for.
+      async (tx) => {
+        const updated = await store.accounts.update(actor.accountId, patch, tx);
+        if (alsoInTransaction) await alsoInTransaction(updated, tx);
+        return updated;
+      },
     ));
     // `recordWithEvent` -> `outbox.commit` returns { result: { row, event, result }, events }.
     // Destructuring one level yielded the wrapper, so callers got { row, event, result } where
@@ -694,8 +702,68 @@ export function createAuthService(deps) {
         payload: { previousName: account.displayName, displayName: name },
         occurredAt: iso(now),
       },
+      /**
+       * auth.md §9 History: "Retained for moderation and impersonation review."
+       *
+       * `account_name_history` has existed since migration 0001 and nothing ever wrote it, so
+       * the only record of a previous name was the `account.name_changed` event — a stream
+       * with its own retention, published to consumers, and not a table a moderator can query.
+       * The event says a rename happened; this is the record that survives to answer "what was
+       * this account called before".
+       *
+       * Written in the SAME transaction as the account row and the event, so the three cannot
+       * disagree. Skipped when the rendered name is unchanged: a no-op rename has no previous
+       * name to retain, and (account_id, changed_at) is the primary key, so a stream of
+       * identical writes at one instant would collide for no reason.
+       */
+      alsoInTransaction: name === account.displayName ? null : async (_updated, tx) => {
+        await store.accountNameHistory.insert({
+          accountId: account.accountId,
+          previousName: account.displayName,
+          changedAt: iso(now),
+          // The actor, which is not always the subject: a §10 moderator rename must name the
+          // moderator, or the row cannot answer who did it.
+          changedBy: actor.id ?? actor.accountId ?? null,
+          reason: 'account_self_service',
+        }, tx);
+      },
     });
     return projectProfile(updated);
+  }
+
+  /**
+   * The §9 history, for moderation and impersonation review.  auth.md §9, §10.
+   *
+   * Guarded by `account:read`, which is the capability that already means "may look at this
+   * account": `player` holds it scoped to `self`, and `support`, `moderator` and `superadmin`
+   * hold it for anyone. §9 says the history is "not publicly visible", and this is what makes
+   * that true — it is deliberately not a field of the public projection (http-api.md §11.8
+   * closes that schema to five keys) and not reachable without a capability check.
+   */
+  async function nameHistory({ actor, accountId = null, limit = 100 }) {
+    const subjectId = accountId ?? actor?.accountId ?? null;
+    if (!subjectId) throw new ApiError('AUTH_REQUIRED', 'Sign in to continue.');
+    requireCapability(actor, 'account:read', { accountId: subjectId });
+    return store.accountNameHistory.listForAccount(subjectId, { limit });
+  }
+
+  // ------------------------------------------------------------------ retention: the sweep
+
+  /**
+   * Delete pre-auth consent rows past their 30-day TTL.  http-api.md §3a.3.
+   *
+   * Expiry was enforced on read only, which answers correctly and retains forever: a row
+   * nobody ever reads again is never deleted, and it is a consent record — evidence of a
+   * legally significant answer — held past the life the contract grants it. Retention is an
+   * obligation, not a cache policy, so something has to run on a clock. `auth/index.js` starts
+   * that timer; this is also callable directly by a janitor or an ops task.
+   *
+   * @returns {Promise<number>} rows deleted.
+   */
+  async function sweepPreAuthConsent() {
+    const removed = await store.preAuthConsent.sweepExpired(iso(clock.now()));
+    if (removed) logger?.info?.('consent.sweep', { removed });
+    return removed;
   }
 
   return {
@@ -706,6 +774,7 @@ export function createAuthService(deps) {
     recoveryStart, recoveryComplete,
     verificationResend, verificationComplete,
     termsGet, termsAccept,
-    changeDisplayName,
+    changeDisplayName, nameHistory,
+    sweepPreAuthConsent,
   };
 }

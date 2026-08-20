@@ -295,6 +295,10 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
           method: early.method, path: early.path,
           query: Object.fromEntries(early.query),
           headers: early.headers, body, scenario,
+          // The stub honours this and derives its own otherwise, which produced TWO ids in one
+          // response: the envelope's `error.correlationId` from the stub and a stray top-level
+          // one added below. One request has one id, or a support ticket has two answers.
+          correlationId: early.correlationId,
         });
         // `offline` models a TRANSPORT failure, which has no HTTP representation. Synthesising
         // a 5xx would be indistinguishable from a real server error and would teach the client

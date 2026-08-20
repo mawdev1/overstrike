@@ -26,7 +26,7 @@ import { createHash } from 'node:crypto';
 import { ApiError } from '../../core/errors.js';
 import {
   TERMINAL_MATCH_STATUSES, OUTCOME_REASONS, INVALIDATION_REASONS,
-  matchOutcomeProblems, terminalResultProblems, assertPageArgs,
+  matchOutcomeProblems, submittableResultProblems, assertPageArgs,
   PAGE_LIMIT_MAX, toHistoryMatchStatus,
 } from '../../core/store.js';
 
@@ -69,7 +69,12 @@ export function deriveRatios(totals) {
 function blankPlayer(accountId, entry) {
   return {
     accountId,
+    // §4.1 requires both on a submitted player row, and they are properties of the ROSTER, not
+    // of the event log. Carried through so a resolver output is a submittable row rather than
+    // one the endpoint refuses for two fields the resolver never had the chance to supply.
+    displayName: entry.displayName ?? null,
     team: entry.team,
+    role: entry.role ?? null,
     kills: 0, deaths: 0, assists: 0, suicides: 0, teamKills: 0,
     headshots: 0, shotsFired: 0, shotsHit: 0, damageDealt: 0,
     plants: 0, defuses: 0,
@@ -327,12 +332,20 @@ export function assertTerminalResult(result) {
 }
 
 /**
- * The stricter form for the SUBMISSION path: the complete §4.2 required field set, then the
- * matrix. A submission is a whole record; the aggregation path sees history rows that carry a
- * subset by design, which is why these are two functions and not one.
+ * The stricter form for the SUBMISSION path: the complete §4.2 required field set, the matrix,
+ * and every nested §4.1 shape. A submission is a whole record; the aggregation path sees history
+ * rows that carry a subset by design, which is why these are two functions and not one.
+ *
+ * The nested half is what was missing. Top-level validation was exact while `players[]`,
+ * `rounds[]`, `roster[]`, `weapons{}`, `teamScores` and `rulesSnapshot` accepted unknown keys,
+ * wrong types and missing fields — so a match server could submit `{ kills: "10" }`, a
+ * `rulesSnapshot` of `{ scoreLimit: 75 }` and a round with no roles, and the platform stored all
+ * three as a finished match. The error names the offending PATH (`players[2].weapons.ar_vector
+ * .kills`), because "VALIDATION_FAILED" against a payload with sixty nested numbers in it is not
+ * a diagnosis.
  */
 export function assertSubmittableResult(result) {
-  const problems = terminalResultProblems(result);
+  const problems = submittableResultProblems(result);
   if (problems.length) {
     throw new ApiError('VALIDATION_FAILED', 'The match result is not a valid §4.2 TerminalResult.', {
       details: { fields: problems },
@@ -413,6 +426,9 @@ const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** §4.2's pending variant: how long a client waits before asking for the result again. */
 const PENDING_RETRY_AFTER_MS = 2000;
 
+/** realtime-lobby.md §2/§7: the reconnect grace window, 90 s from the drop. */
+const RECONNECT_GRACE_MS = 90_000;
+
 /** Key order must not change the hash, or a re-serialised retry looks like a different truth. */
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null);
@@ -423,7 +439,22 @@ function stableStringify(value) {
 
 export const resultHash = (result) => createHash('sha256').update(stableStringify(result)).digest('hex');
 
-export function createStatsService({ store, clock = Date, outbox = null }) {
+/**
+ * @param outbox  REQUIRED. §5.3 makes the result write, the career application and the event one
+ *   transaction, and the event is the only durable trace that a career moved. Optional, it was a
+ *   deployment mode: a process wired without one applied careers silently, and the absence was
+ *   invisible until someone asked why the audit trail had a hole in it. A missing outbox is a
+ *   wiring error, and wiring errors belong at construction where they stop the process, not at
+ *   the first result of the night.
+ * @param visibilityFor  `(subjectId, viewerId) -> { stats, presence, isSelf }` from the profile
+ *   service. Absent, `getMatch` refuses every non-participant — fail closed, because the
+ *   alternative is a privacy rule that is enforced only when a dependency happens to be wired.
+ */
+export function createStatsService({ store, clock = Date, outbox, visibilityFor = null }) {
+  if (!outbox || typeof outbox.emitIn !== 'function') {
+    throw new Error('createStatsService requires an outbox: a career applied with no event is '
+      + 'the state the outbox pattern exists to make impossible (match-result.md §5.3)');
+  }
   /**
    * Apply one terminal result. SERVICE ONLY (§5.1) — this is the single door career numbers
    * come through, and it is closed to anything holding a player token.
@@ -432,6 +463,15 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
    * A replay with the same payload returns the stored response without re-applying; a replay
    * with a different payload for a finalised match is a CONFLICT, because a match finalises
    * once and a second, different truth is a bug or an attack.
+   *
+   * INVALIDATION IS A SUBMISSION-TIME DECISION ONLY. `status: 'invalidated'` is accepted here as
+   * a match's first and only terminal result — the anti-cheat or roster fault was known before
+   * the result was written. Re-submitting a FINALISED match as invalidated is refused by §5.5
+   * like any other second truth, and there is no other door: no admin command invalidates a
+   * completed match, because doing it honestly needs an append-only command plus a compensating
+   * career delta to reverse what was already applied, and neither exists in this phase (see
+   * MATCH_STATUS_TRANSITIONS in core/store.js). Refusing is the failure mode that loses nothing;
+   * a silent forward-only edit would leave a career that no longer reconciles with its history.
    */
   async function applyMatchResult({ actor, result, idempotencyKey = null, correlationId = null }) {
     if (!actor || actor.kind !== 'service') {
@@ -518,44 +558,42 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
       // one transition that changes a career left no durable trace. Emitted in THIS
       // transaction: a career applied with no event explaining it is the exact state the
       // outbox pattern exists to make impossible.
-      if (outbox) {
-        const ctx = {
-          correlationId: correlationId || result.matchId,
-          actor: { kind: 'service', id: RESULT_ACTOR, role: 'service' },
-        };
-        // §5.3 and §4.0: the terminal event follows the STATUS — `match.completed`,
-        // `match.aborted` or `match.invalidated`. Only `match.result_applied` was emitted, so
-        // three catalogued public/audit events (event-envelope.md §6) were produced by nothing
-        // at all, and every consumer of "a match finished" saw an empty stream. It goes first
-        // because the match ending is what causes the career application, not the reverse.
-        await outbox.emitIn(tx, ctx, {
-          type: TERMINAL_EVENT_TYPES[result.status],
-          subject: { kind: 'match', id: result.matchId },
-          payload: {
-            status: result.status,
-            mode: result.mode,
-            mapId: result.mapId,
-            terminationReason: result.terminationReason ?? result.status,
-            outcomeReason: result.outcomeReason ?? null,
-            winnerTeam: result.winnerTeam ?? null,
-            invalidationReason: result.invalidationReason ?? null,
-            teamScores: result.teamScores ?? null,
-            startedAt: result.startedAt ?? null,
-            endedAt: result.endedAt ?? null,
-          },
-        });
-        await outbox.emitIn(tx, ctx, {
-          type: 'match.result_applied',
-          subject: { kind: 'match', id: result.matchId },
-          payload: {
-            status: result.status,
-            outcomeReason: result.outcomeReason ?? null,
-            winnerTeam: result.winnerTeam ?? null,
-            accountsAffected: appliedTo.length,
-            resultAppliedAt,
-          },
-        });
-      }
+      const ctx = {
+        correlationId: correlationId || result.matchId,
+        actor: { kind: 'service', id: RESULT_ACTOR, role: 'service' },
+      };
+      // §5.3 and §4.0: the terminal event follows the STATUS — `match.completed`,
+      // `match.aborted` or `match.invalidated`. Only `match.result_applied` was emitted, so
+      // three catalogued public/audit events (event-envelope.md §6) were produced by nothing
+      // at all, and every consumer of "a match finished" saw an empty stream. It goes first
+      // because the match ending is what causes the career application, not the reverse.
+      await outbox.emitIn(tx, ctx, {
+        type: TERMINAL_EVENT_TYPES[result.status],
+        subject: { kind: 'match', id: result.matchId },
+        payload: {
+          status: result.status,
+          mode: result.mode,
+          mapId: result.mapId,
+          terminationReason: result.terminationReason ?? result.status,
+          outcomeReason: result.outcomeReason ?? null,
+          winnerTeam: result.winnerTeam ?? null,
+          invalidationReason: result.invalidationReason ?? null,
+          teamScores: result.teamScores ?? null,
+          startedAt: result.startedAt ?? null,
+          endedAt: result.endedAt ?? null,
+        },
+      });
+      await outbox.emitIn(tx, ctx, {
+        type: 'match.result_applied',
+        subject: { kind: 'match', id: result.matchId },
+        payload: {
+          status: result.status,
+          outcomeReason: result.outcomeReason ?? null,
+          winnerTeam: result.winnerTeam ?? null,
+          accountsAffected: appliedTo.length,
+          resultAppliedAt,
+        },
+      });
       // Same transaction as the write above: a crash between them would leave a career applied
       // with nothing recording that it was, and the retry would apply it a second time.
       await store.idempotency.put({
@@ -658,18 +696,34 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
    * handler so one projection serves every caller.
    *
    * Four shapes discriminated by `status`, no more and no fewer keys than the union lists.
-   * `correlationId` is on every variant (§4.2), `endedAt` is null ONLY while the match is live —
-   * an ended match awaiting persistence is `pending` WITH a timestamp — and the terminal
-   * refinements carry the whole record including the roster derived from the participants.
+   * `correlationId` is on every variant (§4.2), and the terminal refinements carry the whole
+   * record including the roster derived from the participants.
+   *
+   * The three non-terminal states, which §4.2's table left to inference and which the client
+   * must be able to tell apart from ONE response — it has no other source:
+   *
+   * | stored status | startedAt | endedAt | means |
+   * |---|---|---|---|
+   * | `allocated`   | null      | null    | the id exists, the server has not started the match |
+   * | `in-progress` | set       | null    | LIVE |
+   * | `in-progress` | set       | set     | ended, the result is queued and not yet submitted |
+   *
+   * All three are `pending` with `retryAfterMs`, because a client cannot act on the difference —
+   * it waits either way. All three carry both keys with an explicit null rather than omitting
+   * one, so a missing key stays a bug rather than becoming a fourth state. A row that has
+   * reached a terminal status projects as terminal whether or not the career application has
+   * been stamped: `result_applied_at` is a fact about the career, not about the result.
    */
-  async function getMatch(matchId, { correlationId = null } = {}) {
+  async function getMatch(matchId, { viewer = null, correlationId = null } = {}) {
     const row = typeof matchId === 'string' && matchId ? await store.matches.byId(matchId) : null;
-    if (!row) {
-      // §4.2: never-existed and not-a-participant are both 404. A 403 would confirm the match
-      // exists, which is the fact privacy is refusing to disclose.
-      throw new ApiError('NOT_FOUND', 'No such match.', { details: { matchId } });
-    }
+    // §4.2: never-existed and not-a-participant-and-privacy-forbids are the SAME answer. One
+    // error object, raised from one place, so the two cannot drift into being distinguishable
+    // by message, by `details`, or by how long they take to arrive.
+    const notFound = () => new ApiError('NOT_FOUND', 'No such match.', { details: { matchId } });
+    if (!row) throw notFound();
     const participants = row.participants || [];
+    const access = await accessFor(participants, viewer);
+    if (!access.allowed) throw notFound();
     if (toHistoryMatchStatus(row.status) === 'pending') {
       return {
         matchId: row.matchId,
@@ -709,10 +763,97 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
         joinedAt: p.joinedAt ?? null, leftAt: p.leftAt ?? null,
       })),
       teamScores: row.teamScores,
-      rounds: row.rounds ?? [],
+      // §4.1: "Objective actors are always present in the stored record. Whether they are
+      // RETURNED depends on §4.2." This is that hinge — a stranger reading a public match gets
+      // the round, the reason and the timing, and not who planted.
+      rounds: access.participant ? (row.rounds ?? []) : withoutObjectiveActors(row.rounds),
       players: participants.map((p) => p.stats),
-      evidenceRef: row.evidenceRef,
+      // §7: `evidenceRef` points at the internal authoritative record — the event timeline,
+      // position and combat samples, and anti-cheat flags. It is the input to a cheat review,
+      // not a field a player is owed, and handing it to the participants of a match hands it to
+      // whoever they are protecting. Present as null (§11.8's convention for a withheld field,
+      // never omitted) for every player caller; real only for a service caller, which is the
+      // only caller that has to reconstruct a result from it.
+      evidenceRef: access.service ? row.evidenceRef : null,
       correlationId,
+    };
+  }
+
+  /**
+   * Who may read a match, and what they may read of it.  §4.2.
+   *
+   * Three answers, and the refusal is a 404 rather than a 403 at the call site above:
+   *
+   *  - a SERVICE caller sees everything, including `evidenceRef` (§7);
+   *  - a PARTICIPANT sees the whole record except `evidenceRef`;
+   *  - anyone else sees it only if EVERY participant publishes their career, and then without
+   *    the objective actors.
+   *
+   * "Every participant" is deliberate. A match record is joint: it names ten people, their
+   * teams, their kills and when they left. There is no per-match privacy setting to consult, so
+   * the only defensible reading of "privacy forbids" is that one player's `statsVisibility:
+   * nobody` is not overridden by nine teammates who chose otherwise. The alternative — publish
+   * the record if anyone in it is public — makes the setting worthless to the person who set it,
+   * since they cannot control who they are matched with.
+   */
+  async function accessFor(participants, viewer) {
+    if (viewer && viewer.kind === 'service') return { allowed: true, service: true, participant: true };
+    const viewerId = viewer && typeof viewer === 'object' ? (viewer.accountId ?? null) : viewer ?? null;
+    // No viewer is not "an anonymous viewer": it is a caller that forgot to pass one. Fail
+    // closed, or the authorization is enforced only where someone remembered it.
+    if (typeof viewerId !== 'string' || !viewerId) return { allowed: false };
+    if (participants.some((p) => p.accountId === viewerId)) {
+      return { allowed: true, service: false, participant: true };
+    }
+    // A row with no participants at all — an allocation whose roster has not landed — has
+    // nobody to authorise against, so nobody outside the platform reads it.
+    if (!participants.length || !visibilityFor) return { allowed: false };
+    for (const p of participants) {
+      let visible = null;
+      // A participant whose account has since been deleted cannot consent to anything, and a
+      // throw here must not become a 500 that also confirms the match exists.
+      try { visible = await visibilityFor(p.accountId, viewerId); } catch { return { allowed: false }; }
+      if (!visible?.stats) return { allowed: false };
+    }
+    return { allowed: true, service: false, participant: false };
+  }
+
+  /** Keep the round, drop who did it. The shape is unchanged; the actor id becomes null. */
+  function withoutObjectiveActors(rounds) {
+    return (rounds ?? []).map((round) => ({
+      ...round,
+      plant: round.plant ? { ...round.plant, accountId: null } : (round.plant ?? null),
+      defuse: round.defuse ? { ...round.defuse, accountId: null } : (round.defuse ?? null),
+    }));
+  }
+
+  /**
+   * §7.1 `GET /v1/matches/active` — "am I in a match?", answered server-side.
+   *
+   * The caller's newest non-terminal match, or null. Derived from `match_participants` rather
+   * than from anything the client remembers, because a reload is precisely when the client
+   * remembers nothing (REQ-CC-029).
+   *
+   * `graceEndsAt` is the reconnect window (realtime-lobby.md §2: `graceMs`, 90 s) measured from
+   * the last fact the PLATFORM holds — the roster's `leftAt` if they have dropped, otherwise
+   * now, since a still-seated player's seat is held at least that long. The authoritative
+   * countdown for a ticket is minted by `POST /matches/:id/reconnect-ticket` (§7); this endpoint
+   * exists to tell the client which match to ask about, and answering with a plausible number
+   * from the wrong clock would be worse than the extra request.
+   */
+  async function activeMatchFor(accountId) {
+    if (typeof accountId !== 'string' || !accountId) return null;
+    const page = await store.matches.listForAccount(accountId, { limit: PAGE_LIMIT_MAX, cursor: null });
+    const held = page.items.find((m) => m.status === 'pending');
+    if (!held) return null;
+    const nowMs = clock.now();
+    const leftAtMs = Date.parse(held.participant?.leftAt ?? '');
+    const from = Number.isFinite(leftAtMs) ? leftAtMs : nowMs;
+    return {
+      matchId: held.matchId,
+      roomId: held.roomId ?? null,
+      graceEndsAt: new Date(from + RECONNECT_GRACE_MS).toISOString(),
+      serverNow: new Date(nowMs).toISOString(),
     };
   }
 
@@ -751,5 +892,23 @@ export function createStatsService({ store, clock = Date, outbox = null }) {
     return { items, nextCursor: page.nextCursor ?? null };
   }
 
-  return { applyMatchResult, getCareer, recomputeCareer, history, getMatch };
+  /**
+   * §11.5/§4.3: what a career looks like when privacy forbids it.
+   *
+   * The SAME shape, with the counters null. It was an ad-hoc object — `{ accountId, mode: 'all',
+   * totals: null, weapons: null }` — which for `mode=all` is not the contracted response at all:
+   * the visible answer is per-mode `modes: { tdm, bomb }` and carries no `mode` key, so a client
+   * reading a hidden career got a shape its type never described and could only crash on. Built
+   * here, beside the visible projection, because that is the only way the two stay the same
+   * shape when one of them changes.
+   */
+  function hiddenCareer(accountId, mode, sdv = STAT_DEFINITION_VERSION) {
+    const blank = (m) => ({ accountId, mode: m, statDefinitionVersion: sdv, totals: null, weapons: null });
+    if (mode === 'all') {
+      return { accountId, statDefinitionVersion: sdv, modes: { tdm: blank('tdm'), bomb: blank('bomb') } };
+    }
+    return blank(mode);
+  }
+
+  return { applyMatchResult, getCareer, hiddenCareer, recomputeCareer, history, getMatch, activeMatchFor };
 }

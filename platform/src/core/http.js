@@ -251,9 +251,12 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
             if (answered.__dropSocket) { try { res.destroy(); } catch { /* gone */ } return; }
             status = answered.status ?? 200;
             extraHeaders = answered.headers || null;
-            payload = (answered.body && typeof answered.body === 'object' && !Array.isArray(answered.body))
-              ? { ...answered.body, correlationId }
-              : answered.body;
+            const b = answered.body;
+            const isObject = b && typeof b === 'object' && !Array.isArray(b);
+            // An error envelope already carries its id INSIDE `error`. Adding a top-level one
+            // gave the response two correlation ids that could disagree, plus a key §11's
+            // "anything not stated is forbidden" does not allow on that shape.
+            payload = (isObject && !b.error) ? { ...b, correlationId } : b;
             return finish();
           }
         }

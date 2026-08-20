@@ -83,6 +83,7 @@ const key = (...parts) => parts.join('\u001f');
 function emptyState() {
   return {
     accounts: new Map(),
+    accountNameHistory: new Map(),
     preAuthConsent: new Map(),
     sessions: new Map(),
     refreshTokens: new Map(),
@@ -148,6 +149,25 @@ const ACCOUNT_TIMESTAMPS = [
   'eligibilityDecidedAt', 'emailVerifiedAt', 'termsAcceptedAt', 'consentDecidedAt',
   'createdAt', 'updatedAt', 'deletedAt',
 ];
+
+/**
+ * `account_name_history` (migration 0001).  auth.md §9: the previous name is retained for
+ * moderation and impersonation review.
+ *
+ * The table has existed since 0001 and had no accessor on either adapter, so nothing could
+ * write it and nothing could read it — the retention auth.md §9 requires was a table and a
+ * promise. `changed_at` is part of the primary key, so two rows for one account at the same
+ * instant collide here exactly as they collide on Postgres.
+ */
+const NAME_HISTORY_COLUMNS = columns({
+  accountId: undefined,
+  previousName: undefined,
+  changedAt: null,
+  changedBy: null,
+  reason: null,
+  createdAt: null,
+  updatedAt: null,
+});
 
 const SESSION_COLUMNS = columns({
   sessionId: undefined,
@@ -986,6 +1006,74 @@ export function createMemoryStore(config = {}, deps = {}) {
         r.migratedAt = toIso(at) ?? nowIso();
       });
     },
+
+    /**
+     * Delete every expired row, whether or not anybody ever reads it again.  §3a.3.
+     *
+     * Expiry on read is enough to stop a stale decision being HONOURED, and it is not enough
+     * to satisfy the 30-day retention limit: the rows that are never read again are exactly
+     * the ones nobody deletes, and they are consent records — evidence of a legally
+     * significant answer — sitting past the life the contract grants them. So there is also a
+     * sweep, and something has to call it (auth/index.js runs it on an interval).
+     *
+     * @param at ISO string, Date or epoch ms; defaults to the store's injected clock.
+     * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
+     */
+    sweepExpired(at = null, txh) {
+      const cutoff = at === null || at === undefined ? consentNowMs() : Date.parse(toIso(at));
+      if (!Number.isFinite(cutoff)) {
+        throw new ApiError('VALIDATION_FAILED', 'The sweep instant must be a timestamp.');
+      }
+      return write(txh, (st) => {
+        let removed = 0;
+        for (const [k, row] of st.preAuthConsent) {
+          if (!row.expiresAt || Date.parse(row.expiresAt) > cutoff) continue;
+          st.preAuthConsent.delete(k);
+          removed += 1;
+        }
+        return removed;
+      });
+    },
+  };
+
+  /**
+   * `account_name_history`.  auth.md §9, db-schema.md §2.
+   *
+   * Insert and list only. There is no update and no delete, for the same reason the audit log
+   * has none: a name history the application can rewrite proves nothing in the impersonation
+   * review it exists for. Correcting a wrong row is a new row, not an edit.
+   */
+  const accountNameHistory = {
+    insert(row, txh) {
+      assertCloneable(row, 'account_name_history row');
+      return write(txh, (st) => {
+        const rec = materialise(row, NAME_HISTORY_COLUMNS, 'account_name_history');
+        // 0001 declares the foreign key; enforcing it here too is what keeps memory-green
+        // meaningful about Postgres.
+        requireAccount(st, rec.accountId, 'account_name_history');
+        const ts = nowIso();
+        rec.changedAt = toIso(rec.changedAt) ?? ts;
+        rec.createdAt = toIso(rec.createdAt) ?? ts;
+        rec.updatedAt = toIso(rec.updatedAt) ?? ts;
+        const k = key(rec.accountId, rec.changedAt);
+        if (st.accountNameHistory.has(k)) {
+          throw new ApiError('CONFLICT', 'A name-history row already exists for that instant.', {
+            details: { table: 'account_name_history', accountId: rec.accountId, changedAt: rec.changedAt },
+          });
+        }
+        st.accountNameHistory.set(k, rec);
+        return clone(rec);
+      });
+    },
+
+    /** Newest first: a review starts from the name the subject is impersonating today. */
+    listForAccount(accountId, { limit = 100 } = {}, txh) {
+      return read(txh, (st) => [...st.accountNameHistory.values()]
+        .filter((r) => r.accountId === accountId)
+        .sort((a, b) => (a.changedAt < b.changedAt ? 1 : -1))
+        .slice(0, limit)
+        .map(clone));
+    },
   };
 
   const outbox = {
@@ -1172,7 +1260,7 @@ export function createMemoryStore(config = {}, deps = {}) {
   return {
     kind: 'memory',
     tx,
-    accounts, sessions, refreshTokens, profiles, stats, weaponStats, matches,
+    accounts, accountNameHistory, sessions, refreshTokens, profiles, stats, weaponStats, matches,
     preAuthConsent, outbox, audit, idempotency, flags,
     async health() {
       return closed ? { ok: false, detail: 'closed' } : { ok: true, detail: 'memory' };

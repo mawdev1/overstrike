@@ -249,8 +249,17 @@ export const MATCH_COLUMNS = [
  * lifecycle.
  *
  * What must stay impossible is a SECOND terminal truth: §5.5 makes a second, different result
- * for a finalised match a bug or an attack. So terminal states have no outgoing edges at all,
- * and an invalidation is a review decision applied through its own path, not a re-record.
+ * for a finalised match a bug or an attack. So terminal states have no outgoing edges at all.
+ *
+ * INVALIDATION IS THEREFORE A SUBMISSION-TIME DECISION AND NOTHING ELSE, in this phase.
+ * `invalidated` is reachable only from `allocated` or `in-progress` — the match server submits
+ * it as the match's first and only terminal result. There is deliberately no admin path that
+ * invalidates a `completed` match, because the honest version of that is an append-only
+ * command plus a COMPENSATING career delta (the reversal `STAT_DELTA_LIMITS` keeps signed for),
+ * and neither exists yet. An edge added here without both would let a review decision move a
+ * career with nothing recording that it did, and reverse nothing that was already applied —
+ * which is worse than refusing. When the admin command lands, it adds a compensation
+ * transition here and a delta there, together or not at all.
  */
 export const MATCH_STATUS_TRANSITIONS = Object.assign(Object.create(null), {
   allocated: ['in-progress', 'completed', 'aborted', 'invalidated'],
@@ -303,7 +312,7 @@ export function matchOutcomeProblems(result) {
   const { status, winnerTeam = null, outcomeReason, invalidationReason, terminationReason } = result || {};
   const problems = [];
   if (!TERMINAL_MATCH_STATUSES.includes(status)) {
-    return [{ key: 'status', reason: 'enum', allowed: TERMINAL_MATCH_STATUSES, got: status ?? null }];
+    return withContractPaths([{ key: 'status', reason: 'enum', allowed: TERMINAL_MATCH_STATUSES, got: status ?? null }]);
   }
   // §4.2: terminationReason repeats the status. They are two names for one fact, and a row where
   // they disagree is a row with two truths in it.
@@ -343,7 +352,300 @@ export function matchOutcomeProblems(result) {
   } else if (invalidationReason !== undefined && invalidationReason !== null) {
     problems.push({ key: 'invalidationReason', reason: 'must-be-null', got: invalidationReason });
   }
+
+  // A DRAW is the regulation timer expiring, and nothing else (§4.1, bomb-rules.md §2.1a: "no
+  // overtime in Alpha", so 6-6 at the end of regulation is the only way a match has no winner
+  // and is still `completed`). The matrix's row for `completed` permitted `draw` beside
+  // `elimination`, `defuse` and `detonation` — three reasons that each name a team that won, so
+  // the row said a match could be simultaneously decided and drawn. The wire forbids it; this is
+  // where that becomes checkable.
+  if (winnerTeam === 'draw' && outcomeReason !== undefined && outcomeReason !== 'timer') {
+    problems.push({ key: 'outcomeReason', reason: 'draw-implies-timer', expected: 'timer', got: outcomeReason ?? null });
+  }
+  return withContractPaths(problems);
+}
+
+/**
+ * errors.md §3 fixes the validation field shape as `{ path, rule, message }`; this file's
+ * existing callers — and the suites that assert on them — read `{ key, reason }`. Both are
+ * emitted from one place rather than renaming a field every consumer already branches on.
+ */
+function withContractPaths(problems) {
+  return problems.map((p) => (p.path !== undefined ? p : { ...p, path: p.key, rule: p.reason }));
+}
+
+/** A problem authored path-first, for the nested shapes below. */
+const at = (path, rule, extra = {}) => ({ path, key: path, rule, reason: rule, ...extra });
+
+const isNonEmptyString = (v) => typeof v === 'string' && v.length > 0;
+/** A timestamp the database can hold and `Date.parse` agrees with. */
+const isTimestamp = (v) => typeof v === 'string' && Number.isFinite(Date.parse(v));
+const isCount = (v) => Number.isInteger(v) && v >= 0;
+
+/** §4.1 per-player counters. `score` is separate: it alone may be negative (§2's penalties). */
+const PLAYER_COUNTERS = [
+  'kills', 'deaths', 'assists', 'suicides', 'teamKills',
+  'headshots', 'shotsFired', 'shotsHit', 'damageDealt',
+  'plants', 'defuses', 'roundsPlayed', 'timePlayedSec',
+];
+const PLAYER_KEYS = [
+  'accountId', 'displayName', 'team', 'role', ...PLAYER_COUNTERS,
+  'score', 'disconnected', 'abandoned', 'joinedAt', 'leftAt', 'weapons',
+];
+const ROSTER_KEYS = ['accountId', 'team', 'joinedAt', 'leftAt'];
+const ROUND_KEYS = ['index', 'winner', 'reason', 'startedAt', 'endedAt', 'roles', 'plant', 'defuse'];
+export const TEAMS = ['alpha', 'bravo'];
+const ROLES = ['attacker', 'defender'];
+const ROUND_REASONS = ['elimination', 'defuse', 'detonation', 'timer'];
+const BOMB_SITES = ['A', 'B'];
+/** A weapon id becomes a storage key (`player_weapon_stats`), so it is constrained like one. */
+const WEAPON_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * `rulesSnapshot` is discriminated by mode and every key is present in BOTH variants (§4).
+ *
+ * A snapshot is the immutable copy that makes a historical result interpretable after the
+ * ruleset is retuned (db-schema.md §4). A partial one — `{ killLimit: 75 }` — is not a smaller
+ * snapshot, it is a result nobody can read in a year, and it passed every check the platform
+ * had because `rulesSnapshot` was only tested for being an object.
+ */
+const RULES_KEYS = [
+  'killLimit', 'roundsToWin', 'maxRounds', 'sideSwitchAfter', 'roundLengthSec',
+  'bombTimerSec', 'defuseSec', 'plantSec', 'freezeSec', 'overtime',
+];
+const RULES_BY_MODE = Object.assign(Object.create(null), {
+  // Positive integers where the mode uses the key; null where the mode has no such concept.
+  bomb: { null: ['killLimit'],
+    int: ['roundsToWin', 'maxRounds', 'sideSwitchAfter', 'roundLengthSec', 'bombTimerSec', 'defuseSec', 'plantSec', 'freezeSec'],
+    bool: ['overtime'] },
+  tdm: { null: ['roundsToWin', 'maxRounds', 'sideSwitchAfter', 'roundLengthSec', 'bombTimerSec', 'defuseSec', 'plantSec', 'freezeSec', 'overtime'],
+    int: ['killLimit'], bool: [] },
+});
+
+/** Reject keys the shape does not declare. An unexpected field is a producer that has drifted. */
+function closedKeys(value, allowed, path, problems) {
+  for (const k of Object.keys(value)) {
+    if (!allowed.includes(k)) problems.push(at(`${path}.${k}`, 'unknown-key'));
+  }
+}
+
+function weaponsProblems(weapons, path, problems) {
+  if (!isPlainObject(weapons)) {
+    problems.push(at(path, 'type', { expected: 'object' }));
+    return;
+  }
+  for (const [weaponId, row] of Object.entries(weapons)) {
+    const wp = `${path}.${weaponId}`;
+    if (!WEAPON_ID_RE.test(weaponId)) problems.push(at(wp, 'malformed-weapon-id'));
+    if (!isPlainObject(row)) { problems.push(at(wp, 'type', { expected: 'object' })); continue; }
+    closedKeys(row, WEAPON_COUNTERS, wp, problems);
+    for (const k of WEAPON_COUNTERS) {
+      if (!isCount(row[k])) problems.push(at(`${wp}.${k}`, 'count', { got: row[k] ?? null }));
+    }
+  }
+}
+
+function playerProblems(player, path, problems) {
+  if (!isPlainObject(player)) {
+    problems.push(at(path, 'type', { expected: 'object' }));
+    return;
+  }
+  closedKeys(player, PLAYER_KEYS, path, problems);
+  for (const k of ['accountId', 'displayName']) {
+    if (!isNonEmptyString(player[k])) problems.push(at(`${path}.${k}`, 'required', { expected: 'non-empty string' }));
+  }
+  if (!TEAMS.includes(player.team)) {
+    problems.push(at(`${path}.team`, 'enum', { allowed: TEAMS, got: player.team ?? null }));
+  }
+  // `role` is the STARTING role and is null in a mode that has no sides (§4.1). Absent is not
+  // null: an omitted key is a producer that forgot, and defaulting it invents a side.
+  if (!Object.hasOwn(player, 'role')) {
+    problems.push(at(`${path}.role`, 'required', { expected: 'value or explicit null' }));
+  } else if (player.role !== null && !ROLES.includes(player.role)) {
+    problems.push(at(`${path}.role`, 'enum', { allowed: [...ROLES, null], got: player.role }));
+  }
+  for (const k of PLAYER_COUNTERS) {
+    if (!isCount(player[k])) problems.push(at(`${path}.${k}`, 'count', { got: player[k] ?? null }));
+  }
+  // §2's table has teamKillPenalty and suicidePenalty, so a per-match score is legitimately
+  // negative. It is the one number here that is not a count.
+  if (!Number.isInteger(player.score)) problems.push(at(`${path}.score`, 'integer', { got: player.score ?? null }));
+  for (const k of ['disconnected', 'abandoned']) {
+    if (typeof player[k] !== 'boolean') problems.push(at(`${path}.${k}`, 'boolean', { got: player[k] ?? null }));
+  }
+  if (!isTimestamp(player.joinedAt)) problems.push(at(`${path}.joinedAt`, 'timestamp', { got: player.joinedAt ?? null }));
+  if (!Object.hasOwn(player, 'leftAt')) {
+    problems.push(at(`${path}.leftAt`, 'required', { expected: 'timestamp or explicit null' }));
+  } else if (player.leftAt !== null && !isTimestamp(player.leftAt)) {
+    problems.push(at(`${path}.leftAt`, 'timestamp', { got: player.leftAt }));
+  }
+  weaponsProblems(player.weapons, `${path}.weapons`, problems);
+}
+
+function rosterProblems(entry, path, problems) {
+  if (!isPlainObject(entry)) {
+    problems.push(at(path, 'type', { expected: 'object' }));
+    return;
+  }
+  closedKeys(entry, ROSTER_KEYS, path, problems);
+  if (!isNonEmptyString(entry.accountId)) {
+    problems.push(at(`${path}.accountId`, 'required', { expected: 'non-empty string' }));
+  }
+  if (!TEAMS.includes(entry.team)) {
+    problems.push(at(`${path}.team`, 'enum', { allowed: TEAMS, got: entry.team ?? null }));
+  }
+  if (!isTimestamp(entry.joinedAt)) problems.push(at(`${path}.joinedAt`, 'timestamp', { got: entry.joinedAt ?? null }));
+  if (!Object.hasOwn(entry, 'leftAt')) {
+    problems.push(at(`${path}.leftAt`, 'required', { expected: 'timestamp or explicit null' }));
+  } else if (entry.leftAt !== null && !isTimestamp(entry.leftAt)) {
+    problems.push(at(`${path}.leftAt`, 'timestamp', { got: entry.leftAt }));
+  }
+}
+
+/** `plant` / `defuse`: the objective ACTOR record. Present in the stored row, or explicitly null. */
+function objectiveProblems(value, path, keys, problems) {
+  if (value === null) return;
+  if (!isPlainObject(value)) {
+    problems.push(at(path, 'type', { expected: 'object or null' }));
+    return;
+  }
+  closedKeys(value, keys, path, problems);
+  if (!isNonEmptyString(value.accountId)) {
+    problems.push(at(`${path}.accountId`, 'required', { expected: 'non-empty string' }));
+  }
+  if (!isTimestamp(value.at)) problems.push(at(`${path}.at`, 'timestamp', { got: value.at ?? null }));
+  if (keys.includes('site') && !BOMB_SITES.includes(value.site)) {
+    problems.push(at(`${path}.site`, 'enum', { allowed: BOMB_SITES, got: value.site ?? null }));
+  }
+}
+
+function roundProblems(round, path, problems) {
+  if (!isPlainObject(round)) {
+    problems.push(at(path, 'type', { expected: 'object' }));
+    return;
+  }
+  closedKeys(round, ROUND_KEYS, path, problems);
+  if (!isCount(round.index)) problems.push(at(`${path}.index`, 'count', { got: round.index ?? null }));
+  if (!TEAMS.includes(round.winner)) {
+    problems.push(at(`${path}.winner`, 'enum', { allowed: TEAMS, got: round.winner ?? null }));
+  }
+  if (!ROUND_REASONS.includes(round.reason)) {
+    problems.push(at(`${path}.reason`, 'enum', { allowed: ROUND_REASONS, got: round.reason ?? null }));
+  }
+  for (const k of ['startedAt', 'endedAt']) {
+    if (!isTimestamp(round[k])) problems.push(at(`${path}.${k}`, 'timestamp', { got: round[k] ?? null }));
+  }
+  // §4.1: roles are PER ROUND because the side switch means deriving them from a starting role
+  // plus a switch point silently reinterprets every historical match when the rule changes.
+  if (!isPlainObject(round.roles)) {
+    problems.push(at(`${path}.roles`, 'type', { expected: 'object' }));
+  } else {
+    closedKeys(round.roles, TEAMS, `${path}.roles`, problems);
+    for (const team of TEAMS) {
+      if (!ROLES.includes(round.roles[team])) {
+        problems.push(at(`${path}.roles.${team}`, 'enum', { allowed: ROLES, got: round.roles[team] ?? null }));
+      }
+    }
+  }
+  for (const [k, keys] of [['plant', ['accountId', 'site', 'at']], ['defuse', ['accountId', 'at']]]) {
+    if (!Object.hasOwn(round, k)) {
+      problems.push(at(`${path}.${k}`, 'required', { expected: 'object or explicit null' }));
+      continue;
+    }
+    objectiveProblems(round[k], `${path}.${k}`, keys, problems);
+  }
+}
+
+function teamScoresProblems(teamScores, problems) {
+  if (!isPlainObject(teamScores)) return;              // the required-field check already said so
+  closedKeys(teamScores, TEAMS, 'teamScores', problems);
+  for (const team of TEAMS) {
+    if (!isCount(teamScores[team])) {
+      problems.push(at(`teamScores.${team}`, 'count', { got: teamScores[team] ?? null }));
+    }
+  }
+}
+
+function rulesSnapshotProblems(snapshot, mode, problems) {
+  if (!isPlainObject(snapshot)) return;                // ditto
+  const spec = RULES_BY_MODE[mode];
+  if (!spec) return;                                   // an unknown mode is already a problem
+  closedKeys(snapshot, RULES_KEYS, 'rulesSnapshot', problems);
+  for (const k of RULES_KEYS) {
+    if (!Object.hasOwn(snapshot, k)) {
+      problems.push(at(`rulesSnapshot.${k}`, 'required', { expected: 'value or explicit null' }));
+    }
+  }
+  for (const k of spec.null) {
+    if (Object.hasOwn(snapshot, k) && snapshot[k] !== null) {
+      problems.push(at(`rulesSnapshot.${k}`, 'must-be-null', { mode, got: snapshot[k] }));
+    }
+  }
+  for (const k of spec.int) {
+    if (Object.hasOwn(snapshot, k) && !(Number.isInteger(snapshot[k]) && snapshot[k] > 0)) {
+      problems.push(at(`rulesSnapshot.${k}`, 'positive-integer', { mode, got: snapshot[k] }));
+    }
+  }
+  for (const k of spec.bool) {
+    if (Object.hasOwn(snapshot, k) && typeof snapshot[k] !== 'boolean') {
+      problems.push(at(`rulesSnapshot.${k}`, 'boolean', { mode, got: snapshot[k] }));
+    }
+  }
+}
+
+/**
+ * The §4.1/§4.2 NESTED shapes, exactly: required keys present, no unknown keys, correct types,
+ * closed enums, counts non-negative.
+ *
+ * Separate from `terminalResultProblems` on purpose. That function is what both adapters run
+ * before a write, and it answers "can this row be stored and later rendered" — the columns the
+ * table declares. This one answers "is this the record the wire contract describes", which is
+ * strictly more, and is what the SUBMISSION endpoint must hold a match server to. Applying the
+ * stricter set at the storage door would also apply it to rows written by an allocation, a
+ * backfill or a repair, none of which carry a §4.1 player row at all.
+ */
+export function nestedResultProblems(result) {
+  const problems = [];
+  if (!isPlainObject(result)) return [at('result', 'type', { expected: 'object' })];
+
+  if (Array.isArray(result.players)) {
+    const seen = new Set();
+    result.players.forEach((player, i) => {
+      playerProblems(player, `players[${i}]`, problems);
+      const id = player?.accountId;
+      // (match_id, account_id) is the primary key. A duplicate is a malformed result, and the
+      // last-writer-wins alternative hides the defect upstream rather than reporting it.
+      if (isNonEmptyString(id)) {
+        if (seen.has(id)) problems.push(at(`players[${i}].accountId`, 'duplicate', { got: id }));
+        seen.add(id);
+      }
+    });
+  }
+  if (Array.isArray(result.roster)) {
+    const seen = new Set();
+    result.roster.forEach((entry, i) => {
+      rosterProblems(entry, `roster[${i}]`, problems);
+      const id = entry?.accountId;
+      if (isNonEmptyString(id)) {
+        if (seen.has(id)) problems.push(at(`roster[${i}].accountId`, 'duplicate', { got: id }));
+        seen.add(id);
+      }
+    });
+  }
+  if (Array.isArray(result.rounds)) {
+    result.rounds.forEach((round, i) => roundProblems(round, `rounds[${i}]`, problems));
+  }
+  teamScoresProblems(result.teamScores, problems);
+  rulesSnapshotProblems(result.rulesSnapshot, result.mode, problems);
   return problems;
+}
+
+/**
+ * The complete submission check: the §4.2 required fields, the §4.0 matrix, and every nested
+ * §4.1 shape. One function so the endpoint cannot accidentally run two thirds of it.
+ */
+export function submittableResultProblems(result) {
+  return terminalResultProblems(result).concat(nestedResultProblems(result));
 }
 
 /**
@@ -399,7 +701,7 @@ export function terminalResultProblems(result) {
       problems.push({ key: field, reason: 'required', expected: 'value or explicit null' });
     }
   }
-  return problems.concat(matchOutcomeProblems(result));
+  return withContractPaths(problems).concat(matchOutcomeProblems(result));
 }
 
 /** Throwing form. §4.2 violations are malformed submissions, not variants of the union. */
@@ -439,7 +741,8 @@ export function assertPageArgs({ limit, cursor } = {}) {
     }
   }
   if (fields.length) {
-    throw new ApiError('VALIDATION_FAILED', 'Invalid pagination arguments.', { details: { fields } });
+    throw new ApiError('VALIDATION_FAILED', 'Invalid pagination arguments.',
+      { details: { fields: withContractPaths(fields) } });
   }
   return {
     limit: limit === undefined || limit === null ? PAGE_LIMIT_DEFAULT : limit,

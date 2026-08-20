@@ -76,6 +76,7 @@ function makeStore() {
   const weaponRows = new Map();      // `${account}|${mode}|${weapon}|${sdv}`
   const matches = [];                // newest last; listForAccount reverses
   const idem = new Map();            // `${key}|${actorId}`
+  const events = [];                 // events_outbox rows
 
   const key = (...p) => p.join('|');
 
@@ -85,7 +86,15 @@ function makeStore() {
   let chain = Promise.resolve();
 
   return {
-    _accounts: accounts, _matches: matches, _idem: idem,
+    _accounts: accounts, _matches: matches, _idem: idem, _events: events,
+
+    // §5.3 makes the outbox a wiring REQUIREMENT of the stats service — a career applied with
+    // no event is the state the outbox pattern exists to make impossible — so the fake has to
+    // hold one. A fake without it could only test the mode the contract forbids.
+    outbox: {
+      async insert(row) { events.push(row); return row; },
+    },
+
     async tx(fn) {
       const run = chain.then(() => fn({ fake: true }));
       chain = run.then(() => {}, () => {});
@@ -230,6 +239,18 @@ function seed(store) {
   });
 }
 
+/**
+ * Every module in this file is constructed WITH an outbox.
+ *
+ * `createStatsService` now refuses to construct without one (match-result.md §5.3): a
+ * deployment missing it applied careers with no durable trace and nothing said so. These
+ * constructions used to omit it, which meant the suite's default configuration was the one
+ * configuration the contract does not permit.
+ */
+const moduleWith = (store, extra = {}) => createProfileModule({
+  store, logger: silent, outbox: createOutbox({ store, logger: null }), ...extra,
+});
+
 const ctxFor = (accountId, extra = {}) => ({
   actor: accountId ? { kind: 'user', accountId } : null,
   params: {}, body: {}, headers: {}, query: new URLSearchParams(),
@@ -264,7 +285,7 @@ console.log('\nRoaming settings — If-Match, scope, and range');
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
 
   const initial = await mod.settings.read(ACCOUNT);
   expect(initial.version === 1 && initial.values.fov === 85,
@@ -401,13 +422,26 @@ console.log('\nPrivacy — hidden is null, never 403');
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
 
   const ctx = ctxFor(ACCOUNT, { params: { accountId: OTHER }, query: new URLSearchParams() });
   const hidden = await expectNoThrow(() => mod.handlers.getStats(ctx),
     'stats for a subject with statsVisibility=nobody do not throw');
-  expect(hidden?.totals === null && hidden?.weapons === null,
-    'the hidden career fields are null, not 403', JSON.stringify(hidden));
+  // The default mode is `all`, whose CONTRACTED shape is per-mode (`modes: { tdm, bomb }`) and
+  // carries no top-level `totals` at all (§11.5). This check used to assert `totals === null`
+  // on that response, which the old ad-hoc hidden object satisfied and the contracted one
+  // cannot — so the suite was defending a shape no typed client could consume. The claim
+  // "hidden is null counters, never a 403" is now made against the shape the contract states.
+  expect(hidden?.modes?.tdm?.totals === null && hidden?.modes?.bomb?.totals === null
+      && hidden?.modes?.tdm?.weapons === null,
+    'the hidden career is per-mode null counters, not a 403 and not another shape',
+    JSON.stringify(hidden));
+  const hiddenOneMode = await mod.handlers.getStats(ctxFor(ACCOUNT, {
+    params: { accountId: OTHER }, query: new URLSearchParams('mode=tdm') }));
+  expect(hiddenOneMode.totals === null && hiddenOneMode.weapons === null
+      && hiddenOneMode.mode === 'tdm',
+    'and a single-mode hidden career is the §11.5 shape with null counters',
+    JSON.stringify(hiddenOneMode));
 
   const hiddenProfile = await mod.profiles.getPublicProfile(OTHER, ACCOUNT);
   expect(hiddenProfile.stats === null && hiddenProfile.presence === null
@@ -435,8 +469,14 @@ console.log('\nPrivacy — hidden is null, never 403');
   // Failing control: a public subject shows the same fields populated, and the owner sees their own.
   const visible = await mod.handlers.getStats(
     ctxFor(OTHER, { params: { accountId: ACCOUNT }, query: new URLSearchParams() }));
-  expect(visible.totals !== null, 'a subject with statsVisibility=everyone returns real counters',
-    JSON.stringify(visible.totals));
+  // Against the per-mode shape, and by KEY SET as well as by value: `visible.totals !== null`
+  // was true of `undefined`, so it passed for a response with no counters in it at all.
+  expect(visible.modes?.tdm?.totals !== null && visible.modes?.bomb?.totals !== null,
+    'a subject with statsVisibility=everyone returns real counters',
+    JSON.stringify(visible));
+  expect(JSON.stringify(Object.keys(visible).sort()) === JSON.stringify(Object.keys(hidden).sort()),
+    'the hidden and visible careers are the SAME shape, differing only in the counters',
+    `${JSON.stringify(Object.keys(visible))} vs ${JSON.stringify(Object.keys(hidden))}`);
   // Moderation and consent are OWN-profile fields (§4). Asserting them on the public
   // projection is what kept them in a schema §11.8 closes; the claim itself is still worth
   // making, so it is made against the endpoint that owns them.
@@ -639,6 +679,28 @@ const byId = (rows, id) => rows.find((r) => r.accountId === id);
 
 console.log('\nCareer aggregation — service-only, recomputable, status-aware');
 
+const STARTED_AT = '2026-08-19T00:00:00.000Z';
+const ENDED_AT = '2026-08-19T00:10:00.000Z';
+
+/**
+ * `rulesSnapshot` is discriminated by mode and carries EVERY key of its variant (§4).
+ *
+ * This fixture used to be `{ scoreLimit: 75 }` — a key no variant has, and eight keys short of
+ * either. It passed because `rulesSnapshot` was only checked for being an object, which is the
+ * defect the nested validator now closes; a fixture that stays wrong here would only prove the
+ * validator can be satisfied by a snapshot nobody can interpret in a year.
+ */
+const TDM_RULES = {
+  killLimit: 75,
+  roundsToWin: null, maxRounds: null, sideSwitchAfter: null, roundLengthSec: null,
+  bombTimerSec: null, defuseSec: null, plantSec: null, freezeSec: null, overtime: null,
+};
+const BOMB_RULES = {
+  killLimit: null,
+  roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, roundLengthSec: 105,
+  bombTimerSec: 40, defuseSec: 7, plantSec: 3, freezeSec: 8, overtime: false,
+};
+
 function matchResult({ matchId, status, winnerTeam, outcomeReason, players, mode = 'tdm' }) {
   return {
     matchId, status, mode,
@@ -649,23 +711,33 @@ function matchResult({ matchId, status, winnerTeam, outcomeReason, players, mode
     // The rest of the §4.2 TerminalResult. The real adapter refuses a result missing any of
     // them, so a fixture that omits them is a fixture the shipping store would never accept.
     rulesetVersion: '1.0.0', serverBuild: 'test-build', evidenceRef: `ev:${matchId}`,
-    rulesSnapshot: { scoreLimit: 75 }, roster: players.map((p) => ({ accountId: p.accountId, team: p.team })),
+    rulesSnapshot: mode === 'bomb' ? { ...BOMB_RULES } : { ...TDM_RULES },
+    // §4.1 roster entries are a closed shape: account, team, joined, left.
+    roster: players.map((p) => ({
+      accountId: p.accountId, team: p.team, joinedAt: p.joinedAt, leftAt: p.leftAt,
+    })),
     rounds: [],
     terminationReason: status, outcomeReason,
     invalidationReason: status === 'invalidated' ? 'cheat-detected' : null,
     winnerTeam, teamScores: { alpha: 75, bravo: 40 },
-    startedAt: '2026-08-19T00:00:00.000Z', endedAt: '2026-08-19T00:10:00.000Z',
+    startedAt: STARTED_AT, endedAt: ENDED_AT,
     players,
   };
 }
 
 function playerRow(accountId, team, over = {}) {
   const base = {
-    accountId, team,
+    accountId,
+    // §4.1 requires every key on a submitted player row. `displayName`, `role`, `joinedAt` and
+    // `leftAt` were absent from this fixture, so the suite's idea of a player row was four keys
+    // short of the contract's and no test could have noticed.
+    displayName: `Player-${accountId.slice(-4)}`,
+    team, role: null,
     kills: 10, deaths: 5, assists: 3, suicides: 0, teamKills: 0,
     headshots: 2, shotsFired: 100, shotsHit: 40, damageDealt: 1200,
     plants: 1, defuses: 0, roundsPlayed: 0, timePlayedSec: 600,
     score: 1400, disconnected: false, abandoned: false,
+    joinedAt: STARTED_AT, leftAt: null,
     weapons: { ar_vector: { shots: 100, hits: 40, kills: 10, headshots: 2 } },
   };
   return { ...base, ...over };
@@ -674,7 +746,7 @@ function playerRow(accountId, team, over = {}) {
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
   const service = { kind: 'service', serviceId: 'match-server' };
 
   // A modified client cannot write stats directly.
@@ -832,7 +904,7 @@ console.log('\nProgression migration — one-time, unverified, non-authoritative
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
   const service = { kind: 'service', serviceId: 'match-server' };
 
   await mod.stats.applyMatchResult({
@@ -886,7 +958,7 @@ console.log('\nmatch-result.md §5 — a retry applies once');
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
   const service = { kind: 'service', serviceId: 'match-server' };
   const result = matchResult({ matchId: 'IDEM1', status: 'completed', winnerTeam: 'alpha',
     outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] });
@@ -950,7 +1022,7 @@ console.log('\nmatch-result.md §5 — a retry applies once');
     const account = await store.accounts.create({
       accountId: ACCOUNT, displayName: 'Mawdev', displayNameFolded: 'mawdev',
     });
-    const mod = createProfileModule({ store, logger: { debug() {} } });
+    const mod = moduleWith(store);
     const service = { kind: 'service', serviceId: 'match-server' };
     const result = matchResult({ matchId: 'REALIDEM1', status: 'completed', winnerTeam: 'alpha',
       outcomeReason: 'timer', players: [playerRow(account.accountId, 'alpha')] });
@@ -1008,7 +1080,7 @@ console.log('\nmatch-result.md §4.0 — only a terminal status aggregates');
   // And through the write path: a non-terminal status applies nothing and records nothing.
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
   const service = { kind: 'service', serviceId: 'match-server' };
   await expectCode(() => mod.stats.applyMatchResult({
     actor: service,
@@ -1049,7 +1121,7 @@ console.log('\nA rename goes through the canonical identity path, with its event
   const clock = { now: () => t };
   const config = loadConfig({ PLATFORM_TOKEN_SECRET: 'test-secret-not-a-real-one' });
   const auth = createAuthModule({ store, config, logger: silent, clock });
-  const mod = createProfileModule({ store, clock, logger: silent, identity: auth.service });
+  const mod = moduleWith(store, { clock, identity: auth.service });
 
   await store.accounts.create({
     accountId: ACCOUNT, displayName: 'Mawdev', displayNameFolded: 'mawdev',
@@ -1128,7 +1200,7 @@ console.log('\nA rename goes through the canonical identity path, with its event
   // FAILING CONTROL for the delegation itself: with no identity service wired, a rename is
   // REFUSED rather than performed with no event, no audit row and no history. That refusal is
   // what makes "the rename is written by exactly one implementation" enforceable.
-  const orphan = createProfileModule({ store, clock, logger: silent });
+  const orphan = moduleWith(store, { clock });
   await expectCode(() => orphan.profiles.patchProfile(ACCOUNT, { displayName: 'Nameless' }),
     'SERVICE_UNAVAILABLE', 'a module with no identity service refuses to rename');
   expect((await store.accounts.byId(ACCOUNT)).displayName === 'Again',
@@ -1164,7 +1236,7 @@ console.log('\nhttp-api.md §11.2 — If-Match is compare-and-set, not read-then
   const account = await store.accounts.create({
     accountId: ACCOUNT, displayName: 'Racer', displayNameFolded: 'racer',
   });
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
 
   // Two writers, both holding the same fresh ETag. One must win and one must be told.
   const [a, b] = await Promise.allSettled([
@@ -1219,10 +1291,12 @@ console.log('\nPrivacy fails CLOSED — an unrecognised visibility hides, never 
     ...store._accounts.get(OTHER),
     privacy: { presenceVisibility: 'friends', statsVisibility: 'friends' },
   });
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
   const leaked = await mod.handlers.getStats(
     ctxFor(ACCOUNT, { params: { accountId: OTHER }, query: new URLSearchParams() }));
-  expect(leaked.totals === null && leaked.weapons === null,
+  // Per-mode, because `mode=all` is the default and its hidden form is the §11.5 per-mode shape
+  // with null counters (see the note in §3 above).
+  expect(leaked.modes?.tdm?.totals === null && leaked.modes?.bomb?.weapons === null,
     'a statsVisibility the enum does not contain hides the career', JSON.stringify(leaked));
   // CONTROL: the same call for a subject who really did choose `everyone` returns counters.
   const shown = await mod.handlers.getStats(
@@ -1237,7 +1311,7 @@ console.log('\n§11.5 — mode=all is the default, and it must carry the weapon 
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
   const service = { kind: 'service', serviceId: 'match-server' };
 
   await mod.stats.applyMatchResult({ actor: service,
@@ -1277,7 +1351,7 @@ console.log('\n§11.9 — the binding vocabulary is an allowlist, not an object 
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: { debug() {} } });
+  const mod = moduleWith(store);
 
   for (const action of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
     const err = await expectCode(() => mod.settings.replace(ACCOUNT, {
@@ -1372,7 +1446,7 @@ console.log('\n§4/§11.8 — privacy is a PATCHABLE field, validated against th
 
 {
   const store = createMemoryStore({ storage: 'memory' });
-  const mod = createProfileModule({ store, logger: silent });
+  const mod = moduleWith(store);
   await store.accounts.create({
     accountId: ACCOUNT, displayName: 'Mawdev', displayNameFolded: 'mawdev',
     privacy: { presenceVisibility: 'everyone', statsVisibility: 'everyone' },
@@ -1450,7 +1524,7 @@ console.log('\nhttp-api.md §8 — Idempotency-Key on PATCH /profile/me');
 
 {
   const store = createMemoryStore({ storage: 'memory' });
-  const mod = createProfileModule({ store, logger: silent });
+  const mod = moduleWith(store);
   await store.accounts.create({
     accountId: ACCOUNT, displayName: 'Mawdev', displayNameFolded: 'mawdev',
     privacy: { presenceVisibility: 'everyone', statsVisibility: 'everyone' },
@@ -1526,7 +1600,7 @@ console.log('\n§11.8 — a hidden history is distinguishable from an empty one'
 {
   const store = makeStore();
   seed(store);
-  const mod = createProfileModule({ store, logger: silent });
+  const mod = moduleWith(store);
 
   // OTHER hides their career; ACCOUNT is public and has simply never finished a match. These
   // used to be the same response — `{ items: [], nextCursor: null }` for both — so a client
@@ -1616,7 +1690,7 @@ console.log('\nmatch-result.md §4/§5 — the result lifecycle on the real adap
   });
   // The service shares the store's clock, so the stamp the row carries and the instant the
   // assertion expects come from one source rather than two that drift by a millisecond.
-  const mod = createProfileModule({ store, clock: { now: () => t }, logger: { debug() {} }, outbox });
+  const mod = moduleWith(store, { clock: { now: () => t }, outbox });
   const service = { kind: 'service', serviceId: 'match-server' };
   const player = playerRow(account.accountId, 'alpha');
 
@@ -1627,7 +1701,7 @@ console.log('\nmatch-result.md §4/§5 — the result lifecycle on the real adap
   const MATCH = '01JLIFECYCLEMATCH0000000AA';
   await expectNoThrow(() => store.matches.record({
     matchId: MATCH, status: 'allocated', mode: 'tdm', mapId: 'the-square', mapVersion: '1.0.0',
-    region: 'yyz', rulesSnapshot: { killLimit: 75 }, players: [{ accountId: account.accountId, team: 'alpha' }],
+    region: 'yyz', rulesSnapshot: { ...TDM_RULES }, players: [{ accountId: account.accountId, team: 'alpha' }],
   }), 'a match row is allocated before a ball is fired');
 
   const result = matchResult({ matchId: MATCH, status: 'completed', winnerTeam: 'alpha',
@@ -1651,7 +1725,7 @@ console.log('\nmatch-result.md §4/§5 — the result lifecycle on the real adap
   const QUEUED = '01JLIFECYCLEMATCH0000000BB';
   await store.matches.record({
     matchId: QUEUED, status: 'in-progress', mode: 'tdm', mapId: 'the-square', mapVersion: '1.0.0',
-    region: 'yyz', rulesSnapshot: { killLimit: 75 }, startedAt: new Date(t0 - 600e3).toISOString(),
+    region: 'yyz', rulesSnapshot: { ...TDM_RULES }, startedAt: new Date(t0 - 600e3).toISOString(),
     endedAt: new Date(t0 - 1e3).toISOString(), players: [{ accountId: account.accountId, team: 'alpha' }],
   });
   const queuedRow = await store.matches.byId(QUEUED);
@@ -1716,7 +1790,13 @@ console.log('\nmatch-result.md §4/§5 — the result lifecycle on the real adap
   }), 'CONTROL: the complete result applies');
 
   // --- 5. the §4.2 detail projection ----------------------------------------------------
-  const terminal = await mod.stats.getMatch(MATCH, { correlationId: 'corr-detail' });
+  //
+  // Every call passes a VIEWER. `getMatch` authorises now (§4.2: "caller not a participant,
+  // privacy forbids → 404"), and it fails closed when no viewer is supplied — a projection that
+  // answered anyone who asked was the defect, so a test that keeps calling it without a caller
+  // would be asserting the defect.
+  const viewer = { kind: 'player', accountId: account.accountId };
+  const terminal = await mod.stats.getMatch(MATCH, { viewer, correlationId: 'corr-detail' });
   const TERMINAL_KEYS = ['matchId', 'status', 'rulesetVersion', 'statDefinitionVersion',
     'rulesSnapshot', 'serverBuild', 'mapId', 'mapVersion', 'region', 'mode', 'startedAt',
     'endedAt', 'terminationReason', 'outcomeReason', 'winnerTeam', 'invalidationReason',
@@ -1730,7 +1810,7 @@ console.log('\nmatch-result.md §4/§5 — the result lifecycle on the real adap
     'the terminal projection carries the discriminant, the roster and the players',
     JSON.stringify({ s: terminal.status, r: terminal.roster.length }));
 
-  const pending = await mod.stats.getMatch(QUEUED, { correlationId: 'corr-pending' });
+  const pending = await mod.stats.getMatch(QUEUED, { viewer, correlationId: 'corr-pending' });
   const PENDING_KEYS = ['matchId', 'status', 'mode', 'mapId', 'mapVersion', 'startedAt',
     'endedAt', 'retryAfterMs', 'correlationId'];
   expect(JSON.stringify(Object.keys(pending).sort()) === JSON.stringify([...PENDING_KEYS].sort()),
@@ -1745,15 +1825,24 @@ console.log('\nmatch-result.md §4/§5 — the result lifecycle on the real adap
   const LIVE = '01JLIFECYCLEMATCH0000000EE';
   await store.matches.record({
     matchId: LIVE, status: 'in-progress', mode: 'bomb', mapId: 'the-square', mapVersion: '1.0.0',
-    region: 'yyz', rulesSnapshot: { roundsToWin: 7 }, startedAt: new Date(t).toISOString(),
+    region: 'yyz', rulesSnapshot: { ...BOMB_RULES }, startedAt: new Date(t).toISOString(),
     players: [{ accountId: account.accountId, team: 'alpha' }],
   });
-  const live = await mod.stats.getMatch(LIVE, { correlationId: 'corr-live' });
+  const live = await mod.stats.getMatch(LIVE, { viewer, correlationId: 'corr-live' });
   expect(live.status === 'pending' && live.endedAt === null,
     'CONTROL: a live match is pending with endedAt null', JSON.stringify(live));
   // §4.2: a match nobody can see and a match that never existed are the same answer.
-  await expectCode(() => mod.stats.getMatch('01JNOSUCHMATCH0000000000A'), 'NOT_FOUND',
+  await expectCode(() => mod.stats.getMatch('01JNOSUCHMATCH0000000000A', { viewer }), 'NOT_FOUND',
     'a match that never existed is NOT_FOUND, not an empty terminal shape');
+  // The same answer, byte for byte, for a match that exists and is not the caller's to read.
+  await expectCode(() => mod.stats.getMatch(MATCH,
+    { viewer: { kind: 'player', accountId: '01JSTRANGER000000000000AA' } }), 'NOT_FOUND',
+    'a stranger reading a private participant\'s match gets the SAME NOT_FOUND, never a 403');
+  await expectCode(() => mod.stats.getMatch(MATCH), 'NOT_FOUND',
+    'and a call with no viewer at all is refused rather than defaulted to visible');
+  expect(terminal.evidenceRef === null,
+    '§7: evidenceRef is withheld from a player — present as null, never omitted',
+    JSON.stringify(terminal.evidenceRef));
 
   // --- 6. pagination is validated, not clamped ------------------------------------------
   for (const limit of [0, -1, 101, 2.5, '25']) {

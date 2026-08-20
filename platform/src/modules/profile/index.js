@@ -7,6 +7,10 @@
  */
 import { raw } from '../../core/http.js';
 import { ApiError } from '../../core/errors.js';
+// The SAME guard `/v1/health/ready` uses, imported rather than reimplemented. §5.1 makes result
+// submission service-only, and a second copy of "what counts as a service caller" is how one of
+// them ends up accepting a request the other refuses.
+import { requireServiceCaller } from '../../app.js';
 import { createProfileService } from './profile.js';
 import { createSettingsService, etagFor, SCHEMA_VERSION } from './settings.js';
 import { createStatsService, STAT_DEFINITION_VERSION } from './stats.js';
@@ -78,7 +82,10 @@ export function createProfileModule({
       : null,
   });
   const settings = createSettingsService({ store, clock });
-  const stats = createStatsService({ store, clock, outbox });
+  // `visibilityFor` is what makes §4.2's "caller not a participant, privacy forbids" checkable.
+  // The stats service refuses every non-participant without it, so this is a dependency, not a
+  // decoration.
+  const stats = createStatsService({ store, clock, outbox, visibilityFor: profiles.visibilityFor });
   const migration = createMigrationService({ store, clock });
 
   const handlers = {
@@ -122,10 +129,10 @@ export function createProfileModule({
       // Privacy is the subject's, and a hidden career is null counters — not a 403, which would
       // confirm what it is refusing to show.
       const visible = await profiles.visibilityFor(subjectId, viewerId);
-      if (!visible.stats) {
-        return { accountId: subjectId, mode, statDefinitionVersion: STAT_DEFINITION_VERSION,
-                 totals: null, weapons: null };
-      }
+      // The hidden shape is built by the stats service beside the visible one, so the two cannot
+      // diverge — the ad-hoc object that used to live here was not the §11.5 response at all for
+      // `mode=all`, which is the default and therefore the shape most clients would have hit.
+      if (!visible.stats) return stats.hiddenCareer(subjectId, mode, STAT_DEFINITION_VERSION);
       return stats.getCareer(subjectId, mode);
     },
 
@@ -159,6 +166,54 @@ export function createProfileModule({
     async importProgression(ctx) {
       return migration.importLegacyProgression(actorId(ctx), ctx.body?.progress);
     },
+
+    /** §4.2 `GET /v1/matches/:matchId` — the four-shape union, authorised by the viewer. */
+    async getMatch(ctx) {
+      actorId(ctx);
+      return stats.getMatch(ctx.params.matchId, {
+        viewer: ctx.actor,
+        correlationId: ctx.correlationId,
+      });
+    },
+
+    /** §7.1 `GET /v1/matches/active` — 200 with the held match, or 204. */
+    async getActiveMatch(ctx) {
+      const held = await stats.activeMatchFor(actorId(ctx));
+      // 204 is the contract's "no held match". `undefined` is how core/http.js writes one, and
+      // an empty 200 body would make "not in a match" indistinguishable from a truncated
+      // response.
+      if (!held) return undefined;
+      return held;
+    },
+
+    /**
+     * §5 `POST /v1/matches/:matchId/result` — SERVICE ONLY.
+     *
+     * The guard runs before anything reads the body: if a browser can reach this, the client
+     * writes its own stats and the G1 gate is decorative (§5.1, http-api.md §7).
+     *
+     * The path parameter is authoritative over the body. A payload naming a different match than
+     * the URL would finalise a match the caller did not address and, worse, under an idempotency
+     * key derived from the OTHER id — so the retry of that request would not deduplicate.
+     */
+    async postMatchResult(ctx) {
+      requireServiceCaller(ctx);
+      const matchId = ctx.params.matchId;
+      const body = ctx.body || {};
+      if (body.matchId !== undefined && body.matchId !== matchId) {
+        throw new ApiError('VALIDATION_FAILED', 'The result names a different match than the path.', {
+          details: { fields: [{ path: 'matchId', key: 'matchId', rule: 'path-mismatch',
+            reason: 'path-mismatch', expected: matchId, got: body.matchId }] },
+        });
+      }
+      const header = ctx.headers?.['idempotency-key'];
+      return stats.applyMatchResult({
+        actor: { kind: 'service', id: 'match-server', role: 'service' },
+        result: { ...body, matchId },
+        idempotencyKey: typeof header === 'string' && header.trim() ? header.trim() : null,
+        correlationId: ctx.correlationId,
+      });
+    },
   };
 
   /** Mount on a Router from core/http.js. Auth middleware is supplied by the server wiring. */
@@ -172,6 +227,21 @@ export function createProfileModule({
     router.get('/v1/profile/:accountId', handlers.getPublicProfile, mw);
     router.get('/v1/profile/:accountId/stats', handlers.getStats, mw);
     router.get('/v1/profile/:accountId/matches', handlers.getMatches, mw);
+
+    // ── §7 match routes ────────────────────────────────────────────────────────────────
+    //
+    // Mounted from the profile module because the stats service already owns the §4.2
+    // projection, the §4.0 matrix and the career application; a second module would only
+    // forward to it, and the forwarding layer is where a rule gets re-decided.
+    //
+    // `/active` is registered BEFORE `/:matchId`: both are three segments, the router matches in
+    // registration order, and the reverse order makes `active` a match id nobody has.
+    router.get('/v1/matches/active', handlers.getActiveMatch, mw);
+    router.get('/v1/matches/:matchId', handlers.getMatch, mw);
+    // No auth middleware and no client-build floor: the caller is a match server, not a client
+    // build, and `requireServiceCaller` inside the handler is the gate. This mirrors
+    // `/v1/health/ready`, the platform's other S-marked route.
+    router.post('/v1/matches/:matchId/result', handlers.postMatchResult, { requireBuild: false });
     return router;
   }
 

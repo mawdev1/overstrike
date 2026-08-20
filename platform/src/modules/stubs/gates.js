@@ -69,8 +69,16 @@ export function checkClientBuild(headers, { requireBuild = true, minClientBuild 
   }
 }
 
-/** The bearer token on this request, or null. Throws when one is presented and is not ours. */
-function bearer(headers) {
+/**
+ * The bearer token on this request, or null. Throws when one is presented and is not ours.
+ *
+ * **The shape is not the credential.** Checking only the `stub.access.` prefix meant any
+ * hand-typed `stub.access.anything` was honoured, so the layer accepted a token it never
+ * minted — precisely the forgery production refuses. `verify` is the registry of tokens this
+ * layer actually issued; it is a required argument at every call site, because defaulting it
+ * would silently restore the prefix check that was the bug.
+ */
+function bearer(headers, verify) {
   const header = headers.authorization;
   if (typeof header !== 'string' || header === '') return null;
   const match = /^Bearer\s+(\S+)$/.exec(header);
@@ -80,7 +88,17 @@ function bearer(headers) {
   if (!match || !match[1].startsWith(STUB_ACCESS_PREFIX)) {
     throw new ApiError('AUTH_TOKEN_INVALID', 'Your session is not valid. Sign in again.');
   }
-  return match[1];
+  const token = match[1];
+  const claims = verify(token);
+  // Unknown and forged are one answer, deliberately: errors.md routes AUTH_TOKEN_INVALID to
+  // "clear local session, sign-in" for both, and distinguishing them would be an oracle.
+  if (!claims) throw new ApiError('AUTH_TOKEN_INVALID', 'Your session is not valid. Sign in again.');
+  // A session revoked in another tab is revoked here too. That is the entire reason revocations
+  // live on the account rather than on the client session (accounts.js).
+  if (claims.revoked) {
+    throw new ApiError('AUTH_SESSION_REVOKED', 'You were signed out on another device.');
+  }
+  return token;
 }
 
 /**
@@ -90,10 +108,12 @@ function bearer(headers) {
  * lands, an S endpoint refuses everything without it. `GET /v1/health/ready` is the only S row
  * the stub serves, and `POST /matches/:id/result` is absent from the table entirely.
  *
+ * @param verify {(token: string) => ({ sessionId: string, revoked: boolean }|null)}
+ *   The issued-token registry — see `bearer`.
  * @returns {{ token: string|null, authenticated: boolean }}
  */
-export function checkAuthClass(headers, authClass, { serviceToken = null } = {}) {
-  const token = bearer(headers);          // validated even on P routes: junk is junk everywhere
+export function checkAuthClass(headers, authClass, { serviceToken = null, verify } = {}) {
+  const token = bearer(headers, verify);  // validated even on P routes: junk is junk everywhere
   if (authClass === 'S') {
     const presented = headers['x-service-token'];
     if (!serviceToken || typeof presented !== 'string' || presented !== serviceToken) {

@@ -23,6 +23,7 @@
 import { ApiError } from '../../core/errors.js';
 import { EPOCH_MS, iso } from './clock.js';
 import { stubToken } from './ids.js';
+import { revokeSession } from './accounts.js';
 import * as fx from './fixtures.js';
 
 /** Routes a verification or terms gate applies to: the ones that lead to actually playing. */
@@ -76,7 +77,10 @@ export function initialState(scenarioName) {
       updatedAt: iso(EPOCH_MS - 3600 * 1000),
     },
     settingsBumped: false,
-    revokedSessions: [],
+    // Revocations are NOT here: they belong to the account, so a second tab sees them
+    // (accounts.js). Keeping a per-session copy is what made cross-tab revocation unreachable.
+    // §3b: the name-check rate window, in virtual milliseconds.
+    nameCheckTimes: [],
     rooms: {},
     activeRoomId: null,
     emptyCareer: false,
@@ -420,8 +424,10 @@ export const SCENARIOS = {
   },
 
   'name-taken': {
-    note: 'Both places a display name is chosen: signup and rename.',
+    note: 'All three places a display name is judged: check, signup, rename.',
     routes: {
+      // §3b: the preflight says so first, and says only so — `policy: null`, no holder.
+      'POST /v1/auth/display-name/check': () => ({ status: 200, body: { available: false, policy: null } }),
       'POST /v1/auth/signup': () => throwErr('NAME_TAKEN', 'That name is already taken.'),
       'PATCH /v1/profile/me': () => throwErr('NAME_TAKEN', 'That name is already taken.'),
     },
@@ -517,6 +523,11 @@ export const SCENARIOS = {
     routes: {
       // The client never reproduces the ruleset (design/first-run-flow.md §3); it shows the
       // reason the server names.
+      // The preflight refuses with the same rule id the mutation would, so the screen shows
+      // one reason whichever request discovered it.
+      'POST /v1/auth/display-name/check': () => ({
+        status: 200, body: { available: false, policy: { rule: 'impersonation' } },
+      }),
       'POST /v1/auth/signup': () => throwErr('NAME_POLICY_VIOLATION',
         'That name is not allowed.', { details: { rule: 'impersonation' } }),
       'PATCH /v1/profile/me': () => throwErr('NAME_POLICY_VIOLATION',
@@ -558,10 +569,34 @@ export const SCENARIOS = {
 
   'sessions-current-only': {
     note: 'The empty state for the sessions screen: one device, and it is this one.',
-    init(state) {
+    init(state, account) {
       // Not an empty list — a session list without the caller's own session would mean the
-      // caller is not signed in, which is a different screen.
-      state.revokedSessions = [fx.OTHER_SESSION_ID];
+      // caller is not signed in, which is a different screen. Seeded on the ACCOUNT, because
+      // that is where the session list now lives.
+      revokeSession(account, fx.OTHER_SESSION_ID);
+    },
+  },
+
+  // ── REQ-CC-046: the display-name check states §3b names ───────────────────────────────────
+  //
+  // `available`, `taken` and `policy-refused` are base behaviour (`default` for available,
+  // `name-taken`, `name-policy-violation`), and `checking` is `slow` driving the same request.
+  // These two are the states a client cannot provoke on demand: a rate limiter it would have to
+  // hammer to reach, and a dependency it cannot take down.
+
+  'name-check-rate-limited': {
+    note: 'The check is refused on the first call, so the debounce backoff path is buildable.',
+    routes: {
+      'POST /v1/auth/display-name/check': () => throwErr('RATE_LIMITED',
+        'Too many name checks. Try again shortly.', { retryAfterMs: 60000 }),
+    },
+  },
+
+  'name-check-unavailable': {
+    note: 'The preflight is down. The field stays usable and submit stays authoritative.',
+    routes: {
+      'POST /v1/auth/display-name/check': () => throwErr('SERVICE_UNAVAILABLE',
+        'Name checking is temporarily unavailable.', { retryAfterMs: 5000 }),
     },
   },
 
@@ -615,4 +650,6 @@ export const EXTRA_SCENARIOS = {
   'system-maintenance': '/system/:condition maintenance (REQ-CC-045)',
   'unsupported-client': '/system/:condition update required (REQ-CC-045)',
   'active-lobby-resync': 'active-lobby discovery and resync after reload (REQ-CC-045)',
+  'name-check-rate-limited': '/onboarding/display-name check rate-limited (REQ-CC-046)',
+  'name-check-unavailable': '/onboarding/display-name check unavailable (REQ-CC-046)',
 };

@@ -26,6 +26,9 @@
  *   node platform/test/authtest.mjs
  */
 import { createMemoryStore } from '../src/core/store/memory.js';
+import { createPostgresStore } from '../src/core/store/postgres.js';
+import { runMigrations } from '../src/core/migrate.js';
+import { createProfileService } from '../src/modules/profile/profile.js';
 import { loadConfig } from '../src/core/config.js';
 import { ulid } from '../src/core/ids.js';
 import { ApiError } from '../src/core/errors.js';
@@ -55,6 +58,16 @@ async function codeOf(fn) {
 }
 
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A short, unique, policy-legal display-name suffix — Postgres keeps last run's names. */
+const uniqueTag = () => ulid().slice(-8);
+
+/** Key-sorted JSON, for comparing two bodies that may have taken different routes to get here. */
+function stableJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
+}
 const decode = (token) => JSON.parse(Buffer.from(String(token).split('.')[0], 'base64url').toString('utf8'));
 const median = (xs) => [...xs].sort((p, q) => p - q)[Math.floor(xs.length / 2)];
 const timeIt = async (fn) => {
@@ -90,15 +103,35 @@ const silentLogger = { debug() {}, info() {}, warn() {}, error() {}, child() { r
 const T0 = Date.parse('2026-08-19T12:00:00.000Z');
 
 const open = [];
-function mk({ now = T0, env = {} } = {}) {
+
+function makeClock(now = T0) {
   let t = now;
-  const clock = { now: () => t, advance: (ms) => { t += ms; }, set: (v) => { t = v; } };
+  return { now: () => t, advance: (ms) => { t += ms; }, set: (v) => { t = v; } };
+}
+
+/**
+ * Build the module over ANY store adapter.
+ *
+ * §17–§20 run the same checks against the memory adapter and, when DATABASE_URL is set, against
+ * real PostgreSQL — three of the four defects they cover are adapter-visible, and one of them
+ * (the idempotency race) is INVISIBLE on memory by construction, because that adapter
+ * serialises every transaction. A memory-only proof of a locking fix is not a proof.
+ */
+function moduleOn(store, clock, { env = {} } = {}) {
   const config = loadConfig({ PLATFORM_TOKEN_SECRET: 'test-secret-not-a-real-one', ...env });
-  const store = recording(createMemoryStore({}, {}));
-  const auth = createAuthModule({ store, config, logger: silentLogger, clock, sleep: realSleep });
+  const auth = createAuthModule({
+    store, config, logger: silentLogger, clock, sleep: realSleep,
+    // No janitor timer in a test: §19 calls the sweep directly, and an interval that fires
+    // mid-assertion would make the counts non-deterministic.
+    consentSweepIntervalMs: 0,
+  });
   const h = { store, clock, config, ...auth };
   open.push(h);
   return h;
+}
+
+function mk({ now = T0, env = {} } = {}) {
+  return moduleOn(recording(createMemoryStore({}, {})), makeClock(now), { env });
 }
 
 /** Every §5 outbox row currently staged, and the §2 envelopes they rehydrate to. */
@@ -1064,6 +1097,325 @@ section('16. SIGNUP IS NOT AN ACCOUNT-ENUMERATION ORACLE BY TIMING');
     await codeOf(() => attempt('taken@example.com', 'TakenLast').then(() => {
       throw new ApiError('VALIDATION_FAILED', 'unused');
     })) !== null);
+}
+
+// ============================================================================================
+// 17–20 run against BOTH adapters. Each is written once, as a function of a built module, and
+// called twice: memory always, real PostgreSQL when DATABASE_URL is set (pgtest.mjs sets it).
+// ============================================================================================
+
+/**
+ * 17. auth.md §9 History — "Retained for moderation and impersonation review."
+ *
+ * `account_name_history` has been in migration 0001 since the beginning and had NO accessor on
+ * either adapter and no writer anywhere, so the only trace of a previous name was the
+ * `account.name_changed` event: a stream with its own retention, published outward, and not
+ * something a moderator can query. The retention the contract requires did not exist.
+ */
+async function nameHistoryChecks(h, label) {
+  // Unique per run: on Postgres the rows from the last run are still there, and a display name
+  // is unique on its fold forever.
+  const tag = uniqueTag();
+  const renamed = `Ren${tag}`;
+  const a = await newAccount(h, { email: `hist-${ulid(h.clock.now())}@example.com`, displayName: `Hist${tag}` });
+  const actor = await actorFor(h, a);
+  const original = a.profile.displayName;
+
+  ok(`[${label}] control: a fresh account has no name history`,
+    (await h.service.nameHistory({ actor })).length === 0);
+
+  h.clock.advance(1000);
+  await h.service.changeDisplayName({ actor, displayName: renamed });
+  const history = await h.service.nameHistory({ actor });
+  ok(`[${label}] the rename left a history row`, history.length === 1, JSON.stringify(history));
+  ok(`[${label}] it retains the PREVIOUS name, not the new one`,
+    history[0]?.previousName === original, JSON.stringify(history[0]));
+  ok(`[${label}] it names who changed it and when`,
+    history[0]?.changedBy === actor.id && typeof history[0]?.changedAt === 'string',
+    JSON.stringify(history[0]));
+
+  // A case-only edit is still a name the account was displayed under, so it is still history.
+  h.clock.advance(1000);
+  await h.service.changeDisplayName({ actor, displayName: renamed.toUpperCase() });
+  const twice = await h.service.nameHistory({ actor });
+  ok(`[${label}] a case-only edit is retained too`, twice.length === 2,
+    twice.map((r) => r.previousName).join(','));
+  ok(`[${label}] newest first`, twice[0].previousName === renamed);
+
+  // A no-op rename has no previous name to retain, and (account_id, changed_at) is the primary
+  // key — a stream of identical writes at one instant would collide for nothing.
+  h.clock.advance(1000);
+  await h.service.changeDisplayName({ actor, displayName: renamed.toUpperCase() });
+  ok(`[${label}] a rename to the same rendered name writes nothing`,
+    (await h.service.nameHistory({ actor })).length === 2);
+
+  // §9: not publicly visible. `account:read` is the capability that already means "may look at
+  // this account": self for a player, everyone for support/moderator/superadmin.
+  const other = await newAccount(h, { email: `hist2-${ulid(h.clock.now())}@example.com`, displayName: `Hist${uniqueTag()}` });
+  const otherActor = await actorFor(h, other);
+  ok(`[${label}] another player cannot read it`,
+    await codeOf(() => h.service.nameHistory({ actor: otherActor, accountId: actor.accountId }))
+      === 'AUTH_FORBIDDEN');
+  ok(`[${label}] control: a moderator with a second factor can`,
+    (await h.service.nameHistory({
+      actor: { kind: 'admin', id: 'mod.rivera@overstrike.gg', role: 'moderator', mfa: true },
+      accountId: actor.accountId,
+    })).length === 2);
+  ok(`[${label}] control: the same moderator WITHOUT the second factor cannot`,
+    await codeOf(() => h.service.nameHistory({
+      actor: { kind: 'admin', id: 'mod.rivera@overstrike.gg', role: 'moderator' },
+      accountId: actor.accountId,
+    })) === 'AUTH_FORBIDDEN');
+}
+
+/**
+ * The failing control for §17, and the one that matters: the history row commits WITH the
+ * rename, or the rename does not happen. A history that can be missing exactly the renames
+ * that went wrong is not evidence.
+ */
+async function nameHistoryAtomicityCheck() {
+  const h = mk();
+  const a = await newAccount(h, { email: 'atomic@example.com', displayName: 'AtomicSeventeen' });
+  const actor = await actorFor(h, a);
+  const broken = {
+    ...h.store,
+    accountNameHistory: {
+      ...h.store.accountNameHistory,
+      insert: async () => { throw new ApiError('INTERNAL_ERROR', 'history write refused'); },
+    },
+  };
+  const h2 = moduleOn(broken, h.clock);
+  const before = await eventTypes(h);
+  ok('control: a rename whose history insert fails is refused',
+    await codeOf(() => h2.service.changeDisplayName({ actor, displayName: 'AtomicRenamed' })) !== null);
+  ok('and the account keeps its old name — the write rolled back with it',
+    (await h.store.accounts.byId(actor.accountId)).displayName === 'AtomicSeventeen');
+  ok('and no account.name_changed event was staged for a rename that did not happen',
+    (await eventTypes(h)).filter((t) => t === 'account.name_changed').length
+      === before.filter((t) => t === 'account.name_changed').length);
+}
+
+/**
+ * 18. http-api.md §8 — `PATCH /v1/profile/me` under concurrent retries.
+ *
+ * The same defect already fixed in `applyMatchResult`: `idempotency.get` inside a transaction
+ * takes no lock and there is no row to lock on the first attempt, so on Postgres N concurrent
+ * submissions of one key all read `prior = null` and all execute. The transaction was never the
+ * guard it looked like.
+ *
+ * @param canRace whether this adapter can even exhibit the race. Memory serialises every
+ *   transaction through one queue, so it cannot — which is precisely why a memory-green suite
+ *   reported this as working.
+ */
+async function patchIdempotencyChecks(h, label, { canRace }) {
+  const a = await newAccount(h, { email: `idem-${ulid(h.clock.now())}@example.com`, displayName: `Idem${uniqueTag()}` });
+  const actor = await actorFor(h, a);
+
+  /** Counts EXECUTIONS: `execute()` is the only thing that writes the privacy patch. */
+  const counting = (store) => {
+    const counts = { executions: 0 };
+    const wrapped = {
+      ...store,
+      accounts: {
+        ...store.accounts,
+        update: (...args) => { counts.executions += 1; return store.accounts.update(...args); },
+      },
+    };
+    return { wrapped, counts };
+  };
+
+  const patch = { privacy: { statsVisibility: 'everyone' } };
+  const N = 10;
+
+  const { wrapped, counts } = counting(h.store);
+  const service = createProfileService({
+    store: wrapped, clock: { now: () => h.clock.now() },
+    changeDisplayName: h.service.changeDisplayName,
+  });
+  const key = `patch-${ulid(h.clock.now())}`;
+  const settled = await Promise.allSettled(
+    Array.from({ length: N }, () => service.patchProfile(actor, patch, { idempotencyKey: key })));
+
+  const failures = settled.filter((s) => s.status === 'rejected').map((s) => s.reason?.code ?? String(s.reason));
+  ok(`[${label}] all ${N} concurrent identical PATCHes succeed`, failures.length === 0, failures.join(','));
+  ok(`[${label}] exactly ONE of them executed`, counts.executions === 1, `executions=${counts.executions}`);
+  // Compared key-sorted, not byte-for-byte. `idempotency_keys.response_body` is jsonb, and
+  // jsonb does not preserve key order — so the replayed body comes back from Postgres with its
+  // keys rearranged. That is a storage property, not a difference in the response: §8 requires
+  // the stored response, and JSON object key order carries no meaning in it.
+  const bodies = settled.filter((s) => s.status === 'fulfilled').map((s) => stableJson(s.value));
+  ok(`[${label}] every reply is the same stored response`,
+    bodies.length === N && bodies.every((b) => b === bodies[0]));
+  ok(`[${label}] control: the one execution did apply`,
+    (await h.store.accounts.byId(actor.accountId)).privacy.statsVisibility === 'everyone');
+
+  // The key is still a key: a different payload under it is refused rather than replayed.
+  ok(`[${label}] the same key with a different payload is still IDEMPOTENCY_KEY_REUSED`,
+    await codeOf(() => service.patchProfile(actor, { privacy: { statsVisibility: 'nobody' } },
+      { idempotencyKey: key })) === 'IDEMPOTENCY_KEY_REUSED');
+
+  // THE FAILING CONTROL. Take the lock away and the race returns — on an adapter that can race.
+  //
+  // The pool is warmed first, deliberately. On a cold pool, opening ten connections is itself a
+  // staggered start and the winner can commit before the others read, so the race hides — and a
+  // control that only sometimes fails is not a control. Warm, all ten begin together.
+  await Promise.all(Array.from({ length: N }, () => h.store.accounts.byId(actor.accountId)));
+  const { wrapped: unlockedBase, counts: unlockedCounts } = counting(h.store);
+  const unlocked = { ...unlockedBase, idempotency: { get: h.store.idempotency.get, put: h.store.idempotency.put } };
+  const unlockedService = createProfileService({
+    store: unlocked, clock: { now: () => h.clock.now() },
+    changeDisplayName: h.service.changeDisplayName,
+  });
+  const key2 = `patch-${ulid(h.clock.now())}-unlocked`;
+  await Promise.allSettled(Array.from({ length: N },
+    () => unlockedService.patchProfile(actor, { privacy: { presenceVisibility: 'everyone' } },
+      { idempotencyKey: key2 })));
+  if (canRace) {
+    ok(`[${label}] control: WITHOUT acquire, the same ${N} retries execute more than once`,
+      unlockedCounts.executions > 1, `executions=${unlockedCounts.executions}`);
+  } else {
+    ok(`[${label}] control: without acquire this adapter STILL executes once — it serialises `
+      + 'every transaction, so it cannot show the defect at all',
+    unlockedCounts.executions === 1, `executions=${unlockedCounts.executions}`);
+  }
+}
+
+/**
+ * 19. http-api.md §3a.3 — the 30-day TTL is a retention obligation, not a cache policy.
+ *
+ * Expiry was enforced on READ only. That answers correctly and retains forever: the rows nobody
+ * reads again are exactly the rows nobody deletes, and they are consent records.
+ *
+ * @param countRows counts pre_auth_consent rows WITHOUT reading them through `get`, which
+ *   deletes on read and would therefore perform the very cleanup being measured.
+ */
+async function consentSweepChecks(h, label, countRows) {
+  const live = `sweep-live-${ulid(h.clock.now())}`;
+  const dead = `sweep-dead-${ulid(h.clock.now())}`;
+  const t = h.clock.now();
+  await h.store.preAuthConsent.put({
+    clientSessionId: dead, telemetryPersonal: true, policyVersion: 1,
+    decidedAt: new Date(t).toISOString(), expiresAt: new Date(t + 1000).toISOString(),
+  });
+  await h.store.preAuthConsent.put({
+    clientSessionId: live, telemetryPersonal: false, policyVersion: 1,
+    decidedAt: new Date(t).toISOString(), expiresAt: new Date(t + 30 * 24 * 3600e3).toISOString(),
+  });
+  const base = await countRows();
+  ok(`[${label}] control: both rows are stored`, base >= 2, `rows=${base}`);
+
+  h.clock.advance(2000);
+  ok(`[${label}] control: nothing reads the expired row, so nothing deletes it`,
+    (await countRows()) === base, `rows=${await countRows()}`);
+
+  const removed = await h.sweepPreAuthConsent();
+  ok(`[${label}] the sweep deletes the expired row`, removed >= 1, `removed=${removed}`);
+  ok(`[${label}] and it is gone from the table`, (await countRows()) === base - removed,
+    `rows=${await countRows()} base=${base} removed=${removed}`);
+  ok(`[${label}] control: the live decision survives`,
+    (await h.store.preAuthConsent.get(live))?.telemetryPersonal === false);
+  ok(`[${label}] control: a second sweep finds nothing left to do`,
+    await h.sweepPreAuthConsent() === 0);
+}
+
+section('17. THE PREVIOUS DISPLAY NAME IS RETAINED (auth.md §9)');
+{
+  const h = mk();
+  await nameHistoryChecks(h, 'memory');
+  await nameHistoryAtomicityCheck();
+}
+
+section('18. PATCH /v1/profile/me IS IDEMPOTENT UNDER CONCURRENT RETRIES (§8)');
+{
+  await patchIdempotencyChecks(mk(), 'memory', { canRace: false });
+}
+
+section('19. EXPIRED PRE-AUTH CONSENT IS SWEPT, NOT MERELY UNREAD (§3a.3)');
+{
+  const h = mk();
+  await consentSweepChecks(h, 'memory', async () => h.store._debugCounts().preAuthConsent);
+
+  // The sweep needs a caller, or it is the same dead code the read-path expiry was standing in
+  // for. The module owns the timer; this is the timer, running.
+  const timed = moduleOn(recording(createMemoryStore({}, {})), makeClock(), { env: {} });
+  timed.stop();
+  const janitor = createAuthModule({
+    store: timed.store, config: timed.config, logger: silentLogger, clock: timed.clock,
+    sleep: realSleep, consentSweepIntervalMs: 10,
+  });
+  open.push(janitor);
+  await timed.store.preAuthConsent.put({
+    clientSessionId: 'janitor-row', telemetryPersonal: true, policyVersion: 1,
+    decidedAt: new Date(timed.clock.now()).toISOString(),
+    expiresAt: new Date(timed.clock.now() - 1).toISOString(),
+  });
+  ok('control: the expired row is there before the janitor runs',
+    timed.store._debugCounts().preAuthConsent === 1);
+  await realSleep(120);
+  ok('the janitor timer sweeps without anyone calling it',
+    timed.store._debugCounts().preAuthConsent === 0);
+  janitor.stop();
+}
+
+// ---------------------------------------------------- 20. the same four, on real PostgreSQL
+
+const databaseUrl = process.env.DATABASE_URL;
+section('20. THE SAME CHECKS AGAINST REAL POSTGRESQL');
+if (!databaseUrl) {
+  console.log('  skip DATABASE_URL is not set; the Postgres adapter was not exercised, and a '
+    + 'skip is not a pass — §18 CANNOT fail on memory.');
+} else {
+  await runMigrations({ databaseUrl });
+  const clock = makeClock();
+  // 20 connections: ten concurrent PATCHes each hold one for the length of their transaction,
+  // and nine of those are waiting on the advisory lock. At the default of 10 the pool is the
+  // thing under test rather than the lock.
+  const pgStore = await createPostgresStore({ databaseUrl, poolMax: 20 }, { now: () => clock.now() });
+  const h = moduleOn(pgStore, clock);
+
+  await nameHistoryChecks(h, 'postgres');
+  await patchIdempotencyChecks(h, 'postgres', { canRace: true });
+
+  const pg = (await import('pg')).default;
+  const raw = new pg.Client({ connectionString: databaseUrl });
+  await raw.connect();
+  try {
+    await consentSweepChecks(h, 'postgres', async () =>
+      (await raw.query('select count(*)::int as n from pre_auth_consent')).rows[0].n);
+
+    // Migration 0015: a partial consent record cannot exist, because §4 types the profile field
+    // as an exact union with no partial member and `projectConsent` would serialise one anyway.
+    console.log('\n[postgres] migration 0015 — consent columns move together');
+    const insertAccount = (consent) => raw.query(
+      `insert into accounts (account_id, display_name, display_name_folded,
+                             consent_telemetry, consent_policy_ver, consent_decided_at)
+       values ($1, $2, $3, $4, $5, $6)`,
+      [ulid(), `Chk${Date.now()}`, `chk${Date.now()}-${Math.random()}`, ...consent]);
+
+    const partials = [
+      ['a decision with no policy version', [true, null, new Date().toISOString()]],
+      ['a decision with no decision time', [true, 1, null]],
+      ['a policy version and time with no decision', [null, 1, new Date().toISOString()]],
+    ];
+    for (const [what, cols] of partials) {
+      let refused = null;
+      try { await insertAccount(cols); } catch (err) { refused = err.constraint ?? err.message; }
+      ok(`[postgres] ${what} is refused by the table`,
+        refused === 'accounts_consent_all_or_nothing', String(refused));
+    }
+    ok('[postgres] control: a COMPLETE decision inserts',
+      await (async () => {
+        try { await insertAccount([false, 1, new Date().toISOString()]); return true; }
+        catch (err) { return err.message; }
+      })() === true);
+    ok('[postgres] control: an UNDECIDED account (all three null) inserts — null means undecided',
+      await (async () => {
+        try { await insertAccount([null, null, null]); return true; }
+        catch (err) { return err.message; }
+      })() === true);
+  } finally {
+    await raw.end();
+  }
 }
 
 // -------------------------------------------------------------------------------- summary

@@ -20,6 +20,7 @@ import { ApiError } from '../../core/errors.js';
 import { validateRoamingSettings, defaultRoamingValues, SCHEMA_VERSION } from '../profile/settings.js';
 import * as fx from './fixtures.js';
 import * as rooms from './rooms.js';
+import * as accounts from './accounts.js';
 import { stubToken, stubUlid } from './ids.js';
 
 const okBody = (body) => ({ status: 200, body });
@@ -86,18 +87,42 @@ function profileFor(state, overrides = {}) {
   });
 }
 
+/**
+ * The session this tab holds, as `§11.8` shapes it.
+ *
+ * `sessionId` is the tab's own id from the account scope — one of the ids
+ * `GET /v1/auth/sessions` lists. It used to be minted from the clock, so the id signin handed
+ * back appeared in no session list and "revoke the session I am using" was unexpressible.
+ */
+function sessionBlock(ctx) {
+  return {
+    sessionId: ctx.sessionId,
+    deviceLabel: ctx.sessionId === fx.CURRENT_SESSION_ID ? 'Chrome on macOS' : 'Firefox on Windows',
+    createdAt: ctx.clock.now(),
+  };
+}
+
+/**
+ * The access token for this tab, at this generation.
+ *
+ * Seeded by the tab's SESSION id, not just the generation: two tabs of one account were handed
+ * the identical string, so revoking either session invalidated both — and the account could
+ * never demonstrate the one behaviour the session screen is for. The session id is
+ * position-derived (accounts.js), so this is still identical on replay.
+ */
+const accessTokenFor = (ctx) => stubToken('access', `access:${ctx.sessionId}:${ctx.state.tokenGeneration}`);
+
 function authPayload(ctx, { status }) {
   const { clock, state } = ctx;
-  const accessToken = stubToken('access', `access:${state.tokenGeneration}`);
+  const accessToken = accessTokenFor(ctx);
   state.issuedTokens.push(accessToken);
+  // Registered on the ACCOUNT, so the gate can tell a token this layer minted from one a
+  // client typed, and so a revocation in another tab reaches this one.
+  accounts.issueToken(ctx.account, accessToken, ctx.sessionId);
   const body = {
     accessToken,
     expiresAt: clock.plus(ctx.accessTokenTtlMs),
-    session: {
-      sessionId: stubUlid('session:current', clock.nowMs()),
-      deviceLabel: 'Chrome on macOS',
-      createdAt: clock.now(),
-    },
+    session: sessionBlock(ctx),
     profile: profileFor(state),
     // §3a.3: signup AND signin return the account-scoped receipt; null means undecided.
     consentReceipt: state.consent ? state.consent.accountReceipt : null,
@@ -160,34 +185,70 @@ export const ROUTES = [
   { method: 'POST', path: '/v1/auth/refresh', auth: 'P', handler(ctx) {
     ctx.state.tokenGeneration++;
     ctx.state.tokenIssuedAt = ctx.clock.nowMs();
-    const accessToken = stubToken('access', `access:${ctx.state.tokenGeneration}`);
+    const accessToken = accessTokenFor(ctx);
     ctx.state.issuedTokens.push(accessToken);
+    accounts.issueToken(ctx.account, accessToken, ctx.sessionId);
     return okBody({
       accessToken,
       expiresAt: ctx.clock.plus(ctx.accessTokenTtlMs),
-      session: {
-        sessionId: stubUlid('session:current', ctx.clock.nowMs()),
-        deviceLabel: 'Chrome on macOS',
-        createdAt: ctx.clock.now(),
-      },
+      session: sessionBlock(ctx),
     });
   } },
 
-  { method: 'POST', path: '/v1/auth/signout', auth: 'A', handler: () => noContent() },
-  { method: 'POST', path: '/v1/auth/signout-all', auth: 'A', handler: () => noContent() },
+  // §3: signout revokes "the current session only", signout-all "every session including the
+  // caller's". Both write to the ACCOUNT, so the other tab sees them — which is what makes
+  // cross-tab revocation, a designed shell state, reachable at all.
+  { method: 'POST', path: '/v1/auth/signout', auth: 'A', handler(ctx) {
+    accounts.revokeSession(ctx.account, ctx.sessionId);
+    return noContent();
+  } },
+  { method: 'POST', path: '/v1/auth/signout-all', auth: 'A', handler(ctx) {
+    accounts.revokeAll(ctx.account);
+    return noContent();
+  } },
   { method: 'GET', path: '/v1/auth/sessions', auth: 'A', handler(ctx) {
-    const revoked = ctx.state.revokedSessions;
-    return okBody({ sessions: fx.sessionsList().filter((s) => !revoked.includes(s.sessionId)) });
+    return okBody({ sessions: accounts.sessionList(ctx.account, ctx.sessionId) });
   } },
   { method: 'DELETE', path: '/v1/auth/sessions/:id', auth: 'A', handler(ctx) {
     // §11.8: NOT_FOUND is a documented outcome. Answering 204 for an id that was never a session
     // tells the UI a revocation happened that did not.
     const known = fx.sessionsList().some((s) => s.sessionId === ctx.params.id);
-    if (!known || ctx.state.revokedSessions.includes(ctx.params.id)) {
+    if (!known || accounts.isRevoked(ctx.account, ctx.params.id)) {
       throw new ApiError('NOT_FOUND', 'That session no longer exists.');
     }
-    ctx.state.revokedSessions.push(ctx.params.id);
+    accounts.revokeSession(ctx.account, ctx.params.id);
     return noContent();
+  } },
+
+  /**
+   * §3b `POST /v1/auth/display-name/check` — availability preflight (REQ-CC-046).
+   *
+   * The shell has to give live feedback while the player types, and the only authoritative
+   * answer used to be the mutation itself. Three properties are load-bearing and all three are
+   * implemented here rather than described:
+   *
+   *   1. **It reveals nothing about the holder.** A taken name answers
+   *      `{ available: false, policy: null }` and nothing else — no account id, no profile link.
+   *      Policy is evaluated FIRST, so a refused name never discloses whether it also exists.
+   *   2. **The client does not reproduce the ruleset.** The server names the rule that refused;
+   *      the candidate is not scored client-side (design/first-run-flow.md §3).
+   *   3. **It is advisory.** Nothing is reserved. Signup and rename stay authoritative and can
+   *      still lose the race, so the shell keeps its NAME_TAKEN path.
+   */
+  { method: 'POST', path: '/v1/auth/display-name/check', auth: 'P', handler(ctx) {
+    if (typeof ctx.body.displayName !== 'string') {
+      throw validationFailed([{ path: 'displayName', rule: 'string', message: 'Type a name to check.' }]);
+    }
+    // §9 name-check class. Counted on the normalised virtual clock, so a scenario can reach the
+    // limit deterministically instead of by racing a real one.
+    ctx.state.nameCheckTimes = ctx.state.nameCheckTimes
+      .filter((t) => ctx.clock.nowMs() - t < 60 * 1000);
+    ctx.state.nameCheckTimes.push(ctx.clock.nowMs());
+    if (ctx.state.nameCheckTimes.length > fx.NAME_CHECK_PER_MINUTE) {
+      throw new ApiError('RATE_LIMITED', 'Too many name checks. Try again shortly.',
+        { retryAfterMs: 60 * 1000 });
+    }
+    return okBody(fx.displayNameVerdict(ctx.body.displayName));
   } },
 
   // Always 202, whether or not the account exists — the response is the same either way, or it

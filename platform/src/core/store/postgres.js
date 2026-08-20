@@ -67,6 +67,10 @@ const TABLE_COLUMNS = {
     'consentTelemetry', 'consentPolicyVer', 'consentDecidedAt',
     'privacy', 'createdAt', 'updatedAt', 'deletedAt',
   ],
+  // auth.md §9 History. The table is in 0001; until now nothing could write it.
+  account_name_history: [
+    'accountId', 'previousName', 'changedAt', 'changedBy', 'reason', 'createdAt', 'updatedAt',
+  ],
   sessions: [
     'sessionId', 'accountId', 'deviceLabel', 'userAgentClass', 'ipClass',
     'createdAt', 'lastSeenAt', 'revokedAt', 'revokedReason', 'refreshFamilyId', 'updatedAt',
@@ -751,11 +755,12 @@ export async function createPostgresStore(config = {}, deps = {}) {
    * proves nothing about the adapter that ships. `deps.now` is that instant; falling back to
    * the process clock when nothing is injected keeps production behaviour unchanged.
    */
-  const consentNowIso = () => {
-    const t = deps.now ? deps.now() : Date.now();
+  const storeNowIso = (at = null) => {
+    const t = at ?? (deps.now ? deps.now() : Date.now());
     if (t instanceof Date) return t.toISOString();
     return typeof t === 'string' ? t : new Date(Number(t)).toISOString();
   };
+  const consentNowIso = () => storeNowIso();
 
   const preAuthConsent = {
     /**
@@ -803,6 +808,52 @@ export async function createPostgresStore(config = {}, deps = {}) {
         'update pre_auth_consent set migrated_at = coalesce($2::timestamptz, now()) where client_session_id = $1',
         [clientSessionId, at ?? null]);
       if (rowCount === 0) throw new ApiError('NOT_FOUND', 'No pre-auth consent for that client session.');
+    },
+
+    /**
+     * Delete every expired row, whether or not anybody ever reads it again.  §3a.3.
+     *
+     * Expiry on read stops a stale decision being HONOURED; it does not satisfy the 30-day
+     * retention limit, because the rows nobody reads again are exactly the rows nobody
+     * deletes. `pre_auth_consent_expiry_idx` (0001) serves this predicate.
+     *
+     * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
+     */
+    async sweepExpired(at = null, txh) {
+      const { rowCount } = await q(txh,
+        'delete from pre_auth_consent where expires_at <= $1::timestamptz', [storeNowIso(at)]);
+      return rowCount;
+    },
+  };
+
+  /**
+   * `account_name_history`.  auth.md §9, db-schema.md §2.
+   *
+   * Insert and list only, matching the memory adapter: a name history the application can
+   * rewrite proves nothing in the impersonation review it exists for.
+   */
+  const accountNameHistory = {
+    async insert(row, txh) {
+      // `changed_at` has a `default now()`, and now() inside a transaction is the transaction's
+      // start — not the instant the caller decided. The caller's value wins when it has one,
+      // and the store's injected clock supplies it otherwise, so both adapters stamp the row
+      // from one source.
+      const rec = {
+        accountId: row.accountId,
+        previousName: row.previousName,
+        changedAt: storeNowIso(row.changedAt ?? null),
+        changedBy: row.changedBy ?? null,
+        reason: row.reason ?? null,
+      };
+      return mapRow(await insertRow(txh, 'account_name_history', rec));
+    },
+
+    /** Newest first: a review starts from the name the subject is impersonating today. */
+    async listForAccount(accountId, { limit = 100 } = {}, txh) {
+      const { rows } = await q(txh,
+        'select * from account_name_history where account_id = $1 order by changed_at desc limit $2',
+        [accountId, limit]);
+      return rows.map((r) => mapRow(r));
     },
   };
 
@@ -979,7 +1030,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
   return {
     kind: 'postgres',
     tx,
-    accounts, sessions, refreshTokens, profiles, stats, weaponStats, matches,
+    accounts, accountNameHistory, sessions, refreshTokens, profiles, stats, weaponStats, matches,
     preAuthConsent, outbox, audit, idempotency, flags,
     async health() {
       try {
