@@ -2,7 +2,7 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.1  
+**Version:** 0.2
 **Status:** Ready for Bomb-rules and net-facade contract review  
 **Last updated:** 2026-08-19
 
@@ -20,18 +20,26 @@ The HUD never decides carrier, site eligibility, interaction validity, progress,
 
 ## Data boundary
 
-Bomb presentation consumes one coherent UI snapshot from the frozen net facade plus ordered UI events. Exact names are contract-owned; the UI requires semantic coverage equivalent to:
+Bomb presentation consumes the frozen facade directly plus a small presentation projection;
+it does not invent a second gameplay schema. The binding inputs are:
 
 ```text
-match: id, mode, map, rulesVersion, connectionState
-series: roundNumber, scheduledRounds, side/role by team, roundScore, overtimeState
-round: phase, authoritativeEndsAt/serverNow, outcome, reason
-teams: id, displayName, iconKey, aliveCount, rosterCount
-bomb: state, carrierEntityId, droppedPosition/callout, plantedSiteId
-interaction: kind, state, progress01, refusalCode, actorEntityId
-sites[]: stableId, shortLabel, iconKey, worldPosition, state, eligibility
-localPlayer: entityId, teamId, role, alive, isCarrier, spectatorPolicy
+net.state, net.reconnect, net.netStats
+matchState.matchId, mode, mapId, mapVersion, rulesetVersion
+matchState.serverNow, sampledAt, phase, phaseEndsAt
+matchState.series, round, teams
+matchState.bomb: state, carrierId, siteId, position|null
+matchState.interaction: kind, actorId, progress
+matchState.sites[]: id, site, callout, center, box
+matchState.localPlayer: entityId, team, role, alive, isSpectating, spectatingId,
+                        spectatorPolicy
+roundEnded, matchEnded, bombStateChanged, interactionRefused and decoded Bomb events
 ```
+
+Labels, icon keys, callout-distance presentation, and derived `isCarrier` are client view
+models. They never become alternate authority. In particular, `bomb.position` is always null
+while carried and whenever the position-presence rule filters it; the HUD never reconstructs
+one from zero coordinates or stale entities.
 
 Required events include round countdown/start/end, side switch, bomb assigned/dropped/picked up, plant started/interrupted/completed, defuse started/interrupted/completed, alive-count change, spectator target/policy change, reconnect state, and match end.
 
@@ -64,7 +72,8 @@ The clock receives urgency treatment only at a threshold supplied or derivable f
 
 ### Center lower — interaction
 
-Plant/defuse/pickup interaction appears close to the reticle but below the target area:
+Plant/defuse interaction and automatic-pickup guidance appear close to the reticle but below
+the target area:
 
 - Verb + target: `PLANT — SITE A`, `DEFUSE`, `RECOVER BOMB`.
 - Current binding.
@@ -74,6 +83,10 @@ Plant/defuse/pickup interaction appears close to the reticle but below the targe
   alone does not interrupt under `bomb-rules.md` 1.0.0.
 
 Only the local actor sees full interaction progress unless spectator policy explicitly permits teammates to see it.
+
+`RECOVER BOMB` is guidance, not a third interaction request. Alpha pickup is automatic at
+contact range; the facade accepts only `requestInteraction('plant'|'defuse')`, and state/event
+updates confirm any pickup.
 
 ### Lower left/right — existing combat HUD
 

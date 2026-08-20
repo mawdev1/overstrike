@@ -365,7 +365,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved now that vocabulary v1 is published — thank you for the IDs. `RoamingSettingsV1`/`schemaVersion: 1` consumes settings vocabulary version 1; `keybinds` keys are its 31 canonical binding action IDs; telemetry `settings.friction.category` consumes its 7 category IDs. Neither contract restates a list. The capability enum is now defined once as `UnsupportedReason` in `errors.md` §3.1 and referenced by both the error details and `client.unsupported.reason`, including `build` — which the error had and the event lacked, so the most common rejection had a branch but no measurement.
 
-@@### REQ-CC-033 — Remove the stale room-envelope and health projections
+### REQ-CC-033 — Remove the stale room-envelope and health projections
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P1 typed HTTP client and room-browser fixtures
@@ -376,7 +376,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. §6 is now the sole room-list response schema; §11.3 defines components only and explicitly does not restate the wrapper, and the `browser-empty` fixture uses the canonical envelope. `correlationId` added to the §10 pagination form and the duplicated health bodies removed from §11.8 in favour of §7.1. `rttSource` is deleted — it never had a type or meaning and `X-Region-Rtt` is the sole RTT input.
 
-@@### REQ-CC-034 — Finish propagating the approved onboarding and telemetry model
+### REQ-CC-034 — Finish propagating the approved onboarding and telemetry model
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P1 onboarding and telemetry sender
@@ -387,7 +387,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. Deleted both superseded blocks: the landing-order paragraph and the `accounts.privacy.consent` schema, which contradicted the approved order and the typed columns declared a few lines above them. Signup now requires `clientSessionId` and `consentReceipt` rather than marking them optional — the approved order always reaches a consent decision first, so a signup without them is a client that skipped a step; the only exception is a pre-policy account, which carries `consent: null` and is prompted at next sign-in. Profile `consent` is explicitly object-or-null and projected from the typed columns, not from `privacy`. Telemetry: `clientSessionId` is now conditionally omitted on internal-only pre-consent batches, which is what makes those counts genuinely unlinked rather than merely unlabelled; `landing` and `eligibility` are removed from personal `flow.step` since they can never be lawfully emitted there, and a new closed internal event `funnel.preconsent` carries the top-of-funnel counts §3.1 promises.
 
-@@### REQ-CC-035 — Put `matchId` in the exact facade state it is said to populate
+### REQ-CC-035 — Put `matchId` in the exact facade state it is said to populate
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P2 reconnect and match routing
@@ -398,7 +398,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. `matchId` is now a required field of the exact §5.1 `matchState` schema, not just prose in the source table — you were right that a source table cannot add a key the shape does not have. Sourced from `MatchHandoff` on first connect and from the reconnect-ticket handoff after active-match discovery, stable for the facade lifetime, and identical to the id in `MSG_OUTCOME` and the result record.
 
-@@### REQ-CC-036 — Make Bomb-position presence agree with state validity
+### REQ-CC-036 — Make Bomb-position presence agree with state validity
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P3 protocol decoder and Bomb HUD
@@ -409,7 +409,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved, and this was a real hole. The bit now means **"position is meaningful *and* authorised"** — two conditions, with the state check first: it is 0 unless `bombState` is `dropped` or `planted`, and only then does visibility filtering decide whether it may be 1. Previously attackers always got `visible = 1`, so during `carried` they received the flag set with meaningless zeroes, which the mapping then exposed as a real position at the world origin. A carried bomb's location is the carrier's — `bomb.carrierId` names a visible entity — so `bomb.position` is always null in that state. Encoder invariant, decoder mapping, and the facade null rule now say this identically.
 
-@@### REQ-CC-037 — Make every outcome projection consume the canonical matrix
+### REQ-CC-037 — Make every outcome projection consume the canonical matrix
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before P2–P4 outcome, results, and career implementation
@@ -420,7 +420,7 @@ backend-owned module.
 - Status: DONE
 - Response: Resolved. `status` is a required field of the full §4 record and the discriminant of the union; the invalidated variant is now the full record rather than a contradictory short form. The stale wire sentence claiming every aborted match has no winner is deleted — the mapping table is the only statement of that rule. `matchEnded` uses `outcomeReason`, with `reason` retained for `roundEnded` only. Bomb §9's both-teams-gone row is now `aborted` / `no-contest` / null winner: invalidation is a review decision, not an outcome the server reaches on its own.
 
-@@### REQ-CC-038 — Correct the event-kind decoder boundary
+### REQ-CC-038 — Correct the event-kind decoder boundary
 - Phase: P0
 - Blocking: yes
 - Needed by: Gate G0A / before protocol-v2 decoder implementation
@@ -430,3 +430,36 @@ backend-owned module.
 - Requester's workaround until then: Treat any decoder fixture with `kind >= EV_KINDS.length` as malformed regardless of the current prose.
 - Status: DONE
 - Response: Resolved — and thank you, this was a genuine off-by-one at the untrusted-input boundary. Wire codes are zero-based indices, so the first invalid code is exactly `EV_KINDS.length`; `>` let that value through into `EV_KINDS[code]` and produced `undefined`. Now `>=`, with both boundary vectors required in decoder tests: the last valid appended kind (`interactRefused`, 20) and the first invalid (21). Every other bounds check in this contract is deliberate, which made this one worth catching rather than shrugging at.
+
+@@### REQ-CC-039 — Make the consent boundary measurable without crossing it
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P1 onboarding telemetry
+- Contract affected: `contracts/http-api.md` §§3a.3–3a.5, 11.8; `contracts/telemetry.md` §§3.1, 3.3–3.5; `design/first-run-flow.md`
+- Ask: The pre-consent event closes landing/eligibility, but the boundary still contradicts its consumers. Personal `flow.step` includes `consent` with viewed/completed/failed outcomes even though those observations occur before a decision, personal events are dropped rather than queued, and a declining player can never authorize the completed event. HTTP still says the receipt is required “on every batch,” while telemetry correctly permits receipt-free internal batches. Returning sign-in also yields profile consent but no account-scoped receipt, so `signin` and later personal events have no declared receipt-acquisition step unless the client guesses it must call `GET /v1/onboarding/consent`. Finally, `funnel.preconsent` promises no correlation to later events while every telemetry event/batch carries a correlation ID and the CX flow propagates request correlation IDs.
+- Proposed shape: Measure the consent screen itself as an unlinked internal aggregate (without recording the decision value), and begin personal `flow.step` at signup only after affirmative consent. Make receipt optional/absent for internal-only batches everywhere. Either return the current account-scoped receipt on sign-in or explicitly require the authenticated consent GET before personal telemetry. Define whether `funnel.preconsent.correlationId` is omitted or freshly generated and forbidden from reusing eligibility/consent request IDs, so “unlinked” is enforceable rather than aspirational.
+- Requester's workaround until then: Emit no consent-step or returning-sign-in funnel event; send pre-consent internal telemetry with fresh, non-reused request correlation IDs only.
+- Status: DONE
+- Response: Resolved. Personal `flow.step` now begins at **signup**, not consent — you were right that a declining player can never authorise a `consent/completed` event, which made its presence in the personal registry unanswerable. The consent screen is measured by `funnel.preconsent` as an unlinked internal count that records *that* a decision was reached and never *which*; the stated cost is that decline rate is not measurable. §3.5.1 makes "unlinked" enforceable rather than aspirational: a freshly generated correlation ID per event, never reusing the eligibility or consent request id, no `clientSessionId` on the event or its batch, and no join key stored server-side. Receipt rules are now consistent — required only on batches carrying personal events, absent on internal-only ones. Sign-in returns the account-scoped receipt (or null when undecided), so a returning player has a declared acquisition step instead of guessing at the consent GET.
+
+@@### REQ-CC-040 — Publish a genuinely exact terminal-result response union
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / before P1 career and P4 results
+- Contract affected: `contracts/match-result.md` §4; `contracts/http-api.md` §§1, 11.5
+- Ask: `REQ-CC-037` corrected the values, but §4.2 still does not publish exact response variants: invalidated and aborted contain `/* every other field */`, completed is only a comment, and correlation ID appears on invalidated but not the full §4 record or aborted example despite the global HTTP rule. The base record fixes `invalidationReason` to null while the invalidated variant requires it non-null without stating its type/closed values. Separately, match history permits `status: pending` but fixes `endedAt` to a timestamp and always supplies `result`/`playerSummary`, so it cannot represent the live pending state whose canonical detail response has `endedAt: null` and no final stats.
+- Proposed shape: Define one named `TerminalResult` field set and exact completed/aborted/invalidated refinements with status-dependent `terminationReason`, `outcomeReason`, `winnerTeam`, and `invalidationReason` invariants. Define the HTTP response as that record plus required `correlationId`, without ellipses. Publish a discriminated history-summary union with exact pending nullability and availability of result/player summary.
+- Requester's workaround until then: Keep terminal result and pending-history fixtures semantic; do not generate their TypeScript unions from the current examples.
+- Status: DONE
+- Response: Resolved. §4.2 publishes a named `TerminalResult` field set with exact completed/aborted/invalidated refinements and a status-dependent invariant table — no ellipses, no comment standing in for a variant. `invalidationReason` is a closed enum-or-null, which the base record had fixed to null while the invalidated variant required it non-null with no type. `correlationId` is on every variant per §1. §4.3 adds the discriminated history-summary union: a pending item carries null for every outcome field rather than omitting them, so one renderer handles both and a missing key is always a bug rather than a state.
+
+@@### REQ-CC-041 — Supply stateful stubs for every contracted P1 shell branch
+- Phase: P0
+- Blocking: yes
+- Needed by: Gate G0A / Build Plan §0.5 stub-first exit condition
+- Contract affected: `contracts/http-api.md` §§11.10–12; `contracts/realtime-lobby.md` §10; `contracts/net-facade.md` §8; `design/first-run-flow.md`; `design/shell-ia.md`
+- Ask: The stub catalogues cover happy paths and selected failures, but they still do not meet `REQ-CX-001`'s requirement that every designed screen state be reachable deterministically. HTTP has no stateful scenarios for eligibility denial/success, consent accept/decline, verification pending/invalid/expired, terms acceptance/version conflict, pre-policy `consent: null`, active-match discovery/reconnect, aborted result, or a pending history summary. `?__stub=error:CODE` cannot model a multi-request transition or receipt migration. Lobby lacks deterministic room-closed/kicked, reconnect-grace exhaustion, and match-ready/version-handoff branches. The facade has broad timelines, but no stated coverage of the exact Bomb visibility and terminal outcome matrix.
+- Proposed shape: Add a small set of stateful scenario timelines that collectively cover every row in the CX screen matrices, including the approved onboarding chain, reload reconnect, all terminal result discriminants, lobby removal/closure/resync exhaustion, Bomb hidden/visible/carried position, and every outcome-matrix winner/null combination. State which scenario owns each CX acceptance row so coverage is auditable rather than inferred from names.
+- Requester's workaround until then: CX can build static isolated fixtures, but cannot accept the platform/lobby/facade stubs as the P1 executable contract.
+- Status: DONE
+- Response: Resolved, and this was the right thing to insist on — Build Plan §0.5 makes stubs the exit condition, so "a fixture exists" was never the bar. Scenarios are now **stateful**: selected by `X-Stub-Scenario`, keyed per `clientSessionId`, advanced by the requests the client makes, so multi-request transitions work — verification pending then accepted, consent decided then migrated at signup. 31 HTTP scenarios cover the full onboarding chain, pre-policy consent, active-match discovery and reconnect including grace exhaustion, every terminal result discriminant, and both pending variants. Lobby adds room-closed, kicked, countdown-continues, grace exhaustion, and handoff version mismatch. The facade adds Bomb carried/dropped-visible/dropped-hidden/planted position and one scenario per outcome-matrix row. §11.11 is a coverage map from routes in `shell-ia.md` to owning scenarios, so coverage is auditable rather than inferred from names — and a CX acceptance row with no owner is a gap in that table, not in your UI.

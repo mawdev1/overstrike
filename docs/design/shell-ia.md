@@ -2,7 +2,7 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.1  
+**Version:** 0.2
 **Status:** Ready for product and contract review  
 **Last updated:** 2026-08-19
 
@@ -32,7 +32,11 @@ The app shell survives game-runtime creation and disposal. Returning from a matc
 │   ├── /create-account
 │   └── /recover
 ├── /onboarding
+│   ├── /eligibility
+│   ├── /consent
 │   ├── /display-name
+│   ├── /verify
+│   ├── /terms
 │   └── /essential-settings
 ├── /play
 │   ├── /rooms
@@ -114,6 +118,7 @@ Transitions occur only after the owning service acknowledges them. UI may show p
 | State slice | Source of truth | Client persistence |
 |---|---|---|
 | Session/authentication | Auth contract/platform | Contract-approved credential only; never in URL |
+| Eligibility/consent/verification/terms | Onboarding and profile APIs | Opaque receipts only for their contracted lifetime; never birthdate or inferred consent |
 | Profile/display identity | Profile API | Read cache with freshness metadata |
 | Room list | Platform API | Memory cache; stale rows labelled and non-joinable |
 | Room membership/roster/ready | Lobby snapshot and ordered deltas | Last snapshot for stale presentation only |
@@ -131,8 +136,12 @@ Every data screen is implemented as an isolated view with a state fixture. `Not 
 |---|---|---|---|---|---|
 | Welcome/compatibility | Capability check | N/A | Retry check | Local-only entry | Unsupported/update required |
 | Sign in/create | Submit pending | Initial form | Rate limit/network | Cannot submit | Restricted/ineligible |
+| Eligibility | Evaluating gate | Initial neutral form | Validation/network | Cannot submit | Ineligible under current policy |
+| Telemetry consent | Policy/decision load | Undecided | Save retry | No personal telemetry | Declined is valid, not terminal |
 | Recovery | Submit/check pending | Initial form | Expired/rate limit | Cannot submit | Completed/invalid request |
-| Display name | Availability/submit | Initial field | Service/policy retry | Cannot submit | Account restriction |
+| Display name/signup | Availability/submit | Initial field | Service/policy/receipt retry | Cannot submit | Account restriction |
+| Verification | Token check/resend | Awaiting token | Invalid/expired token | Cannot submit | Verified |
+| Terms | Current version load/accept | N/A | Version conflict/network | Cannot submit | Acceptance required |
 | Essential settings | Roaming load/save | Defaults | Unsynced changes | Local changes allowed | N/A |
 | Server browser | Skeleton rows | No rooms/no filter matches | Fetch failed | Stale list, join disabled | Maintenance/update |
 | Room details | Details fetch | Room gone | Refresh/join failed | Last details stale | Ineligible/version/full |
@@ -171,7 +180,9 @@ The compact indicator shows the worst relevant state. Expanding it reveals each 
 
 ## Responsive layout
 
-P0 recommends desktop keyboard/mouse as the Alpha support scope, pending human approval of the browser/device matrix.
+D5 fixes desktop keyboard/mouse as the Alpha support scope. Match entry requires a supported
+desktop browser plus WebGL2, pointer lock, binary WebSocket frames, and the minimum hardware
+profile; the gate runs before the game runtime loads.
 
 - `>= 1280 x 720`: fully supported target; primary navigation rail plus content.
 - `1024–1279 CSS px`: compact rail; two-column content stacks without hiding actions.

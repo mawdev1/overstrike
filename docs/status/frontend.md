@@ -4,21 +4,21 @@
 
 **Updated:** 2026-08-19
 **Phase:** P0 — Contract freeze
-**Overall:** BLOCKED AT G0A — sixth-pass graph audit found five residual cross-file chains plus one protocol boundary defect in 1.5.0
+**Overall:** BLOCKED AT G0A — seventh-pass review accepts the six 1.6.0 amendments but finds three remaining executable-contract gaps
 
 ---
 
 ## P0 frontend deliverables
 
-All six P0.2 specifications exist. The Square and accessibility baselines now incorporate the
-decided D3/D5 values; the other four remain unchanged from the initial review pack.
+All six P0.2 specifications exist. The Square/accessibility baselines incorporate D3/D5;
+first-run, shell, HUD, and settings have been amended to match the approved contract graph.
 
 | Deliverable | Status |
 |---|---|
 | `docs/design/first-run-flow.md` | READY FOR REVIEW; 0.2 records the approved eligibility → consent → signup sequence and reload discovery |
-| `docs/design/shell-ia.md` | READY FOR REVIEW; D5 capability gate incorporated |
+| `docs/design/shell-ia.md` | READY FOR REVIEW; 0.2 adds the approved eligibility, consent, verification, and terms routes/states |
 | `docs/design/square-artdirection.md` | READY FOR ART REVIEW; D3 envelope accepted |
-| `docs/design/hud-bomb.md` | READY FOR REVIEW; live implementation awaits wire/facade consistency |
+| `docs/design/hud-bomb.md` | READY FOR REVIEW; 0.2 binds its data boundary to the exact facade and automatic pickup rule |
 | `docs/design/accessibility.md` | READY FOR REVIEW; D5 verification matrix incorporated |
 | `docs/design/settings-inventory.md` | READY FOR REVIEW; vocabulary v1 IDs published in 0.2 (`REQ-CX-005`) |
 
@@ -141,19 +141,36 @@ The CX-owned first-run flow is now version 0.2 and matches the approved onboardi
 also replaces the impossible persisted reconnect-token resume rule with authenticated active-
 match discovery followed by issuance of a fresh single-use ticket.
 
+## Seventh-pass amendment audit
+
+The 1.6.0 amendments close `REQ-CC-033` through `038` at the specific fields they changed.
+This pass then tested whether the resulting contracts can drive the CX screen and fixture
+matrices without inventing a transition or type. Three adjacent gaps remain:
+
+| Chain | Seventh-pass result |
+|---|---|
+| Room state / HTTP | **PASS.** One paginated room envelope, one RTT header, correlated health responses, and matching empty fixture. |
+| Match reconnect | **PASS.** Active-match discovery restores an exact handoff and `matchState.matchId` is now a real required field. |
+| Bomb position / decoder | **PASS.** Position presence is meaningful-and-authorized, carried maps to null, and the event-kind boundary is `>= length`. |
+| Settings / capability | **PASS.** Vocabulary v1 and the shared unsupported-reason enum remain coherent. |
+| Onboarding / telemetry | **BLOCKED.** The personal registry still includes the pre-decision consent step, receipt rules disagree, returning sign-in has no declared receipt path, and “unlinked” correlation is not enforceable. `REQ-CC-039` |
+| Match outcome | **BLOCKED.** Matrix values now agree, but the terminal HTTP union still contains placeholders/inconsistent correlation and history cannot represent its own pending state exactly. `REQ-CC-040` |
+| Executable stubs | **BLOCKED.** Named scenarios do not cover the stateful onboarding, reload reconnect, lobby terminal, Bomb visibility, and result branches required by the CX screen matrices. `REQ-CC-041` |
+
+Two CX projections were corrected in the same pass: `shell-ia.md` 0.2 now exposes every
+approved onboarding route/state, and `hud-bomb.md` 0.2 consumes the exact facade vocabulary
+and treats pickup as automatic contact behavior rather than a third interaction request.
+
 ## Backend requests
 
-`REQ-CC-001` through `032` are marked `DONE` and retained as review history. The sixth pass
-files six exact residual requests rather than reopening completed requests:
+`REQ-CC-001` through `038` are marked `DONE` and retained as review history. The seventh pass
+files three executable-contract requests rather than reopening completed requests:
 
 | Request | Scope |
 |---|---|
-| `REQ-CC-033` | Remove stale room/pagination/health projections and define the dangling RTT query |
-| `REQ-CC-034` | Propagate the approved onboarding order, storage source, nullable consent, and pre-consent telemetry rules |
-| `REQ-CC-035` | Add the handoff's required match identity to exact facade state |
-| `REQ-CC-036` | Make Bomb-position presence false whenever position bytes are not meaningful |
-| `REQ-CC-037` | Apply the outcome matrix to the full result, facade field, wire prose, and Bomb disconnect rule |
-| `REQ-CC-038` | Fix the zero-based event-kind decoder boundary and add edge vectors |
+| `REQ-CC-039` | Close consent-step, receipt-acquisition, and unlinked-correlation telemetry rules |
+| `REQ-CC-040` | Publish exact terminal-result and pending-history response unions |
+| `REQ-CC-041` | Make every contracted CX state reachable through deterministic stateful stubs |
 
 No frontend implementation will infer an endpoint body, build a reducer from unspecified
 deltas, manufacture match outcomes, reconstruct an undefined server clock, or emit an
@@ -166,9 +183,9 @@ open-ended telemetry object.
 | D1 Supabase Auth | ACCEPTED as working platform choice | Verify immediate revocation/session listing by P1 exit |
 | D2 Supabase Postgres Toronto + Fly match regions | ACCEPTED | No frontend hold |
 | D3 The Square 88 m envelope | ACCEPTED and incorporated into art direction | Graybox measurement in `REQ-CX-002` |
-| D4 Bomb Alpha format | ACCEPTED at max 12 / draw 6–6 | Outcome/result projection remains in `REQ-CC-031` |
+| D4 Bomb Alpha format | ACCEPTED at max 12 / draw 6–6 | Exact result response projection remains in `REQ-CC-040` |
 | D5 desktop browser/device matrix | ACCEPTED and incorporated into CX specs | Implement/verify capability gate in P1 |
-| D6 age 13 / prizes 18+ working default | ACCEPTED AS WORKING DEFAULT | Professional legal review before P8/P11; consent order/validity in `REQ-CC-028` |
+| D6 age 13 / prizes 18+ working default | ACCEPTED AS WORKING DEFAULT | Professional legal review before P8/P11; telemetry boundary in `REQ-CC-039` |
 
 `REQ-CX-003` and `REQ-CX-004` are accepted. The former is explicitly accepted against the
 final amended D3 values (88 m, 9–14 s, 12–16 s, 16–22 s, 48 m), not the stale values preserved
@@ -183,7 +200,7 @@ Measured on the current tree without modifying product source:
 |---|---|---|
 | Client boot | `src/main.js` statically imports and constructs `Game` | P1 shell must split/lazy-load game runtime |
 | Menu | `src/ui/menu.js`: 1,782 lines, 8 panels, 3 in-memory shells | Reuse visual language; move account/lobby/career routes to isolated shell modules |
-| HUD | `src/ui/hud.js`: 1,754 lines; scoreboard 261; minimap 661 | Bomb UI targets the facade only after `REQ-CC-030`/`031` |
+| HUD | `src/ui/hud.js`: 1,754 lines; scoreboard 261; minimap 661 | Bomb state may target the facade; terminal result UI awaits `REQ-CC-040` |
 | Settings | 30 non-binding defaults and 23 binding entries | Validation exists; roaming/captions/a11y/mouse rebinding/real diagnostics remain |
 | World | MERIDIAN 86×86 m, 18 spawns | Technical fixture only; The Square is a new map ID/manifest |
 | Network UI | Scoreboard synthesizes deterministic ping | Remove when measured facade data exists; never propagate into shell |
@@ -198,17 +215,19 @@ Measured on the current tree without modifying product source:
 - Fifth-pass graph audit: **complete** across the same six chains, including exact-state tests.
 - Fifth-pass amendments (`REQ-CC-027`–`032`): **received and reviewed** at 1.5.0.
 - Sixth-pass graph audit: **complete** across canonical schemas and their repeated projections.
+- Sixth-pass amendments (`REQ-CC-033`–`038`): **received and accepted** at 1.6.0.
+- Seventh-pass executable-contract audit: **complete** across telemetry, result unions, and stub coverage.
 - `REQ-CX-005`: **ACCEPTED**; settings vocabulary v1 published in the CX inventory.
 - Settings/unsupported-reason chain: **PASSED** after `REQ-CC-032`.
-- G0A: **NOT PASSED** — six residual amendment groups remain (`REQ-CC-033`–`038`).
-- Product tests: not run; this pass changes only the CX-owned first-run specification,
+- G0A: **NOT PASSED** — three residual amendment groups remain (`REQ-CC-039`–`041`).
+- Product tests: not run; this pass changes only the CX-owned shell/HUD specifications,
   frontend status, and requests-to-backend handoff.
 - Worktree: remains dirty with pre-existing mixed product changes; none were modified by this
   review and no commit was created.
 
 ## Next frontend action
 
-Re-review `REQ-CC-033` through `038` as end-to-end chains. Sign off G0A only after every shared
-concept has one canonical source, repeated examples reference it without drift, and every
-projection is lossless through transport, UI, and persistence. P1 implementation remains
-blocked until the affected contracts are frozen.
+Re-review `REQ-CC-039` through `041` as executable flows, not isolated paragraphs. Sign off G0A
+only when consent telemetry is lawful and emit-able, terminal result/history unions are exact,
+and the backend stubs can deterministically drive every required CX state. P1 implementation
+remains blocked until the affected contracts are frozen.
