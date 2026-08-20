@@ -2,7 +2,7 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.1  
+**Version:** 0.2
 **Status:** Ready for product and profile-contract review  
 **Last updated:** 2026-08-19
 
@@ -20,6 +20,22 @@ Define every player-facing Alpha setting, its valid values/default, persistence 
 | `PRACTICE` | Local offline/private-practice setup only; never sent as authority for an online room | Bot difficulty/count, local TDM kill limit |
 
 Roaming settings need per-key schema/version and update semantics in the profile contract. Until that exists, the current local store remains a cache only. Device settings never overwrite roaming values from another machine.
+
+## Canonical vocabulary
+
+**Vocabulary version:** `1`. Category and binding-action IDs are transport/storage identifiers,
+not display copy. They are lower camel case, are not localized, and remain stable if a label is
+retitled. Renaming or reusing a shipped ID requires a coordinated contract change and migration.
+
+| Category ID | Display label |
+|---|---|
+| `input` | Input |
+| `bindings` | Bindings |
+| `graphics` | Graphics |
+| `audioCaptions` | Audio & captions |
+| `crosshairHud` | Crosshair & HUD |
+| `accessibility` | Accessibility |
+| `network` | Network |
 
 ## Input and camera
 
@@ -42,39 +58,39 @@ Reduced-motion preset proposes camera shake 25%, view bob 0%, and weapon sway 35
 
 All actions are `ROAM`, apply live, and have primary plus optional secondary bindings. Defaults shown reflect the current client where present.
 
-| Action | Default primary | Default secondary |
-|---|---|---|
-| Move forward | `W` | — |
-| Move back | `S` | — |
-| Strafe left | `A` | — |
-| Strafe right | `D` | — |
-| Jump | `Space` | — |
-| Sprint | `Left Shift` | — |
-| Crouch/slide | `Left Ctrl` | `C` |
-| Lean/contextual lean | `Q` | — |
-| Fire | `Mouse 1` | — |
-| Aim | `Mouse 2` | — |
-| Reload | `R` | — |
-| Melee | `F` | — |
-| Lethal grenade | `G` | — |
-| Tactical equipment | Unbound | — |
-| Interact / plant / defuse / pickup | `E` | — |
-| Primary weapon | `1` | — |
-| Secondary weapon | `2` | — |
-| Tertiary/special | `3` | — |
-| Next weapon | Mouse wheel down | — |
-| Previous weapon | Mouse wheel up | — |
-| Last weapon | `V` | — |
-| Killstreak/action slot | `B` | — |
-| Inspect weapon | `X` | — |
-| Scoreboard (hold) | `Tab` | — |
-| Open text chat | `Enter` | — |
-| Team chat | `Y` | — |
-| Tactical ping / ping wheel | Middle mouse | Unbound |
-| Mute current spectator/voice target | Unbound | — |
-| Spectate previous | Left arrow | — |
-| Spectate next | Right arrow | — |
-| Pause/back | `Escape` (reserved) | — |
+| Action ID | Display label | Default primary | Default secondary |
+|---|---|---|---|
+| `forward` | Move forward | `W` | — |
+| `back` | Move back | `S` | — |
+| `left` | Strafe left | `A` | — |
+| `right` | Strafe right | `D` | — |
+| `jump` | Jump | `Space` | — |
+| `sprint` | Sprint | `Left Shift` | — |
+| `crouch` | Crouch/slide | `Left Ctrl` | `C` |
+| `lean` | Lean/contextual lean | `Q` | — |
+| `fire` | Fire | `Mouse 1` | — |
+| `aim` | Aim | `Mouse 2` | — |
+| `reload` | Reload | `R` | — |
+| `melee` | Melee | `F` | — |
+| `grenade` | Lethal grenade | `G` | — |
+| `tacticalEquipment` | Tactical equipment | Unbound | — |
+| `interact` | Interact / plant / defuse / pickup | `E` | — |
+| `weapon1` | Primary weapon | `1` | — |
+| `weapon2` | Secondary weapon | `2` | — |
+| `weapon3` | Tertiary/special | `3` | — |
+| `nextWeapon` | Next weapon | Mouse wheel down | — |
+| `previousWeapon` | Previous weapon | Mouse wheel up | — |
+| `lastWeapon` | Last weapon | `V` | — |
+| `killstreak` | Killstreak/action slot | `B` | — |
+| `inspect` | Inspect weapon | `X` | — |
+| `scoreboard` | Scoreboard (hold) | `Tab` | — |
+| `textChat` | Open text chat | `Enter` | — |
+| `teamChat` | Team chat | `Y` | — |
+| `tacticalPing` | Tactical ping / ping wheel | Middle mouse | Unbound |
+| `muteCurrentTarget` | Mute current spectator/voice target | Unbound | — |
+| `spectatePrevious` | Spectate previous | Left arrow | — |
+| `spectateNext` | Spectate next | Right arrow | — |
+| `pause` | Pause/back | `Escape` (reserved) | — |
 
 Voice push-to-talk is intentionally absent until voice ships with moderation/privacy controls. `Escape` remains reserved and cannot be rebound. Browser/OS reserved shortcuts are rejected. Binding capture supports keyboard and mouse, cancel, timeout, clear, reset action, reset category, and reset all. Conflicts require an explicit `SWAP`, `UNBIND OTHER`, or `CANCEL`; the client never silently removes a binding.
 
@@ -240,4 +256,5 @@ Implementation gaps against this inventory:
 - `net-facade.md`: measured RTT, jitter, loss, correction, snapshot, and protocol health.
 - `telemetry.md`: settings-friction event allowlist/privacy.
 - `feature-flags.md`: staged settings/shell/diagnostics rollout.
-- Human decision: supported browser/device/input matrix and public default for performance readout.
+- D5 fixes the supported browser/device/input matrix; the public default for the performance
+  readout still needs a human product decision.
