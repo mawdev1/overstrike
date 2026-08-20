@@ -27,7 +27,7 @@ import {
   STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
   MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
   assertMatchTransition, assertPageArgs, TERMINAL_MATCH_STATUSES,
-  INITIAL_SETTINGS_VERSION, casMayCreateProfile, assertExpectedVersion,
+  INITIAL_SETTINGS_VERSION, casMayCreateProfile, assertExpectedVersion, assertSweepInstant,
 } from '../store.js';
 
 const TX = Symbol('overstrike.pgtx');
@@ -59,7 +59,7 @@ const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
  * a column that is not in the schema has no business in a statement whether it is quotable
  * or not.
  */
-const TABLE_COLUMNS = {
+export const TABLE_COLUMNS = {
   accounts: [
     'accountId', 'status', 'emailHash', 'displayName', 'displayNameFolded',
     'passwordHash', 'roles', 'nameChangedAt',
@@ -140,6 +140,14 @@ function columnName(table, camelKey) {
     });
   }
   const col = toSnake(camelKey);
+  // UNREACHABLE while the allow-list above is clean, and therefore unkillable by any test
+  // (mutatetest, 2026-08-20). Every caller-supplied key has already been matched against
+  // `ALLOWED`, so `camelKey` is one of the 110 names in `TABLE_COLUMNS` — and all 110 snake-case
+  // into `^[a-z][a-z0-9_]*$` (measured; `storetest.mjs` re-measures it on every run, which is
+  // what keeps this line's premise true as columns are added). The line is the second half of
+  // "belt and braces": it catches an ALLOW-LIST ENTRY that was itself mistyped, which is the one
+  // way a key can reach `set ${col} = $1` without a caller having chosen it. The check that
+  // stops the injection this file's header is about is the allow-list, and that one IS killed.
   if (!/^[a-z][a-z0-9_]*$/.test(col)) {
     throw new ApiError('VALIDATION_FAILED', `Unusable column name for ${table}`, { details: { table } });
   }
@@ -208,6 +216,11 @@ export async function createPostgresStore(config = {}, deps = {}) {
 
   function entryOf(txh) {
     if (txh === undefined || txh === null) return null;
+    // EQUIVALENT MUTANT (mutatetest with a real database, 2026-08-20), same as the memory
+    // adapter's: an object without the tag has no `handleState` entry either, so the check two
+    // lines down raises the identical INTERNAL_ERROR, and `WeakMap.get` returns `undefined` for
+    // a primitive rather than throwing. Kept because the two ask different questions — "is this
+    // shaped like a handle" and "is it one of MINE".
     if (!txh[TX]) throw new ApiError('INTERNAL_ERROR', 'Not a transaction handle from this store.');
     const entry = handleState.get(txh);
     if (!entry || entry.store !== storeTag) {
@@ -315,6 +328,11 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
 
     async byEmailHash(hash, txh) {
+      // EQUIVALENT MUTANT here and NOT on the memory adapter (mutatetest, 2026-08-20), which is
+      // exactly why it is written down in both. `email_hash = NULL` is never true in SQL, so
+      // deleting this line still yields zero rows; the memory adapter's `===` comparison WOULD
+      // match every account whose hash is null and hand back an arbitrary one. Same guard, and
+      // it is load-bearing on one adapter only — `storetest.mjs` asserts the rule on both.
       if (hash === null || hash === undefined) return null;
       const { rows } = await q(txh, 'select * from accounts where email_hash = $1', [hash]);
       return mapRow(rows[0]);
@@ -328,10 +346,31 @@ export async function createPostgresStore(config = {}, deps = {}) {
     async update(accountId, patch, txh) {
       // account_id and created_at are immutable; updated_at belongs to the 0001 trigger, and
       // accepting one from the patch is a clock the caller writes. Same rule on both adapters.
+      //
+      // A patch that tries to RENAME the account is refused rather than dropped. Dropping it
+      // silently was a divergence the memory adapter did not have: memory raised
+      // VALIDATION_FAILED, while here the key was destructured away and — when it was the only
+      // key — the empty update then surfaced as NOT_FOUND. Two adapters, two answers, neither
+      // of them the one the caller's mistake deserves.
+      if (Object.hasOwn(patch, 'accountId') && patch.accountId !== accountId) {
+        throw new ApiError('VALIDATION_FAILED', 'accountId is immutable.', {
+          details: { table: 'accounts', column: 'accountId' },
+        });
+      }
       const { accountId: _ignored, createdAt: _ignored2, updatedAt: _ignored3, ...rest } = patch;
       const row = await updateRow(txh, 'accounts', rest, 'account_id = $1', [accountId]);
-      if (!row) throw new ApiError('NOT_FOUND', 'No such account.', { details: { accountId } });
-      return mapRow(row);
+      // EQUIVALENT MUTANT (mutatetest with a real database, 2026-08-20), and the reason is the
+      // re-read below: the UPDATE has already committed by the time it runs, so it returns the
+      // same row this line would have. What it costs is a second round trip on every account
+      // write, which is why the line stays.
+      if (row) return mapRow(row);
+      // No row came back for one of two reasons, and they are not the same answer. A patch with
+      // nothing left to set is a NO-OP that returns the account — which is what the memory
+      // adapter does — and reporting NOT_FOUND for it told a caller its account had vanished
+      // because it sent an empty PATCH body.
+      const current = await accounts.byId(accountId, txh);
+      if (!current) throw new ApiError('NOT_FOUND', 'No such account.', { details: { accountId } });
+      return current;
     },
   };
 
@@ -772,10 +811,27 @@ export async function createPostgresStore(config = {}, deps = {}) {
    */
   const storeNowIso = (at = null) => {
     const t = at ?? (deps.now ? deps.now() : Date.now());
+    // EQUIVALENT MUTANT (mutatetest with a real database, 2026-08-20). Deleting this line
+    // changes no behaviour: a Date falls through to `new Date(Number(t)).toISOString()`, and
+    // `Number(date)` is `date.valueOf()` which IS `date.getTime()` — measured over 200 000
+    // random instants plus the epoch, the maximum representable date and an invalid date, and
+    // identical every time. Same shortcut, same reasoning, as the memory adapter's `storeNowMs`.
     if (t instanceof Date) return t.toISOString();
     return typeof t === 'string' ? t : new Date(Number(t)).toISOString();
   };
   const consentNowIso = () => storeNowIso();
+
+  /**
+   * The instant a retention sweep runs at.
+   *
+   * NOT `storeNowIso`: that hands a caller-supplied string straight to `$1::timestamptz`, and
+   * `timestamptz` is generous — it read `'yesterday'` as a real instant and swept on it, while
+   * the memory adapter refused the same argument. `'banana'` diverged too, as 22007 →
+   * INTERNAL_ERROR against memory's VALIDATION_FAILED. The rule is decided once, in store.js.
+   */
+  const sweepIso = (at) => (at === null || at === undefined
+    ? storeNowIso()
+    : new Date(assertSweepInstant(at)).toISOString());
 
   const preAuthConsent = {
     /**
@@ -849,7 +905,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
      */
     async sweepExpired(at = null, txh) {
       const { rowCount } = await q(txh,
-        'delete from pre_auth_consent where expires_at <= $1::timestamptz', [storeNowIso(at)]);
+        'delete from pre_auth_consent where expires_at <= $1::timestamptz', [sweepIso(at)]);
       return rowCount;
     },
   };
@@ -913,6 +969,11 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
 
     async markPublished(eventIds, at, txh) {
+      // EQUIVALENT MUTANT on THIS adapter and not on the other (mutatetest, 2026-08-20). Deleting
+      // it here is harmless: `pg` binds `undefined` as null, `event_id = any(null::text[])`
+      // matches nothing, and an empty array matches nothing either. The memory adapter iterated
+      // the argument and threw `eventIds is not iterable` — so an idle relay was a no-op in
+      // production and a crash in every test. Both now say no-op; `storetest.mjs` asserts it.
       if (!eventIds?.length) return;
       await q(txh,
         'update events_outbox set published_at = coalesce($2::timestamptz, now()) '
@@ -998,6 +1059,13 @@ export async function createPostgresStore(config = {}, deps = {}) {
             ? null : JSON.stringify(row.responseBody),
           // Null is the §8 "permanent" retention class, not a missing value: the sweep skips it.
           row.expiresAt ?? null]);
+      // EQUIVALENT MUTANT (mutatetest with a real database, 2026-08-20), and deliberately kept.
+      // Deleting it costs a round trip and changes no answer: `on conflict do nothing returning
+      // *` gives the row back only when THIS call inserted it, and the re-read below then finds
+      // that same row with the same `requestHash`, so the comparison passes and `cur` is
+      // returned — the identical value. It stays because the extra SELECT is on the hot path
+      // (every first write of every idempotent request) and because "we inserted it" and "it was
+      // already there" are different facts that this line is the only place to tell apart.
       if (rows[0]) return mapRow(rows[0]);
       const cur = await idempotency.get(row.key, row.actorId, txh);
       if (cur && cur.requestHash !== row.requestHash) {
@@ -1030,7 +1098,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
     async sweepExpired(at = null, txh) {
       const { rowCount } = await q(txh,
         'delete from idempotency_keys where expires_at is not null and expires_at <= $1::timestamptz',
-        [storeNowIso(at)]);
+        [sweepIso(at)]);
       return rowCount;
     },
   };

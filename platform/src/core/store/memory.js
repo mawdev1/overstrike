@@ -31,7 +31,7 @@ import {
   STAT_COUNTERS, WEAPON_COUNTERS, STAT_DELTA_LIMITS, WEAPON_DELTA_LIMITS, assertCounterDelta,
   MATCH_COLUMNS, normaliseMatchResult, toHistoryMatchStatus, assertStorable,
   assertMatchTransition, assertPageArgs, TERMINAL_MATCH_STATUSES,
-  INITIAL_SETTINGS_VERSION, casMayCreateProfile, assertExpectedVersion,
+  INITIAL_SETTINGS_VERSION, casMayCreateProfile, assertExpectedVersion, assertSweepInstant,
 } from '../store.js';
 
 /** Handles are tagged so a handle from another store (or a stray object) fails loudly. */
@@ -334,6 +334,12 @@ export function createMemoryStore(config = {}, deps = {}) {
 
   function stateFor(tx) {
     if (tx === undefined || tx === null) return null;
+    // EQUIVALENT MUTANT (mutatetest, 2026-08-20). Deleting this line changes no observable
+    // behaviour: an object without the tag has no entry in `handleState` either, so the check
+    // below raises the same INTERNAL_ERROR with the same message. `WeakMap.get` returns
+    // `undefined` for a primitive rather than throwing, so a string or a number takes the same
+    // path. It stays because the two checks answer different questions — "is this shaped like a
+    // handle" and "is it one of MINE" — and collapsing them loses the first.
     if (!tx[TX]) throw new ApiError('INTERNAL_ERROR', 'Not a transaction handle from this store.');
     const entry = handleState.get(tx);
     // A handle from another store instance carries the tag but not an entry in THIS store's
@@ -484,6 +490,16 @@ export function createMemoryStore(config = {}, deps = {}) {
         assertKnown(patch, ACCOUNT_COLUMNS, 'accounts');
         if (Object.hasOwn(patch, 'accountId') && patch.accountId !== accountId) {
           throw new ApiError('VALIDATION_FAILED', 'accountId is immutable.');
+        }
+        // `privacy` is NOT NULL DEFAULT '{}' (0001), so "present and null" is not an operation
+        // it has. Postgres answered a null with a 23502 → VALIDATION_FAILED and this adapter
+        // stored the null, which is the shape of divergence this file exists to prevent:
+        // `normalizePrivacy` then read a null nobody could have written on the adapter that
+        // ships. Clearing privacy is `{}`, and it has to be said.
+        if (Object.hasOwn(patch, 'privacy') && patch.privacy === null) {
+          throw new ApiError('VALIDATION_FAILED', 'accounts.privacy cannot be null.', {
+            details: { table: 'accounts', column: 'privacy' },
+          });
         }
         const next = { ...cur, ...patch, accountId, createdAt: cur.createdAt };
         for (const c of ACCOUNT_TIMESTAMPS) next[c] = toIso(next[c]);
@@ -701,6 +717,14 @@ export function createMemoryStore(config = {}, deps = {}) {
         const cur = st.profiles.get(accountId);
         // Absence IS the initial version (store.js), so the first-ever write lands and a CAS
         // holding any other version finds nothing to match rather than inventing a row.
+        //
+        // EQUIVALENT MUTANT (mutatetest, 2026-08-20): deleting this line changes nothing here.
+        // `casMayCreateProfile(v)` is `v === INITIAL_SETTINGS_VERSION`, and when `cur` is absent
+        // `actual` IS `INITIAL_SETTINGS_VERSION` — so the two conditions are the same test and
+        // the comparison two lines down returns null on exactly the same inputs. It is not
+        // redundant on the POSTGRES adapter, where the same decision has to be made inside the
+        // statement (`$9::boolean or exists (...)`) and cannot be left to a later comparison;
+        // stating it here keeps the two adapters visibly answering one rule.
         if (!cur && !casMayCreateProfile(expectedVersion)) return null;
         const actual = cur?.settingsVersion ?? INITIAL_SETTINGS_VERSION;
         if (actual !== expectedVersion) return null;
@@ -930,6 +954,12 @@ export function createMemoryStore(config = {}, deps = {}) {
           if (p.accountId !== accountId) continue;
           if (cursor !== null && !(p.matchId < cursor)) continue;
           const m = st.matches.get(p.matchId);
+          // UNREACHABLE, and therefore unkillable by any test (mutatetest, 2026-08-20). A
+          // participant row is written only by `record`, in the same `write` that sets its
+          // match row, and nothing on this adapter deletes from `st.matches` — so a participant
+          // whose match is missing cannot be produced through the interface. It stays because
+          // the alternative when the invariant does break is a TypeError inside a `sort`
+          // comparator, which names neither the match nor the account.
           if (!m) continue;
           rows.push({ m, p });
         }
@@ -968,6 +998,12 @@ export function createMemoryStore(config = {}, deps = {}) {
    */
   const storeNowMs = () => {
     const t = deps.now ? deps.now() : Date.now();
+    // EQUIVALENT MUTANT (mutatetest, 2026-08-20). Deleting this line changes no behaviour: a
+    // Date falls through to `Number(t)`, and `Number(date)` is `date.valueOf()` which IS
+    // `date.getTime()`. Measured over 200 000 random instants plus the epoch, the maximum
+    // representable date and an invalid date: identical every time, `NaN` included. The line
+    // stays because it names the shape rather than relying on a coercion, and `storetest.mjs`
+    // exercises all three clock shapes against a real TTL instead.
     if (t instanceof Date) return t.getTime();
     return typeof t === 'string' ? Date.parse(t) : Number(t);
   };
@@ -1050,10 +1086,8 @@ export function createMemoryStore(config = {}, deps = {}) {
      * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
      */
     sweepExpired(at = null, txh) {
-      const cutoff = at === null || at === undefined ? storeNowMs() : Date.parse(toIso(at));
-      if (!Number.isFinite(cutoff)) {
-        throw new ApiError('VALIDATION_FAILED', 'The sweep instant must be a timestamp.');
-      }
+      // One rule for both adapters (store.js): Postgres read "yesterday" as a real instant.
+      const cutoff = at === null || at === undefined ? storeNowMs() : assertSweepInstant(at);
       return write(txh, (st) => {
         let removed = 0;
         for (const [k, row] of st.preAuthConsent) {
@@ -1145,6 +1179,11 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
 
     markPublished(eventIds, at, txh) {
+      // A relay poll that claimed nothing publishes nothing, and that is the quiet normal case,
+      // not an error. The Postgres adapter has said so since it was written; this one threw
+      // `eventIds is not iterable` — so the two adapters answered an idle relay differently and
+      // only one of them was running in production.
+      if (!eventIds?.length) return Promise.resolve();
       return write(txh, (st) => {
         const ts = toIso(at) ?? nowIso();
         for (const id of eventIds) {
@@ -1261,10 +1300,8 @@ export function createMemoryStore(config = {}, deps = {}) {
      * @returns {Promise<number>} rows deleted, so a janitor can log or gauge it.
      */
     sweepExpired(at = null, txh) {
-      const cutoff = at === null || at === undefined ? storeNowMs() : Date.parse(toIso(at));
-      if (!Number.isFinite(cutoff)) {
-        throw new ApiError('VALIDATION_FAILED', 'The sweep instant must be a timestamp.');
-      }
+      // One rule for both adapters (store.js): Postgres read "yesterday" as a real instant.
+      const cutoff = at === null || at === undefined ? storeNowMs() : assertSweepInstant(at);
       return write(txh, (st) => {
         let removed = 0;
         for (const [k, row] of st.idempotency) {

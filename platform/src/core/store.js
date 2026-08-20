@@ -141,6 +141,12 @@ import { ApiError } from './errors.js';
  * different wrong answers to one bad argument; this is the single right one.
  */
 export function assertStorable(value, what) {
+  // EQUIVALENT MUTANT (mutatetest, 2026-08-20). Deleting this line changes no behaviour and no
+  // test can kill it: `structuredClone(null)` and `structuredClone(undefined)` both succeed and
+  // return their argument, so the try/catch below reaches the same `return value`. Measured:
+  // `structuredClone(null) === null`, `structuredClone(undefined) === undefined`. It stays
+  // because it says the rule — null and undefined ARE storable — rather than leaving the reader
+  // to work that out from the clone algorithm. `storetest.mjs` asserts the rule instead.
   if (value === undefined || value === null) return value;
   try {
     structuredClone(value);
@@ -199,6 +205,34 @@ export function assertExpectedVersion(expectedVersion) {
     });
   }
   return expectedVersion;
+}
+
+/**
+ * The instant a retention sweep runs at, as epoch milliseconds.  http-api.md §8, §3a.3.
+ *
+ * Shared, because the two adapters answered a malformed instant differently and both answers
+ * were wrong in a way nothing could see. `sweepExpired('banana')` raised VALIDATION_FAILED on
+ * memory and INTERNAL_ERROR on Postgres (22007 is not in the driver-error table) — and
+ * `sweepExpired('yesterday')` was refused on memory and SILENTLY HONOURED on Postgres, because
+ * `timestamptz` parses it. A sweep is a DELETE across a whole table; an instant the two
+ * adapters read differently is a retention policy that means one thing in tests and another in
+ * production, with the row count as the only evidence and nobody reading it.
+ *
+ * `null`/`undefined` are not malformed: they mean "the store's own clock", which is what every
+ * janitor passes. Only a value that was MEANT to be an instant and is not one throws.
+ */
+export function assertSweepInstant(at) {
+  const ms = at instanceof Date ? at.getTime()
+    : typeof at === 'number' ? at
+      : typeof at === 'string' ? Date.parse(at)
+        : Number.NaN;
+  if (!Number.isFinite(ms)) {
+    throw new ApiError('VALIDATION_FAILED', 'The sweep instant must be a timestamp.', {
+      details: { fields: [{ key: 'at', path: 'at', reason: 'timestamp', rule: 'timestamp',
+        got: typeof at === 'string' ? at.slice(0, 32) : typeof at }] },
+    });
+  }
+  return ms;
 }
 
 /** Career counters (db-schema.md §3). Anything not listed is not a stat, and a typo must not be swallowed. */

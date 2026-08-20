@@ -17,12 +17,16 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createMemoryStore } from '../src/core/store/memory.js';
-import { createPostgresStore } from '../src/core/store/postgres.js';
+import { createPostgresStore, TABLE_COLUMNS } from '../src/core/store/postgres.js';
 import {
   loadMigrations, planMigrations, runMigrations, MIGRATIONS_DIR,
 } from '../src/core/migrate.js';
 import { ulid } from '../src/core/ids.js';
-import { INITIAL_SETTINGS_VERSION } from '../src/core/store.js';
+import {
+  INITIAL_SETTINGS_VERSION, createStore,
+  assertStorable, toStoredMatchStatus, STORED_MATCH_STATUSES,
+  matchOutcomeProblems, terminalResultProblems, nestedResultProblems, submittableResultProblems,
+} from '../src/core/store.js';
 
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
@@ -48,6 +52,29 @@ async function expectOk(name, fn) {
   } catch (err) {
     bad(name, `threw ${err?.code ?? ''} ${err?.message ?? err}`);
   }
+}
+
+/**
+ * Assert that a SPECIFIC problem is reported — the path and the rule, never `length > 0`.
+ *
+ * `problems.length > 0` is satisfied by whichever single check happens to fire first, so one
+ * surviving guard makes every other guard in the same function untestable: delete any of the
+ * other twenty and the assertion still passes. Naming the path and the rule is what makes the
+ * check able to notice the guard it is about going away.
+ */
+/** errors.md §3 says `{path, rule}`; the older callers read `{key, reason}`. Both are emitted. */
+const reports = (problems, path, rule) =>
+  problems.some((p) => (p.path ?? p.key) === path && (p.rule ?? p.reason) === rule);
+
+function problemAt(name, problems, path, rule) {
+  check(name, reports(problems, path, rule),
+    `no {path: ${path}, rule: ${rule}} in ${JSON.stringify(problems)}`);
+}
+
+/** The other half: this path/rule must NOT be reported. */
+function noProblemAt(name, problems, path, rule) {
+  check(name, !reports(problems, path, rule),
+    `{path: ${path}, rule: ${rule}} was reported: ${JSON.stringify(problems)}`);
 }
 
 /**
@@ -1365,6 +1392,814 @@ async function testConformance(store, tag) {
     `damageDealt=${reversed.damageDealt}`);
 }
 
+// ---------------------------------------------------------------------------------------
+// 9. The §4.1/§4.2 result shape, function by function.
+//
+// `core/store.js` decides these once for both adapters, and the endpoint that holds a match
+// server to them (`profile/stats.js` `assertSubmittableResult`) calls straight through. Every
+// check below therefore calls the exported rule itself and asserts the SPECIFIC problem — the
+// path and the rule — because `problems.length > 0` is satisfied by whichever guard happens to
+// fire first, which makes every other guard in the same function untestable.
+//
+// A mutation sweep put a number on that: 22 of the 31 guards that survived deletion in this
+// file were `problems.push(...)` lines inside these functions, and the suite was green with
+// each of them removed.
+// ---------------------------------------------------------------------------------------
+
+/** A §4.1 player row with every key the shape declares, all of them well-formed. */
+function submissionPlayer(accountId, team, over = {}) {
+  return {
+    accountId,
+    displayName: `p_${accountId.slice(-4)}`,
+    team,
+    role: team === 'alpha' ? 'attacker' : 'defender',
+    kills: 10, deaths: 4, assists: 2, suicides: 0, teamKills: 0, headshots: 3,
+    shotsFired: 90, shotsHit: 30, damageDealt: 1400,
+    plants: 1, defuses: 0, roundsPlayed: 12, timePlayedSec: 600,
+    score: 1200,
+    disconnected: false, abandoned: false,
+    joinedAt: iso(-600e3), leftAt: null,
+    weapons: { ar_default: { shots: 90, hits: 30, kills: 8, headshots: 3 } },
+    ...over,
+  };
+}
+
+/**
+ * A complete `ResultSubmission` (match-result.md §5.1): every required top-level field, the
+ * §4.0 matrix satisfied, and every nested §4.1 shape well-formed.
+ *
+ * `newResult` above is deliberately NOT this: it satisfies the top-level §4.2 check the storage
+ * door runs and nothing more, so it cannot serve as the control for the nested rules — a
+ * fixture that already has problems makes "this input has a problem" meaningless.
+ */
+function newSubmission(alpha, bravo, over = {}) {
+  return {
+    matchId: ulid(),
+    status: 'completed',
+    mode: 'bomb',
+    mapId: 'the-square', mapVersion: '1.0.0', region: 'yyz',
+    rulesetVersion: 'bomb-1.0.0', statDefinitionVersion: '1.0.0', serverBuild: 'storetest',
+    terminationReason: 'completed', outcomeReason: 'defuse',
+    invalidationReason: null, winnerTeam: 'alpha',
+    rulesSnapshot: {
+      killLimit: null,
+      roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, roundLengthSec: 115,
+      bombTimerSec: 40, defuseSec: 5, plantSec: 3, freezeSec: 10,
+      overtime: false,
+    },
+    teamScores: { alpha: 7, bravo: 5 },
+    rounds: [{
+      index: 0, winner: 'alpha', reason: 'defuse',
+      startedAt: iso(-600e3), endedAt: iso(-500e3),
+      roles: { alpha: 'attacker', bravo: 'defender' },
+      plant: { accountId: bravo, site: 'A', at: iso(-550e3) },
+      defuse: { accountId: alpha, at: iso(-520e3) },
+    }],
+    roster: [
+      { accountId: alpha, team: 'alpha', joinedAt: iso(-600e3), leftAt: null },
+      { accountId: bravo, team: 'bravo', joinedAt: iso(-600e3), leftAt: null },
+    ],
+    players: [submissionPlayer(alpha, 'alpha'), submissionPlayer(bravo, 'bravo')],
+    evidenceRef: 'ev-1',
+    startedAt: iso(-600e3), endedAt: iso(),
+    ...over,
+  };
+}
+
+async function testResultShapeRules() {
+  console.log('\n=========== STORE — the §4.1/§4.2 result shape ===========');
+
+  const A = ulid();
+  const B = ulid();
+
+  // CONTROL FIRST, and it is the control the whole section rests on: a complete submission has
+  // NO problems at all. Without it every "this is reported" check below is satisfied by a
+  // function that reports something about everything.
+  const clean = submittableResultProblems(newSubmission(A, B));
+  check('control: a complete §5.1 submission has no problems at all',
+    clean.length === 0, JSON.stringify(clean));
+
+  // --- the argument itself ---------------------------------------------------------------
+  for (const [name, value] of [['null', null], ['a string', 'result'], ['an array', []]]) {
+    problemAt(`terminalResultProblems reports ${name} as the wrong type`,
+      terminalResultProblems(value), 'result', 'type');
+    problemAt(`nestedResultProblems reports ${name} as the wrong type`,
+      nestedResultProblems(value), 'result', 'type');
+  }
+
+  // --- players[] -------------------------------------------------------------------------
+  const withPlayer = (over) => {
+    const r = newSubmission(A, B);
+    r.players[0] = submissionPlayer(A, 'alpha', over);
+    return nestedResultProblems(r);
+  };
+  problemAt('a non-integer score is reported at players[0].score',
+    withPlayer({ score: '1200' }), 'players[0].score', 'integer');
+  // §2's penalties make a per-match score legitimately negative — it is the one number here
+  // that is not a count, so the control has to prove the rule is `integer` and not `count`.
+  noProblemAt('control: a negative score is legal and is not reported',
+    withPlayer({ score: -50 }), 'players[0].score', 'integer');
+  problemAt('a joinedAt that Date.parse cannot read is reported at players[0].joinedAt',
+    withPlayer({ joinedAt: 'yesterday' }), 'players[0].joinedAt', 'timestamp');
+  problemAt('an absent joinedAt is reported at players[0].joinedAt',
+    withPlayer({ joinedAt: undefined }), 'players[0].joinedAt', 'timestamp');
+  problemAt('a player that is not an object is reported at its own index',
+    nestedResultProblems({ ...newSubmission(A, B), players: ['nope'] }), 'players[0]', 'type');
+  // Absent is not null here either: a player row with no `leftAt` KEY is a producer that
+  // forgot, and defaulting it to null records that they played to the end.
+  const noLeftAt = newSubmission(A, B);
+  delete noLeftAt.players[0].leftAt;
+  problemAt('a player with no leftAt KEY is reported as required',
+    nestedResultProblems(noLeftAt), 'players[0].leftAt', 'required');
+  noProblemAt('control: an explicit null leftAt on a player is legal',
+    withPlayer({ leftAt: null }), 'players[0].leftAt', 'required');
+  problemAt('control: a leftAt that is present but unreadable is reported as a timestamp',
+    withPlayer({ leftAt: 'when they left' }), 'players[0].leftAt', 'timestamp');
+
+  // --- players[].weapons{} ---------------------------------------------------------------
+  problemAt('a weapons map that is not an object is reported at players[0].weapons',
+    withPlayer({ weapons: 'ar_default' }), 'players[0].weapons', 'type');
+  // The weapon id becomes a storage key in `player_weapon_stats`, so it is constrained like one.
+  problemAt('a weapon id with a space in it is reported as malformed',
+    withPlayer({ weapons: { 'ar default': { shots: 1, hits: 1, kills: 0, headshots: 0 } } }),
+    'players[0].weapons.ar default', 'malformed-weapon-id');
+  problemAt('a weapon id carrying a quote is reported as malformed',
+    withPlayer({ weapons: { "ar'; drop": { shots: 1, hits: 1, kills: 0, headshots: 0 } } }),
+    "players[0].weapons.ar'; drop", 'malformed-weapon-id');
+  noProblemAt('control: a dotted, dashed, colonned id is a legal weapon id',
+    withPlayer({ weapons: { 'ar.vector-2:mk3': { shots: 1, hits: 1, kills: 0, headshots: 0 } } }),
+    'players[0].weapons.ar.vector-2:mk3', 'malformed-weapon-id');
+
+  // --- roster[] --------------------------------------------------------------------------
+  const withRoster = (entry) => {
+    const r = newSubmission(A, B);
+    r.roster[0] = entry;
+    return nestedResultProblems(r);
+  };
+  problemAt('a roster entry that is not an object is reported at its own index',
+    withRoster('nope'), 'roster[0]', 'type');
+  problemAt('a roster entry with no accountId is reported as required',
+    withRoster({ team: 'alpha', joinedAt: iso(-600e3), leftAt: null }),
+    'roster[0].accountId', 'required');
+  problemAt('a roster accountId that is the empty string is reported as required',
+    withRoster({ accountId: '', team: 'alpha', joinedAt: iso(-600e3), leftAt: null }),
+    'roster[0].accountId', 'required');
+  noProblemAt('control: a roster entry with a real accountId is not reported',
+    withRoster({ accountId: A, team: 'alpha', joinedAt: iso(-600e3), leftAt: null }),
+    'roster[0].accountId', 'required');
+  problemAt('a roster joinedAt that is not a timestamp is reported',
+    withRoster({ accountId: A, team: 'alpha', joinedAt: 0, leftAt: null }),
+    'roster[0].joinedAt', 'timestamp');
+  // Absent is not null: an omitted key is a producer that forgot, and defaulting it invents a
+  // fact about when the player left.
+  problemAt('a roster entry with no leftAt KEY is reported as required',
+    withRoster({ accountId: A, team: 'alpha', joinedAt: iso(-600e3) }),
+    'roster[0].leftAt', 'required');
+  noProblemAt('control: an explicit null leftAt is legal',
+    withRoster({ accountId: A, team: 'alpha', joinedAt: iso(-600e3), leftAt: null }),
+    'roster[0].leftAt', 'required');
+
+  // --- duplicate account ids -------------------------------------------------------------
+  // (match_id, account_id) is the primary key of match_participants, so a duplicate is a
+  // malformed result rather than a last-writer-wins merge.
+  const dupPlayers = newSubmission(A, B);
+  dupPlayers.players[1] = submissionPlayer(A, 'bravo');
+  problemAt('the same account twice in players[] is reported as a duplicate',
+    nestedResultProblems(dupPlayers), 'players[1].accountId', 'duplicate');
+  const dupRoster = newSubmission(A, B);
+  dupRoster.roster[1] = { accountId: A, team: 'bravo', joinedAt: iso(-600e3), leftAt: null };
+  problemAt('the same account twice in roster[] is reported as a duplicate',
+    nestedResultProblems(dupRoster), 'roster[1].accountId', 'duplicate');
+  // …and the duplicate check must not fire on the ABSENCE of an id. Two players who both
+  // forgot `accountId` are two `required` problems, not a duplicate: reporting them as one
+  // account submitted twice sends the producer looking for a roster bug it does not have.
+  const noIds = newSubmission(A, B);
+  noIds.players = [submissionPlayer(A, 'alpha', { accountId: undefined }),
+    submissionPlayer(B, 'bravo', { accountId: undefined })];
+  const noIdProblems = nestedResultProblems(noIds);
+  noProblemAt('two players with no accountId are not reported as duplicates of each other',
+    noIdProblems, 'players[1].accountId', 'duplicate');
+  problemAt('control: they are reported as missing an accountId',
+    noIdProblems, 'players[1].accountId', 'required');
+
+  // --- rounds[] --------------------------------------------------------------------------
+  // `drop` REMOVES the key rather than setting it to undefined: `{...round, defuse: undefined}`
+  // still has an own `defuse`, so `Object.hasOwn` is true and the "the producer forgot this
+  // key entirely" case — which is the one the required-check exists for — is never reached.
+  const withRound = (over, drop = []) => {
+    const r = newSubmission(A, B);
+    r.rounds[0] = { ...r.rounds[0], ...over };
+    for (const k of drop) delete r.rounds[0][k];
+    return nestedResultProblems(r);
+  };
+  problemAt('a round that is not an object is reported at its own index',
+    nestedResultProblems({ ...newSubmission(A, B), rounds: ['nope'] }), 'rounds[0]', 'type');
+  problemAt('a round winner outside the team enum is reported',
+    withRound({ winner: 'draw' }), 'rounds[0].winner', 'enum');
+  noProblemAt('control: a round won by bravo is legal',
+    withRound({ winner: 'bravo' }), 'rounds[0].winner', 'enum');
+
+  // --- rounds[].plant / .defuse: the objective ACTOR record ------------------------------
+  problemAt('a round with no defuse KEY at all is reported as required',
+    withRound({}, ['defuse']), 'rounds[0].defuse', 'required');
+  problemAt('a round with no plant KEY at all is reported as required',
+    withRound({}, ['plant']), 'rounds[0].plant', 'required');
+  problemAt('a plant that is not an object is reported',
+    withRound({ plant: 'site A' }), 'rounds[0].plant', 'type');
+  problemAt('a plant with no planter is reported at plant.accountId',
+    withRound({ plant: { site: 'A', at: iso(-550e3) } }), 'rounds[0].plant.accountId', 'required');
+  problemAt('a plant with no readable instant is reported at plant.at',
+    withRound({ plant: { accountId: B, site: 'A', at: 'during the round' } }),
+    'rounds[0].plant.at', 'timestamp');
+  problemAt('a plant at a site outside the enum is reported',
+    withRound({ plant: { accountId: B, site: 'C', at: iso(-550e3) } }),
+    'rounds[0].plant.site', 'enum');
+  // An explicit null is the "nobody planted" record and must produce nothing at all — the
+  // guard that says so is one line, and without this check deleting it is invisible.
+  const noObjective = withRound({ plant: null, defuse: null });
+  noProblemAt('an explicitly null plant is not reported as the wrong type',
+    noObjective, 'rounds[0].plant', 'type');
+  noProblemAt('an explicitly null defuse is not reported as the wrong type',
+    noObjective, 'rounds[0].defuse', 'type');
+  check('control: a round with no objective at all is otherwise clean',
+    noObjective.length === 0, JSON.stringify(noObjective));
+
+  // --- rulesSnapshot ---------------------------------------------------------------------
+  const withRules = (over) => nestedResultProblems({
+    ...newSubmission(A, B),
+    rulesSnapshot: { ...newSubmission(A, B).rulesSnapshot, ...over },
+  });
+  problemAt('a non-boolean overtime is reported at rulesSnapshot.overtime',
+    withRules({ overtime: 'yes' }), 'rulesSnapshot.overtime', 'boolean');
+  noProblemAt('control: overtime true is accepted',
+    withRules({ overtime: true }), 'rulesSnapshot.overtime', 'boolean');
+
+  // --- the §4.0 matrix, per row -----------------------------------------------------------
+  //
+  // A forfeit or an abandon is an ABORTED match WITH a winner (§4.2, wire-protocol §8.9): the
+  // player who quit still lost. `winnerTeam: null` there is the case that has to be reported
+  // on its own, because the obvious probe — `winnerTeam: 'draw'` — is also caught by the
+  // draw-implies-timer rule and so proves nothing about this one.
+  for (const reason of ['forfeit', 'abandon']) {
+    problemAt(`an aborted ${reason} with no winner is reported at winnerTeam`,
+      matchOutcomeProblems({ status: 'aborted', outcomeReason: reason, winnerTeam: null }),
+      'winnerTeam', 'enum');
+    const legal = matchOutcomeProblems({
+      status: 'aborted', terminationReason: 'aborted', outcomeReason: reason, winnerTeam: 'bravo',
+      invalidationReason: null,
+    });
+    check(`control: an aborted ${reason} WITH a winner satisfies the matrix`,
+      legal.length === 0, JSON.stringify(legal));
+  }
+
+  // --- stored match statuses --------------------------------------------------------------
+  //
+  // `pending` is a RESPONSE status that collapses to `allocated`; anything outside the stored
+  // set is a caller inventing a lifecycle state, and letting it through writes a status the
+  // table's check constraint does not have.
+  check('control: pending is stored as allocated', toStoredMatchStatus('pending') === 'allocated',
+    toStoredMatchStatus('pending'));
+  for (const stored of STORED_MATCH_STATUSES) {
+    check(`control: ${stored} is stored as itself`, toStoredMatchStatus(stored) === stored,
+      toStoredMatchStatus(stored));
+  }
+  for (const junk of ['finished', 'PENDING', '', 'completed ', 'in_progress']) {
+    let code = null;
+    try { toStoredMatchStatus(junk); } catch (err) { code = err?.code; }
+    check(`the status ${JSON.stringify(junk)} is refused`, code === 'VALIDATION_FAILED',
+      `it answered ${code === null ? toStoredMatchStatus(junk) : code}`);
+  }
+
+  // --- assertStorable's fast path ---------------------------------------------------------
+  //
+  // MEASURED, not assumed: `structuredClone(null)` and `structuredClone(undefined)` both
+  // succeed, so the early return in `assertStorable` is a shortcut and not a rule. Deleting it
+  // is an EQUIVALENT MUTANT and no test can kill it — see the comment at store.js:144. What is
+  // checkable is the contract the shortcut states: a null is storable and comes back as null.
+  check('a null is storable and is handed straight back',
+    assertStorable(null, 'probe') === null, 'assertStorable changed a null');
+  check('an undefined is storable and is handed straight back',
+    assertStorable(undefined, 'probe') === undefined, 'assertStorable changed an undefined');
+  let symCode = null;
+  try { assertStorable(Symbol('x'), 'probe'); } catch (err) { symCode = err?.code; }
+  check('control: a Symbol is not storable', symCode === 'VALIDATION_FAILED', `got ${symCode}`);
+}
+
+// ---------------------------------------------------------------------------------------
+// 10. The adapter registry. `createStore` is the only thing that may import an adapter, so it
+// is the only place a config typo can silently become the wrong storage engine.
+// ---------------------------------------------------------------------------------------
+async function testAdapterRegistry() {
+  console.log('\n=========== STORE — the adapter registry ===========');
+
+  const memStore = await createStore({ storage: 'memory' }, {});
+  check('createStore({storage: memory}) builds the memory adapter', memStore.kind === 'memory',
+    `it built ${memStore.kind}`);
+  await memStore.close();
+
+  // No database: a pool that answers nothing is enough to prove which adapter was CHOSEN, which
+  // is the only thing this function decides. `pg` is stubbed out so a missed `deps.pool` fails
+  // loudly rather than dialling a real server.
+  const pool = {
+    async query() { return { rows: [], rowCount: 0 }; },
+    async connect() { return { query: async () => ({ rows: [] }), release() {} }; },
+    on() {}, async end() {},
+  };
+  const pgChosen = await createStore(
+    { storage: 'postgres', databaseUrl: 'postgres://storetest/registry' },
+    { pool, pg: { Pool: function FakePool() { throw new Error('storetest: the fake pool was bypassed'); } } });
+  check('createStore({storage: postgres}) builds the Postgres adapter', pgChosen.kind === 'postgres',
+    `it built ${pgChosen.kind}`);
+  await pgChosen.close();
+
+  for (const storage of ['sqlite', 'Postgres', '', undefined]) {
+    let message = null;
+    try { await createStore({ storage }, {}); } catch (err) { message = err.message; }
+    check(`storage=${JSON.stringify(storage)} is refused by name`,
+      /unknown storage adapter/.test(message ?? ''), `it answered ${message}`);
+  }
+
+  // The Postgres adapter refuses to exist without a connection string rather than building a
+  // pool that dials `localhost` — which is what an unset DATABASE_URL in production looks like.
+  let noUrl = null;
+  const savedUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  try {
+    await createStore({ storage: 'postgres' }, { pool });
+  } catch (err) { noUrl = err.message; } finally {
+    if (savedUrl !== undefined) process.env.DATABASE_URL = savedUrl;
+  }
+  check('the Postgres adapter refuses to build with no DATABASE_URL',
+    /DATABASE_URL is required/.test(noUrl ?? ''), `it answered ${noUrl}`);
+}
+
+// ---------------------------------------------------------------------------------------
+// 11. The memory adapter's own internals: timestamp normalisation and the closed-store gate.
+// Neither is reachable through the shared conformance suite — the first because Postgres
+// normalises in the driver, the second because closing the shared store would end the run.
+// ---------------------------------------------------------------------------------------
+async function testMemoryInternals() {
+  console.log('\n[memory] timestamps cross the interface as ISO strings');
+
+  const acct = newAccount();
+  await mem.accounts.create(acct);
+  const sessionId = ulid();
+  await mem.sessions.create({ sessionId, accountId: acct.accountId, refreshFamilyId: ulid() });
+
+  // `pg` accepts a Date and epoch ms; this adapter has to accept the same three shapes or code
+  // written against one breaks against the other.
+  const epochMs = Date.parse('2026-02-03T04:05:06.000Z');
+  await mem.sessions.touch(sessionId, epochMs);
+  check('epoch milliseconds are normalised to an ISO string',
+    (await mem.sessions.byId(sessionId)).lastSeenAt === '2026-02-03T04:05:06.000Z',
+    JSON.stringify((await mem.sessions.byId(sessionId)).lastSeenAt));
+  await mem.sessions.touch(sessionId, new Date('2026-02-04T00:00:00.000Z'));
+  check('a Date is normalised to an ISO string',
+    (await mem.sessions.byId(sessionId)).lastSeenAt === '2026-02-04T00:00:00.000Z',
+    JSON.stringify((await mem.sessions.byId(sessionId)).lastSeenAt));
+  await mem.sessions.touch(sessionId, '2026-02-05T00:00:00.000Z');
+  check('control: an ISO string is kept as it is',
+    (await mem.sessions.byId(sessionId)).lastSeenAt === '2026-02-05T00:00:00.000Z',
+    JSON.stringify((await mem.sessions.byId(sessionId)).lastSeenAt));
+  await throwsCode('a timestamp that is none of the three shapes is refused', 'VALIDATION_FAILED',
+    () => mem.sessions.touch(sessionId, { at: 'now' }));
+
+  // The store's injected clock, in every shape it may hand back. `storeNowMs` is what every TTL
+  // in this adapter compares against, so a clock shape it mishandles silently disables expiry.
+  const at = Date.parse('2026-06-01T00:00:00.000Z');
+  for (const [shape, now] of [
+    ['a Date', () => new Date(at)],
+    ['epoch ms', () => at],
+    ['an ISO string', () => new Date(at).toISOString()],
+  ]) {
+    const clocked = createMemoryStore({ storage: 'memory' }, { now });
+    const sid = ulid();
+    await clocked.preAuthConsent.put({
+      clientSessionId: sid, telemetryPersonal: true, policyVersion: 1,
+      expiresAt: new Date(at - 1000).toISOString(),
+    });
+    check(`a decision already expired against ${shape} reads as absent`,
+      (await clocked.preAuthConsent.get(sid)) === null, 'the expired decision was returned');
+    const liveSid = ulid();
+    await clocked.preAuthConsent.put({
+      clientSessionId: liveSid, telemetryPersonal: true, policyVersion: 1,
+      expiresAt: new Date(at + 86_400_000).toISOString(),
+    });
+    check(`control: an unexpired decision against ${shape} is returned`,
+      (await clocked.preAuthConsent.get(liveSid))?.telemetryPersonal === true,
+      'the live decision was swept too');
+    await clocked.close();
+  }
+
+  // A handle from ANOTHER store instance carries the same module-level tag symbol but belongs
+  // to a different state, so the tag alone is not identity.
+  const peer = createMemoryStore({ storage: 'memory' }, {});
+  let peerHandle = null;
+  await peer.tx(async (t) => { peerHandle = t; });
+  await throwsCode('a handle from another store instance is refused', 'INTERNAL_ERROR',
+    () => mem.accounts.byId(acct.accountId, peerHandle));
+  await peer.close();
+}
+
+/**
+ * `close()` is a state, not a courtesy: a store that keeps answering after it is closed hands
+ * back rows from a state nothing will ever publish again.
+ */
+async function testClosedStore() {
+  console.log('\n[memory] a closed store answers SERVICE_UNAVAILABLE');
+  const store = createMemoryStore({ storage: 'memory' }, {});
+  const acct = newAccount();
+  await store.accounts.create(acct);
+  // CONTROL: it works before the close, so the refusals below are about the close.
+  check('control: an open store reads the row it wrote',
+    (await store.accounts.byId(acct.accountId))?.accountId === acct.accountId, 'the open store is broken');
+  check('control: an open store reports healthy', (await store.health()).ok === true, 'health is false while open');
+
+  await store.close();
+  for (const [name, call] of [
+    ['a read', () => store.accounts.byId(acct.accountId)],
+    ['a write', () => store.accounts.create(newAccount())],
+    ['a transaction', () => store.tx(async () => 1)],
+  ]) {
+    await throwsCode(`${name} on a closed store is SERVICE_UNAVAILABLE`, 'SERVICE_UNAVAILABLE', call);
+  }
+  check('a closed store reports unhealthy', (await store.health()).ok === false,
+    'a closed store still reports healthy');
+}
+
+// ---------------------------------------------------------------------------------------
+// 12. Transaction handles, on both adapters.
+//
+// The handle is the only thing standing between a caller and somebody else's transaction — on
+// Postgres it names a pooled connection on which `commit` and `rollback` are one call away.
+// ---------------------------------------------------------------------------------------
+async function testHandles(store, tag) {
+  console.log(`\n[${tag}] transaction handles`);
+
+  let real = null;
+  await store.tx(async (t) => { real = t; });
+
+  for (const [name, value] of [['a plain object', {}], ['an array', []], ['a string', 'tx']]) {
+    await throwsCode(`${name} is not a transaction handle`, 'INTERNAL_ERROR',
+      () => store.accounts.byId(ulid(), value));
+  }
+
+  // The tag alone is not identity. The symbol is reachable from a real handle, so a caller who
+  // wants one can have one — what they cannot have is the state it refers to, which lives in a
+  // WeakMap keyed by the handle rather than on it.
+  const [tagSymbol] = Object.getOwnPropertySymbols(real);
+  check('control: the handle carries exactly one own symbol and no own keys',
+    tagSymbol !== undefined && Object.keys(real).length === 0,
+    `symbols=${Object.getOwnPropertySymbols(real).length} keys=${Object.keys(real).length}`);
+  await throwsCode('a forged handle carrying the tag symbol is refused', 'INTERNAL_ERROR',
+    () => store.accounts.byId(ulid(), Object.freeze({ [tagSymbol]: true })));
+  await throwsCode('a handle whose transaction has ended is refused', 'INTERNAL_ERROR',
+    () => store.accounts.byId(ulid(), real));
+
+  // --- the EXPLICIT handle wins over the ambient context --------------------------------
+  //
+  // Rule 4 of the interface: passing the handle enrols the call in that transaction. The only
+  // way to prove the explicit handle is what decided — rather than the ambient transaction the
+  // call happens to be written inside — is to use it from OUTSIDE that transaction's async
+  // context, where the ambient answer is "no transaction" and the two differ.
+  const staged = newAccount();
+  let handle = null;
+  let ready = null;
+  let release = null;
+  const readyP = new Promise((r) => { ready = r; });
+  const gate = new Promise((r) => { release = r; });
+  const running = store.tx(async (t) => {
+    await store.accounts.create(staged, t);
+    handle = t;
+    ready();
+    await gate;
+  });
+  await readyP;
+  const byHandle = await withTimeout(store.accounts.byId(staged.accountId, handle), 4000,
+    'a read on an explicit handle from outside the transaction');
+  const byNothing = await store.accounts.byId(staged.accountId);
+  release();
+  await running;
+
+  check('a read given the handle sees that transaction\'s uncommitted write',
+    byHandle?.accountId === staged.accountId,
+    'the explicit handle was ignored and the read fell through to the committed state');
+  check('control: the same read WITHOUT the handle does not see it',
+    byNothing === null,
+    'the write was visible outside its transaction, so the check above proves nothing');
+  check('control: it is visible to everyone once the transaction commits',
+    (await store.accounts.byId(staged.accountId))?.accountId === staged.accountId,
+    'the transaction did not commit');
+}
+
+// ---------------------------------------------------------------------------------------
+// 13. A primary key is not up for grabs — on both adapters.
+//
+// Every one of these is a unique constraint or a foreign key the schema declares. The memory
+// adapter has to enforce them itself, and an adapter that shrugs at a duplicate is one that
+// silently overwrites a row Postgres would have refused.
+// ---------------------------------------------------------------------------------------
+async function testKeyCollisions(store, tag) {
+  console.log(`\n[${tag}] declared keys and foreign keys`);
+
+  const acct = newAccount();
+  await store.accounts.create(acct);
+
+  await throwsCode('an account id that already exists is CONFLICT', 'CONFLICT',
+    () => store.accounts.create({ ...newAccount(), accountId: acct.accountId }));
+  await throwsCode('an email hash that already exists is CONFLICT', 'CONFLICT',
+    () => store.accounts.create({ ...newAccount(), emailHash: acct.emailHash }));
+  // CONTROL: a fresh account still lands, so the two refusals are about the collision.
+  const fresh = newAccount();
+  await expectOk('control: an account with fresh identifiers is created',
+    () => store.accounts.create(fresh));
+
+  // A null email hash is "identity is delegated to the provider" (migration 0008), not a value:
+  // many accounts may have one, and a lookup for null must not hand back an arbitrary one.
+  const noEmail = { accountId: ulid(), displayName: `p_${ulid().slice(-8)}` };
+  noEmail.displayNameFolded = fold(noEmail.displayName);
+  await store.accounts.create(noEmail);
+  check('byEmailHash(null) is not a wildcard for every account without one',
+    (await store.accounts.byEmailHash(null)) === null,
+    'a null hash matched an account whose email hash is null');
+  check('byEmailHash(undefined) is not a wildcard either',
+    (await store.accounts.byEmailHash(undefined)) === null, 'an undefined hash matched a row');
+  check('control: byEmailHash still finds an account that does have one',
+    (await store.accounts.byEmailHash(acct.emailHash))?.accountId === acct.accountId,
+    'the lookup answers null for everything');
+
+  // --- accounts.update: the immutable column and the unique one ------------------------
+  await throwsCode('a patch that renames accountId is refused', 'VALIDATION_FAILED',
+    () => store.accounts.update(acct.accountId, { accountId: ulid() }));
+  await expectOk('control: a patch naming the SAME accountId is a no-op, not an error',
+    () => store.accounts.update(acct.accountId, { accountId: acct.accountId, status: 'active' }));
+  // An empty patch is a NO-OP that returns the account, not a report that it does not exist.
+  // Postgres built `update accounts set  where …`, got nothing back, and read the empty result
+  // as "no such account" — so an empty PATCH body answered 404 on the adapter that ships and
+  // 200 on the one every test runs against.
+  const noop = await store.accounts.update(acct.accountId, {});
+  check('a patch with nothing in it returns the account unchanged',
+    noop?.accountId === acct.accountId && noop.status === (await store.accounts.byId(acct.accountId)).status,
+    JSON.stringify(noop));
+  await throwsCode('control: an empty patch for an account that does not exist is still NOT_FOUND',
+    'NOT_FOUND', () => store.accounts.update(ulid(), {}));
+
+  // `privacy` is NOT NULL DEFAULT '{}' (0001). Clearing it is `{}`; a null is a caller who
+  // means something the column cannot hold.
+  await throwsCode('a null privacy is refused', 'VALIDATION_FAILED',
+    () => store.accounts.update(acct.accountId, { privacy: null }));
+  const clearedPrivacy = await store.accounts.update(acct.accountId, { privacy: {} });
+  check('control: an empty object clears privacy',
+    clearedPrivacy.privacy !== null && Object.keys(clearedPrivacy.privacy).length === 0,
+    JSON.stringify(clearedPrivacy.privacy));
+
+  await throwsCode('updating to an email hash another account holds is CONFLICT', 'CONFLICT',
+    () => store.accounts.update(acct.accountId, { emailHash: fresh.emailHash }));
+  const rehashed = await store.accounts.update(acct.accountId, { emailHash: `h_${ulid()}` });
+  check('control: updating to an unused email hash is accepted',
+    rehashed.emailHash.startsWith('h_'), JSON.stringify(rehashed.emailHash));
+
+  // --- sessions and refresh tokens ------------------------------------------------------
+  const sessionId = ulid();
+  const familyId = ulid();
+  await store.sessions.create({ sessionId, accountId: acct.accountId, refreshFamilyId: familyId });
+  await throwsCode('a session id that already exists is CONFLICT', 'CONFLICT',
+    () => store.sessions.create({ sessionId, accountId: acct.accountId, refreshFamilyId: ulid() }));
+
+  const tokenId = ulid();
+  const token = { tokenId, familyId, accountId: acct.accountId, sessionId, expiresAt: iso(86400e3) };
+  await store.refreshTokens.create(token);
+  await throwsCode('a refresh token id that already exists is CONFLICT', 'CONFLICT',
+    () => store.refreshTokens.create({ ...token, familyId: ulid() }));
+  await throwsCode('a refresh token for a session that does not exist is NOT_FOUND', 'NOT_FOUND',
+    () => store.refreshTokens.create({ ...token, tokenId: ulid(), sessionId: ulid() }));
+  await expectOk('control: a second token on the same session is fine',
+    () => store.refreshTokens.create({ ...token, tokenId: ulid() }));
+
+  // Revocation is never re-stamped: the FIRST revocation is the one that explains what happened,
+  // and a retry that overwrote its reason would erase the only record of why.
+  await store.sessions.revoke(sessionId, 'password-changed', iso(-60_000));
+  await store.sessions.revoke(sessionId, 'user-logout', iso());
+  const revoked = await store.sessions.byId(sessionId);
+  check('a second revoke keeps the first reason and instant',
+    revoked.revokedReason === 'password-changed' && Date.parse(revoked.revokedAt) < Date.now() - 30_000,
+    JSON.stringify({ reason: revoked.revokedReason, at: revoked.revokedAt }));
+
+  // --- the append-only tables -----------------------------------------------------------
+  const event = newEvent(acct.accountId);
+  await store.outbox.insert(event);
+  await throwsCode('the same outbox event id twice is CONFLICT', 'CONFLICT',
+    () => store.outbox.insert(event));
+  const auditRow = await store.audit.insert({
+    actorKind: 'system', action: 'storetest.keys', subjectKind: 'account',
+    subjectId: acct.accountId, reasonCode: 'TEST',
+  });
+  await throwsCode('the same audit id twice is CONFLICT', 'CONFLICT',
+    () => store.audit.insert({
+      auditId: auditRow.auditId, actorKind: 'system', action: 'storetest.keys',
+      subjectKind: 'account', subjectId: acct.accountId, reasonCode: 'TEST',
+    }));
+
+  // account_name_history's primary key is (account_id, changed_at): two renames recorded at one
+  // instant collide, rather than one silently replacing the other in a moderation record.
+  const changedAt = iso();
+  await store.accountNameHistory.insert({
+    accountId: acct.accountId, previousName: 'OldName', changedAt, reason: 'rename',
+  });
+  await throwsCode('two name-history rows for one account at one instant collide', 'CONFLICT',
+    () => store.accountNameHistory.insert({
+      accountId: acct.accountId, previousName: 'OlderName', changedAt, reason: 'rename',
+    }));
+  await expectOk('control: the same rename an instant later is recorded',
+    () => store.accountNameHistory.insert({
+      accountId: acct.accountId, previousName: 'OlderName', changedAt: iso(1000), reason: 'rename',
+    }));
+}
+
+// ---------------------------------------------------------------------------------------
+// 14. Rules decided once in store.js and enforced by both adapters (interface rule 5).
+// ---------------------------------------------------------------------------------------
+async function testSharedRules(store, tag) {
+  console.log(`\n[${tag}] rules both adapters answer the same way`);
+
+  const acct = newAccount();
+  await store.accounts.create(acct);
+
+  // --- the match status is a closed set -------------------------------------------------
+  await throwsCode('a match status outside the stored set is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(acct.accountId, 'alpha')],
+      { status: 'finished' })));
+  // "No status" and "a status I do not recognise" are both VALIDATION_FAILED, so the code alone
+  // cannot tell them apart — and the two are different producer mistakes. A missing status names
+  // the COLUMN it is missing from; an unknown one echoes the value. Asserting only the code
+  // leaves the missing-status check deletable, because the enum below refuses a non-string too.
+  for (const missing of [undefined, 3, null, {}]) {
+    let details = null;
+    try {
+      await store.matches.record(newAllocation(ulid(), [newPlayer(acct.accountId, 'alpha')],
+        { status: missing }));
+    } catch (err) { details = err?.details ?? null; }
+    check(`a match whose status is ${JSON.stringify(missing) ?? 'undefined'} is refused as a missing column`,
+      details?.column === 'status' && details?.table === 'matches'
+        && (details.fields ?? []).some((f) => f.key === 'status' && f.reason === 'required'),
+      `details were ${JSON.stringify(details)}`);
+  }
+  for (const junk of [null, 'a result', 42, []]) {
+    await throwsCode(`a result that is ${JSON.stringify(junk)} is refused`, 'VALIDATION_FAILED',
+      () => store.matches.record(junk));
+  }
+
+  // --- the ALLOCATION shape --------------------------------------------------------------
+  // A non-terminal row knows the identifiers and nothing else. Each required one on its own,
+  // so a refusal is about the field that was removed.
+  for (const field of ['matchId', 'mapId', 'region', 'mode']) {
+    const allocation = newAllocation(ulid(), [newPlayer(acct.accountId, 'alpha')]);
+    delete allocation[field];
+    // eslint-disable-next-line no-loop-func
+    await throwsCode(`an allocation with no ${field} is refused`, 'VALIDATION_FAILED',
+      () => store.matches.record(allocation));
+  }
+  await throwsCode('an allocation whose mode is outside the enum is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(acct.accountId, 'alpha')],
+      { mode: 'ffa' })));
+  await throwsCode('an allocation carrying a terminationReason is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(acct.accountId, 'alpha')],
+      { terminationReason: 'completed' })));
+  await expectOk('control: the same allocation without any of those is accepted',
+    () => store.matches.record(newAllocation(ulid(), [newPlayer(acct.accountId, 'alpha')])));
+
+  // --- participants ----------------------------------------------------------------------
+  await throwsCode('a participant with no accountId is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [{ team: 'alpha', kills: 0 }])));
+  await throwsCode('a participant whose accountId is not a string is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [{ accountId: 42, team: 'alpha' }])));
+  await throwsCode('the same account twice in one match is refused', 'VALIDATION_FAILED',
+    () => store.matches.record(newAllocation(ulid(), [
+      newPlayer(acct.accountId, 'alpha'), newPlayer(acct.accountId, 'bravo')])));
+
+  // --- feature flags: enabled and is_kill_switch are NOT NULL booleans -------------------
+  const flagKey = `test.${ulid().slice(-8).toLowerCase()}`;
+  for (const [column, value] of [['enabled', 'yes'], ['enabled', null], ['enabled', 1],
+    ['isKillSwitch', 'no'], ['isKillSwitch', null]]) {
+    await throwsCode(`feature_flags.${column} = ${JSON.stringify(value)} is refused`, 'VALIDATION_FAILED',
+      () => store.flags.set(flagKey, { [column]: value }));
+  }
+  const flagged = await store.flags.set(flagKey, { enabled: true, isKillSwitch: false, rollout: { pct: 5 } });
+  check('control: a boolean flag patch is accepted',
+    flagged.enabled === true && flagged.isKillSwitch === false && flagged.rollout?.pct === 5,
+    JSON.stringify(flagged));
+  const partial = await store.flags.set(flagKey, { rollout: null });
+  check('control: a key absent from a flag patch leaves its column alone',
+    partial.enabled === true && partial.rollout === null, JSON.stringify(partial));
+
+  // --- profiles.settingsVersion is NOT NULL and an integer -------------------------------
+  // `upsert` has to hold the same line the CAS does. It is the path the settings service takes
+  // when there is no If-Match, so a string version reaching it writes a version nothing can
+  // compare against afterwards.
+  for (const bad of ['9', 9.5, null, true, {}]) {
+    await throwsCode(`an upsert with settingsVersion ${JSON.stringify(bad)} is refused`,
+      'VALIDATION_FAILED',
+      () => store.profiles.upsert(acct.accountId, { settingsVersion: bad }));
+  }
+  const versioned = await store.profiles.upsert(acct.accountId, { settingsVersion: 3 });
+  check('control: an integer settingsVersion is accepted', versioned.settingsVersion === 3,
+    JSON.stringify(versioned));
+
+  // --- markResultApplied says WHICH refusal it is ----------------------------------------
+  //
+  // "Already applied" and "never finalised" are both CONFLICT, so a test that only checks the
+  // code cannot tell them apart — and the caller's next move differs completely: one is a
+  // duplicate delivery to drop, the other is a result that has not arrived yet. `reason` is
+  // what carries that, so `reason` is what has to be asserted.
+  const appliedId = ulid();
+  await store.matches.record(newResult(appliedId, [newPlayer(acct.accountId, 'alpha')]));
+  await store.matches.markResultApplied(appliedId, iso());
+  const liveId = ulid();
+  await store.matches.record(newAllocation(liveId, [newPlayer(acct.accountId, 'alpha')]));
+  for (const [name, matchId, reason] of [
+    ['a result already applied', appliedId, 'result-already-applied'],
+    ['a match that never finalised', liveId, 'not-terminal'],
+  ]) {
+    let details = null;
+    try {
+      await store.matches.markResultApplied(matchId, iso());
+    } catch (err) { details = err?.details ?? null; }
+    check(`re-applying ${name} is refused with reason=${reason}`,
+      details?.reason === reason, `details were ${JSON.stringify(details)}`);
+  }
+
+  // --- the relay's empty batch -----------------------------------------------------------
+  //
+  // A poll that claimed nothing hands `markPublished` an empty list — or, on the path where the
+  // claim itself failed, no list at all. Both are the normal quiet case and neither is an error:
+  // an adapter that built `event_id = any($1)` out of them turns an idle relay into a crash loop
+  // whose only symptom is that events stop being published.
+  for (const [name, batch] of [['an empty', []], ['an absent', undefined], ['a null', null]]) {
+    await expectOk(`markPublished tolerates ${name} batch`,
+      () => store.outbox.markPublished(batch, iso()));
+  }
+  // CONTROL: it still publishes a batch that has something in it.
+  const publishable = newEvent(acct.accountId);
+  await store.outbox.insert(publishable);
+  await store.outbox.markPublished([publishable.eventId], iso());
+  check('control: a batch with one id in it does publish that event',
+    !(await store.outbox.claimUnpublished(500)).some((e) => e.eventId === publishable.eventId),
+    'the event is still unpublished, so the three tolerated batches prove nothing');
+
+  // --- the sweeps take an INSTANT, and refuse anything else ------------------------------
+  // A sweep that quietly reads `banana` as "now" (or as the epoch) either deletes everything or
+  // deletes nothing, and both look exactly like a sweep that ran.
+  for (const [name, sweep] of [
+    ['idempotency', (at) => store.idempotency.sweepExpired(at)],
+    ['preAuthConsent', (at) => store.preAuthConsent.sweepExpired(at)],
+  ]) {
+    for (const junk of ['banana', '', 'yesterday']) {
+      // eslint-disable-next-line no-loop-func
+      await throwsCode(`${name}.sweepExpired refuses ${JSON.stringify(junk)}`, 'VALIDATION_FAILED',
+        () => sweep(junk));
+    }
+    await expectOk(`control: ${name}.sweepExpired accepts an ISO instant`, () => sweep(iso()));
+    await expectOk(`control: ${name}.sweepExpired defaults to the store's clock`, () => sweep());
+  }
+
+  // --- a consent decision recorded between the expiry read and the expiry delete ---------
+  //
+  // `preAuthConsent.get` deletes what it finds expired, and it re-checks the row INSIDE the
+  // write rather than deleting by key: a decision recorded in that window is a live, legally
+  // significant answer, and deleting it by key erases it. Both calls are enrolled in one
+  // transaction so the interleaving is deterministic rather than a race the suite hopes for.
+  const raced = ulid();
+  await store.preAuthConsent.put({
+    clientSessionId: raced, telemetryPersonal: false, policyVersion: 1,
+    decidedAt: iso(-60_000), expiresAt: iso(-1000),
+  });
+  await store.tx(async (tx) => {
+    const reading = store.preAuthConsent.get(raced, tx);   // sees the expired row
+    await store.preAuthConsent.deleteFor(raced, tx);       // …which is gone before the delete half runs
+    check('an expiring read whose row vanished under it answers null rather than throwing',
+      (await reading) === null, 'the read did not survive the row disappearing');
+  });
+  // CONTROL: the expiry delete really does happen, and it really is conditional on expiry.
+  const stale = ulid();
+  await store.preAuthConsent.put({
+    clientSessionId: stale, telemetryPersonal: true, policyVersion: 1,
+    decidedAt: iso(-60_000), expiresAt: iso(-1000),
+  });
+  check('control: an expired decision reads as absent', (await store.preAuthConsent.get(stale)) === null,
+    'the expired decision was honoured');
+  check('control: and reading it DELETED it rather than filtering it',
+    (await store.preAuthConsent.deleteFor(stale)) === false,
+    'the row is still there — expiry filtered on read instead of deleting');
+  const kept = ulid();
+  await store.preAuthConsent.put({
+    clientSessionId: kept, telemetryPersonal: true, policyVersion: 1,
+    decidedAt: iso(), expiresAt: iso(30 * 86400e3),
+  });
+  check('control: an unexpired decision survives being read',
+    (await store.preAuthConsent.get(kept))?.telemetryPersonal === true, 'a live decision was deleted');
+  await store.preAuthConsent.deleteFor(kept);
+}
+
 async function runSuite(store, tag) {
   await testRollback(store, tag);
   await testOutboxAtomicity(store, tag);
@@ -1374,6 +2209,9 @@ async function runSuite(store, tag) {
   await testStats(store, tag);
   await testInterface(store, tag);
   await testMatches(store, tag);
+  await testHandles(store, tag);
+  await testKeyCollisions(store, tag);
+  await testSharedRules(store, tag);
   await testConformance(store, tag);
 }
 
@@ -1394,7 +2232,19 @@ await throwsCode('a birthdate cannot be stored on an account', 'VALIDATION_FAILE
   () => mem.accounts.create({ ...newAccount(), birthdate: '1990-01-01' }));
 await throwsCode('an account without a folded name is refused', 'VALIDATION_FAILED',
   () => mem.accounts.create({ accountId: ulid(), displayName: 'Nameless' }));
+
+// The memory adapter's own timestamp normalisation and its own lifecycle, neither of which
+// the shared conformance suite can reach through the interface.
+await testMemoryInternals();
+
 await mem.close();
+
+// `assertOpen` needs a store that is really closed, so it gets its own instance rather than
+// being bolted onto the end of the shared suite.
+await testClosedStore();
+
+await testResultShapeRules();
+await testAdapterRegistry();
 
 // ---------------------------------------------------------------------------------------
 // The migration runner's refusals. These need no database: the rules are decided by comparing
@@ -1484,6 +2334,28 @@ console.log('\n=========== POSTGRES — statement building ===========');
     }));
   await throwsCode('an inherited key is not a column of any table', 'VALIDATION_FAILED',
     () => pgStore.accounts.update('VIC2', { constructor: 'OWNED' }));
+
+  // The allow-list is what stops the injection, and `columnName`'s second check — that the
+  // resolved name is identifier-shaped — is belt to its braces: it can only fire for an
+  // ALLOW-LIST ENTRY that was itself mistyped, so it is unreachable while the list is clean and
+  // no test can kill it (see the comment at postgres.js's `columnName`). What IS checkable, and
+  // what that line's whole premise rests on, is that the list stays clean. Re-measured here on
+  // every run rather than recorded once in a comment, because the list grows with the schema.
+  {
+    const toSnakeHere = (s) => s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    const entries = Object.entries(TABLE_COLUMNS);
+    const all = entries.flatMap(([t, cols]) => cols.map((c) => [t, c]));
+    const bad = all.filter(([, c]) => !/^[a-z][a-z0-9_]*$/.test(toSnakeHere(c)));
+    check(`every one of the ${all.length} allow-listed columns snake-cases into an identifier`,
+      all.length > 100 && bad.length === 0, bad.map(([t, c]) => `${t}.${c}`).join(', '));
+    // CONTROL: the measurement can fail. A column named the way the injection was would not
+    // survive it — which is what makes "0 failing" above a statement rather than a tautology.
+    check('control: the same measurement rejects a key shaped like the injection',
+      !/^[a-z][a-z0-9_]*$/.test(toSnakeHere(injection)), toSnakeHere(injection));
+    check('control: every table in the allow-list is non-empty',
+      entries.length >= 8 && entries.every(([, cols]) => Array.isArray(cols) && cols.length > 0),
+      entries.map(([t, c]) => `${t}=${c?.length}`).join(', '));
+  }
 
   // CONTROL: a legitimate patch still builds a parameterised statement. Without this, an
   // adapter that refused every update would pass all three refusals above.
@@ -1645,6 +2517,33 @@ if (!databaseUrl) {
     const raw = new pg.Client({ connectionString: databaseUrl });
     await raw.connect();
     try {
+      // --- SQL NULL is not jsonb 'null' -------------------------------------------------
+      //
+      // jsonb columns are stringified before they reach the driver, and a null that went
+      // through `JSON.stringify` arrives as the four characters `null` — a jsonb value that is
+      // present and reads back through `pg` as JS `null`, indistinguishable from an absent one
+      // through the adapter. `is null` is the only question that tells them apart, so it has to
+      // be asked here rather than through a read that cannot see the difference.
+      const nullProbe = ulid();
+      const probeAccount = newAccount();
+      await pgStore.accounts.create(probeAccount);
+      await pgStore.matches.record(newAllocation(nullProbe, [newPlayer(probeAccount.accountId, 'alpha')]));
+      const { rows: [jsonbRow] } = await raw.query(
+        `select rounds is null as rounds_null, team_scores is null as scores_null,
+                rules_snapshot is null as rules_null
+           from matches where match_id = $1`, [nullProbe]);
+      check('an allocation stores SQL NULL in its jsonb columns, not the string "null"',
+        jsonbRow?.rounds_null === true && jsonbRow.scores_null === true,
+        JSON.stringify(jsonbRow));
+      // CONTROL: the probe can tell the two apart, and a jsonb column that IS written is not
+      // null — otherwise "it is null" would be satisfied by a row that stored nothing at all.
+      check('control: a NOT NULL jsonb column on the same row is not null',
+        jsonbRow?.rules_null === false, JSON.stringify(jsonbRow));
+      const { rows: [litmus] } = await raw.query(
+        "select 'null'::jsonb is null as literal_null, null::jsonb is null as sql_null");
+      check('control: jsonb \'null\' is NOT SQL NULL, which is what makes the check above real',
+        litmus.literal_null === false && litmus.sql_null === true, JSON.stringify(litmus));
+
       const probe = ulid();
       await raw.query(
         `insert into audit_log (audit_id, actor_kind, action, subject_kind, subject_id, reason_code)
