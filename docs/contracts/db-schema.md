@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — host resolved; awaiting REQ-CX-001 |
-| **Version** | 1.0.0 |
+| **Version** | 1.3.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |
 | **Scope** | P1–P5. Economy, ownership, creator, and agent tables are later contracts |
@@ -96,15 +96,22 @@ player_stats(
   kills bigint, deaths bigint, assists bigint, suicides bigint, team_kills bigint,
   headshots bigint, shots_fired bigint, shots_hit bigint, damage_dealt bigint,
   plants bigint, defuses bigint,
-  matches bigint, wins bigint, losses bigint,
+  matches bigint, wins bigint, losses bigint, draws bigint,   -- draws: REQ-CC-019
   rounds_played bigint, time_played_sec bigint,
   updated_at timestamptz,
   primary key (account_id, mode, stat_definition_version)
 )
 
-player_weapon_stats(account_id, mode, weapon_id, shots, hits, kills, headshots,
-                    primary key (account_id, mode, weapon_id))
+player_weapon_stats(account_id, mode, weapon_id, stat_definition_version,
+                    shots, hits, kills, headshots,
+                    primary key (account_id, mode, weapon_id, stat_definition_version))
 ```
+
+`draws` exists because the HTTP career surface returns it and Bomb can genuinely draw at 6-6
+(`bomb-rules.md` §2.1a). A returned field with no column is a field that reads zero forever.
+
+`stat_definition_version` is part of the weapon-stats key for the same reason it is part of
+`player_stats`: a definition change must not silently rewrite historical per-weapon accuracy.
 
 **Counters only. No stored ratios.** K/D, accuracy, and win rate are computed at read time;
 a stored ratio goes stale and then disagrees with its own inputs, and only one of the two is
@@ -158,6 +165,8 @@ events_outbox(
   correlation_id, causation_id,
   actor jsonb, payload jsonb,
   privacy_class, retention_class,
+  schema_ref text not null,          -- REQ-CC-019: event-envelope.md §2 requires it on the wire,
+                                     -- so it must be storable, not re-derived at publish time
   occurred_at, recorded_at,
   published_at timestamptz,          -- null = not yet relayed
   attempts int default 0, last_error text, dead_lettered_at timestamptz

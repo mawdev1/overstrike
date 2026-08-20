@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] shell UI, presence service, room service |
 
@@ -45,66 +45,39 @@ Opening the socket is what converts a reservation into a seat.
 client that has the welcome can render the whole lobby. Every later message is a delta
 against it.
 
-**Exact shape (REQ-CC-003).** `state.snapshot` carries the identical `d` payload with
-`"t": "state.snapshot"` — the envelope type differs, so a reducer can tell a resync from a
-first connect rather than inferring it from `seq`.
+**Exact shape.** `state.snapshot` carries the identical `d` payload with
+`"t": "state.snapshot"` — the envelope type differs so a reducer can tell a resync from a first
+connect rather than inferring it from `seq`.
 
 ```jsonc
 { "t": "lobby.welcome", "seq": 0, "ts": "…", "correlationId": "…",
   "d": {
     "protocol": 1,
-    "serverTime": "…",          // authoritative clock; the client offsets against it
+    "serverTime": "…",          // wall clock, ISO-8601 (wire-protocol.md §8.10)
     "heartbeatMs": 15000,
     "graceMs": 90000,
-    "you": {
-      "accountId": "…", "displayName": "…",
-      "team": "alpha|bravo|unassigned",
-      "ready": false, "isOwner": false,
-      "seatHeldUntil": null      // non-null only while reconnecting
-    },
-    "room": {
-      "roomId": "…", "name": "…", "region": "yyz",
-      "map": "the-square", "mapVersion": "1.0.0",
-      "mode": "tdm|bomb", "rulesetVersion": "bomb-1.0.0", "build": "…",
-      "status": "open|countdown|in-progress|closing",
-      "capacity": 12, "playerCount": 6,
-      "hasPassword": false, "ownerAccountId": "…",
-      "joinable": true, "joinBlockedReason": null,
-      "settings": { "killLimit": 75, "roundsToWin": 7, "maxRounds": 12,
-                    "roundLengthSec": 105, "backfill": true,
-                    "requiredReady": 8, "minPlayers": 2 }
-    },
-    "roster": [ {
-      "accountId": "…", "displayName": "…",
-      "team": "alpha|bravo|unassigned",
-      "ready": false, "isOwner": false, "isLocal": false,
-      "connection": "connected|reconnecting|disconnected",
-      "estimatedRttMs": 24,
-      "loadout": { "primaryIdx": 0, "secondaryIdx": 3 },
-      "joinedAt": "…"
-    } ],
-    "countdown": null,           // or { "endsAt", "requiredReady", "currentReady" }
-    "chatHistory": [ ]           // this room only, bounded to the last 50
+    "you": { "accountId": "…", "team": "alpha|bravo|unassigned",
+             "ready": false, "isOwner": false, "seatHeldUntil": null },
+    "room":      { /* RoomCore      — http-api.md §11.3 */ },
+    "roster":    [ /* RosterMember  — http-api.md §11.3 */ ],
+    "countdown": null,          // or CountdownState
+    "chatHistory": [ /* ChatMessage, most recent 50, this room only */ ]
   } }
 ```
 
-Every field is required. `null` means present-and-empty; an omitted key is a contract
-violation.
+**The components are shared; the envelopes are not (REQ-CC-015).** This block used to claim it
+matched the REST detail response "exactly", which was never true — REST wraps room, roster and
+countdown together with `correlationId`, while here they sit under `d` with correlation on the
+frame. `RoomCore`, `RoomSettings`, `RosterMember`, and `CountdownState` are defined once in
+`http-api.md` §11.3 and embedded by both. `d.you` is realtime-only: it is per-connection state,
+which a cacheable REST resource has no business carrying.
 
-**One shared schema, not two similar ones (REQ-CC-011).** This block previously claimed to
-match `http-api.md` §11.3 "exactly" while renaming `settings` to `rules` and dropping
-`joinable` and `joinBlockedReason` — so a client building one renderer for both would have
-broken on the first field it reached for. The canonical definitions now live in one place:
-
-| Schema | Defined in | Used by |
-|---|---|---|
-| `RoomState` | `http-api.md` §11.3 | `GET /v1/rooms/:id`, `lobby.welcome.d.room`, `state.snapshot`, `room.updated` |
-| `RosterMember` | `http-api.md` §11.3 | the same, plus `roster.delta` |
-
-The lobby `room` block **is** `RoomState`, field for field, including `joinable` and
-`joinBlockedReason`. The key is `settings` in both — `rules` above was the rename and is gone.
-`correlationId` stays on the envelope (§2) rather than inside `d`, because in the socket it
-belongs to the frame, not the room.
+```jsonc
+// ChatMessage
+{ "id": "…", "accountId": "…", "displayName": "…",
+  "text": "…",              // ≤ 200 chars, already policy-filtered
+  "ts": "…", "filtered": false }
+```
 
 Failures close the socket with a code and an `errors.md` payload: bad ticket
 (`SESSION_TOKEN_INVALID`), expired reservation (`SLOT_RESERVATION_EXPIRED`), room gone
@@ -124,7 +97,7 @@ Failures close the socket with a code and an `errors.md` payload: bad ticket
 | `countdown.tick` | `{ remainingMs }` | 1 Hz. The UI animates between ticks; it does not invent the end time |
 | `countdown.aborted` | `{ reason, byAccountId? }` | `reason` ∈ `player-left`, `player-unready`, `team-imbalance`, `allocation-failed`, `owner-cancelled` |
 | `match.allocating` | `{ }` | Allocation started — may take seconds |
-| `match.ready` | `{ matchId, serverUrl, sessionTicket, expiresAt }` | **The handoff.** See §6 |
+| `match.ready` | see §6.1 — carries **all** static match metadata | **The handoff.** See §6 |
 | `match.failed` | `errors.md` payload | `MATCH_ALLOCATION_FAILED`, `MATCH_SERVER_UNREACHABLE` |
 | `chat.message` | `{ id, accountId, displayName, text (≤200 chars), ts, filtered: bool }` | Already policy-filtered; `filtered` marks server-redacted text |
 | `chat.removed` | `{ id, reason }` | Moderation retraction |
@@ -169,6 +142,33 @@ server  match.ready { matchId, serverUrl, sessionTicket }   → to each member i
 client  opens the match socket with sessionTicket   (wire-protocol.md)
 server  room.updated { status: "in-progress" }
 ```
+
+### 6.1 `match.ready` payload (REQ-CC-018)
+
+The binary welcome cannot economically carry map ids, version strings, and policy objects, and
+`net-facade.md` §5.1 needs all of them as static fields. They come from **this JSON handoff**,
+not from `MSG_WELCOME`:
+
+```jsonc
+{ "matchId": "…", "serverUrl": "wss://…",
+  "sessionTicket": "…", "expiresAt": "…",
+  "reconnectGraceMs": 90000,
+  "mapId": "the-square", "mapVersion": "1.0.0",
+  "mode": "bomb", "rulesetVersion": "bomb-1.0.0",
+  "region": "yyz", "serverBuild": "…", "protocolVersion": 2,
+  "series": { "roundsToWin": 7, "maxRounds": 12, "sideSwitchAfter": 6, "overtime": false },
+  "spectatorPolicy": { "canSpectateEnemies": false, "canFreeCam": false, "canUseTeamChat": false },
+  "sites": [ { "id": "site-A", "site": "A", "callout": "Fountain",
+               "center": { "x": 0, "y": 0, "z": 0 },
+               "box": { "min": {…}, "max": {…} } } ] }
+```
+
+`sites` is the canonical projection of `map-data.md` §3.3 objective volumes joined to their
+§3.4 callout regions — computed server-side from the map manifest so the client never has to
+load level geometry to label a site.
+
+The binary `MSG_WELCOME` keeps only what changes per connection or per match restart:
+ids, seed, kill limit, mode, flags, tick rate.
 
 Binding rules:
 

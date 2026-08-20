@@ -32,6 +32,49 @@ production bug, which is exactly the failure mode the two-lane model exists to p
 
 ---
 
+## 2026-08-20 — Cross-reference audit, `REQ-CC-015`…`020` (additive)
+
+Codex audited **producer→consumer chains across files** rather than each file alone. Every
+finding was real. Affected contracts go to **1.3.0**.
+
+| Request | Finding |
+|---|---|
+| `REQ-CC-015` | "One `RoomState` used field-for-field by both" was circular — the envelopes genuinely differ |
+| `REQ-CC-016` | The settings allowlist claimed to mirror the CX inventory and contradicted it in six ways |
+| `REQ-CC-017` | Eligibility, verification, terms and consent were referenced by four contracts and implemented by none |
+| `REQ-CC-018` | `net.reconnecting` was a state with no exit; static facade fields had no producer |
+| `REQ-CC-019` | The outcome→result→persistence projection was lossy in six places |
+| `REQ-CC-020` | The KPI table and the event registry named different events |
+
+### The pattern in all six
+
+**Each contract was internally consistent and wrong at its seams.** Two rounds of per-file
+review passed these because per-file review cannot catch them: the defect is never inside a
+file, it is in the space between two.
+
+- Draw and no-winner were the same wire value, so every invalidated match would have read as
+  a tie in results and career stats.
+- The match session ticket is single-use and nothing minted another, so a dropped player could
+  never rejoin their own live match — the facade documented a `reconnecting` state that had no
+  exit.
+- `interactionRefused` was sourced from cancellation events, which cannot represent a
+  precondition that was never met (not-carrier, already-planted).
+- Dropped-bomb position was an event, so a resyncing client would never learn where the bomb
+  was.
+- The career surface returned `draws` with no column behind it.
+
+### Two places the other lane's spec was better than mine
+
+- **Settings.** My §11.9 table was a divergent copy, so it is deleted rather than corrected;
+  `design/settings-inventory.md` is now the single source of truth. Codex's scoping was simply
+  right — volume belongs to the device, not the profile.
+- **The birthdate.** Resolving the onboarding chain produced a better answer than either
+  contract had: the eligibility preflight evaluates a date of birth and **discards it**, so the
+  most sensitive field in the funnel is never stored at all.
+
+**Lesson recorded:** contract review must trace chains across files. Per-file sufficiency is
+necessary and not sufficient, and three review rounds have now demonstrated it.
+
 ## 2026-08-20 — Second Codex review, `REQ-CC-010`…`014` (additive)
 
 Codex re-reviewed the 1.1.0 amendments and found five further gaps. All resolved; affected

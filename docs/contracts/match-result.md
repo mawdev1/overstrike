@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -78,8 +78,13 @@ binding additions:
 {
   "matchId": "01J…",              // assigned at ALLOCATION, not completion
   "rulesetVersion": "bomb-1.0.0",
+  "rulesSnapshot": {                  // REQ-CC-019 — immutable copy of the series config
+    "roundsToWin": 7, "maxRounds": 12, "sideSwitchAfter": 6,
+    "roundLengthSec": 105, "bombTimerSec": 40, "defuseSec": 7, "plantSec": 3,
+    "overtime": false
+  },
   "statDefinitionVersion": "1.0.0",  // which definitions in §3 produced these numbers
-  "serverBuild": "…", "mapVersion": "the-square@…", "region": "yyz",
+  "serverBuild": "…", "mapId": "the-square", "mapVersion": "1.0.0", "region": "yyz",
   "mode": "tdm|bomb",
   "startedAt": "…", "endedAt": "…",
   "terminationReason": "completed|aborted|invalidated",
@@ -143,8 +148,9 @@ as "your match vanished" and invites a client to try to supply its own stats.
 ```jsonc
 // queued, or the match is still live
 { "matchId": "…", "status": "pending",
-  "mode": "bomb", "map": "the-square",
-  "startedAt": "…", "endedAt": null,
+  "mode": "bomb", "mapId": "the-square", "mapVersion": "1.0.0",
+  "startedAt": "…",
+  "endedAt": null,          // null while LIVE; the real timestamp once ended and queued
   "retryAfterMs": 2000, "correlationId": "…" }
 
 // invalidated
@@ -156,7 +162,8 @@ as "your match vanished" and invites a client to try to supply its own stats.
 
 | Case | Response |
 |---|---|
-| Live or queued | `200` with `status: "pending"` and `retryAfterMs` |
+| Live | `200`, `status: "pending"`, **`endedAt: null`** |
+| Ended, result queued | `200`, `status: "pending"`, **`endedAt` set** — the database already has `ended_at`, and hardcoding null here contradicted it (REQ-CC-019) |
 | Completed | `200` with the immutable record |
 | Invalidated | `200` with `status: "invalidated"`; stats are **not** in career totals |
 | Never existed | `404 NOT_FOUND` |
@@ -164,6 +171,16 @@ as "your match vanished" and invites a client to try to supply its own stats.
 
 A `pending` response never invites the browser to submit anything. Result submission is
 service-only (§5), and no field in this response hints otherwise.
+
+**`mapId` and `mapVersion` are separate fields, everywhere (REQ-CC-019).** This record
+previously combined them as `"the-square@…"` while `map-data.md`, `db-schema.md`, the room
+schema, and the facade all kept them apart — so the one place that had to join against the
+others was the one place that had to re-parse a string first.
+
+**`rulesSnapshot` is immutable and copied at allocation.** `bomb-rules.md` says `maxRounds`
+appears in the result; without this block it did not. A result that names only
+`rulesetVersion` is uninterpretable the moment that ruleset is retuned, which is exactly what
+`REQ-CX-002` may do to the bomb timer.
 
 `statDefinitionVersion` is what makes a five-year-old match still interpretable after the
 definitions change. Without it, a career total is a sum of numbers that meant different

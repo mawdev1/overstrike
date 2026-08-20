@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -38,15 +38,26 @@ always preferable to stuttering.
 
 ### 3.1 Funnel and first-session KPIs (P5 gate evidence)
 
-| Metric | Definition |
+**Names here are the registry names in §3.3.1 (REQ-CC-020).** This table previously used
+underscore forms (`first_match_completed`, `lobby_abandoned`) while the registry used dotted
+ones, so the two halves of the same contract named different events and neither was wrong on
+its own.
+
+| Event | Measures |
 |---|---|
-| `signin.step` | Each first-run step reached: landing, signup, name, settings, browser, lobby, ready, match, results |
-| `time_to_first_match_sec` | First landing → first match `live`. The headline onboarding number |
-| `first_match_completed` | Whether the first match was played to its end |
-| `lobby_abandoned` | Left a lobby before launch, with the last state reached |
-| `connection_failure` | Failed connect, by `errors.md` code and stage |
-| `settings_friction` | Opened settings during the first session, and which panel |
-| `unsupported_client` | Blocked by the browser matrix, with the reason |
+| `flow.step` | Each first-run step, with its outcome — the spine of the funnel |
+| `session.first_match` | Time to first match and whether it completed |
+| `lobby.abandoned` | Left before launch, with the last state reached |
+| `connection.failure` | Failed connect, by stage and `errors.md` code |
+| `room.join_failure` | Join refused, by reason |
+| `match.handoff_failure` | Allocation or handoff failed after countdown |
+| `match.return_outcome` | How the player left a match and whether they returned to lobby |
+| `settings.friction` | Settings opened during the first session, by UI category |
+| `client.unsupported` | Blocked by the D5 matrix, with the failing check |
+
+`flow.step` replaces separate viewed/completed/failed events: `first-run-flow.md` needs all
+three per step, and nine steps × three outcomes as distinct names would be twenty-seven
+registry rows describing one thing.
 
 ### 3.1.1 Supported browser and device matrix — **DECIDED** (D5)
 
@@ -91,11 +102,11 @@ Content-Type: application/json
 { "clientSessionId": "01J…",     // client-generated ULID, non-authoritative
   "schemaVersion": 1,
   "events": [ {
-    "name": "signin.step",
+    "name": "flow.step",
     "version": 1,
     "occurredAt": "…",
     "correlationId": "…",
-    "payload": { "step": "display-name" }
+    "payload": { "step": "display-name", "outcome": "completed", "errorCode": null }
   } ] }
 
 202 → { "accepted": 12, "rejected": 0, "correlationId": "…" }
@@ -138,19 +149,25 @@ Every payload below is closed: unlisted keys are dropped server-side, not stored
 
 | `name` | v | Class | Payload |
 |---|---:|---|---|
-| `signin.step` | 1 | personal | `{ step }` — `landing`\|`signup`\|`signin`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results` |
-| `session.first_match_completed` | 1 | personal | `{ completed: bool, mode, timeToFirstMatchSec: 0–86400 }` |
-| `lobby.abandoned` | 1 | personal | `{ lastState }` — `browsing`\|`joining`\|`in-lobby`\|`countdown`; `dwellSec: 0–86400` |
+| `flow.step` | 1 | personal | `{ step, outcome }` — step `landing`\|`signup`\|`signin`\|`eligibility`\|`verify`\|`terms`\|`consent`\|`display-name`\|`settings`\|`browser`\|`lobby`\|`ready`\|`match`\|`results`; outcome `viewed`\|`completed`\|`failed`; `errorCode` required when `failed`, else null |
+| `session.first_match` | 1 | personal | `{ completed: bool, mode, timeToFirstMatchSec: 0–86400 }` |
+| `lobby.abandoned` | 1 | personal | `{ lastState, dwellSec: 0–86400 }` — lastState `browsing`\|`joining`\|`in-lobby`\|`countdown` |
+| `room.join_failure` | 1 | personal | `{ code, joinBlockedReason }` — both closed enums from `errors.md` / `http-api.md` §11.3; `joinBlockedReason` null when the failure was not a block |
+| `match.handoff_failure` | 1 | personal | `{ stage, code }` — stage `allocating`\|`ticket`\|`connect`\|`welcome` |
+| `match.return_outcome` | 1 | personal | `{ outcome, returnedToLobby: bool }` — outcome `completed`\|`disconnected`\|`kicked`\|`aborted`\|`grace-expired` |
 | `connection.failure` | 1 | personal | `{ stage, code }` — stage `platform`\|`lobby`\|`match`; code from `errors.md` |
-| `settings.friction` | 1 | personal | `{ panel, duringFirstSession: bool }` — panel from §11.9's key set |
-| `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — reason `webgl2`\|`browser-version`\|`os`\|`memory`\|`pointer-lock` |
+| `settings.friction` | 1 | personal | `{ category, duringFirstSession: bool }` — category is the **UI section** from `design/settings-inventory.md` (`controls`\|`bindings`\|`video`\|`audio`\|`interface`\|`accessibility`\|`diagnostics`\|`practice`), not a settings key |
+| `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — reason covers every D5 check: `webgl2`\|`browser-version`\|`os-version`\|`pointer-lock`\|`websocket-binary`\|`memory`\|`vram`\|`cpu-cores`\|`mobile-or-tablet` |
 | `client.fps` | 1 | internal | `{ p50: 0–1000, p01: 0–1000, windowSec: 1–600 }` |
 | `client.frame_time` | 1 | internal | `{ p50Ms, p95Ms, p99Ms }` each 0–10000 |
-| `client.webgl_context_lost` | 1 | internal | `{ recovered: bool, uptimeSec }` |
+| `client.webgl_context_lost` | 1 | internal | `{ recovered: bool, uptimeSec: 0–604800 }` |
 | `client.error` | 1 | internal | `{ errorClass, fatal: bool }` — **class only, never the raw message** |
 | `client.asset_build` | 1 | internal | `{ ms: 0–600000 }` |
-| `client.heap` | 1 | internal | `{ usedMb: 0–65536, sampledAtSec }` |
-| `client.net_health` | 1 | internal | `{ rttMs, jitterMs, lossPct: 0–100, correctionRatePerSec, snapshotAgeMs }` |
+| `client.heap` | 1 | internal | `{ usedMb: 0–65536, sampledAtSec: 0–604800 }` |
+| `client.net_health` | 1 | internal | `{ rttMs: 0–10000, jitterMs: 0–10000, lossPct: 0–100, correctionRatePerSec: 0–1000, snapshotAgeMs: 0–60000 }` |
+
+Every field is required unless its description says otherwise; `null` is permitted only where
+explicitly named (`errorCode`, `joinBlockedReason`).
 
 Units are in the key names. Every numeric field has stated bounds, and a value outside them is
 rejected rather than clamped — a 900 000 ms frame time is a bug in the sender, and silently
@@ -169,8 +186,8 @@ is a CCR, because the warehouse already has rows under the old interpretation.
 | Class | Gate |
 |---|---|
 | `internal` health and performance | Sent always. No personal data, needed to keep the game running |
-| `personal` funnel and KPI | Requires the privacy consent state from `auth.md` §11 / `http-api.md` §4 |
-| Before any consent decision | Only `internal` class is sent |
+| `personal` funnel and KPI | Requires `consent.telemetryPersonal` from `http-api.md` §3a.3 — a record distinct from eligibility and from profile visibility |
+| Before any consent decision | Only `internal` class is sent. Personal events are **dropped, not queued** — queuing against a later "yes" is collecting first and asking afterwards |
 
 A player who declines consent still produces `internal` telemetry, because refusing to
 diagnose a crash is not a privacy win for anyone. They produce no `personal` events at all.

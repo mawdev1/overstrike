@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Client HTTP layer, lobby socket, match server, Admin Portal |
 
@@ -187,7 +187,9 @@ change. Open questions are listed in [`../decisions/P0-decisions.md`](../decisio
 
 What this contract fixes regardless of where the policy lands:
 
-- Age/eligibility is captured **before** any sensitive profile data is collected, not after —
+- Age/eligibility is captured **before** any sensitive profile data is collected, via the
+  §3a.1 preflight that evaluates a birthdate and **discards it**, persisting only the derived
+  boolean and policy version —
   which means it may be read and written during account creation. The restriction in D6 is on
   the *separate prize-eligibility flag*, which stays isolated to P8/P11; the account-eligibility
   record itself is a normal part of signup and the profile.

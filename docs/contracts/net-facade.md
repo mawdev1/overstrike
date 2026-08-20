@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -119,6 +119,7 @@ frames; entity objects are pooled and their contents change under you.
     state: 'none'|'carried'|'dropped'|'planted'|'defused'|'detonated',
     carrierId: number|null,     // null when unknown to you — see §5.1.1
     siteId: 'A'|'B'|null,
+    position: { x, y, z } | null,   // resync-safe; from MSG_MATCHSTATE, not from an event
   } | null,
 
   interaction: {                                       // ¹
@@ -127,7 +128,8 @@ frames; entity objects are pooled and their contents change under you.
     progress: number,           // 0..1, SERVER-driven. Never advance this locally
   } | null,
 
-  sites: [ { id: 'A', callout: 'Fountain', box: {min,max} } ] | null,   // from map-data.md §3.3
+  sites: [ { id: 'site-A', site: 'A', callout: 'Fountain',
+             center: {x,y,z}, box: {min,max} } ] | null,   // from match.ready §6.1
 
   localPlayer: {
     entityId: number, team: 'alpha'|'bravo'|'unassigned',
@@ -196,13 +198,13 @@ client cannot have, and REQ-CC-012 correctly caught three of them.
 | Event | Payload | Wire source |
 |---|---|---|
 | `welcome` | `{ clientId, entityId, matchSeed, killLimit, mode, isReconnect, isSpectator, protocolVersion, serverTickRateHz }` | `MSG_WELCOME` v2 (§8.4) |
-| `matchState` | the §5.1 object | `MSG_MATCHSTATE` (§8.6) + `MSG_WELCOME` for the static fields |
+| `matchState` | the §5.1 object | `MSG_MATCHSTATE` (§8.6) for live state; **`match.ready` (`realtime-lobby.md` §6.1) for every static field** — map, ruleset, region, build, series, spectator policy, sites |
 | `stateChange` | `{ from, to, reason }` | Facade-local; `reason` from `MSG_REJECT` or socket close |
 | `disconnected` | `{ reason, code, retryable, graceEndsAt }` | Socket close + `MSG_REJECT` (§8.3) |
 | `versionMismatch` | `{ clientVersion, serverVersion }` | `MSG_REJECT` (§8.3) |
-| `interactionRefused` | `{ kind, reason }` | `plantCancel`/`defuseCancel` event `amount` (§8.7) |
+| `interactionRefused` | `{ kind, reason }` | **`interactRefused` event (§8.7 kind 20)** — its own kind, because a refusal is not a cancellation |
 | `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
-| `matchEnded` | `{ matchId, winner, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9) |
+| `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, reason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` for aborted/invalidated — distinct from `'draw'` |
 | `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
 
 `interactionRefused.reason` maps from the cancel-reason enum on the wire: `0` released →
@@ -220,7 +222,13 @@ a promise would collapse those two into one silent case.
 ```
 
 `graceEndsAt` is the server's authoritative deadline, so the countdown a player sees is the
-real one rather than an optimistic guess (`realtime-lobby.md` §8).
+real one rather than an optimistic guess.
+
+**Where it comes from, since a dropped socket carries nothing (REQ-CC-018).** The initial
+budget is `reconnectGraceMs` in `match.ready` (§6.1). On a drop the facade calls
+`POST /v1/matches/:matchId/reconnect-ticket`, which returns both a fresh single-use ticket and
+the authoritative `graceEndsAt`. The match ticket is single-use exactly like the lobby one, so
+without that endpoint `reconnecting` was a state the client could enter and never leave.
 
 ## 6. Subscribing
 

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -46,6 +46,96 @@ service token — never reachable from a browser).
 list is readable by anyone who has the account, including someone who just stole it; handing
 them the owner's home IP makes a compromise worse.
 
+## 3a. Onboarding: eligibility, verification, terms, consent (REQ-CC-017)
+
+Four gates stood between a visitor and a first match, each referenced by some contract and
+**none of them implemented**: `auth.md` required eligibility before sensitive data while signup
+posted a birthdate with everything else; `errors.md` routed `AUTH_VERIFICATION_REQUIRED` and
+`AUTH_TERMS_ACCEPTANCE_REQUIRED` to UI states no endpoint could clear; and `telemetry.md`
+gated personal events on a consent state that lived nowhere. The chain, in order:
+
+```
+1. POST /v1/onboarding/eligibility   → preflight. No account, no birthdate retained
+2. POST /v1/auth/signup              → account created; refresh cookie set
+3. POST /v1/onboarding/verify/...    → clears AUTH_VERIFICATION_REQUIRED
+4. GET/POST /v1/onboarding/terms     → clears AUTH_TERMS_ACCEPTANCE_REQUIRED
+5. PUT /v1/onboarding/consent        → telemetry consent, separate from all of the above
+```
+
+### 3a.1 Eligibility preflight — **no birthdate is stored**
+
+```http
+POST /v1/onboarding/eligibility      P
+{ "dateOfBirth": "1994-03-02", "jurisdiction": "CA-ON" }
+
+200 → { "eligible": true, "minimumAge": 13, "correlationId": "…" }
+403 → AUTH_ELIGIBILITY_DENIED, details: { "category": "under-minimum-age" }
+```
+
+The birthdate is evaluated and **discarded**; only the derived boolean and the policy version
+are persisted, at signup. This is why the preflight is separate from signup: `auth.md` §11
+requires eligibility *before* sensitive data is collected, and the cleanest way to honour that
+is to never store the most sensitive field at all. `details.category` never echoes the date or
+the computed age.
+
+Signup therefore takes `{ email, password, displayName }` — **no `dateOfBirth`**, correcting
+§11.8 — plus the eligibility receipt from this call.
+
+### 3a.2 Verification and terms
+
+```http
+POST /v1/onboarding/verify/resend     A   → 202
+POST /v1/onboarding/verify/complete   A   { "token" } → 204
+   errors: AUTH_RECOVERY_TOKEN_INVALID · AUTH_RECOVERY_TOKEN_EXPIRED
+
+GET  /v1/onboarding/terms             P   → { "version", "url", "publishedAt", "correlationId" }
+POST /v1/onboarding/terms/accept      A   { "version" } → 204
+   errors: CONFLICT (a newer version now applies; body carries it)
+```
+
+### 3a.3 Consent — a distinct record
+
+Consent is **not** eligibility and **not** profile visibility. Conflating them was the original
+error: `telemetry.md` pointed at "auth §11 / HTTP §4", which define age and who can see a
+profile — neither is a decision about analytics.
+
+```http
+GET /v1/onboarding/consent    auth OPTIONAL
+PUT /v1/onboarding/consent    auth OPTIONAL
+{ "telemetryPersonal": true, "policyVersion": 1 }
+→ { "telemetryPersonal": true, "policyVersion": 1,
+    "decidedAt": "…", "subject": "account|client-session", "correlationId": "…" }
+```
+
+Auth-optional because the funnel starts before an account exists. Signed out, the decision is
+keyed to `clientSessionId` and returned as a **consent receipt** the client replays on its
+telemetry batches; at signup the receipt is migrated to the account.
+
+**Until a decision exists, personal-class events are dropped, not queued.** Queuing them
+against a later "yes" would mean collecting first and asking afterwards. `internal`-class
+events flow throughout (`telemetry.md` §3.4) — declining analytics is not a reason to stop
+being able to diagnose a crash.
+
+The consent record lives in `accounts.privacy` (`db-schema.md` §2), which this contract now
+schematises:
+
+```jsonc
+"privacy": {
+  "presenceVisibility": "everyone|friends|nobody",
+  "statsVisibility": "everyone|nobody",
+  "consent": { "telemetryPersonal": bool, "policyVersion": int, "decidedAt": "…" }
+}
+```
+
+### 3a.4 Two conventions this fixes
+
+- **`VALIDATION_FAILED` is always HTTP 400.** §11.2 returned 428 for a missing `If-Match`; that
+  is now `CONFLICT` (409) with `details.reason: "if-match-required"`. One code, one status, or
+  the client cannot branch on status at all.
+- **Signup and signin set the refresh cookie.** `Set-Cookie: os_rt=…; Secure; HttpOnly;
+  SameSite=Lax; Path=/v1/auth` — stated because §11.1 described rotation on refresh without
+  ever saying where the first cookie comes from.
+
 ## 4. Profile and stats
 
 | Method | Path | Auth | Notes |
@@ -63,7 +153,9 @@ them the owner's home IP makes a compromise worse.
 ```json
 {
   "accountId": "01J…", "displayName": "…", "createdAt": "…",
-  "privacy": { "presenceVisibility": "everyone|friends|nobody", "statsVisibility": "everyone|nobody" },
+  "privacy": { "presenceVisibility": "everyone|friends|nobody",
+               "statsVisibility": "everyone|nobody",
+               "consent": { "telemetryPersonal": true, "policyVersion": 1, "decidedAt": "…" } },
   "moderation": { "status": "clear|restricted|banned", "activeSanctions": [] },
   "flags": { "nameChangeAvailableAt": "…" },
   "correlationId": "…"
@@ -148,7 +240,24 @@ two simultaneous joiners for one seat resolve deterministically.
 |---|---|---|---|
 | GET | `/v1/matches/:matchId` | A | Authoritative result. `match-result.md` |
 | POST | `/v1/matches/:matchId/result` | **S** | Match server → platform. Idempotent. Never browser-reachable |
+| POST | `/v1/matches/:matchId/reconnect-ticket` | A | **REQ-CC-018.** Fresh single-use match ticket while the entity is still held |
 | POST | `/v1/reports` | A | Player report; returns a reference |
+
+`POST /v1/matches/:matchId/reconnect-ticket` is the match-socket analogue of the lobby's
+§6 endpoint, and exists for the same reason: the session ticket is consumed at `MSG_HELLO`, so
+without a way to mint another, a client that dropped could never rejoin its own live match —
+`net.reconnecting` was a state with no exit.
+
+```json
+200 → { "serverUrl": "wss://…", "sessionTicket": "…", "expiresAt": "…",
+        "graceEndsAt": "…", "correlationId": "…" }
+409 → RECONNECT_GRACE_EXPIRED     // entity released; the match continues without you
+404 → NOT_FOUND                   // no such match, or you were never in it
+```
+
+`graceEndsAt` is authoritative here and nowhere else: a dropped socket cannot deliver it, and a
+client counting down from its own drop timestamp would disagree with the server about when its
+seat expires.
 | GET | `/v1/config/flags` | A | Client-visible flags only. `feature-flags.md` |
 | GET | `/v1/config/regions` | P | Region list with probe endpoints |
 | GET | `/v1/health` | P | Liveness. No dependency detail |
@@ -233,7 +342,7 @@ If-Match: "7"
 { "schemaVersion": 1, "values": { … } }
 200 → { "schemaVersion": 1, "version": 8, "values": { … }, "updatedAt": "…", "correlationId": "…" }
 409 → CONFLICT, details: { "currentVersion": 9, "values": { … } }
-428 → VALIDATION_FAILED when If-Match is absent
+409 → CONFLICT, details: { "reason": "if-match-required" }   // never 428 — see §3a.4
 ```
 
 `If-Match` is **required**. Settings roam across devices, so two tabs racing is the normal
@@ -242,35 +351,90 @@ The 409 returns the current server state so the UI can merge rather than re-fetc
 
 `schemaVersion` is the shape of `values`; `version` is the row's revision counter.
 
-### 11.3 Room detail and roster
+### 11.3 Room components (REQ-CC-015)
 
-```json
-{ "roomId": "…", "name": "…", "region": "yyz", "map": "the-square", "mapVersion": "1.0.0",
+The previous version claimed REST and realtime shared one `RoomState` "field for field". They
+did not, and could not: the REST detail response wraps room fields together with `roster`,
+`countdown`, and `correlationId`, while the lobby socket puts room fields in `d.room`, keeps
+roster and countdown beside it, and carries correlation on the envelope. Two different
+envelopes around the same data is correct design; claiming they were the same object was not.
+
+So the **components** are canonical and shared; the **responses** that embed them are not.
+
+```jsonc
+// ── RoomCore ───────────────────────────────────────────────────────────────
+{ "roomId": "…", "name": "…", "region": "yyz",
+  "mapId": "the-square", "mapVersion": "1.0.0",
   "mode": "tdm|bomb", "rulesetVersion": "bomb-1.0.0", "build": "…",
   "status": "open|countdown|in-progress|closing",
   "capacity": 12, "playerCount": 6,
   "joinable": true,
-  "joinBlockedReason": null,
+  "joinBlockedReason": null,        // full|in-progress|closing|password|sanctioned|
+                                    // region-restricted|build-mismatch|banned-from-room
   "hasPassword": false,
   "ownerAccountId": "…",
-  "settings": { "killLimit": 75, "roundsToWin": 7, "backfill": true },
-  "roster": [ {
-      "accountId": "…", "displayName": "…",
-      "team": "alpha|bravo|unassigned",
-      "ready": false, "isOwner": false, "isLocal": false,
-      "connection": "connected|reconnecting|disconnected",
-      "estimatedRttMs": 24,
-      "loadout": { "primaryIdx": 0, "secondaryIdx": 3 }
-  } ],
-  "countdown": null,
-  "correlationId": "…" }
+  "estimatedRttMs": 24,             // null when unmeasured (§11.6)
+  "settings": { /* RoomSettings */ } }
+
+// ── RoomSettings ───────────────────────────────────────────────────────────
+{ "killLimit": 75,                  // TDM only, null in bomb
+  "roundsToWin": 7,                 // bomb only, null in tdm
+  "maxRounds": 12,                  // bomb only, null in tdm
+  "roundLengthSec": 105,            // bomb only, null in tdm
+  "backfill": true,
+  "requiredReady": 8,
+  "minPlayers": 2 }
+
+// ── RosterMember ───────────────────────────────────────────────────────────
+{ "accountId": "…", "displayName": "…",
+  "team": "alpha|bravo|unassigned",
+  "ready": false, "isOwner": false, "isLocal": false,
+  "connection": "connected|reconnecting|disconnected",
+  "estimatedRttMs": 24,             // null when unmeasured
+  "loadout": { "primaryIdx": 0, "secondaryIdx": 3 },
+  "joinedAt": "…" }
+
+// ── CountdownState ─────────────────────────────────────────────────────────
+{ "endsAt": "…", "requiredReady": 8, "currentReady": 6 }
 ```
 
-`joinBlockedReason` is a closed enum, so the UI branches rather than parses:
-`full`, `in-progress`, `closing`, `password`, `sanctioned`, `region-restricted`,
-`build-mismatch`, `banned-from-room`.
+Mode-specific `RoomSettings` keys are **present and null** in the other mode rather than
+omitted, so one parser handles both without key-existence checks.
 
-`countdown`, when active: `{ "endsAt": "…", "requiredReady": 8, "currentReady": 6 }`.
+Two responses embed those components:
+
+| Response | Shape | Used by |
+|---|---|---|
+| `RoomDetailResponse` | `{ ...RoomCore, roster: RosterMember[], countdown: CountdownState\|null, correlationId }` | `GET /v1/rooms/:id`, `POST /rooms/:id/{team,ready,loadout}` |
+| `RoomRealtimeState` | `{ room: RoomCore, roster: RosterMember[], countdown: CountdownState\|null, you: {…} }` inside the socket envelope | `lobby.welcome.d`, `state.snapshot.d` |
+
+`GET /v1/rooms` returns `RoomCore[]` only — no roster. A browser listing forty rooms does not
+need four hundred roster entries, and sending them makes the list slow at exactly the moment
+it should feel instant.
+
+**`room.updated` is `Partial<RoomCore>`** restricted to these keys: `name`, `status`,
+`capacity`, `playerCount`, `joinable`, `joinBlockedReason`, `settings`, `ownerAccountId`.
+`settings` is replaced **wholesale** when any part of it changes — a partial settings patch
+would need per-key null semantics that collide with the present-and-null rule above. `roomId`,
+`mapId`, `mapVersion`, `mode`, `rulesetVersion`, and `build` never change for a live room; a
+room needing different ones is a different room.
+
+### 11.3a Room create response
+
+`POST /v1/rooms` returned "RoomState + reservation", which is not a shape. It is:
+
+```jsonc
+201 → { "room": { /* RoomCore */ },
+        "roster": [ /* the creator */ ],
+        "countdown": null,
+        "reservationId": "…", "expiresAt": "…",
+        "lobbySocketUrl": "wss://…", "lobbyTicket": "…",
+        "correlationId": "…" }
+```
+
+Creating a room joins it, so the creator receives the same reservation fields as §11.4 and
+follows the identical path to the socket. There is no separate create-then-join step to get
+wrong.
 
 ### 11.4 Join
 
@@ -339,7 +503,8 @@ See `feature-flags.md` §3.1 for the exact `GET /v1/config/flags` response.
 left to inference.
 
 ```jsonc
-// POST /v1/auth/signup   { "email", "password", "displayName", "dateOfBirth" }
+// POST /v1/auth/signup   { "email", "password", "displayName", "eligibilityReceipt" }
+//   dateOfBirth is NOT sent here — see §3a.1; it never leaves the preflight
 // POST /v1/auth/signin   { "email", "password" }
 201/200 → { "accessToken", "expiresAt", "session": { "sessionId", "deviceLabel", "createdAt" },
             "profile": { /* §4 GET /profile/me */ }, "correlationId" }
@@ -406,28 +571,49 @@ left to inference.
 each value being the §11.5 body. It does **not** sum across modes — a combined K/D over two
 rulesets with different death semantics is a number that means nothing.
 
-### 11.9 Roaming settings — the allowlist
+### 11.9 Roaming settings — `RoamingSettingsV1` (REQ-CC-016)
 
-`values` in §11.2 is a closed object, not free-form. It mirrors `docs/design/settings-inventory.md`;
-anything outside it is rejected with `VALIDATION_FAILED` rather than stored.
+**This section no longer contains a table, deliberately.** It previously carried a hand-written
+allowlist that claimed to mirror `design/settings-inventory.md` and did not: it renamed
+`adsSensitivity` to `adsSensitivityScale`, narrowed FOV from 60–120 to 70–110, invented a
+`voice` audio channel, collapsed primary/secondary bindings to a single action→code map, and
+put the volume controls in roaming scope. Duplicating a table is what produced that drift, so
+the duplicate is gone.
 
-| Key | Type | Range | Roams? |
-|---|---|---|---|
-| `sensitivity` | number | 0.05–10.0 | yes |
-| `adsSensitivityScale` | number | 0.1–2.0 | yes |
-| `fov` | integer | 70–110 | yes |
-| `invertY` | boolean | — | yes |
-| `crosshair` | object | `{ style, size 1–10, thickness 1–5, gap 0–10, colorHex, dot }` | yes |
-| `hud` | object | `{ scale 0.75–1.5, showKillfeed, showMinimap, showDamageNumbers }` | yes |
-| `audio` | object | `{ master, sfx, music, voice }` each 0–1 | yes |
-| `accessibility` | object | `{ reduceShake, reduceMotion, subtitles, colorblindMode, textScale 1.0–1.5 }` | yes |
-| `keybinds` | object | action → code, from a closed action list | yes |
-| `network.showDiagnostics` | boolean | — | yes |
-| resolution, graphics quality, audio device, display | — | — | **no — local only** |
+**`design/settings-inventory.md` is the single source of truth for settings.** It is
+Codex-owned, and this contract defers to it.
 
-The bottom row is the reason the allowlist exists: roaming a monitor resolution or a GPU
-quality preset to a different machine is a bug that looks like a feature until someone signs in
-on a laptop.
+```
+RoamingSettingsV1  ≡  exactly the rows of design/settings-inventory.md whose Scope is ROAM,
+                      keyed by their canonical IDs, with that document's
+                      type, range, step, enum and default.
+```
+
+| Scope in the inventory | Server behaviour |
+|---|---|
+| `ROAM` | Stored and returned by §11.2. The complete set, no additions |
+| `DEVICE` | **Rejected** with `VALIDATION_FAILED`. Local only — render scale, quality, frame cap, and **all volume controls**, because they depend on the physical machine |
+| `SESSION` | Rejected. Live measured values, never persisted |
+| `PRACTICE` | Rejected. Offline practice setup; the server room owns the online equivalents |
+
+Volume being `DEVICE` is the clearest case: roaming a master volume from a desktop with
+speakers to a laptop is a setting arriving wrong on a machine that had it right.
+
+**Bindings** carry primary **and optional secondary** per action, as the inventory specifies
+(`Crouch/slide` ships `Left Ctrl` + `C`). A single action→code map cannot express that:
+
+```jsonc
+"keybinds": { "crouchSlide": { "primary": "ControlLeft", "secondary": "KeyC" },
+              "jump":        { "primary": "Space",       "secondary": null } }
+```
+
+**Validation** is generated from the inventory rather than hand-maintained here, so a change to
+a range in the design doc cannot silently disagree with the server. A key outside the ROAM set,
+or a value outside its stated range, step, or enum, is rejected — never clamped, because a
+clamped setting is a setting the player did not choose and cannot see they did not get.
+
+`schemaVersion` (§11.2) is `1` for `RoamingSettingsV1`. Adding a ROAM row is additive within
+the version; removing or retyping one is a CCR against both documents.
 
 ### 11.10 Stub scenarios (REQ-CC-010)
 

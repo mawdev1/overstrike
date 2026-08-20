@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `REVIEW` — amended per Codex review; awaiting re-sign-off |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -194,7 +194,7 @@ intentions. This is the byte layout. `PROTOCOL_VERSION` becomes **2** only when 
 |---|---:|---|---|
 | `MSG_HELLO` | 5 | c→s | 4 + `n` (ticket) |
 | `MSG_REJECT` | 6 | s→c | 4 + `n` (reason) |
-| `MSG_MATCHSTATE` | 7 | s→c | 28 |
+| `MSG_MATCHSTATE` | 7 | s→c | 40 |
 | `MSG_OUTCOME` | 8 | s→c | 32 |
 
 ### 8.2 `MSG_HELLO` — authenticated handshake (closes G1 + G2)
@@ -273,7 +273,7 @@ all of them. 6-bit progress is ~1.6% granularity, far finer than a progress bar 
 (`net-facade.md` §5.1). A bar that keeps filling through a dropped packet tells the player they
 are safe when the server has already cancelled the plant.
 
-### 8.6 `MSG_MATCHSTATE` — 28 bytes, sent on change only
+### 8.6 `MSG_MATCHSTATE` — 40 bytes, sent on change only
 
 Not per tick, and not inside the snapshot: match state changes a few times a round while
 snapshots go out at `SNAPSHOT_INTERVAL`, so folding it in would resend unchanged bytes
@@ -297,6 +297,14 @@ thousands of times a match.
 | 22 | u8 | `interactProgress` 0–63 |
 | 23 | u8 | `sideSwitched` — 0/1 |
 | 24 | u32 | `serverTimeMs` (low 32 bits) |
+| 28 | f32 | `bombX` |
+| 32 | f32 | `bombY` |
+| 36 | f32 | `bombZ` |
+
+**Bomb position is state, not an event (REQ-CC-018).** `bombDropped` (§8.7) fires once; a
+client that reconnects or resyncs after it has fired would never learn where the bomb is. It
+lives in the state message so every snapshot of the world is complete on its own. Meaningful
+when `bombState` is `dropped` or `planted`; zero otherwise.
 
 **Null sentinels are explicit**: entity id `0` is never a valid entity, and `0` on an enum is
 always "none". A decoder never has to distinguish absent from zero.
@@ -312,8 +320,15 @@ Appended to `EV_KINDS` **in this order** — the wire code is the index:
 10 plantStart      11 plantComplete    12 plantCancel
 13 defuseStart     14 defuseComplete   15 defuseCancel
 16 bombDropped     17 bombPickedUp     18 bombDetonated
-19 roundStart
+19 roundStart      20 interactRefused
 ```
+
+**`interactRefused` is separate from the cancel kinds (REQ-CC-018).** A cancellation ends
+something that had started; a refusal means it never started — wrong phase, not the carrier,
+already planted. The facade previously sourced `interactionRefused` from `plantCancel`, which
+cannot express a precondition that was never met. `amount` carries the refusal reason: `0`
+not-eligible, `1` wrong-phase, `2` outside-volume, `3` not-carrier, `4` already-planted.
+Sent only to the refused player.
 
 All reuse the existing 12-byte event header. `entityId` is the actor; `amount` carries the
 cancel reason for `plantCancel`/`defuseCancel` (0 released, 1 left volume, 2 died, 3 round
@@ -343,7 +358,7 @@ cannot substitute — it says a round ended, not who won or why.
 | 0 | u8 | `MSG_OUTCOME` |
 | 1 | u8 | `scope` — 1 round, 2 match |
 | 2 | u8 | `roundIndex` (255 = not applicable) |
-| 3 | u8 | `winner` — 0 draw, 1 alpha, 2 bravo |
+| 3 | u8 | `winner` — 0 **none/undecided**, 1 alpha, 2 bravo, 3 draw |
 | 4 | u8 | `reason` — see below |
 | 5 | u8 | `terminationReason` — 0 completed, 1 aborted, 2 invalidated (match scope only) |
 | 6 | u16 | `scoreAlpha` |
@@ -353,6 +368,22 @@ cannot substitute — it says a round ended, not who won or why.
 | 16 | bytes[16] | `matchId`, the ULID's 16 raw bytes |
 
 `reason`: `0` elimination, `1` defuse, `2` detonation, `3` timer, `4` forfeit, `5` abandon.
+
+**`winner: 0` is "no winner", not "draw" (REQ-CC-019).** Draw is `3`. The two are different
+facts and the earlier encoding could not tell them apart: an aborted or invalidated match has
+no winner at all, which `match-result.md` represents as `winnerTeam: null`, while a 6-6 finish
+is a genuine draw. Collapsing them would have made every invalidated match look like a tie in
+the results screen and in career stats.
+
+| `winner` | `terminationReason` | `winnerTeam` in the result |
+|---|---|---|
+| 1 or 2 | 0 completed | `"alpha"` / `"bravo"` |
+| 3 | 0 completed | `"draw"` |
+| 0 | 1 aborted | `null` |
+| 0 | 2 invalidated | `null` |
+
+`forfeit` and `abandon` pair with a decided `winner` and `terminationReason: 1` — the match
+ended abnormally but someone still won it.
 
 `matchId` travels as 16 raw bytes rather than its 26-character text form — a ULID is a 128-bit
 value, and sending it as text would cost 10 extra bytes on a message that already carries
