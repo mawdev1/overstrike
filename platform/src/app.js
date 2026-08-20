@@ -105,8 +105,18 @@ export async function buildApp(config, overrides = {}) {
  * Rather than duplicate a signer — two ways to mint, one way to verify — this translates
  * auth's `readConsent` result into telemetry's `{ ok, reason, subject, subjectId }` verdict.
  */
-function adaptAuthConsent(receipts, config, clock) {
+function adaptAuthConsent(receipts, config) {
   return {
+    /**
+     * @param expect {{ accountId: string|null, clientSessionId: string|null }}
+     *   The caller's AUTHENTICATED state, as the telemetry service knows it. Note the key
+     *   names: an earlier version of this adapter read `expect.subject`/`expect.subjectId`,
+     *   which the service never sends, so both were `undefined` and the guards
+     *   `if (expect.subject && …)` short-circuited to no check at all. A receipt issued for
+     *   client session A then authorised personal telemetry submitted as session B — a
+     *   receipt is evidence about ONE subject, and possession of anyone's made it a bearer
+     *   token for everyone's.
+     */
     verify(receipt, expect = {}) {
       const claims = receipts.readConsent(receipt);
       if (!claims) return { ok: false, reason: 'receipt_signature_invalid' };
@@ -114,15 +124,30 @@ function adaptAuthConsent(receipts, config, clock) {
       if (claims.policyVersion !== config.consentPolicyVersion) {
         return { ok: false, reason: 'receipt_policy_stale' };
       }
-      // A receipt is only evidence about the subject it was issued for. Accepting one bound to
-      // another subject would make it a bearer token for someone else's consent.
-      const subject = claims.subject;
-      const subjectId = claims.subjectId ?? null;
-      if (expect.subject && expect.subject !== subject) return { ok: false, reason: 'receipt_unbound' };
-      if (expect.subjectId && expect.subjectId !== subjectId) {
-        return { ok: false, reason: 'receipt_subject_mismatch' };
+
+      // Exactly ONE expected subject, derived from authenticated state — never from the
+      // receipt, which is the thing being checked. Authenticated callers must present an
+      // account receipt for THEIR account; signed-out callers must present a client-session
+      // receipt for the session they are submitting as. There is no third case, and an
+      // unresolvable one is refused rather than defaulted.
+      const authenticated = typeof expect.accountId === 'string' && expect.accountId !== '';
+      const wantSubject = authenticated ? 'account' : 'client-session';
+      const wantId = authenticated ? expect.accountId : expect.clientSessionId;
+
+      if (typeof wantId !== 'string' || wantId === '') {
+        // A signed-out personal batch with no client session has no subject to bind to, so
+        // there is nothing a receipt could prove about it.
+        return { ok: false, reason: 'receipt_unbound' };
       }
-      return { ok: true, subject, subjectId, policyVersion: claims.policyVersion };
+      if (claims.subject !== wantSubject) return { ok: false, reason: 'receipt_unbound' };
+      if (claims.subjectId !== wantId) return { ok: false, reason: 'receipt_subject_mismatch' };
+
+      return {
+        ok: true,
+        subject: claims.subject,
+        subjectId: claims.subjectId,
+        policyVersion: claims.policyVersion,
+      };
     },
   };
 }
@@ -220,7 +245,7 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     // The HMAC verified, the claims did not, and EVERY personal-class event from every
     // consenting player was discarded as `consent_declined`. The whole client funnel.
     const consent = deps.auth
-      ? adaptAuthConsent(deps.auth.receipts, config, deps.clock)
+      ? adaptAuthConsent(deps.auth.receipts, config)
       : telemetry.createConsentReceipts({
         secret: config.tokenSecret,
         policyVersion: config.consentPolicyVersion,

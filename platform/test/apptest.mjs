@@ -153,6 +153,52 @@ await withApp(async ({ call }) => {
     JSON.stringify(forged.body));
 });
 
+// ── 3b. a consent receipt binds to EXACTLY ONE subject ────────────────────────────────
+await withApp(async ({ call }) => {
+  section('consent receipt subject binding');
+  const A = '01M0EFV571B7VBQCNXHAT5WTBR';
+  const Bs = '01M0EFV571B7VBQCNXHAT5WTBS';
+  const ev = [{
+    name: 'flow.step', version: 1, occurredAt: new Date().toISOString(),
+    correlationId: CORR, payload: { step: 'signup', outcome: 'completed', errorCode: null },
+  }];
+
+  const cA = await call('PUT', '/v1/onboarding/consent',
+    { telemetryPersonal: true, policyVersion: 1, clientSessionId: A });
+
+  // The vulnerability: the adapter read expect.subject/expect.subjectId while the service
+  // sends accountId/clientSessionId, so both were undefined and the `if (expect.x && …)`
+  // guards short-circuited to no check. Possession of ANY valid receipt authorised personal
+  // telemetry for ANY session.
+  const cross = await call('POST', '/v1/telemetry/client',
+    { clientSessionId: Bs, consentReceipt: cA.body?.receipt, schemaVersion: 1, events: ev });
+  check(cross.body?.accepted === 0,
+    "session A's receipt does NOT authorise session B",
+    JSON.stringify(cross.body));
+
+  const same = await call('POST', '/v1/telemetry/client',
+    { clientSessionId: A, consentReceipt: cA.body?.receipt, schemaVersion: 1, events: ev });
+  check(same.body?.accepted === 1,
+    'control: the same session IS authorised, so the refusal above is not blanket',
+    JSON.stringify(same.body));
+
+  const noSid = await call('POST', '/v1/telemetry/client',
+    { consentReceipt: cA.body?.receipt, schemaVersion: 1, events: ev });
+  check(noSid.body?.accepted === 0,
+    'a personal batch with no subject to bind to is refused',
+    JSON.stringify(noSid.body));
+
+  // Cross-class: a client-session receipt presented by an authenticated caller. The expected
+  // subject is derived from authenticated state, so this must not satisfy an account subject.
+  const { signup } = await onboard(call, { sid: A, email: 'binding@example.invalid' });
+  const crossClass = await call('POST', '/v1/telemetry/client',
+    { clientSessionId: A, consentReceipt: cA.body?.receipt, schemaVersion: 1, events: ev },
+    { authorization: `Bearer ${signup.body?.accessToken}` });
+  check(crossClass.body?.accepted === 0,
+    'a client-session receipt does not authorise an AUTHENTICATED batch',
+    JSON.stringify(crossClass.body));
+});
+
 // ── 4. the relay drains the outbox ────────────────────────────────────────────────────
 await withApp(async ({ call, app }) => {
   section('outbox relay');
