@@ -18,6 +18,14 @@ import { NetClient } from '../src/net/client.js';
 import { createLoopbackPair } from '../src/net/transport.js';
 import { Prediction, POSITION_TOLERANCE } from '../src/net/prediction.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
+import {
+  PROTOCOL_VERSION, ENTITY_FIELDS, EV_KINDS, MSG_SNAPSHOT, MSG_WELCOME, MSG_REJECT,
+  MSG_MATCHSTATE, MATCHSTATE_BYTES, WELCOME_BYTES_V1, WELCOME_BYTES_V2,
+  encodeSnapshot, decodeSnapshot, encodeHello, decodeHello, encodeReject, decodeReject,
+  encodeWelcome, decodeWelcome, encodeMatchState, decodeMatchState,
+  encodeOutcome, decodeOutcome, encodeCommands, packInteract, unpackInteract, evCode,
+  matchIdBytes, ulidFromBytes, INTERACT_PROGRESS_MAX, EV_SPATIAL, upgradeMessage,
+} from '../src/net/protocol.js';
 
 const argv = process.argv.slice(2);
 const arg = (k, d) => {
@@ -771,6 +779,878 @@ console.log('\nlag compensation');
   else bad('view tick accounts for both delays', `got ${1000 - withInterp} ticks back, expected 16`);
   if (withoutInterp - withInterp === 12) ok('the interpolation delay is the larger half at 60 ms RTT');
   else bad('the interpolation delay is accounted for', `only ${withoutInterp - withInterp} ticks of difference`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Protocol v2 — the Bomb wire (wire-protocol.md §8, bomb-rules.md §11)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+//
+// Everything below asserts a SPECIFIC decoded value out of REAL bytes. "It encoded without
+// throwing" is not a test of a wire format: a field written at the wrong offset, a bit packed
+// into the wrong position and a reason index off by one all encode perfectly.
+
+/** Assert two numbers are exactly equal, and say both when they are not. */
+const eq = (name, got, want) => {
+  if (got === want) ok(`${name} = ${JSON.stringify(got)}`);
+  else bad(name, `got ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
+};
+
+/** A minimal wire entity: every field present, so a keyframe writes all of them. */
+function wireEntity(id, over = {}) {
+  const e = { id };
+  for (const [name] of ENTITY_FIELDS) e[name] = 0;
+  return Object.assign(e, over);
+}
+
+console.log('\nprotocol v2 — version and the append-only rule');
+
+{
+  eq('PROTOCOL_VERSION', PROTOCOL_VERSION, 2);
+
+  // §7 G3 / §9.2: the interact field is APPENDED. Its index IS its bit in the field mask, so
+  // an insert anywhere before it silently reassigns the meaning of every later field on every
+  // older client — which is the one wire mistake that cannot be noticed at runtime.
+  const idx = ENTITY_FIELDS.findIndex(([n]) => n === 'interact');
+  eq('interact is ENTITY_FIELDS index 16 (appended, not inserted)', idx, 16);
+  eq('ENTITY_FIELDS length', ENTITY_FIELDS.length, 17);
+  const before = ENTITY_FIELDS.slice(0, 16).map(([n]) => n).join(',');
+  eq('the sixteen v1 entity fields kept their order and indices', before,
+    'x,y,z,yaw,pitch,vx,vy,vz,health,armor,height,lean,flags,team,weaponIdx,ammo');
+
+  // The event codes are the contract's numbers, checked by NAME against INDEX. Asserting
+  // `EV_KINDS.length` alone would pass with the eleven kinds in any order.
+  const wantCodes = {
+    plantStart: 10, plantComplete: 11, plantCancel: 12,
+    defuseStart: 13, defuseComplete: 14, defuseCancel: 15,
+    bombDropped: 16, bombPickedUp: 17, bombDetonated: 18,
+    roundStart: 19, interactRefused: 20,
+  };
+  const wrong = Object.entries(wantCodes).filter(([k, v]) => evCode(k) !== v);
+  if (wrong.length === 0) ok('all eleven appended event kinds sit at their §8.7 codes (10-20)');
+  else bad('appended event kinds are at their contract codes',
+    wrong.map(([k, v]) => `${k} is ${evCode(k)}, contract says ${v}`).join('; '));
+  eq('the first ten v1 event kinds are untouched', EV_KINDS.slice(0, 10).join(','),
+    'hitmarker,kill,fire,damaged,death,respawn,explosion,blood,flash,roundEnd');
+  eq('interactRefused is the last valid kind', EV_KINDS.length - 1, 20);
+}
+
+{
+  // An OLD-FORMAT snapshot must still decode for the fields it had. This is the whole reason
+  // §7 G3 says "appended, never inserted": a v1 server's bytes carry sixteen fields and a
+  // 16-bit mask, and a v2 decoder has to read every one of them at the offset v1 wrote it.
+  const V1_FIELDS = ENTITY_FIELDS.slice(0, 16);
+  const SIZE = { f32: 4, u16: 2, u8: 1 };
+  const src = {
+    x: 1.5, y: 2.25, z: -3.75, yaw: 0.5, pitch: -0.25,
+    vx: 4, vy: -5, vz: 6, health: 87, armor: 33,
+    height: 1.8, lean: -0.5, flags: 0x21, team: 1, weaponIdx: 3, ammo: 29,
+  };
+  const buf = new ArrayBuffer(128);
+  const v = new DataView(buf);
+  v.setUint8(0, MSG_SNAPSHOT);
+  v.setUint8(1, 1);                       // keyframe
+  v.setUint32(2, 900, true);
+  v.setUint32(6, 0, true);
+  v.setUint32(10, 42, true);
+  v.setUint32(14, 1, true);
+  let o = 18;
+  v.setUint32(o, 7, true); o += 4;
+  v.setUint32(o, 0xffff, true); o += 4;   // sixteen bits set — a v1 encoder's full mask
+  for (const [name, type] of V1_FIELDS) {
+    if (type === 'f32') { v.setFloat32(o, src[name], true); o += 4; }
+    else if (type === 'u16') { v.setUint16(o, src[name], true); o += 2; }
+    else { v.setUint8(o, src[name]); o += 1; }
+    void SIZE;
+  }
+  const snap = decodeSnapshot(buf.slice(0, o), null);
+  const e = snap.entities[0];
+  // f32 on the wire, so the expectation is the f32 of the value v1 wrote, not the float64.
+  const mismatched = Object.keys(src).filter((k) => e[k] !== Math.fround(src[k]));
+  if (mismatched.length === 0) {
+    ok('a v1-format snapshot still decodes all sixteen of its fields exactly');
+  } else {
+    bad('an old-format snapshot decodes the fields it had',
+      mismatched.map((k) => `${k}: got ${e[k]}, v1 wrote ${src[k]}`).join('; '));
+  }
+  eq('and the appended field defaults to 0 rather than reading past the frame', e.interact, 0);
+  eq('the v1 entity id survives', e.id, 7);
+  eq('the v1 tick survives', snap.tick, 900);
+
+  // The v1 welcome is a strict PREFIX of the v2 one, which is the property that makes the
+  // append safe. Its four fields must still come out at their v1 offsets.
+  const w1 = new ArrayBuffer(WELCOME_BYTES_V1);
+  const wv = new DataView(w1);
+  wv.setUint8(0, MSG_WELCOME);
+  wv.setUint32(1, 11, true);
+  wv.setUint32(5, 22, true);
+  wv.setUint32(9, 33333, true);
+  wv.setUint16(13, 75, true);
+  const oldW = decodeWelcome(w1);
+  eq('v1 welcome: clientId', oldW.clientId, 11);
+  eq('v1 welcome: entityId', oldW.entityId, 22);
+  eq('v1 welcome: matchSeed', oldW.matchSeed, 33333);
+  eq('v1 welcome: killLimit', oldW.killLimit, 75);
+  eq('v1 welcome carries no version, and says so rather than guessing', oldW.protocolVersion, null);
+}
+
+console.log('\nprotocol v2 — the packed interact byte (§8.5)');
+
+{
+  // Bit boundaries, both ends of both fields. The packing is kind in bits 0-1 and progress in
+  // bits 2-7, and every one of these round trips through a REAL delta-coded snapshot rather
+  // than through packInteract's own inverse — decoding a value with the function that
+  // produced it proves only that the pair is self-consistent.
+  const cases = [
+    ['none, 0', 0, 0], ['none, 63', 0, 63],
+    ['plant, 0', 1, 0], ['plant, 1', 1, 1], ['plant, 62', 1, 62], ['plant, 63', 1, 63],
+    ['defuse, 0', 2, 0], ['defuse, 63', 2, 63], ['defuse, 32', 2, 32],
+  ];
+  let allGood = true;
+  for (const [label, kind, progress] of cases) {
+    const byte = packInteract(kind, progress);
+    const snap = { tick: 1, baseTick: 0, lastCommandSeq: 0, entities: [wireEntity(5, { interact: byte })], events: [] };
+    const got = decodeSnapshot(encodeSnapshot(snap, null), null).entities[0].interact;
+    const un = unpackInteract(got);
+    if (got !== byte || un.kind !== kind || un.progress !== progress) {
+      allGood = false;
+      bad(`interact round trip (${label})`,
+        `wire byte ${got} (sent ${byte}) decoded as kind ${un.kind} progress ${un.progress}`);
+    }
+  }
+  if (allGood) ok(`all ${cases.length} interact kind/progress boundary vectors survive a snapshot round trip`);
+
+  // The two ends of the six-bit field must be DIFFERENT bytes — a packing that dropped the
+  // progress bits would pass a "0 stays 0" test on its own.
+  if (packInteract(1, 0) !== packInteract(1, 63)) ok('progress 0 and 63 are genuinely different bytes');
+  else bad('progress occupies bits 2-7', 'progress 0 and 63 packed identically — the bits are being discarded');
+  eq('progress 63 packs into the top six bits', packInteract(0, 63), 0xfc);
+  eq('defuse packs into bits 0-1', packInteract(2, 0), 0x02);
+  eq('progress is clamped, not wrapped, at 64', unpackInteract(packInteract(1, 64)).progress, 63);
+
+  // §8.11: kind 3 is reserved and is treated as 0. Never rendered.
+  const reserved = unpackInteract(3 | (17 << 2));
+  eq('a reserved interact kind decodes as none', reserved.kind, 0);
+  eq('and is flagged as reserved rather than silently normal', reserved.reserved, true);
+  eq('its progress is still readable', reserved.progress, 17);
+
+  // §8.5: no new flag bit. Bit 7 of `flags` stays spare.
+  const F = { ALIVE: 1, CROUCH: 2, SPRINT: 4, SLIDE: 8, FIRING: 16, ADS: 32, RELOAD: 64 };
+  const used = Object.values(F).reduce((a, b) => a | b, 0);
+  eq('flags bit 7 is still spare (no new flag bit was taken)', used & 0x80, 0);
+}
+
+console.log('\nprotocol v2 — appended event kinds (§8.7)');
+
+{
+  const events = [
+    { kind: 'roundStart', entityId: 0, amount: 3 },
+    { kind: 'plantStart', entityId: 41 },
+    { kind: 'plantCancel', entityId: 41, reason: 'left-volume' },
+    { kind: 'plantComplete', entityId: 41 },
+    { kind: 'defuseStart', entityId: 77 },
+    { kind: 'defuseCancel', entityId: 77, reason: 'died' },
+    { kind: 'defuseComplete', entityId: 77 },
+    { kind: 'bombPickedUp', entityId: 41 },
+    { kind: 'bombDropped', entityId: 41, x: 12.5, y: 0.25, z: -8.75 },
+    { kind: 'bombDetonated', entityId: 0, x: 3.5, y: 1.5, z: 2.5 },
+    { kind: 'interactRefused', entityId: 41, requestedKind: 2, reason: 'already-planted' },
+  ];
+  const snap = { tick: 5, baseTick: 0, lastCommandSeq: 0, entities: [wireEntity(1)], events };
+  const out = decodeSnapshot(encodeSnapshot(snap, null), null).events;
+
+  eq('all eleven Bomb events survive the wire', out.length, 11);
+  eq('kinds decode in order', out.map((e) => e.kind).join(','),
+    'roundStart,plantStart,plantCancel,plantComplete,defuseStart,defuseCancel,defuseComplete,'
+    + 'bombPickedUp,bombDropped,bombDetonated,interactRefused');
+
+  eq('plantStart carries the actor as entityId', out[1].entityId, 41);
+  eq('plantCancel reason index', out[2].reason, 1);
+  eq('plantCancel reason name', out[2].reasonName, 'left-volume');
+  eq('defuseCancel reason name', out[5].reasonName, 'died');
+
+  // The two spatial Bomb kinds. `bombDropped` has to be state-complete on the wire: a client
+  // that resyncs after it fired learns the position from MSG_MATCHSTATE, but the event still
+  // has to say where the drop happened for the effect to land in the right place.
+  const drop = out[8];
+  if (drop.x === 12.5 && drop.y === 0.25 && drop.z === -8.75) ok('bombDropped carries its vec3 exactly');
+  else bad('bombDropped carries a position', `(${drop.x}, ${drop.y}, ${drop.z})`);
+  const det = out[9];
+  if (det.x === 3.5 && det.y === 1.5 && det.z === 2.5) ok('bombDetonated carries its vec3 exactly');
+  else bad('bombDetonated carries a position', `(${det.x}, ${det.y}, ${det.z})`);
+  if (EV_SPATIAL.has('bombDropped') && EV_SPATIAL.has('bombDetonated')) {
+    ok('both are cullable by distance (in EV_SPATIAL)');
+  } else {
+    bad('bombDropped and bombDetonated are distance-cullable', 'they are not in EV_SPATIAL');
+  }
+  if (!EV_SPATIAL.has('plantComplete')) ok('a plant is a fact about a round, not a place — not culled');
+  else bad('non-spatial Bomb kinds are not culled', 'plantComplete is in EV_SPATIAL');
+
+  // §8.7: a refusal is not a cancellation. It carries BOTH the requested kind and the reason,
+  // because the facade needs `{ kind, reason }` and `amount` alone cannot produce both.
+  const ref = out[10];
+  eq('interactRefused requested kind (from flags bits 1-5)', ref.requestedKind, 2);
+  eq('interactRefused requested kind name', ref.requestedKindName, 'defuse');
+  eq('interactRefused reason index', ref.reason, 4);
+  eq('interactRefused reason name', ref.reasonName, 'already-planted');
+  eq('and its actor', ref.entityId, 41);
+}
+
+{
+  // §8.11, both boundary vectors, spelled out because the comparison is `>=` and not `>`:
+  // wire codes are zero-based indices into EV_KINDS, so the FIRST invalid code is
+  // EV_KINDS.length. `>` let exactly that value through into EV_KINDS[code] — `undefined` —
+  // at the decoder's untrusted-input boundary.
+  const mk = (code) => {
+    const buf = new ArrayBuffer(18 + 8 + 2 + 12);
+    const v = new DataView(buf);
+    v.setUint8(0, MSG_SNAPSHOT); v.setUint8(1, 1);
+    v.setUint32(2, 1, true); v.setUint32(6, 0, true); v.setUint32(10, 0, true);
+    v.setUint32(14, 0, true);                 // no entities
+    let o = 18;
+    v.setUint16(o, 1, true); o += 2;          // one event
+    v.setUint8(o, code); o += 1;
+    v.setUint8(o, 0); o += 1;
+    v.setUint32(o, 99, true); o += 4;
+    v.setUint32(o, 0, true); o += 4;
+    v.setUint16(o, 0, true); o += 2;
+    return buf.slice(0, o);
+  };
+  const last = decodeSnapshot(mk(20), null);
+  eq('the LAST valid event code (20, interactRefused) decodes', last.events[0]?.kind, 'interactRefused');
+  const first = decodeSnapshot(mk(EV_KINDS.length), null);
+  eq(`the FIRST invalid event code (${EV_KINDS.length}) yields no event`, first.events.length, 0);
+  eq('and the event block is abandoned rather than resynchronised onto garbage', first.truncatedEvents, true);
+  const undef = first.events.some((e) => e.kind === undefined || e.kind === 'unknown');
+  if (!undef) ok('no event with an undefined kind reaches a consumer');
+  else bad('an out-of-range code never becomes an event', JSON.stringify(first.events));
+}
+
+console.log('\nprotocol v2 — MSG_MATCHSTATE (§8.6)');
+
+{
+  const full = {
+    phase: 'planted', roundIndex: 9, localRole: 'defender',
+    scoreAlpha: 6, scoreBravo: 5, phaseRemainingMs: 39900,
+    aliveAlpha: 2, aliveBravo: 4,
+    bombState: 'planted', bombCarrierId: 0, bombSite: 'B',
+    interactActorId: 8181, interactProgress: 63, sideSwitched: true,
+    serverTimeMs: 4000000000, bombPosition: { x: -12.5, y: 0.75, z: 44.25 },
+  };
+  const buf = encodeMatchState(full);
+  eq('MSG_MATCHSTATE is exactly 41 bytes', buf.byteLength, MATCHSTATE_BYTES);
+  eq('and it is tagged as one', new DataView(buf).getUint8(0), MSG_MATCHSTATE);
+  const d = decodeMatchState(buf);
+  eq('phase', d.phase, 'planted');
+  eq('roundIndex', d.roundIndex, 9);
+  eq('localRole', d.localRole, 'defender');
+  eq('scoreAlpha', d.scoreAlpha, 6);
+  eq('scoreBravo', d.scoreBravo, 5);
+  eq('phaseRemainingMs (deciseconds on the wire)', d.phaseRemainingMs, 39900);
+  eq('aliveAlpha', d.aliveAlpha, 2);
+  eq('aliveBravo', d.aliveBravo, 4);
+  eq('bombState', d.bombState, 'planted');
+  eq('bombSite', d.bombSite, 'B');
+  eq('interactActorId', d.interactActorId, 8181);
+  eq('interactProgress', d.interactProgress, 63);
+  eq('interactProgressFrac', d.interactProgressFrac, 1);
+  eq('sideSwitched', d.sideSwitched, true);
+  eq('serverTimeMs survives the top of the u32 range', d.serverTimeMs, 4000000000);
+  eq('bombPositionVisible', d.bombPositionVisible, true);
+  eq('bombX', d.bombPosition.x, -12.5);
+  eq('bombY', d.bombPosition.y, 0.75);
+  eq('bombZ', d.bombPosition.z, 44.25);
+
+  // Null sentinels. `0` is never a valid entity id and `0` on an enum is always "none", so a
+  // decoder never has to distinguish absent from zero.
+  eq('carrier 0 decodes as null, not as entity 0', d.bombCarrierId, null);
+  const noSite = decodeMatchState(encodeMatchState({ ...full, bombSite: null }));
+  eq('site 0 decodes as null, not as site A', noSite.bombSite, null);
+
+  // REQ-CC-036, the bug the contract calls out by name: a CARRIED bomb has no position of its
+  // own, so the flag must be false even for an attacker who is always authorised for one that
+  // exists. Feeding a position here is exactly what the old rule did, and it published a real
+  // -looking position at the world origin.
+  const carried = decodeMatchState(encodeMatchState({
+    ...full, bombState: 'carried', bombCarrierId: 4242, bombPosition: { x: 1, y: 2, z: 3 },
+  }));
+  eq('a carried bomb reports no position however authorised the recipient is',
+    carried.bombPositionVisible, false);
+  eq('and the decoder exposes it as null, not as (0,0,0)', carried.bombPosition, null);
+  eq('while the carrier id still comes through', carried.bombCarrierId, 4242);
+
+  // The origin problem, stated directly (REQ-CC-030): (0,0,0) is a legal world position and
+  // `map-data.md`'s canonical site is centred on it, so zeroes cannot mean "hidden".
+  const atOrigin = decodeMatchState(encodeMatchState({
+    ...full, bombState: 'dropped', bombPosition: { x: 0, y: 0, z: 0 },
+  }));
+  eq('a bomb genuinely at the origin is visible', atOrigin.bombPositionVisible, true);
+  if (atOrigin.bombPosition && atOrigin.bombPosition.x === 0 && atOrigin.bombPosition.z === 0) {
+    ok('and decodes as the origin rather than as absent');
+  } else {
+    bad('the origin is a real position', JSON.stringify(atOrigin.bombPosition));
+  }
+  const hidden = decodeMatchState(encodeMatchState({ ...full, bombState: 'dropped', bombPosition: null }));
+  eq('a hidden bomb is not visible', hidden.bombPositionVisible, false);
+  eq('and is null, which is a DIFFERENT decode from the origin above', hidden.bombPosition, null);
+
+  // §8.11: enums out of range clamp to 0, and a wrong length is not state.
+  const bent = encodeMatchState(full);
+  new DataView(bent).setUint8(1, 200);
+  eq('an out-of-range phase clamps to warmup', decodeMatchState(bent).phase, 'warmup');
+  eq('a truncated match state is refused outright', decodeMatchState(bent.slice(0, 40)), null);
+}
+
+console.log('\nprotocol v2 — MSG_OUTCOME (§8.9)');
+
+{
+  const ULID = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+  eq('a ULID survives 16 raw bytes and back', ulidFromBytes(matchIdBytes(ULID)), ULID);
+  eq('matchId is 16 bytes, not 26 characters', matchIdBytes(ULID).byteLength, 16);
+
+  const o = decodeOutcome(encodeOutcome({
+    scope: 'round', roundIndex: 4, winner: 'bravo', reason: 'defuse',
+    terminationReason: 'completed', scoreAlpha: 2, scoreBravo: 3, roundsPlayed: 5,
+    actorId: 909, matchId: ULID,
+  }));
+  eq('scope', o.scope, 'round');
+  eq('roundIndex', o.roundIndex, 4);
+  eq('winner', o.winner, 'bravo');
+  eq('winnerTeam', o.winnerTeam, 'bravo');
+  eq('reason', o.reason, 'defuse');
+  eq('terminationReason', o.terminationReason, 'completed');
+  eq('scoreAlpha', o.scoreAlpha, 2);
+  eq('scoreBravo', o.scoreBravo, 3);
+  eq('roundsPlayed', o.roundsPlayed, 5);
+  eq('actorId (the defuser)', o.actorId, 909);
+  eq('matchId round-trips through the wire', o.matchId, ULID);
+
+  // REQ-CC-019. `winner: 0` is "no winner"; `winner: 3` is a draw. Collapsing them would make
+  // every invalidated match look like a 6-6 tie in the results screen and in career stats.
+  const draw = decodeOutcome(encodeOutcome({
+    scope: 'match', winner: 'draw', reason: 'timer', terminationReason: 'completed',
+    scoreAlpha: 6, scoreBravo: 6, roundsPlayed: 12, matchId: ULID,
+  }));
+  eq('a 6-6 finish is a draw', draw.winner, 'draw');
+  eq('and its winnerTeam is "draw", not null', draw.winnerTeam, 'draw');
+  const none = decodeOutcome(encodeOutcome({
+    scope: 'match', winner: 'none', reason: 'no-contest', terminationReason: 'invalidated',
+    scoreAlpha: 3, scoreBravo: 1, roundsPlayed: 4, matchId: ULID,
+  }));
+  eq('an invalidated match has no winner', none.winner, 'none');
+  eq('and its winnerTeam is null, which is NOT "draw"', none.winnerTeam, null);
+  eq('roundIndex 255 means "not applicable", not round 255', none.roundIndex, null);
+
+  // §8.9's two bold rows: an ABORTED match can have a winner. A forfeit is the most common
+  // abnormal ending and the remaining team earns the win.
+  const forfeit = decodeOutcome(encodeOutcome({
+    scope: 'match', winner: 'alpha', reason: 'forfeit', terminationReason: 'aborted',
+    scoreAlpha: 4, scoreBravo: 2, roundsPlayed: 6, matchId: ULID,
+  }));
+  eq('an aborted match can still name a winner (forfeit)', forfeit.winnerTeam, 'alpha');
+  eq('and stays aborted', forfeit.terminationReason, 'aborted');
+}
+
+console.log('\nprotocol v2 — the handshake (§8.2, §8.3, §8.4)');
+
+{
+  const h = decodeHello(encodeHello(2, 'st_abc123'));
+  eq('hello: protocolVersion', h.protocolVersion, 2);
+  eq('hello: ticket', h.ticket, 'st_abc123');
+  eq('an empty ticket is an empty string, not null', decodeHello(encodeHello(2, '')).ticket, '');
+  // The declared ticket length is attacker-controlled; a short frame claiming 255 bytes must
+  // not read whatever follows it in memory.
+  const lying = encodeHello(2, 'abcd');
+  new DataView(lying).setUint8(3, 255);
+  eq('a hello whose declared length does not match the frame is refused', decodeHello(lying), null);
+  eq('a 3-byte hello is refused rather than read', decodeHello(new ArrayBuffer(3)), null);
+
+  const r = decodeReject(encodeReject('PROTOCOL_VERSION_MISMATCH', 2));
+  eq('reject: reason', r.reason, 'PROTOCOL_VERSION_MISMATCH');
+  eq('reject: the server\'s own version rides along', r.serverVersion, 2);
+
+  const w = decodeWelcome(encodeWelcome({
+    clientId: 3, entityId: 44, matchSeed: 987654, killLimit: 0,
+    protocolVersion: 2, mode: 'bomb', flags: 1, serverTickRateHz: 120,
+  }));
+  eq('v2 welcome is 21 bytes', encodeWelcome({}).byteLength, WELCOME_BYTES_V2);
+  eq('welcome: clientId', w.clientId, 3);
+  eq('welcome: entityId', w.entityId, 44);
+  eq('welcome: matchSeed', w.matchSeed, 987654);
+  eq('welcome: protocolVersion', w.protocolVersion, 2);
+  eq('welcome: mode', w.mode, 'bomb');
+  eq('welcome: isReconnect (flags bit 0)', w.isReconnect, true);
+  eq('welcome: isSpectator (flags bit 1)', w.isSpectator, false);
+  eq('welcome: serverTickRateHz', w.serverTickRateHz, 120);
+  // REQ-CC-021: `RoomSettings` says `null` and a u16 cannot. `normalizeKillLimit` clamps to 1,
+  // so 0 is unambiguous — but only a decoder that knows the rule can apply it.
+  eq('killLimit 0 in Bomb decodes as null, not as a limit of zero', w.killLimit, null);
+  const tdm = decodeWelcome(encodeWelcome({ mode: 'tdm', killLimit: 75, protocolVersion: 2 }));
+  eq('and a TDM kill limit is left alone', tdm.killLimit, 75);
+}
+
+{
+  // The rejection, over a real transport, decoded from the bytes the client actually received.
+  const s = await makeSession();
+  const c = s.conns[0];
+  const sess = c.session;
+  const raw = [];
+  // Tap the wire ahead of the client so the assertions are about BYTES, not about what
+  // NetClient chose to remember.
+  c.cT.onMessage((d) => { raw.push(d.slice(0)); c.client._onMessage(d); });
+
+  c.cT.send(encodeHello(PROTOCOL_VERSION - 1, 'st_old_client'));
+  c.sT.pump(0);            // deliver client -> server
+  c.cT.pump(0);            // deliver server -> client
+
+  const rejectFrame = raw.find((b) => new DataView(b).getUint8(0) === MSG_REJECT);
+  if (!rejectFrame) {
+    bad('an incompatible client is rejected at handshake',
+      `no MSG_REJECT on the wire — frames were [${raw.map((b) => new DataView(b).getUint8(0)).join(',')}]`);
+  } else {
+    const dec = decodeReject(rejectFrame);
+    eq('the rejection reason on the wire', dec.reason, 'PROTOCOL_VERSION_MISMATCH');
+    eq('and it names the server\'s version so the client can say which build to get',
+      dec.serverVersion, PROTOCOL_VERSION);
+  }
+  eq('the session is gone — no entity is left driving', s.server.clients.size, 0);
+  eq('the client knows it was rejected', c.client.rejected?.reason, 'PROTOCOL_VERSION_MISMATCH');
+  eq('and it forgets its entity rather than carrying on', c.client.entityId, 0);
+
+  // The upgrade message itself. §8.3's whole reason for putting the server's version in the
+  // reject frame is that the client can then say WHICH way the mismatch runs — "reload" and
+  // "try another server" are opposite instructions and giving the wrong one wastes the
+  // player's time. Both directions, since a bare "versions differ" would pass either way.
+  const newer = upgradeMessage(5, 2);
+  const older = upgradeMessage(1, 2);
+  if (/v5/.test(newer) && /update|reload/i.test(newer)) ok(`a newer server says to update: "${newer}"`);
+  else bad('a newer server produces an update message', newer);
+  if (/v1/.test(older) && /another server/i.test(older)) ok(`an older server says to go elsewhere: "${older}"`);
+  else bad('an older server produces a different message', older);
+  if (newer !== older) ok('the two directions are genuinely different messages');
+  else bad('the upgrade message distinguishes the two directions', 'both read the same');
+
+  // A frame already in flight from a rejected peer must be dropped UNREAD. That peer is by
+  // definition the one whose bytes we do not agree about.
+  const late = emptyCommand();
+  late.seq = 99;
+  s.server._onMessage(sess, encodeCommands([late]));
+  eq('a late frame from a rejected client is counted and dropped', sess.stats.rejectedMessages, 1);
+  eq('and never reaches the command queue', sess.queue.length, 0);
+}
+
+{
+  // The green half. A matching version is accepted and the welcome carries v2.
+  const s = await makeSession();
+  const c = s.conns[0];
+  const raw = [];
+  c.cT.onMessage((d) => { raw.push(d.slice(0)); c.client._onMessage(d); });
+
+  c.cT.send(encodeHello(PROTOCOL_VERSION, 'st_good_client'));
+  c.sT.pump(0);
+  c.cT.pump(0);
+
+  const rejected = raw.some((b) => new DataView(b).getUint8(0) === MSG_REJECT);
+  if (!rejected) ok('a matching version is not rejected');
+  else bad('a matching version is accepted', 'the server rejected a client speaking its own version');
+  eq('the connection survives', s.server.clients.size, 1);
+  eq('the server kept the ticket for G2 to validate', c.session.ticket, 'st_good_client');
+  eq('the welcome names the negotiated version', c.client.welcome?.protocolVersion, PROTOCOL_VERSION);
+  eq('and the server tick rate', c.client.welcome?.serverTickRateHz, 120);
+  eq('the client was not rejected', c.client.rejected, null);
+  eq('and it knows which entity it drives', c.client.entityId, c.entity.id);
+}
+
+{
+  // The other direction: a v1 SERVER. It sends 15 bytes and no version at all, which is not
+  // "unknown, carry on" — it is a server that cannot describe the fields this build reads.
+  const [cT, sT] = createLoopbackPair();
+  const client = new NetClient(cT);
+  const w1 = new ArrayBuffer(WELCOME_BYTES_V1);
+  const v = new DataView(w1);
+  v.setUint8(0, MSG_WELCOME);
+  v.setUint32(1, 1, true);
+  v.setUint32(5, 5, true);
+  v.setUint32(9, 7, true);
+  v.setUint16(13, 75, true);
+  sT.send(w1);
+  cT.pump(0);
+  eq('a v1 server is refused by the client', client.rejected?.reason, 'PROTOCOL_VERSION_MISMATCH');
+  eq('the client records which version the server speaks', client.rejected?.serverVersion, 1);
+  eq('and never adopts an entity from it', client.entityId, 0);
+}
+
+console.log('\nprotocol v2 — the per-recipient bomb-position filter (§8.6, §8.8)');
+
+{
+  // THE high-risk part, proved the only way that means anything: by decoding the bytes two
+  // recipients actually receive and asserting they differ. Testing the function that decides
+  // visibility would pass even if the encoder wrote the coordinates for everyone anyway.
+  const s = await makeSession({ clients: 3 });
+  const [A, B, C] = s.conns;
+  const g = s.game;
+
+  // Find a bomb position, a viewpoint that CANNOT see it, and one that CAN. Probed against
+  // the real world rather than hard-coded, so a map change makes this test say so instead of
+  // quietly measuring nothing.
+  const sp = g.world.spawnPoints.map((p) => p.position ?? p);
+  const BOMB = { x: sp[0].x, y: sp[0].y + 0.3, z: sp[0].z };
+  const eyeH = A.entity.eyeHeight ?? 1.6;
+  let blind = null, seeing = null;
+  for (let i = 1; i < sp.length; i++) {
+    const clear = g.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, BOMB);
+    if (clear && !seeing) seeing = sp[i];
+    if (!clear && !blind) blind = sp[i];
+  }
+  if (!blind || !seeing) {
+    bad('the map offers both a blocked and a clear sightline to the bomb',
+      `blocked=${!!blind} clear=${!!seeing} — this test cannot distinguish anything`);
+  }
+
+  const place = (conn, p, team) => {
+    conn.entity.position.set(p.x, p.y, p.z);
+    conn.entity.team = team;
+    conn.entity.alive = true;
+  };
+  place(A, sp[2], 0);                 // attacker: authorised by role, wherever they stand
+  place(B, blind ?? sp[1], 1);        // defender who cannot see the drop
+  place(C, seeing ?? sp[1], 1);       // defender who can
+
+  const m = g.match;
+  m.modeId = 'bomb';
+  m.roundIndex = 4;
+  m.scores = [3, 2];
+  m.aliveCounts = { alpha: 3, bravo: 2 };
+  m.phaseRemainingMs = 71500;
+  m.sideSwitched = false;
+  m.attackingTeam = 0;
+  m.phase = 'live';
+  m.bomb = { state: 'dropped', carrierId: 0, siteId: null, position: BOMB };
+  m.interaction = { kind: 'none', actorId: 0, progress: 0 };
+
+  // Tap all three wires, then let the server produce one broadcast.
+  const taps = [A, B, C].map((conn) => {
+    const frames = [];
+    conn.cT.onMessage((d) => { frames.push(d.slice(0)); conn.client._onMessage(d); });
+    return frames;
+  });
+  s.server._broadcastMatchState();
+  for (const conn of [A, B, C]) conn.cT.pump(0);
+
+  const stateOf = (frames) => frames.find((b) => new DataView(b).getUint8(0) === MSG_MATCHSTATE);
+  const [fa, fb, fc] = taps.map(stateOf);
+
+  if (!fa || !fb || !fc) {
+    bad('every client received a match state', `attacker=${!!fa} blindDefender=${!!fb} seeingDefender=${!!fc}`);
+  } else {
+    const da = decodeMatchState(fa);
+    const db = decodeMatchState(fb);
+    const dc = decodeMatchState(fc);
+
+    // Both recipients agree about the PUBLIC facts. This matters: if they differed here the
+    // difference below could be anything, and the filter would prove nothing.
+    eq('attacker and defender agree on the phase', db.phase, da.phase);
+    eq('...on the round index', db.roundIndex, 4);
+    eq('...on the scores', `${db.scoreAlpha}-${db.scoreBravo}`, '3-2');
+    eq('...on the alive counts', `${db.aliveAlpha}/${db.aliveBravo}`, '3/2');
+    eq('...and on the bomb STATE — only the coordinates are filtered', db.bombState, 'dropped');
+    eq('the attacker is told they are attacking', da.localRole, 'attacker');
+    eq('the defender is told they are defending', db.localRole, 'defender');
+
+    // The filter itself.
+    eq('the attacker sees the dropped bomb', da.bombPositionVisible, true);
+    if (da.bombPosition
+      && Math.abs(da.bombPosition.x - BOMB.x) < 1e-3
+      && Math.abs(da.bombPosition.y - BOMB.y) < 1e-3
+      && Math.abs(da.bombPosition.z - BOMB.z) < 1e-3) {
+      ok(`and the coordinates are the real ones (${BOMB.x}, ${BOMB.y.toFixed(2)}, ${BOMB.z})`);
+    } else {
+      bad('the authorised recipient gets the real coordinates', JSON.stringify(da.bombPosition));
+    }
+    eq('the defender with no sightline does NOT', db.bombPositionVisible, false);
+    eq('and gets null rather than a position that could be read as the origin', db.bombPosition, null);
+    eq('a defender who CAN see it does', dc.bombPositionVisible, true);
+
+    // Two frames, decoded, differing. Byte-level, so this cannot be satisfied by a decoder
+    // that hides a value it was nonetheless sent.
+    const ba = new Uint8Array(fa);
+    const bb = new Uint8Array(fb);
+    let differAt = -1;
+    for (let i = 0; i < MATCHSTATE_BYTES; i++) if (ba[i] !== bb[i]) { differAt = i; break; }
+    if (differAt >= 0) ok(`the two recipients' frames genuinely differ, first at byte ${differAt}`);
+    else bad("two recipients' frames differ", 'the attacker and the blind defender received identical bytes');
+
+    // And the strongest form: the real coordinates are NOWHERE in the unauthorised frame.
+    // Not as the visible triple, not as a stale float left over from another recipient's
+    // encode, not at any offset at all.
+    const dv = new DataView(fb);
+    const wanted = [BOMB.x, BOMB.y, BOMB.z].map((n) => Math.fround(n));
+    let leaked = null;
+    for (let off = 0; off + 4 <= MATCHSTATE_BYTES; off++) {
+      const f = dv.getFloat32(off, true);
+      if (wanted.some((w) => w !== 0 && f === w)) { leaked = { off, f }; break; }
+    }
+    if (!leaked) ok('the bomb coordinates appear nowhere in the unauthorised frame, at any offset');
+    else bad('an unauthorised recipient never receives the coordinates',
+      `float32 ${leaked.f} at byte ${leaked.off} matches the real bomb position`);
+  }
+}
+
+{
+  // §8.8, the carrier — the same filter on a different field, plus REQ-CC-036: a CARRIED bomb
+  // has no position, so even the attackers who are always authorised must be told nothing.
+  const s = await makeSession({ clients: 3 });
+  const [A, B, C] = s.conns;
+  const g = s.game;
+  const sp = g.world.spawnPoints.map((p) => p.position ?? p);
+  const eyeH = A.entity.eyeHeight ?? 1.6;
+  const CARRIER_AT = sp[0];
+  const chest = { x: CARRIER_AT.x, y: CARRIER_AT.y + eyeH, z: CARRIER_AT.z };
+  let blind = null, seeing = null;
+  for (let i = 1; i < sp.length; i++) {
+    const clear = g.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, chest);
+    if (clear && !seeing) seeing = sp[i];
+    if (!clear && !blind) blind = sp[i];
+  }
+
+  const place = (conn, p, team) => {
+    conn.entity.position.set(p.x, p.y, p.z);
+    conn.entity.team = team;
+    conn.entity.alive = true;
+  };
+  place(A, CARRIER_AT, 0);            // the carrier, an attacker
+  place(B, blind ?? sp[1], 1);        // an enemy who cannot see them
+  place(C, seeing ?? sp[1], 1);       // an enemy who can
+
+  const m = g.match;
+  m.modeId = 'bomb';
+  m.roundIndex = 1;
+  m.scores = [0, 0];
+  m.aliveCounts = { alpha: 1, bravo: 2 };
+  m.phaseRemainingMs = 100000;
+  m.attackingTeam = 0;
+  m.phase = 'live';
+  // A carried bomb's position is the carrier's — `bomb.position` stays null in this state.
+  m.bomb = { state: 'carried', carrierId: A.entity.id, siteId: null, position: null };
+  m.interaction = { kind: 'plant', actorId: A.entity.id, progress: 0.5 };
+
+  const taps = [A, B, C].map((conn) => {
+    const frames = [];
+    conn.cT.onMessage((d) => { frames.push(d.slice(0)); conn.client._onMessage(d); });
+    return frames;
+  });
+  s.server._broadcastMatchState();
+  for (const conn of [A, B, C]) conn.cT.pump(0);
+  const pick = (f) => decodeMatchState(f.find((b) => new DataView(b).getUint8(0) === MSG_MATCHSTATE));
+  const [da, db, dc] = taps.map(pick);
+
+  eq('a teammate always sees the carrier', da.bombCarrierId, A.entity.id);
+  eq('an enemy with no sightline gets null, not the carrier', db.bombCarrierId, null);
+  eq('an enemy who can see them gets the id', dc.bombCarrierId, A.entity.id);
+  eq('everyone still learns the bomb is carried', db.bombState, 'carried');
+  // Step 1 of §8.6's encoder invariant, which is the step that was missing.
+  eq('a carried bomb has no position, even for the carrier themselves', da.bombPositionVisible, false);
+  eq('and the decoder says null rather than the world origin', da.bombPosition, null);
+  // Objective progress is public, and it is the six-bit wire quantity all the way through.
+  eq('objective progress is on the wire for both sides', db.interactProgress, Math.round(0.5 * INTERACT_PROGRESS_MAX));
+  eq('and names its actor', db.interactActorId, A.entity.id);
+}
+
+{
+  // The filter is re-evaluated every frame, not decided once at round start.
+  //
+  // A defender walking into line of sight of a dropped bomb changes NOTHING in the first
+  // twenty-four bytes — same phase, same scores, same bomb state, same everything public.
+  // The only bytes that move are the visibility flag and the three coordinates. A change
+  // test that ignored the tail of the frame would suppress that send, and the player would
+  // walk up to a bomb their client had been told nothing about.
+  const s = await makeSession({ clients: 1 });
+  const c = s.conns[0];
+  const g = s.game;
+  const sp = g.world.spawnPoints.map((p) => p.position ?? p);
+  const BOMB = { x: sp[0].x, y: sp[0].y + 0.3, z: sp[0].z };
+  const eyeH = c.entity.eyeHeight ?? 1.6;
+  let blind = null, seeing = null;
+  for (let i = 1; i < sp.length; i++) {
+    const clear = g.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, BOMB);
+    if (clear && !seeing) seeing = sp[i];
+    if (!clear && !blind) blind = sp[i];
+  }
+  const m = g.match;
+  m.modeId = 'bomb';
+  m.phase = 'live';
+  m.roundIndex = 0;
+  m.scores = [0, 0];
+  m.aliveCounts = { alpha: 1, bravo: 1 };
+  m.phaseRemainingMs = 100000;
+  m.attackingTeam = 0;
+  m.bomb = { state: 'dropped', carrierId: 0, siteId: null, position: BOMB };
+  m.interaction = { kind: 'none', actorId: 0, progress: 0 };
+  c.entity.team = 1;                    // a DEFENDER: authorised only by sight
+  c.entity.alive = true;
+
+  c.entity.position.set(blind.x, blind.y, blind.z);
+  for (let i = 0; i < 5; i++) { s.server._broadcastMatchState(); c.cT.pump(0); }
+  eq('a blind defender is told nothing about the drop', c.client.matchState?.bombPositionVisible, false);
+  const sentWhileBlind = c.session.stats.matchStates;
+  eq('and is told it once, not every tick', sentWhileBlind, 1);
+
+  c.entity.position.set(seeing.x, seeing.y, seeing.z);
+  s.server._broadcastMatchState();
+  c.cT.pump(0);
+  eq('walking into sight sends a new frame', c.session.stats.matchStates, sentWhileBlind + 1);
+  eq('and the position arrives', c.client.matchState?.bombPositionVisible, true);
+  if (c.client.matchState?.bombPosition
+    && Math.abs(c.client.matchState.bombPosition.x - BOMB.x) < 1e-3) {
+    ok('with the real coordinates — the change was in the tail of the frame, and was still noticed');
+  } else {
+    bad('a change confined to the position bytes is detected',
+      `bombPosition ${JSON.stringify(c.client.matchState?.bombPosition)}`);
+  }
+}
+
+{
+  // "On change only" (§8.6), with the one honest exception: `serverTimeMs` changes every tick
+  // by construction, so a naive change test would send this 120 times a second and defeat its
+  // own purpose. The clock is excluded from the test and carried by a heartbeat instead.
+  const s = await makeSession({ clients: 1 });
+  const c = s.conns[0];
+  const g = s.game;
+  c.entity.team = 0;
+  c.entity.alive = true;
+  const m = g.match;
+  m.modeId = 'bomb';
+  m.phase = 'live';
+  m.roundIndex = 0;
+  m.scores = [0, 0];
+  m.aliveCounts = { alpha: 1, bravo: 1 };
+  m.phaseRemainingMs = 100000;
+  m.attackingTeam = 0;
+  m.bomb = { state: 'carried', carrierId: c.entity.id, siteId: null, position: null };
+  m.interaction = { kind: 'none', actorId: 0, progress: 0 };
+
+  for (let i = 0; i < 60; i++) { s.server._broadcastMatchState(); c.cT.pump(0); }
+  const afterSteady = c.session.stats.matchStates;
+  eq('an unchanged match state is sent once, not once per tick', afterSteady, 1);
+
+  m.bomb = { state: 'planted', carrierId: 0, siteId: 'A', position: { x: 5, y: 1, z: 5 } };
+  m.phase = 'planted';
+  s.server._broadcastMatchState();
+  c.cT.pump(0);
+  eq('a change is sent immediately', c.session.stats.matchStates, 2);
+  eq('and the client decoded the new state', c.client.matchState?.bombState, 'planted');
+  eq('with its site', c.client.matchState?.bombSite, 'A');
+
+  for (let i = 0; i < 121; i++) { s.server._broadcastMatchState(); c.cT.pump(0); }
+  if (c.session.stats.matchStates > 2) {
+    ok(`the clock heartbeat still goes out while nothing changes (${c.session.stats.matchStates} frames over 182 ticks)`);
+  } else {
+    bad('the server clock keeps arriving during a quiet phase',
+      'no heartbeat — a client joining mid-round would age one clock sample for the whole round');
+  }
+  if (c.session.stats.matchStates < 20) ok('and it is a heartbeat, not a per-tick resend');
+  else bad('the heartbeat is rare', `${c.session.stats.matchStates} frames in 182 ticks`);
+}
+
+{
+  // TDM must be untouched. `MSG_MATCHSTATE` on a TDM stream would be 41 bytes of zeroes,
+  // several times a second, describing a mode that has no rounds and no bomb.
+  const s = await makeSession({ clients: 1 });
+  run(s, 60, (cmd) => { cmd.wishForward = 1; });
+  eq('a TDM match sends no MSG_MATCHSTATE at all', s.conns[0].session.stats.matchStates, 0);
+  eq('and the client has no bomb state to render', s.conns[0].client.matchState, null);
+  eq('the TDM welcome still carries its kill limit', s.conns[0].client.killLimit > 0, true);
+}
+
+console.log('\nprotocol v2 — objective evidence (match-result.md §7)');
+
+{
+  const s = await makeSession({ clients: 1 });
+  const c = s.conns[0];
+  const g = s.game;
+  c.entity.team = 0;
+  c.entity.alive = true;
+  g.match.modeId = 'bomb';
+  g.match.roundIndex = 3;
+  g.match.phase = 'live';
+  g.tick = 1200;
+  s.server.evidence.identify({ matchId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', rulesetVersion: 'bomb-1.0.0', serverBuild: 'test' });
+
+  const planter = c.entity.id;
+  s.server.objectiveEvent({ kind: 'roundStart', roundIndex: 3 });
+  s.server.objectiveEvent({
+    kind: 'plantStart', actorId: planter, actorTeam: 0, site: 'A',
+    position: { x: 10.123456, y: 0.5, z: -4.25 }, progress: 0,
+  });
+  g.tick = 1560;
+  s.server.objectiveEvent({
+    kind: 'plantComplete', actorId: planter, actorTeam: 0, site: 'A',
+    position: { x: 10.123456, y: 0.5, z: -4.25 }, progress: 1,
+  });
+  s.server.objectiveEvent({
+    kind: 'interactRefused', actorId: planter, actorTeam: 0,
+    requestedKind: 1, reason: 'already-planted',
+  });
+  s.server.objectiveEvent({ kind: 'nonsense', actorId: planter });
+
+  const ev = s.server.evidence;
+  eq('every objective fact is recorded, and nothing else is', ev.rows.length, 4);
+  eq('an unknown kind is refused rather than stored as "unknown"', ev.of('nonsense').length, 0);
+
+  const plant = ev.of('plantComplete')[0];
+  eq('the completion names its actor', plant.actorId, planter);
+  eq('and their side, by name', plant.actorTeam, 'alpha');
+  eq('and the site', plant.site, 'A');
+  eq('and the round it belongs to', plant.roundIndex, 3);
+  eq('and the tick it happened on', plant.tick, 1560);
+  eq('and the server clock, in the domain §8.10 calls server-monotonic',
+    plant.serverTimeMs, Math.round(1560 * FIXED_DT * 1000));
+  eq('the position is unfiltered — evidence is not a per-recipient view', plant.position.x, 10.123);
+  eq('progress is the same six-bit quantity the wire carries', plant.progress, INTERACT_PROGRESS_MAX);
+
+  // §10 of bomb-rules: `plants` counts COMPLETIONS only. The evidence has to make that
+  // countable without re-deriving it, or two services will count it two ways.
+  eq('a start is not a completion', ev.of('plantStart').length, 1);
+  eq('and the authoritative plant count is the completions', ev.of('plantComplete').length, 1);
+
+  const refusal = ev.of('interactRefused')[0];
+  eq('a refusal records what was asked for', refusal.requestedKind, 1);
+  eq('and why it was refused', refusal.reason, 'already-planted');
+
+  eq('the record is ordered', ev.rows.map((r) => r.seq).join(','), '0,1,2,3');
+  eq('and identifies the match it reconstructs', ev.toJSON().matchId, '01ARZ3NDEKTSV4RRFFQ69G5FAV');
+  eq('and the ruleset that produced it', ev.toJSON().rulesetVersion, 'bomb-1.0.0');
+  eq('and the wire version it was recorded under', ev.toJSON().protocolVersion, PROTOCOL_VERSION);
+  eq('one round\'s rows are retrievable as a unit', ev.forRound(3).length, 4);
+  eq('and a round that never happened yields none, not everything', ev.forRound(9).length, 0);
+
+  // The same call put the events on the wire. One ingestion point, so the timeline a review
+  // reads and the timeline a player saw can never describe different rounds.
+  run(s, 8, () => {});
+  const kinds = c.client.snapshots.flatMap((sn) => sn.events).map((e) => e.kind);
+  if (kinds.includes('plantComplete')) ok('the same objective facts reached the client as wire events');
+  else bad('objective events reach the wire', `client saw [${[...new Set(kinds)].join(',')}]`);
+  const gotRefusal = c.client.snapshots.flatMap((sn) => sn.events).find((e) => e.kind === 'interactRefused');
+  if (gotRefusal) {
+    eq('the refusal reached its target with the reason intact', gotRefusal.reasonName, 'already-planted');
+    eq('and the kind they asked for', gotRefusal.requestedKindName, 'plant');
+  } else {
+    bad('a refusal is delivered to the refused player', 'no interactRefused event arrived');
+  }
+}
+
+{
+  // A refusal is private (§8.7): "sent only to the refused player". Broadcasting it announces
+  // who is standing on a site trying to plant.
+  const s = await makeSession({ clients: 2 });
+  const [me, other] = s.conns;
+  s.server.objectiveEvent({
+    kind: 'interactRefused', actorId: me.entity.id, requestedKind: 1, reason: 'wrong-phase',
+  });
+  run(s, 8, () => {});
+  const mine = me.client.snapshots.flatMap((sn) => sn.events).filter((e) => e.kind === 'interactRefused');
+  const theirs = other.client.snapshots.flatMap((sn) => sn.events).filter((e) => e.kind === 'interactRefused');
+  eq('the refused player is told', mine.length, 1);
+  eq('and nobody else is', theirs.length, 0);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nnetcode runs clean');

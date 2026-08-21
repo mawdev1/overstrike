@@ -17,6 +17,7 @@ import { WebSocketTransport } from './transport.js';
 import { Prediction } from './prediction.js';
 import {
   quantiseCommand, encodeLoadout, F_ALIVE, F_CROUCH, F_SPRINT, F_FIRING, F_ADS, F_RELOAD,
+  unpackInteract,
 } from './protocol.js';
 import { WEAPON_WIRE_IDX } from '../weapons/weaponDefs.js';
 import { FIXED_DT } from '../core/mathUtils.js';
@@ -66,14 +67,43 @@ export class MultiplayerSession {
     /** id -> stand-in object, so kill events can be identity-compared. See `_entityFor`. */
     this._stubs = new Map();
 
+    /**
+     * Newest authoritative Bomb state, or null in TDM. Read by the HUD.
+     *
+     * Held as decoded, never extrapolated. `interaction.progress` in particular is
+     * server-driven: a plant bar that keeps filling through a dropped packet tells the player
+     * they are safe when the server has already cancelled the plant.
+     */
+    this.matchState = null;
+    /** Newest round or match outcome, or null. */
+    this.outcome = null;
+
     this.net.onSnapshot((snap) => this._onSnapshot(snap));
+    this.net.onMatchState((s) => {
+      this.matchState = s;
+      this.game.bus?.emit?.('matchState', s);
+    });
+    this.net.onOutcome((o) => {
+      this.outcome = o;
+      this.game.bus?.emit?.(o.scope === 'match' ? 'matchOutcome' : 'roundOutcome', o);
+    });
+    this.net.onReject((r) => {
+      this.connected = false;
+      this.game.bus?.emit?.('netRejected', r);
+    });
     // Adopting the seed is not bookkeeping: every shot's spread is addressed by it, so
     // until this runs the client predicts a different bullet than the server fires.
     this.net.onWelcome((net) => {
-      if (net.matchSeed == null) return;
-      if (this.game.matchSeed === net.matchSeed) return;
-      this.game.matchSeed = net.matchSeed;
-      this.game.rng?.reseed?.(net.matchSeed);
+      if (net.matchSeed != null && this.game.matchSeed !== net.matchSeed) {
+        this.game.matchSeed = net.matchSeed;
+        this.game.rng?.reseed?.(net.matchSeed);
+      }
+      // The host owns the round rules. Without this field a client configured for 75
+      // kills could stay in combat after a first-to-25 server had already ended.
+      if (net.killLimit != null) {
+        this.game.settings?.set?.('killLimit', net.killLimit);
+        if (this.game.match) this.game.match.killLimit = net.killLimit;
+      }
     });
   }
 
@@ -82,14 +112,31 @@ export class MultiplayerSession {
    * does not know which entity in the snapshots is itself, so sending commands would be
    * predicting on behalf of nobody.
    */
-  static connect(game, url, { timeoutMs = 10000 } = {}) {
+  static connect(game, url, { timeoutMs = 10000, sessionTicket = '' } = {}) {
     return new Promise((resolve, reject) => {
       let transport;
       try { transport = new WebSocketTransport(url); } catch (e) { reject(e); return; }
       const session = new MultiplayerSession(game, transport);
+      // The opening frame (§8.2). `WebSocketTransport` queues until the socket is open, so
+      // this is genuinely first on the wire rather than first in wall-clock order.
+      session.net.sendHello(sessionTicket);
 
       const started = Date.now();
       const poll = setInterval(() => {
+        // A refused handshake is terminal and must fail the connect rather than time out —
+        // a ten-second wait for a server that already said "upgrade" tells the player
+        // nothing and invites a retry that cannot succeed.
+        if (session.net.rejected) {
+          clearInterval(poll);
+          const r = session.net.rejected;
+          const err = new Error(r.message);
+          err.code = r.reason;
+          err.serverVersion = r.serverVersion;
+          err.retryable = false;
+          transport.close();
+          reject(err);
+          return;
+        }
         if (session.net.entityId) {
           clearInterval(poll);
           session.connected = true;
@@ -303,6 +350,61 @@ export class MultiplayerSession {
           present.deathScreen(null);
           break;
 
+        case 'roundEnd': {
+          const match = g.match;
+          if (!match) break;
+          match.scores[0] = ev.killerId;
+          match.scores[1] = ev.victimId;
+          match.killLimit = ev.amount || match.killLimit;
+          // A client that saw every kill will already have ended itself from the final
+          // kill event immediately before this one. A late joiner will not have the full
+          // score history, so the authoritative whistle completes its sequence here.
+          if (match.phase !== 'ended') {
+            const reason = ev.weaponIdx === 1 ? 'time' : ev.weaponIdx === 2 ? 'draw' : 'killLimit';
+            const winnerTeam = reason === 'draw' || ev.killerId === ev.victimId
+              ? -1 : (ev.killerId > ev.victimId ? 0 : 1);
+            match._end({
+              winner: winnerTeam,
+              winnerTeam,
+              winnerEntity: null,
+              reason,
+            });
+          }
+          break;
+        }
+
+        // ── Bomb (§8.7) ──────────────────────────────────────────────────────────────
+        //
+        // Re-emitted onto the local bus rather than pushed at the HUD, for the same reason
+        // `kill` is: the HUD already subscribes and does more with each than one call could
+        // express, and one code path is how single-player and multiplayer feedback stay the
+        // same thing. Nothing here CHANGES any state — the server owns the round, and a
+        // client that acted on `plantComplete` locally would be simulating the objective.
+        case 'plantStart': case 'plantComplete': case 'plantCancel':
+        case 'defuseStart': case 'defuseComplete': case 'defuseCancel':
+        case 'bombDropped': case 'bombPickedUp': case 'bombDetonated':
+        case 'roundStart':
+          g.bus?.emit('objective', {
+            kind: ev.kind,
+            actor: this._entityFor(ev.entityId),
+            actorId: ev.entityId ?? 0,
+            actorName: this._nameFor(ev.entityId),
+            mine: ev.entityId === mineId,
+            reason: ev.reasonName ?? null,
+            position: ev.x === undefined ? null : { x: ev.x, y: ev.y, z: ev.z },
+          });
+          break;
+
+        case 'interactRefused':
+          // Routed to this player alone (§8.7). It carries BOTH what they asked for and why
+          // it was refused, because a refusal is not a cancellation: nothing had started, so
+          // there is no progress to unwind and the message the player needs is different.
+          g.bus?.emit('interactionRefused', {
+            kind: ev.requestedKindName ?? 'none',
+            reason: ev.reasonName ?? 'not-eligible',
+          });
+          break;
+
         default: break;                                  // a kind this build does not know
       }
     }
@@ -432,6 +534,9 @@ export class MultiplayerSession {
           id: ea.id, x: 0, y: 0, z: 0, yaw: 0, pitch: 0, health: 0, team: 0,
           alive: false, crouching: false, sprinting: false,
           firing: false, ads: false, reloading: false,
+          // Whether this remote is planting or defusing, and how far through — from the
+          // server's `interact` byte, never advanced locally.
+          interactKind: 'none', interactProgress: 0,
         };
         this.remotes.set(ea.id, r);
       }
@@ -450,6 +555,11 @@ export class MultiplayerSession {
       r.firing = !!(eb.flags & F_FIRING);
       r.ads = !!(eb.flags & F_ADS);
       r.reloading = !!(eb.flags & F_RELOAD);
+      // Taken from the newer of the two frames rather than interpolated: a plant either is or
+      // is not happening, and blending a kind between two values would invent a third state.
+      const it = unpackInteract(eb.interact ?? 0);
+      r.interactKind = it.kindName;
+      r.interactProgress = it.progressFrac;
     }
     // Anyone who has left the snapshot has left the match.
     for (const id of [...this.remotes.keys()]) if (!seen.has(id)) this.remotes.delete(id);

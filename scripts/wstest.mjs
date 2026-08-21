@@ -14,7 +14,10 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
-import { encodeCommands, quantiseCommand, MSG_WELCOME, MSG_SNAPSHOT, decodeSnapshot } from '../src/net/protocol.js';
+import {
+  encodeCommands, quantiseCommand, MSG_WELCOME, MSG_SNAPSHOT, MSG_REJECT,
+  decodeSnapshot, encodeHello, decodeReject, PROTOCOL_VERSION,
+} from '../src/net/protocol.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 8123;
@@ -133,6 +136,62 @@ const emptyCommand = () => ({
 });
 
 await new Promise((r, j) => { ws.on('open', r); ws.on('error', j); });
+
+// ── the v2 handshake, over a real socket ─────────────────────────────────────────────
+//
+// The loopback in `nettest` cannot catch anything about actual sockets, and the handshake is
+// the one exchange where getting it wrong means a client decodes bytes it does not agree
+// about. So it is exercised here too, against the real `server/index.js`.
+client.sendHello('st_wstest_ticket');
+for (let i = 0; i < 100 && !client.welcome; i++) await sleep(20);
+if (!client.welcome) {
+  bad('the welcome decodes over a real socket', 'no welcome arrived within 2 s');
+} else {
+  if (client.welcome.protocolVersion === PROTOCOL_VERSION) {
+    ok(`the welcome carries the negotiated protocol version (${PROTOCOL_VERSION}) over a real socket`);
+  } else {
+    bad('the welcome carries a protocol version',
+      `got ${client.welcome.protocolVersion}, this build speaks ${PROTOCOL_VERSION}`);
+  }
+  if (client.welcome.mode === 'tdm') ok('and the mode it is running');
+  else bad('the welcome names the mode', `got ${JSON.stringify(client.welcome.mode)}`);
+  if (client.welcome.serverTickRateHz === 120) ok('and the server tick rate (120 Hz)');
+  else bad('the welcome names the tick rate', `got ${client.welcome.serverTickRateHz}`);
+  if (client.rejected === null) ok('a matching version is not rejected over a real socket');
+  else bad('a matching version is accepted', JSON.stringify(client.rejected));
+}
+
+{
+  // An incompatible client, on its own socket. Decoded from the bytes the socket delivered —
+  // not from what the client object decided to remember.
+  const old = new WebSocket(`ws://127.0.0.1:${PORT}`);
+  const frames = [];
+  let closed = false;
+  old.on('message', (d) => frames.push(toArrayBuffer(d)));
+  old.on('close', () => { closed = true; });
+  await new Promise((r, j) => { old.on('open', r); old.on('error', j); });
+  old.send(Buffer.from(encodeHello(PROTOCOL_VERSION - 1, 'st_stale_build')), { binary: true });
+  for (let i = 0; i < 100 && !closed; i++) await sleep(20);
+
+  const rejectFrame = frames.find((b) => new DataView(b).getUint8(0) === MSG_REJECT);
+  if (!rejectFrame) {
+    bad('an incompatible client is rejected over a real socket',
+      `no MSG_REJECT — got message types [${frames.map((b) => new DataView(b).getUint8(0)).join(',')}]`);
+  } else {
+    const r = decodeReject(rejectFrame);
+    if (r.reason === 'PROTOCOL_VERSION_MISMATCH') ok('a stale client is refused with PROTOCOL_VERSION_MISMATCH');
+    else bad('the rejection names the reason', `got ${JSON.stringify(r.reason)}`);
+    if (r.serverVersion === PROTOCOL_VERSION) ok(`and the reject frame names the server's version (${r.serverVersion})`);
+    else bad("the rejection carries the server's version", `got ${r.serverVersion}`);
+  }
+  if (closed) ok('and the server closed the socket rather than leaving it half-alive');
+  else { bad('a rejected socket is closed', 'still open after 2 s'); try { old.close(); } catch { /* gone */ } }
+
+  const h = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+  if (h.clients === 1) ok('the rejected connection left no session behind');
+  else bad('a rejected connection is not counted as a client', `clients=${h.clients}`);
+}
+
 // Wait for the welcome AND for a snapshot that mentions us, so the baseline exists before
 // anything is measured against it.
 for (let i = 0; i < 100 && !client.entityId; i++) await sleep(20);
@@ -238,6 +297,11 @@ if (startWire && endWire) {
       `turned ${turned.toFixed(3)} rad, expected ${expected.toFixed(3)} from ${applied} applied commands`);
   }
 }
+
+// A TDM server must not put Bomb state on the wire. `MSG_MATCHSTATE` there would be 41 bytes
+// of zeroes several times a second describing a mode with no rounds and no bomb.
+if (client.stats.matchStates === 0) ok('a TDM server sends no MSG_MATCHSTATE over the socket');
+else bad('TDM carries no match state', `${client.stats.matchStates} MSG_MATCHSTATE frames arrived`);
 
 const h2 = health2;
 if (h2.clients === 1) ok('health reports the connected client');

@@ -12,7 +12,10 @@
  * changes direction.
  */
 import {
-  MSG_SNAPSHOT, MSG_WELCOME, encodeCommands, decodeSnapshot, quantiseCommand,
+  MSG_SNAPSHOT, MSG_WELCOME, MSG_REJECT, MSG_MATCHSTATE, MSG_OUTCOME,
+  encodeCommands, decodeSnapshot, quantiseCommand, encodeHello, decodeWelcome, decodeReject,
+  decodeMatchState, decodeOutcome, PROTOCOL_VERSION, upgradeMessage,
+  REJECT_PROTOCOL_VERSION_MISMATCH,
 } from './protocol.js';
 
 /**
@@ -48,11 +51,33 @@ export class NetClient {
     /** Wall clock when `latestTick` arrived, so render time can advance between snapshots. */
     this.latestAtMs = 0;
 
-    this.stats = { sent: 0, snapshots: 0, acked: 0, discarded: 0 };
+    this.stats = { sent: 0, snapshots: 0, acked: 0, discarded: 0, matchStates: 0, outcomes: 0 };
     this._onSnapshot = null;
     this._onWelcome = null;
+    this._onMatchState = null;
+    this._onOutcome = null;
+    this._onReject = null;
     /** The server's match seed. Shot spread is addressed by it — see GameServer._sendWelcome. */
     this.matchSeed = null;
+    /** Authoritative TDM round limit, appended to the welcome packet. `null` in Bomb. */
+    this.killLimit = null;
+    /** The whole v2 welcome, so a caller can read `mode`, `isReconnect`, the tick rate. */
+    this.welcome = null;
+    /** The version the server said it speaks, once it has said it. */
+    this.serverVersion = null;
+    /**
+     * Set when this connection has been refused, and never cleared.
+     *
+     * `{ reason, serverVersion, message }`. A rejection is TERMINAL — `errors.md` §5 says
+     * never retry `PROTOCOL_VERSION_MISMATCH` — so once it is set the client stops decoding
+     * anything else and the transport is closed. A client that kept reading after a version
+     * mismatch would be doing the exact thing negotiation exists to prevent.
+     */
+    this.rejected = null;
+    /** Newest decoded `MSG_MATCHSTATE`, or null before the first one. Bomb only. */
+    this.matchState = null;
+    /** Newest decoded `MSG_OUTCOME`, or null. */
+    this.outcome = null;
 
     transport.onMessage((data) => this._onMessage(data));
   }
@@ -60,20 +85,100 @@ export class NetClient {
   /** Called with each decoded snapshot, for prediction to reconcile against. */
   onSnapshot(fn) { this._onSnapshot = fn; }
   onWelcome(fn) { this._onWelcome = fn; }
+  /** Called with each decoded `MSG_MATCHSTATE`. Bomb HUD, round timer, plant bar. */
+  onMatchState(fn) { this._onMatchState = fn; }
+  /** Called with each decoded `MSG_OUTCOME` — round and match results. */
+  onOutcome(fn) { this._onOutcome = fn; }
+  /** Called once if the connection is refused. Terminal: the socket is already closing. */
+  onReject(fn) { this._onReject = fn; }
+
+  /**
+   * Say hello (§8.2). **The first frame this client puts on the socket.**
+   *
+   * Carries the version this build speaks so the server can refuse it before either side
+   * decodes anything the other might mean differently — which is the whole of G1. The ticket
+   * rides along for G2; today the server stores it and does not read it.
+   */
+  sendHello(ticket = '') {
+    this.transport.send(encodeHello(PROTOCOL_VERSION, ticket));
+  }
+
+  /**
+   * Refuse this connection locally and stop.
+   *
+   * Reached from two directions: an explicit `MSG_REJECT`, and a welcome whose version does
+   * not match ours — including a welcome with NO version, which means a server that predates
+   * negotiation. Both are the same fact and must have the same effect, or a v1 server would
+   * still be able to feed a v2 client bytes it will misread.
+   */
+  _reject(reason, serverVersion) {
+    if (this.rejected) return this.rejected;
+    this.serverVersion = serverVersion;
+    this.rejected = {
+      reason,
+      serverVersion,
+      message: upgradeMessage(serverVersion, PROTOCOL_VERSION),
+    };
+    // Nothing decoded after this point, including anything already in the receive buffer.
+    this.entityId = 0;
+    try { this.transport.close(); } catch { /* already gone */ }
+    this._onReject?.(this.rejected);
+    return this.rejected;
+  }
 
   _onMessage(data) {
+    if (this.rejected) return;
+    if (data.byteLength < 1) return;
     const v = new DataView(data);
     const type = v.getUint8(0);
 
+    if (type === MSG_REJECT) {
+      const r = decodeReject(data);
+      this._reject(r?.reason || REJECT_PROTOCOL_VERSION_MISMATCH, r?.serverVersion ?? null);
+      return;
+    }
+
     if (type === MSG_WELCOME) {
-      this.clientId = v.getUint32(1, true);
-      this.entityId = v.getUint32(5, true);
+      const w = decodeWelcome(data);
+      if (!w) return;
+      // The version gate, on the client's side of the handshake. A server that predates §8.4
+      // sends 15 bytes and no version at all — which is not "unknown, carry on", it is a v1
+      // server, and v1 cannot describe the fields this build now reads.
+      if (w.protocolVersion !== PROTOCOL_VERSION) {
+        this._reject(REJECT_PROTOCOL_VERSION_MISMATCH, w.protocolVersion ?? 1);
+        return;
+      }
+      this.serverVersion = w.protocolVersion;
+      this.welcome = w;
+      this.clientId = w.clientId;
+      this.entityId = w.entityId;
       // Sent again on every match restart, so this is an assignment and not a one-time
-      // handshake. `null` only if talking to a server that predates the field.
-      this.matchSeed = data.byteLength >= 13 ? v.getUint32(9, true) : null;
+      // handshake.
+      this.matchSeed = w.matchSeed;
+      this.killLimit = w.killLimit;
       if (this._onWelcome) this._onWelcome(this);
       return;
     }
+
+    if (type === MSG_MATCHSTATE) {
+      const s = decodeMatchState(data);
+      if (!s) return;                        // wrong length: a desynced frame, not state
+      this.matchState = s;
+      this.stats.matchStates++;
+      this._onMatchState?.(s);
+      return;
+    }
+
+    if (type === MSG_OUTCOME) {
+      const o = decodeOutcome(data);
+      if (!o) return;
+      this.outcome = o;
+      this.stats.outcomes++;
+      this._onOutcome?.(o);
+      return;
+    }
+
+    // §8.11: an unknown type is ignored. Additive types must not break an older peer.
     if (type !== MSG_SNAPSHOT) return;
 
     // Coded against the last snapshot at the tick the server names. Finding it rather

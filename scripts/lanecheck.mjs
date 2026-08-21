@@ -205,6 +205,37 @@ function onlyStatusLines(file) {
   return touched.every((l) => allowed.some((p) => l.startsWith(p)));
 }
 
+
+/**
+ * The text of a watched file on either side of the change under examination.
+ *
+ * `--commit=SHA` compares SHA^ against SHA; `--base=REF` compares the merge base against HEAD;
+ * the working-tree mode compares HEAD against what is on disk, which is what a developer wants
+ * before they commit.
+ */
+function versionSideOf(side, file) {
+  const commit = arg('commit');
+  if (commit) {
+    const parent = git('rev-list', '--parents', '-n', '1', commit).trim().split(' ')[1];
+    if (side === 'before') return parent ? show(`${parent}:${file}`) : '';
+    return show(`${commit}:${file}`);
+  }
+  const base = arg('base');
+  if (base) {
+    const merged = git('merge-base', base, 'HEAD').trim();
+    return side === 'before' ? show(`${merged}:${file}`) : show(`HEAD:${file}`);
+  }
+  if (side === 'before') return show(`HEAD:${file}`);
+  try { return readFileSync(path.join(ROOT, file), 'utf8'); } catch { return ''; }
+}
+
+/** `git show`, but a path that does not exist on that side is empty rather than fatal. */
+function show(spec) {
+  try {
+    return execFileSync('git', ['show', spec], { cwd: ROOT, encoding: 'utf8' });
+  } catch { return ''; }
+}
+
 // ── guards ────────────────────────────────────────────────────────────────────────────
 
 const problems = [];
@@ -254,9 +285,27 @@ if (byLane.CC.length && byLane.CX.length) {
 const pv = cfg.protocolVersionGuard;
 if (files.includes(pv.watch)) {
   const diff = git('diff', '--unified=0', ...diffRange(), '--', pv.constantFile);
-  const bumped = diff
-    .split('\n')
-    .some((l) => l.startsWith('+') && !l.startsWith('+++') && l.includes(pv.constantName));
+  // Compare the ASSIGNED VALUE, not the presence of the name.
+  //
+  // This used to be `line.includes('PROTOCOL_VERSION')` over the added lines, which any added
+  // line mentioning the constant satisfied — and `protocol.js` mentions it in a docstring and
+  // again in `REJECT_PROTOCOL_VERSION_MISMATCH`. Reverting the constant to 1 while touching a
+  // comment left the guard reporting OK. It was checking that somebody typed the name near the
+  // change, which is not the rule; the rule is that the number moved.
+  const valueOf = (text) => {
+    const m = new RegExp(`${pv.constantName}\\s*=\\s*(\\d+)`).exec(text || '');
+    return m ? Number(m[1]) : null;
+  };
+  const before = valueOf(versionSideOf('before', pv.constantFile));
+  const after = valueOf(versionSideOf('after', pv.constantFile));
+  // A constant that cannot be READ is a failure, not a pass: the guard has lost the thing it
+  // exists to check, and answering OK would be the same silence it just stopped producing.
+  if (after === null) {
+    problems.push(
+      `${pv.constantName} could not be read from ${pv.constantFile}. The guard cannot confirm a\n`
+      + `        wire change was versioned, and a guard that cannot check must not report OK.`);
+  }
+  const bumped = before !== null && after !== null && after > before;
   // An empty diff means the file did not change *in the range being examined* — which is the
   // normal case when --files names an already-committed path. There is nothing to version, so
   // demanding a bump would be a false failure rather than a caught violation.
