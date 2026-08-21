@@ -12,6 +12,17 @@ npm install
 npm run dev      # http://127.0.0.1:5180
 ```
 
+To exercise the real API or the contract stubs from the browser shell, run the control plane
+in a second terminal. Vite proxies `/v1` to it on the browser's own origin, matching production:
+
+```bash
+node platform/src/index.js             # http://127.0.0.1:8090
+npm run dev                            # http://127.0.0.1:5180
+```
+
+Set `VITE_PLATFORM_PROXY_TARGET` only if the platform listens elsewhere. Named stub scenarios
+remain opt-in through `X-Stub-Scenario`; requests without it use the live development routes.
+
 Click to lock the mouse. `Esc` pauses.
 
 ```bash
@@ -36,7 +47,8 @@ the interaction between systems rather than inside one function. Each script dri
 | `node scripts/aggression.mjs` | bot engagement per difficulty — shots, distinct shooters, hits, damage/s, time-to-first-shot |
 | `node scripts/beauty.mjs` | six auto-chosen open viewpoints, same every run, so lighting and art changes are comparable |
 | `node scripts/auditK.mjs` | regression guard for every defect the independent audit found, each with a control case |
-| `node scripts/auditA…L.mjs` | memory growth, all five modes, numerical edge cases, fixed-timestep behaviour, contract conformance, error paths, per-step cost |
+| `npm run tdmtest` | proves TDM is the only ruleset, the kill limit is configurable, and the final kill triggers one ordered round-end/results sequence |
+| `node scripts/auditA…L.mjs` | memory growth, TDM lifecycle, numerical edge cases, fixed-timestep behaviour, contract conformance, error paths, per-step cost |
 | `node scripts/diag*.mjs` | focused subsystem probes (collision, ballistics, bot aim) |
 
 Headless Chromium rasterises through SwiftShader, so **the frame rate these report is
@@ -78,7 +90,7 @@ All bindings are remappable in **Settings → Controls**.
   model with reaction delay and converging error. Four difficulty tiers.
 - **Map** — "Meridian", a three-lane Mediterranean compound with interiors, rooftops,
   balconies and deliberate cover placement.
-- **Modes** — Team Deathmatch, Free-for-All, Gun Game, Domination, Kill Confirmed.
+- **Mode** — Team Deathmatch only, with a configurable team kill limit and a complete after-action sequence.
 - **Killstreaks** — UAV, Airstrike, Sentry Gun, Chopper Gunner.
 - **Progression** — persistent XP, 55 levels, weapon unlocks, lifetime stats and challenges.
 - **Presentation** — ACES tonemapping, bloom, film grain, chromatic aberration, dynamic

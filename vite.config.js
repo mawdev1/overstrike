@@ -1,7 +1,27 @@
 import { defineConfig } from 'vite';
+import { readFileSync } from 'node:fs';
+
+const https = process.env.VITE_HTTPS_KEY_FILE && process.env.VITE_HTTPS_CERT_FILE ? {
+  key: readFileSync(process.env.VITE_HTTPS_KEY_FILE),
+  cert: readFileSync(process.env.VITE_HTTPS_CERT_FILE),
+} : undefined;
 
 export default defineConfig({
-  server: { port: 5180, strictPort: false, host: '127.0.0.1' },
+  server: {
+    port: 5180,
+    strictPort: false,
+    host: '127.0.0.1',
+    https,
+    // Mirror nginx's production same-origin API path. This preserves httpOnly refresh-cookie
+    // and SameSite behaviour in development instead of requiring a permissive CORS mode.
+    proxy: {
+      '/v1': {
+        target: process.env.VITE_PLATFORM_PROXY_TARGET || 'http://127.0.0.1:8090',
+        changeOrigin: false,
+        ws: true,
+      },
+    },
+  },
   build: {
     target: 'es2022',
     /**

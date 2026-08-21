@@ -20,6 +20,7 @@ RUN npm ci --omit=dev
 # conversion — one simulation, not a server reimplementation that drifts from the client.
 COPY src ./src
 COPY server ./server
+COPY platform/src/shared ./platform/src/shared
 
 ENV NODE_ENV=production
 ENV PORT=8080

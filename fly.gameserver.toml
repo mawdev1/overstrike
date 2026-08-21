@@ -8,7 +8,19 @@
 app = "overstrike-gs"
 primary_region = "iad"
 
+# Set OVERSTRIKE_MATCH_TICKET_SECRET to the same independent value as
+# PLATFORM_MATCH_TICKET_SECRET with `fly secrets set`; never expose PLATFORM_TOKEN_SECRET
+# to a game server. The public listener fails closed without the match-only secret.
+# Set OVERSTRIKE_MATCH_CONTROL_SECRET to the same independent value as
+# PLATFORM_MATCH_CONTROL_SECRET. It authenticates allocation/status/release control calls.
+
 [build]
+
+[env]
+  OVERSTRIKE_REGION = "iad"
+  OVERSTRIKE_SERVER_ID = "overstrike-gs-iad-1"
+  OVERSTRIKE_PUBLIC_WS_URL = "wss://overstrike-gs.fly.dev"
+  OVERSTRIKE_PLATFORM_CONTROL_URL = "https://overstrike-platform.fly.dev"
 
 [http_service]
   internal_port = 8080
@@ -32,8 +44,9 @@ primary_region = "iad"
     hard_limit = 16
 
   [[http_service.checks]]
-    # /health reports the tick counter, so this checks the match is actually SIMULATING
-    # rather than merely that the process is alive and accepting sockets.
+    # Public /health is deliberately minimal liveness. Match/tick/session detail belongs to
+    # authenticated control/debug surfaces; exposing it here makes a load-balancer probe a
+    # live-match intelligence relay.
     interval = "15s"
     timeout = "2s"
     grace_period = "20s"

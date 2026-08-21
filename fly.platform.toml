@@ -29,6 +29,14 @@ primary_region = "yyz"        # ca-central-1 per docs/decisions/P0-decisions.md 
   PLATFORM_STORAGE = "postgres"
   PLATFORM_PORT = "8080"
   PLATFORM_LOG_LEVEL = "info"
+  PLATFORM_IDENTITY_PROVIDER = "supabase"
+  PLATFORM_MAIL_TRANSPORT = "resend"
+  PLATFORM_MAIL_API_URL = "https://api.resend.com/emails"
+  PLATFORM_PUBLIC_BASE_URL = "https://overstrike.fly.dev"
+  PLATFORM_LOBBY_PUBLIC_URL = "wss://overstrike.fly.dev"
+  PLATFORM_MATCH_SERVER_URL = "wss://overstrike-gs.fly.dev"
+  PLATFORM_MATCH_SERVER_ALLOWED_HOSTS = "overstrike-gs.fly.dev"
+  PLATFORM_MATCH_SERVER_REGION = "iad"
 
   # Fly terminates TLS at its edge and forwards one hop. Without this the platform reads
   # the proxy's address as the client's, which would key §9's per-IP auth limit and the
@@ -41,15 +49,43 @@ primary_region = "yyz"        # ca-central-1 per docs/decisions/P0-decisions.md 
 #   fly secrets set --app overstrike-platform \
 #     DATABASE_URL="postgres://...@...supabase.co:5432/postgres?sslmode=require" \
 #     PLATFORM_TOKEN_SECRET="$(openssl rand -hex 32)" \
-#     PLATFORM_SERVICE_TOKEN="$(openssl rand -hex 32)"
+#     PLATFORM_MATCH_TICKET_SECRET="$(openssl rand -hex 32)" \
+#     PLATFORM_MATCH_CONTROL_SECRET="$(openssl rand -hex 32)" \
+#     PLATFORM_SERVICE_TOKEN="$(openssl rand -hex 32)" \
+#     SUPABASE_URL="https://<project-ref>.supabase.co" \
+#     SUPABASE_SERVICE_ROLE_KEY="<service-role-key>" \
+#     PLATFORM_MAIL_FROM="Overstrike <accounts@<verified-domain>>" \
+#     PLATFORM_MAIL_API_KEY="re_<resend-api-key>" \
+#     PLATFORM_ALERT_WEBHOOK_URL="https://<incident-relay>/<secret-route>"
 #
-# PLATFORM_TOKEN_SECRET signs access tokens and every receipt; rotating it signs out every
+# Before the FIRST deploy that enables Supabase, migration 0021 must already be applied, a
+# verification and recovery canary must have been delivered through the configured From domain,
+# and every pre-existing local-KDF account must be cut over during a maintenance window:
+#
+#   DATABASE_URL="..." SUPABASE_URL="..." SUPABASE_SERVICE_ROLE_KEY="..." \
+#     npm run identity:cutover                 # mandatory dry-run; must report no blockers
+#   DATABASE_URL="..." SUPABASE_URL="..." SUPABASE_SERVICE_ROLE_KEY="..." \
+#     npm run identity:cutover -- --apply      # creates recovery-required provider users
+#   DATABASE_URL="..." npm run identity:cutover  # must then report 0 candidates, 0 blockers
+#
+# The apply step revokes active sessions and gives each migrated account a random, undisclosed
+# provider password, so those players must use the normal password-recovery flow. Production
+# also refuses to boot while any live account retains a local credential or lacks a Supabase
+# subject. Do not bypass this with PLATFORM_IDENTITY_PROVIDER=local; that is forbidden in prod.
+# Readiness separately reports `alerts: down` until PLATFORM_ALERT_WEBHOOK_URL is configured.
+# The URL commonly embeds a routing secret and therefore belongs in Fly secrets, never `[env]`.
+#
+# PLATFORM_TOKEN_SECRET signs access tokens and receipts and is never shared with game servers.
+# PLATFORM_MATCH_TICKET_SECRET is a separate key shared only with OVERSTRIKE_MATCH_TICKET_SECRET
+# on match servers. Rotating it invalidates outstanding handoffs without signing players out.
+# Rotating PLATFORM_TOKEN_SECRET signs out every
 # player and invalidates every outstanding eligibility and consent receipt. PLATFORM_SERVICE_
 # TOKEN is what the game server presents to submit match results and read /v1/health/ready —
 # it is NOT a player credential and must never be shipped to a browser.
 #
-# config.js fails fast rather than defaulting on either: a platform that boots with a
-# development signing key would accept forged tokens in production and look healthy doing it.
+# config.js fails fast rather than defaulting production credentials: a platform that boots with
+# a development signing key, missing provider, or disabled recovery transport would look healthy
+# while accepting forged tokens or locking players out.
 
 [http_service]
   internal_port = 8080
@@ -63,6 +99,9 @@ primary_region = "yyz"        # ca-central-1 per docs/decisions/P0-decisions.md 
   auto_stop_machines = "suspend"
   auto_start_machines = true
   min_machines_running = 1
+  # P2 realtime rooms have one socket authority. Room/member state survives restarts in
+  # Postgres, but WebSocket fanout is intentionally single-process until P5 adds the broker.
+  max_machines_running = 1
 
   [http_service.concurrency]
     type = "requests"

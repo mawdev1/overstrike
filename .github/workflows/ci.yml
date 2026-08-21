@@ -58,6 +58,8 @@ jobs:
       # name claims, and only one of them can fail for database reasons.
       - name: platform suite (memory)
         run: npm run platformtest
+      - name: six-client lobby, allocation and reconnect (memory)
+        run: npm run lobbytest && npm run presencetest && npm run lifecyclefaulttest && npm run completiontest
       - name: platform suite (real postgres) + migration replay
         env:
           DATABASE_URL: postgres://postgres:overstrike-test@127.0.0.1:5432/postgres
@@ -95,5 +97,11 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: npm ci --ignore-scripts || npm install --ignore-scripts
-      - name: simulation and map harnesses
-        run: npm run simtest && npm run maptest && npm run nettest
+      - name: install browser used by CX acceptance harnesses
+        run: npx playwright install --with-deps chromium
+      - name: simulation and mode harnesses
+        run: npm run simtest && npm run tdmtest && npm run bombtest && npm run bombbottest && npm run nettest && npm run facadetest && npm run wstest && npm run servertest
+      - name: deterministic nav artifact and all P3 map guards
+        run: npm run maptest && npm run navbake:check && npm run navtest && npm run collisiontest && npm run stairtest && npm run vertprobe && npm run mapbalance && npm run geomtest && npm run siteoutcome
+      - name: P2/P3 client acceptance
+        run: npm run viteproxytest && npm run uishell && npm run browserlivetest && npm run uimap && npm run mapperf && npm run uibomb && npm run uilobby

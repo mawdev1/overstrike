@@ -105,7 +105,8 @@ Payloads are plain objects. **Canonical events (do not invent variants):**
 | `explosion` | `{ point, radius, damage, attacker, weaponId }` |
 | `spawn` | `{ entity }` |
 | `playerDamaged` | `{ amount, dirWorld }` — for the directional damage indicator |
-| `matchStart` / `matchEnd` | `{ mode, scores }` |
+| `matchStart` | `{ mode:'tdm', killLimit, scores }` |
+| `roundEnd` / `matchEnd` | final immutable result, in that order; `matchEnd` opens After Action |
 | `killstreak` | `{ entity, count }` |
 | `notice` | `{ text, sub, duration }` — big centre-screen text |
 
