@@ -13,23 +13,39 @@
  * map where attackers actually lose. The bias is not small and it is not subtle.
  *
  * The attacking squad COMMITS to one site per round before it moves (`botManager.js`
- * `_bombSite`: one deterministic choice per round, and non-carriers escort it rather than
- * choosing independently). That commitment is the site the round was fought over whether
- * or not a plant ever happened, so that is what each round is attributed to.
+ * `_bombSite`: one deterministic choice per round, memoised, so a carrier death does not
+ * make the squad change its mind). That commitment is the site the round was fought over
+ * whether or not a plant ever happened, so that is what each round is attributed to.
  *
- * It is read from the bots' own live state (`bot.objectiveRole` / `bot.objectiveSite` on an
- * attacker, on the first live tick of the round), not recomputed from the seed arithmetic.
- * A copy of the formula would keep agreeing with itself after the planner changed. As a
- * cross-check, §B asserts that every completed plant landed on the site this harness
- * recorded as committed — if the two ever disagree, the attribution is wrong and the run
- * fails rather than reporting a number built on it.
+ * What the squad does NOT do is all go there. `_applyBombObjective` sends every ODD team
+ * slot to `lurk` at the OTHER site — a deliberate anti-deathball split, not an accident —
+ * so an attributed round is one in which roughly the even half of the squad executes the
+ * committed site while the odd half contests the other. Measured over the full 2,085-round
+ * sample: 71.4% of pre-plant sited attacker-ticks are at the committed site, and 89 of those
+ * 2,085 rounds spent MORE attacker-ticks at the site the round is not booked to. That is
+ * the size of the approximation the per-site win rate rests on; it is not small enough to
+ * leave in prose that can go stale, so §B measures and prints it every run and hard-fails if the
+ * committed site ever stops holding the majority (`PRESENCE_MIN`). This paragraph replaces
+ * an earlier one that claimed non-carriers "escort it rather than choosing independently",
+ * which the planner stopped doing and the harness never noticed.
+ *
+ * The commitment is read from the bots' own live state (`bot.objectiveRole` /
+ * `bot.objectiveSite` on an attacker, on the first committed tick of the round), not
+ * recomputed from the seed arithmetic — a copy of the formula would keep agreeing with
+ * itself after the planner changed. Because that reads ONE bot, §B separately asserts that
+ * every attacker in a committed role all round named the SAME site, which is the property
+ * that lets one bot's state stand for the round and is what a per-bot planner would break.
  *
  * ── 2. Do the bots actually plant? ───────────────────────────────────────────────────
  *
  * If they cannot plant, every round ends on the round timer or on elimination and the win
  * rates measure the clock, not the sites. So the plant rate is measured and gated BEFORE
- * any distribution is reported (§B). Measured on The Square over 2,085 rounds: 77.9% of
- * rounds reach a completed plant. The gate sits at 40%.
+ * any distribution is reported (§B) — and since 2026-08-21 that sentence is true. Until
+ * then the gate failed the run and §C printed the distribution anyway, and then escalated
+ * the resulting 0%-and-16% figures as a §7.1 breach under the GEOMETRY lane's ticket, when
+ * the cause was that no bot could plant. §C is now skipped whole, with the gates that
+ * blocked it listed in its place. Measured on The Square over 2,085 rounds: 77.9% of rounds
+ * reach a completed plant. The gate sits at 40%.
  *
  * ── 3. Cost, measured rather than guessed ────────────────────────────────────────────
  *
@@ -59,26 +75,48 @@
  *     site A attack win rate        46.3%  (479/1035, 95% CI 43.3–49.3)  → inside 45–55
  *     site B attack win rate        54.3%  (570/1050, 95% CI 51.3–57.3)  → inside 45–55
  *     A/B asymmetry                  8.0 points
+ *     attacker presence at the committed site  71.4%  (89/2085 rounds mostly elsewhere)
+ *
+ *   Re-run in full on 2026-08-21 by `npm run siteoutcome` (200 matches, `--strict`) after
+ *   the §B rewrite below, and it reproduces every figure above to the decimal — 158 s wall
+ *   on a loaded machine. Nothing about WHAT is measured changed, so the row was confirmed
+ *   rather than replaced; the presence line is the one addition, and it is new information
+ *   about an approximation that was always there (§1), not a change to the win rate.
  *
  *   Both sites sit inside the §7.1 band, with a ±3 point interval — narrow enough that the
  *   band is genuinely being policed rather than merely not contradicted. Site B sits 0.7
  *   points under the upper edge, so this row is worth re-reading after any change to the
  *   objective planner rather than treated as settled.
  *
- *   One caveat that belongs next to the number: this repository's `src/ai/**` is another
- *   lane's file and was being edited while these runs were taken. The sim is deterministic
+ *   One caveat that belongs next to the number: `src/ai/**` is this lane's own code held by
+ *   another session, and was being edited while these runs were taken. The sim is deterministic
  *   at any fixed source state (proven by §D), but the win rate is a property of the map AND
  *   the bots, so this row is a joint measurement and must be regenerated when either moves.
  *
- * ── The other lane this measurement runs THROUGH ─────────────────────────────────────
+ * ── The code this measurement runs THROUGH ───────────────────────────────────────────
  *
- * The site a round was fought over is read from the bots' Bomb objective layer, which lives
- * in `src/ai/**`. On a tree where that layer has not landed, not one round in the sample
- * commits to a site and not one plant completes, and §B reports that as PENDING/ABSENT and
- * declines to print a win rate — the `maptest.mjs` ABSENT-vs-PARTIAL rule. A tree where
- * SOME rounds commit, or where rounds commit but nothing is ever planted, is PARTIAL and
- * hard-fails. Verified both ways: `git archive HEAD` (layer absent) reports PENDING and
- * exits 0; the working tree (layer present) measures 2,085 rounds.
+ * The site a round was fought over is read from the bots' Bomb objective layer in
+ * `src/ai/botManager.js` — this lane's own code ([CC] per `docs/lane-ownership.json`), held
+ * by another session. So the `maptest.mjs` ABSENT-vs-PARTIAL rule applies, with one
+ * correction that took a reproduction to see:
+ *
+ * ABSENCE IS DECIDED BY A CAPABILITY PROBE, NOT BY THE SAMPLE. A tree without the layer and
+ * a tree whose layer is 100% broken produce the identical sample — zero commitments, zero
+ * plants — and the earlier rule (`uncommitted === rounds && planted === 0` ⇒ PENDING, exit
+ * 0) mapped both to "not landed yet". That is backwards: a swallowed throw, a renamed field
+ * or an early return is the most likely shape of a real regression, and it is exactly the
+ * TOTAL shape. Reproduced by disabling `_applyBombObjective` at runtime, the old code
+ * printed `PENDING … is not present in this tree`, `plant rate 0.0%`, and exited 0.
+ *
+ * The child therefore probes whether `botManager` exposes `_applyBombObjective`,
+ * `_bombSite` and `_setObjective` at all, and only that probe can say ABSENT. On a tree that
+ * HAS them, an empty sample is a hard failure with no ticket on it, because it is our
+ * regression. Genuine absence is PENDING, names `src/ai/botManager.js` rather than the
+ * geometry lane's REQ-CX-008, and is fatal under `--strict`.
+ *
+ * Verified both ways at 2026-08-21 HEAD, which DOES carry the layer: the layer stubbed to a
+ * no-op reports `113/113 rounds recorded no site commitment` and exits 1; the layer removed
+ * from the prototype reports PENDING, exits 0, and exits 1 under `--strict`.
  *
  * ── Envelope breaches are PENDING, not FAIL ──────────────────────────────────────────
  *
@@ -107,23 +145,31 @@
  * Every degradation edits the REAL map manifest that the ruleset, the bots and the nav
  * layer all read (`world.manifest.objectives`). Nothing is stubbed and no second
  * implementation exists, and site B is left untouched inside the same run as a control.
- * Measured at 40 matches each, all four runs taken back to back on one tree state:
+ * Measured at 40 matches each on 2026-08-21, all four runs back to back on one tree state:
  *
- *   run                             site A attack        site B (control)     verdict
- *   ─────────────────────────────── ──────────────────── ──────────────────── ─────────
- *   restored (no --degrade)         46.3% (CI 39.6–53.2) 55.7% (CI 48.9–62.2) exit 0
- *   --degrade=site-a-shrink         13.1% (CI  9.1–18.5) 52.2% (CI 45.4–58.9) exit 1
- *   --degrade=site-a-nodefuse       84.3% (CI 79.0–88.4) 54.2% (CI 47.7–60.6) exit 1
- *   --degrade=site-a-swallow        10.2% (CI  6.9–14.8) 30.8% (CI 25.1–37.1) exit 1
+ *   run                        plant rate  site A attack        site B (control)     exit
+ *   ────────────────────────── ─────────── ──────────────────── ──────────────────── ────
+ *   restored (no --degrade)    77.2%       46.3% (CI 39.6–53.2) 55.7% (CI 48.9–62.2)  0
+ *   --degrade=site-a-shrink    39.7%       withheld             withheld              1
+ *   --degrade=site-a-nodefuse  76.0%       84.3% (CI 79.0–88.4) 54.2% (CI 47.7–60.6)  1
+ *   --degrade=site-a-swallow   47.8%       10.2% (CI  6.9–14.8) 30.8% (CI 25.1–37.1)  1
  *
- * `shrink` and `nodefuse` are the two edges of the band, low and high, each with a decisive
- * interval and each with the control site still reported as inside or inconclusive in the
- * same run — so the failure is attributable to site A rather than to the sample.
+ * `nodefuse` and `swallow` are the two edges of the band, high and low, each with a decisive
+ * interval, and `nodefuse` leaves the control site inconclusive in the same run — so the
+ * failure is attributable to site A rather than to the sample. `shrink` proves a different
+ * gate: a site nobody can stand in drops the plant rate to 39.7%, under the 40% floor, and
+ * §C is withheld. This row used to read `13.1% (CI 9.1–18.5)` — those numbers were §C
+ * printing a distribution the plant gate had already failed, which is precisely the thing
+ * §2 promised not to do. They are gone rather than corrected.
  *
  * The restored row is worth reading closely: site B's 55.7% is OUTSIDE the band, and the
  * run still exits 0, because at 212 rounds the interval straddles it. That is the
  * three-valued verdict doing its job rather than a threshold being soft — at 200 matches
  * (§ RESULT-200) the same site reports 54.3% with a ±3 point interval.
+ *
+ * The measurement itself is unchanged by all of this: a round is still attributed to the
+ * site its attackers committed to, so RESULT-200 above still stands and was NOT re-run.
+ * The restored 40-match row reproduces its 46.3% / 55.7% to the decimal on today's tree.
  */
 import os from 'node:os';
 import path from 'node:path';
@@ -151,6 +197,15 @@ const BAND_HI = 0.55;
  * balance between planting and being stopped, which is the thing under measurement.
  */
 const PLANT_RATE_MIN = 0.40;
+/**
+ * Attributing a whole round to one site is only defensible while the attacking force is
+ * mostly AT that site. It is not entirely: the planner lurks odd team slots at the other
+ * site on purpose (§1), which is why this is a majority test and not an equality one.
+ * Measured 71.4% over 2,085 rounds (and 71.9% / 71.4% / 71.7% at 131, 629 and 417), so the
+ * floor is far enough below to catch "the squad no longer goes where the round says it
+ * went", not to police the size of the lurk.
+ */
+const PRESENCE_MIN = 0.50;
 /** A legal series is 7–12 rounds (`BOMB_PARAMS.roundsToWin` / `maxRounds`). */
 const ROUNDS_MIN = 7;
 const ROUNDS_MAX = 12;
@@ -183,6 +238,22 @@ async function runMatch(seed, degrade) {
   const game = new Game({ headless: true });
   await game.initHeadless({ presenter: new NullPresenter(), mapId: 'the-square' });
 
+  /**
+   * Does the capability this harness measures THROUGH exist in this tree at all?
+   *
+   * Structural, and deliberately not derived from the sample: "no round committed to a
+   * site" is what a tree WITHOUT the objective layer and a tree WHOSE objective layer is
+   * totally broken both look like, and those are opposite answers (see §B). This probe is
+   * the only thing allowed to say "absent"; everything else is measurement, and a
+   * measurement that comes back empty on a tree that HAS the layer is a regression.
+   */
+  const bm = game.bots;
+  const capability = {
+    applyBombObjective: typeof bm?._applyBombObjective === 'function',
+    bombSite: typeof bm?._bombSite === 'function',
+    setObjective: typeof bm?._setObjective === 'function',
+  };
+
   const degradeNote = applyDegrade(game, degrade);
 
   game.startMatch({ mode: 'bomb', botCount: 11, difficulty: 'regular', seed });
@@ -193,7 +264,11 @@ async function runMatch(seed, degrade) {
 
   /** Roles an ATTACKER holds while it is executing the squad's committed site plan. */
   const ATTACK_ROLES = new Set(['plant', 'planting', 'escort', 'recover']);
+  /** Every role that puts an attacker at an authored site pre-plant, INCLUDING the lurk. */
+  const SITED_ROLES = new Set(['plant', 'planting', 'escort', 'recover', 'lurk']);
   const committedBy = new Map();          // roundIndex -> site id the attackers committed to
+  const namedBy = new Map();              // roundIndex -> Set of sites named by ATTACK_ROLES bots
+  const presenceBy = new Map();           // roundIndex -> Map(site id -> attacker-ticks, pre-plant)
 
   // A whole series, bounded. The bound is a hang detector, not a sample cut-off: a run that
   // hits it is reported as a failure, never folded into the statistics.
@@ -203,13 +278,25 @@ async function runMatch(seed, degrade) {
     game._fixedUpdate(FIXED_DT);
     ticks++;
     if (!rules.liveRound) continue;
-    if (committedBy.has(rules.roundIndex)) continue;
+    const ri = rules.roundIndex;
+    // Pre-plant only. After the plant both squads converge on the bomb's site by
+    // construction, so counting those ticks would report the plant back to itself.
+    const prePlant = rules.phase === 'live';
+    let named = namedBy.get(ri);
+    if (!named) { named = new Set(); namedBy.set(ri, named); }
+    let presence = presenceBy.get(ri);
+    if (!presence) { presence = new Map(); presenceBy.set(ri, presence); }
     for (const bot of game.bots.bots) {
       if (!bot.alive || bot.team !== rules.attackingTeam) continue;
       if (typeof bot.objectiveSite !== 'string' || bot.objectiveSite === '') continue;
-      if (!ATTACK_ROLES.has(bot.objectiveRole)) continue;
-      committedBy.set(rules.roundIndex, bot.objectiveSite);
-      break;
+      const role = bot.objectiveRole;
+      if (ATTACK_ROLES.has(role)) {
+        named.add(bot.objectiveSite);
+        if (!committedBy.has(ri)) committedBy.set(ri, bot.objectiveSite);
+      }
+      if (prePlant && SITED_ROLES.has(role)) {
+        presence.set(bot.objectiveSite, (presence.get(bot.objectiveSite) ?? 0) + 1);
+      }
     }
   }
 
@@ -224,11 +311,18 @@ async function runMatch(seed, degrade) {
     planted: r.planted === true,
     plantSite: typeof r.site === 'string' ? r.site : null,
     committedSite: committedBy.get(i) ?? null,
+    // Every site named by an attacker in a committed role this round. More than one means
+    // the squad did not commit as a squad, so no single site can stand for the round.
+    namedSites: [...(namedBy.get(i) ?? [])].sort(),
+    // Pre-plant attacker-ticks per site, lurks included: where the attacking force
+    // actually spent the round, as opposed to which site the round is attributed to.
+    presence: Object.fromEntries(presenceBy.get(i) ?? []),
   }));
 
   const out = {
     finished: rules.series !== null,
     ticks,
+    capability,
     siteIds: [...rules.siteIds],
     rounds,
     degradeNote,
@@ -304,10 +398,15 @@ let failures = 0;
 const ok = (n, d = '') => console.log(`  ok   ${n}${d ? `\n       ${d}` : ''}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const note = (n) => console.log(`  --   ${n}`);
-/** §7 envelope breach on [CX]-owned geometry: loud, named, non-fatal unless --strict. */
-const pending = (n, d) => {
-  if (STRICT) { failures++; console.log(`  FAIL ${n}\n       ${d}`); return; }
-  console.log(`  PENDING  ${n}: ${d} — REQ-CX-008 (geometry, [CX]).`);
+/**
+ * Loud, named, non-fatal unless `--strict` — and it must SAY WHOSE work it is waiting on.
+ * The owner is an argument because this harness has two of them: a §7 envelope breach is
+ * [CX] geometry (REQ-CX-008), while a missing objective layer is `src/ai/**`. Stamping the
+ * geometry lane's ticket on a bot-code defect is worse than printing nothing.
+ */
+const pending = (n, d, owner = 'REQ-CX-008 (geometry, [CX])') => {
+  if (STRICT) { failures++; console.log(`  FAIL ${n}\n       ${d}\n       owner: ${owner}`); return; }
+  console.log(`  PENDING  ${n}: ${d} — ${owner}.`);
 };
 
 function runChild(seed) {
@@ -398,49 +497,82 @@ const uncommitted = rounds.filter((r) => r.committedSite === null);
 const planted = rounds.filter((r) => r.planted && r.plantSite !== null);
 
 /**
- * ABSENT is a schedule; PARTIAL is a defect. The same distinction `maptest.mjs` draws for a
- * §3 manifest, for the same reason, and it is load-bearing here.
+ * ABSENT is a schedule; PARTIAL is a defect — and ABSENT is decided by a CAPABILITY PROBE,
+ * never by the measurement.
  *
  * This harness measures the map THROUGH the bots' Bomb objective layer (`botManager.js`
- * `_applyBombObjective`), which is `src/ai/**` — another lane's file. On a tree where that
- * layer has not landed, no attacker ever takes a Bomb objective role and no plant ever
- * completes: not one round in the whole sample. That is a lane that has not landed yet, it
- * is a real state, and failing on it would mean this lane could never commit a measurement
- * before the other lane commits the thing being measured.
+ * `_applyBombObjective`). A tree without that layer and a tree whose layer is 100% broken
+ * produce the SAME sample — zero commitments, zero plants — and they are opposite verdicts:
+ * one is work that has not landed, the other is a regression in exactly the code this
+ * harness exists to measure, and the most likely shape a regression takes (a swallowed
+ * throw, a renamed field, an early return) is the total one. An empty sample can therefore
+ * never be allowed to mean "absent" on its own; only the probe can say that, and it reads
+ * the tree, not the run.
  *
- * A tree where SOME rounds commit and some do not, or where rounds commit but nothing is
- * ever planted, is a different thing entirely: the layer is there and it is broken. That
- * must fail, and it does, in the branches below.
+ * `src/ai/**` is this lane's own code ([CC], `docs/lane-ownership.json`: `src/**` → CC),
+ * held by another session — so a present-but-broken layer is OUR regression and hard-fails
+ * with no ticket stamped on it. Genuine absence is a schedule, is named as such, and is
+ * fatal under `--strict`.
  */
-const ABSENT = rounds.length > 0 && uncommitted.length === rounds.length && planted.length === 0;
+const capable = good.filter((r) => r.capability?.applyBombObjective === true
+  && r.capability?.bombSite === true && r.capability?.setObjective === true);
+const CAPABLE = capable.length === good.length;
+const ABSENT = capable.length === 0;
+
+if (!CAPABLE && !ABSENT) {
+  // Every child forks the same tree, so this cannot happen without one child having failed
+  // to construct a BotManager at all. Reported rather than folded into either branch.
+  bad('every match agrees on whether the bots\' Bomb objective layer exists',
+    `${capable.length}/${good.length} children found it — the sample mixes two trees and nothing below can be attributed`);
+}
 
 if (rounds.length === 0) {
   bad('the sample contains rounds', '0 rounds — every statistic below would be computed over an empty set');
 } else if (ABSENT) {
-  console.log(`  PENDING  not one of the ${rounds.length} rounds saw an attacker take a Bomb objective role,`
-    + ' and not one plant completed — the bots\' Bomb objective layer (src/ai/**, another lane) is not present in this tree.');
-  console.log('           Tracked, not ignored: the moment ANY round commits to a site or ANY plant');
-  console.log('           completes, the branches below turn this into a failure. No win rate is reported,');
-  console.log('           because a distribution over zero attributed rounds is not a measurement.');
+  pending('the bots\' Bomb objective layer is present in this tree',
+    `botManager exposes no _applyBombObjective/_bombSite/_setObjective, so no attacker can take a Bomb`
+    + ` objective role and no site can be attributed (${rounds.length} rounds, ${planted.length} plants).`
+    + ' No win rate is reported: a distribution over zero attributed rounds is not a measurement.'
+    + ' The moment the layer lands, an empty sample becomes a FAILURE',
+    'src/ai/botManager.js ([CC], another session) — the objective layer has not landed');
 } else if (uncommitted.length === 0) {
   ok(`every one of the ${rounds.length} rounds recorded an attacker site commitment`);
 } else {
   bad('every round records which site the attackers committed to',
-    `${uncommitted.length}/${rounds.length} did not — those rounds cannot be attributed to a site, and a rate computed over the rest would silently drop them`);
+    `${uncommitted.length}/${rounds.length} did not, on a tree that HAS the objective layer — those rounds cannot be`
+    + ' attributed to a site, and a rate computed over the rest would silently drop them');
 }
 
-// The attribution cross-check. If the bots plant somewhere other than the site this
-// harness recorded as their commitment, the commitment is not what it claims to be.
-const mismatched = planted.filter((r) => r.plantSite !== r.committedSite);
-if (ABSENT) {
-  // Already reported above. Asserting it twice would read as two independent findings.
-} else if (planted.length === 0) {
-  bad('the sample contains completed plants', '0 — see the plant-rate gate below');
-} else if (mismatched.length === 0) {
-  ok(`all ${planted.length} completed plants landed on the site recorded as committed`);
+/**
+ * Did the squad commit as a SQUAD?
+ *
+ * The round's site is read off ONE attacker on its first committed tick. That is only a
+ * property of the round if every other attacker in a committed role names the same site all
+ * round — which is what `_bombSite`'s one-choice-per-round memo is for, and is exactly what
+ * a planner rewritten to choose per-bot would break. (Lurks are excluded on purpose: the
+ * planner sends odd team slots to the OTHER site by design, see §1 and the presence split
+ * below. This asks about the committed group only.)
+ *
+ * This replaces a plant-site-vs-committed-site cross-check that could not fail: a bot only
+ * REQUESTS a plant while standing in the site it planned, so both sides of that comparison
+ * came from the same memoised `_bombSite` call and it was empirically 0/85, 0/61, 0/178,
+ * including under `--degrade=site-a-nodefuse`. It read as an independent audit and was not
+ * one, so it is gone rather than kept for the reassurance.
+ */
+const committedRounds = rounds.filter((r) => r.committedSite !== null);
+const split = committedRounds.filter((r) => (r.namedSites?.length ?? 0) > 1);
+if (ABSENT || committedRounds.length === 0) {
+  // Nothing committed; already reported above.
+} else if (split.length === 0) {
+  ok(`in all ${committedRounds.length} attributed rounds every attacker in a committed role named one site`);
 } else {
-  bad('every completed plant lands on the site recorded as committed',
-    `${mismatched.length}/${planted.length} did not — the per-site attribution is wrong, so no win rate below can be trusted`);
+  bad('the attacking squad commits to one site per round',
+    `${split.length}/${committedRounds.length} rounds had attackers committed to different sites`
+    + ` (e.g. ${split[0].namedSites.join(' + ')}) — one site cannot stand for such a round, so the attribution below is invalid`);
+}
+
+if (!ABSENT && planted.length === 0) {
+  bad('the sample contains completed plants', '0 — see the plant-rate gate below');
 }
 
 const plantRate = rounds.length ? planted.length / rounds.length : 0;
@@ -454,11 +586,82 @@ if (rounds.length === 0 || ABSENT) {
     `${(plantRate * 100).toFixed(1)}% < ${(PLANT_RATE_MIN * 100).toFixed(0)}% — with plants this rare the rounds are decided by the round clock and elimination, so the numbers below measure the timer, not the sites`);
 }
 
+/**
+ * Where the attacking force actually was, printed next to the site the round is booked to.
+ *
+ * The attribution is one site per round, and the planner does NOT send the whole squad
+ * there: odd team slots lurk at the other site (`botManager.js` `_applyBombObjective`).
+ * So the size of that approximation is published every run rather than left as prose that
+ * could go stale the way the old §1 rationale did — and it is gated, because below a
+ * majority the round's booked site stops describing where the round was fought.
+ */
+let presenceShare = 0;
+{
+  let atCommitted = 0;
+  let elsewhere = 0;
+  let roundsMostlyElsewhere = 0;
+  for (const r of rounds) {
+    const p = r.presence ?? {};
+    const here = p[r.committedSite] ?? 0;
+    let away = 0;
+    for (const [site, n] of Object.entries(p)) if (site !== r.committedSite) away += n;
+    atCommitted += here;
+    elsewhere += away;
+    if (away > here) roundsMostlyElsewhere++;
+  }
+  const total = atCommitted + elsewhere;
+  presenceShare = total > 0 ? atCommitted / total : 0;
+  if (ABSENT || rounds.length === 0) {
+    // No commitment to be present at; already reported.
+  } else if (total === 0) {
+    bad('the sample records where the attackers were',
+      'not one sited attacker-tick in the whole sample, on a tree that HAS the objective layer');
+  } else {
+    console.log(`  attacker presence, pre-plant: ${(presenceShare * 100).toFixed(1)}% of sited attacker-ticks were at the`
+      + ` committed site, ${(100 - presenceShare * 100).toFixed(1)}% at the other one`
+      + ` (${roundsMostlyElsewhere}/${rounds.length} rounds spent more at the site they are NOT booked to)`);
+    if (presenceShare > PRESENCE_MIN) {
+      ok(`the committed site holds the majority of sited attacker presence (> ${(PRESENCE_MIN * 100).toFixed(0)}%)`
+        + ' — the lurk half of the squad is by design, and the round is still booked to the committed site');
+    } else {
+      bad('the committed site holds the majority of sited attacker presence',
+        `${(presenceShare * 100).toFixed(1)}% ≤ ${(PRESENCE_MIN * 100).toFixed(0)}% — the attacking force spends most of the round somewhere`
+        + ' other than the site each round is booked to, so booking the round to one site no longer describes anything');
+    }
+  }
+}
+
+/**
+ * Everything §C needs in order to be a measurement rather than a decoration.
+ *
+ * §2 of the header promises the distribution is gated BEFORE it is reported. That promise
+ * used to be false: the plant-rate gate called `bad()` and then §C printed the win rates
+ * anyway — and, worse, escalated the resulting 0%-and-16% figures as a §7.1 GEOMETRY breach
+ * under another lane's ticket, when the actual cause was that no bot could plant. A number
+ * that is known to be meaningless is not improved by printing it with a caveat, and a lane
+ * label attached to the wrong lane is a false accusation.
+ */
+const blockers = [];
+if (rounds.length === 0) blockers.push('the sample contains no rounds');
+if (ABSENT) blockers.push('the bots\' Bomb objective layer is not present in this tree, so no round is attributed to a site');
+if (!CAPABLE && !ABSENT) blockers.push('the children disagree about whether the objective layer exists');
+if (siteIds.length < 2) blockers.push(`the map declares ${siteIds.length} bomb site(s); a per-site figure needs 2`);
+if (!ABSENT && uncommitted.length > 0) blockers.push(`${uncommitted.length}/${rounds.length} rounds recorded no site commitment`);
+if (!ABSENT && split.length > 0) blockers.push(`${split.length} rounds had attackers committed to different sites`);
+if (!ABSENT && rounds.length > 0 && presenceShare <= PRESENCE_MIN) {
+  blockers.push(`only ${(presenceShare * 100).toFixed(1)}% of sited attacker presence was at the site its round is booked to`);
+}
+if (!ABSENT && rounds.length > 0 && plantRate < PLANT_RATE_MIN) {
+  blockers.push(`the plant rate ${(plantRate * 100).toFixed(1)}% is under the ${(PLANT_RATE_MIN * 100).toFixed(0)}% floor,`
+    + ' so the rounds were decided by the clock and elimination rather than by the sites');
+}
+
 // ── C. site win rates ────────────────────────────────────────────────────────────────
 console.log('');
 const perSite = [];
-if (ABSENT) {
-  note('no attack/defend win rate is reported: there are no rounds attributed to a site to compute one from');
+if (blockers.length > 0) {
+  console.log('  no attack/defend win rate is reported — the gates above say it would not be a measurement:');
+  for (const b of blockers) console.log(`     · ${b}`);
 } else {
 console.log('  attack win rate per committed site (§7.1: 45–55%)');
 for (const site of siteIds) {
