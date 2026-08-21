@@ -1,6 +1,165 @@
 # Contract changelog
 
+## 2026-08-21 — `wire-protocol.md` 1.8.0 → 1.9.0 — held interact bit (`PROTOCOL_VERSION` stays 3)
+
+`bomb-rules.md` §6.4 requires the plant key held continuously and nothing on the wire could
+express it: `interact` is an EDGE bit and `HELD_BITS` was 8 of 8 bits of a u8. The server read
+the edge as a hold, so a held key reset the plant on every tick after the press and **no human
+player could plant or defuse** — bots could, because they call `BombRules.requestInteract`
+in-process. `HELD_BITS` gains `interactHeld` at bit 8, the command's held field widens u8 → u16
+at offset 11, and `COMMAND_BYTES` goes 30 → 31. Bits 0–7 keep their indices *and* their byte
+(little-endian), so no pre-existing bit moved, per §7 G3; the fields after it shift by one byte,
+which is safe only because a command batch is never decoded by prefix. Folded into the
+already-unreleased `PROTOCOL_VERSION = 3` rather than bumping again.
+
+## 2026-08-21 — `net-facade.md` 1.10.0 → 1.11.0 — cold-load ticket reservation
+
+Authoritative browser entry now consumes its 60-second launch ticket through `reserve()` before
+renderer/Game initialization, then uses `promoteReservation()` and the authenticated reconnect
+provider after `bindGame()`. The lightweight socket sends no commands and the match referee clock
+does not start until promoted roster clients submit their signed loadouts.
+
+## 2026-08-21 — `realtime-lobby.md` 1.10.0 → 1.11.0 — URL-secret removal
+
+Shipping browser clients carry the single-use lobby ticket in the
+`overstrike-ticket.<ticket>` WebSocket subprotocol rather than a query string. The server keeps
+query parsing only as a bounded compatibility path for protocol-v1 clients and test fixtures.
+This is additive at the server boundary and removes credentials from browser/proxy URLs.
+
+## 2026-08-21 — `db-schema.md` 2.1.0 — durable match-ticket consumption
+
+Migration 0025 adds the single-use `match_tickets` admission ledger. The game server verifies
+the compact HMAC and then atomically consumes its exact jti/account/room/match tuple through the
+authenticated platform control plane. Expired, mismatched, concurrent, and post-restart replay
+attempts fail before entity allocation; reconnect always mints a new durable jti.
+Consumed and unconsumed receipts retain for 24 hours past expiry, then the lobby janitor purges
+them; the append-once/consume-once row is explicitly exempt from mutable-table `updated_at`.
+
+## 2026-08-21 — `wire-protocol.md` 1.7.0 → 1.8.0 and `net-facade.md` 1.9.1 → 1.10.0 — tactical ping
+
+`PROTOCOL_VERSION` is 3. `MSG_TACTICAL_PING` carries only a closed intent kind; the game
+server supplies the position, rate-limits to one per 1.5 seconds, and broadcasts the resulting
+`MSG_TACTICAL_PING_EVENT` to the sender's team only. This closes P2.B3 without accepting
+client coordinates or exposing a team cue to opponents. The facade adds the closed
+`requestTacticalPing(kind)` method and team-filtered `tacticalPing` event; contract document
+versions remain semantic versions and are distinct from the binary `PROTOCOL_VERSION`.
+
+## 2026-08-21 — `http-api.md` 2.1.0 — unverified legacy practice import
+
+The authenticated one-shot `/v1/profile/me/progression-import` request/response is now exact.
+The normalized record is permanently `verified:false`, remains separate from authoritative
+career/result tables, replays rather than merges, and does not require deleting the local
+practice blob.
+
+## 2026-08-21 — `realtime-lobby.md` 1.10.0 — W3C launch trace propagation
+
+Client intent frames may carry W3C `traceparent` beside their durable correlation ULID. A valid
+client trace is retained through platform allocation/control and game-server spans without being
+placed in tickets or public handoffs; missing context derives from correlation for old clients,
+while malformed/zero context is refused.
+
+## 2026-08-21 — `db-schema.md` 2.0.0 — retained chat/report evidence
+
+Migration 0024 adds `chat_messages`, complete removal metadata, expiry/room indexes and
+`reports.chat_message_id`. Report duplicate identity now includes that nullable message id with
+`NULLS NOT DISTINCT`; referenced messages remain reconstructable through their moderation hold.
+
+## 2026-08-21 — `realtime-lobby.md` 1.9.0 / `telemetry.md` 2.1.0 — moderated chat evidence
+
+Accepted chat is normalized and policy-filtered server-side, retained internally for 30 days,
+and linkable to reports by a verified `chatMessageId`. Open reports hold the row through
+resolution plus 30 days. Service removal persists actor/reason/time and broadcasts
+`chat.removed`; it does not expose persisted history to later room joins.
+
+## 2026-08-21 — `match-result.md` / `http-api.md` 2.0.0 — atomic authoritative evidence
+
+The service-only result endpoint now accepts the exact `{result,evidence}`
+`AuthoritativeResultSubmissionV1` envelope. Flat HTTP submissions and unknown wrapper keys are
+refused. A shared stable digest and independent reconstruction bind complete, non-truncated
+authority evidence to TerminalResult; result, immutable evidence, career, idempotency and both
+terminal outbox events commit atomically. This is a breaking service-producer amendment.
+
+## 2026-08-21 — `http-api.md` 1.13.0 — observable cross-tier operations baseline
+
+Browser requests now originate W3C trace context, and lobby launch correlation is propagated
+through platform match-control calls into the dedicated authority and terminal application.
+Service-only metrics and incident-timeline reads expose bounded/redacted route counters, alert
+signals, durable event/audit metadata, and recent client/platform/match-server spans. Outbox
+dead letters and platform 5xx responses route closed alert payloads through a secret webhook;
+production readiness reports alert routing down until it is configured. Trace context is not
+placed in tickets or business payloads, and timeline projections exclude payloads, actor ids,
+email, chat, provider responses, and credentials.
+
+## 2026-08-20 — `auth.md` 1.7.0 — fail-closed legacy identity cutover
+
+Migration 0021's nullable provider columns did not migrate existing credential rows. Enabling the
+production Supabase adapter in that state would make every legacy signin fail subject binding and
+make recovery reject the missing subject. The explicit operator cutover now provisions a random,
+undisclosed provider credential, binds the exact provider subject, clears the local KDF, revokes
+sessions, and requires normal account recovery. It is dry-run by default, resumable after provider
+creation, compensates a provider create when the database attach fails, and refuses to adopt a
+same-email provider identity without matching account metadata. Production refuses to boot until
+the live-account readiness query reaches zero. No automatic remote call was added to SQL migration
+or process startup, and no local-provider production escape hatch exists.
+
+The same cutover now requires the recovery channel it depends on. Production refuses the `none`
+and credential-logging transports and requires configured Resend From/API credentials; service
+readiness names mail separately. Provider bodies are no longer copied into mail-failure logs,
+where a proxy could echo the API credential, and recovery copy now matches the contractual
+30-minute TTL rather than saying one hour. Live verification/recovery canary delivery remains an
+external deployment gate, not something configuration readiness pretends to prove.
+
+## 2026-08-20 — realtime lobby 1.8.0
+
+- Closed the ping kind/target union and shipped server-owned ping/loadout catalogs.
+- Added authoritative `mute.set`/`mute.changed`, persisted mute projection on reconnect, and
+  reserved WebSocket close-code mappings.
+
 Every contract amendment lands here. Newest at the top.
+
+## 2026-08-20 — `net-facade.md` 1.9.1 — spectator policy alignment
+
+Policy version 1 now projects the BombRules permission exactly: free camera is allowed only
+after a round is decided (`roundEnd`/`matchEnd`), while chat reopens at `freeze` so deferred
+dead-player chat can be delivered. The previous facade table also enabled free camera during
+`warmup` and `freeze`; the authoritative ruleset refused it there, leaving the HUD offering a
+control the server denied and allowing a pre-round position leak if a server ever trusted that
+client projection. This is a restrictive clarification of an already server-enforced rule.
+
+## 2026-08-20 — `auth.md` 1.6.0, `db-schema.md` 1.9.0, `http-api.md` 1.12.0, `match-result.md` 1.9.0, `errors.md` 1.7.0, `telemetry.md` 2.0.0 — REQ-CC-058/059/061
+
+**D1 is executable.** Production now requires the Supabase identity adapter and its URL/service
+credential; the local scrypt provider is a non-production test seam, including dummy-KDF work for
+unknown identities. Provider subjects have dedicated constrained columns rather than being
+misstored in `password_hash`. Signup compensation cannot mask its original failure. Recovery is
+a reserved-token, resumable saga so an external provider update followed by a local failure does
+not spend the only credential capable of completing the platform transaction and session
+revocation. Live Supabase credentials and provider-side acceptance remain deployment evidence,
+not something this code-only change claims to have proved.
+
+**CCR: unload delivery, approved by the human owner's instruction to complete P0–P3.** Beacon
+cannot carry the mandatory correlation/build headers or bearer identity, and its boolean return
+does not acknowledge server acceptance. A single same-origin `/v1/telemetry/unload` ingress now
+revalidates body metadata, derives signed-in identity only from a short-lived endpoint-scoped
+httpOnly Strict cookie acquired over the ordinary authenticated client, and transactionally
+deduplicates `deliveryId`. Signed-out personal delivery remains receipt/client-session bound and
+internal delivery remains identity-free. On unload, queue deletion at `sendBeacon(true)` is the
+explicit response-independent, at-most-once best-effort trade; normal delivery still waits for
+`202`. There is no generic beacon URL or dual-support window because no conforming ingress had
+previously shipped.
+
+**Result identity and retention.** `ResultSubmission.roster` and `.players` are now explicitly
+one participant set: exact account membership and team equality, independent of ordering. The
+service already persisted participants from `players`, so accepting a contradictory `roster`
+returned success for a record that read back differently. The exact path-derived
+`Idempotency-Key` is enforced at both HTTP and service boundaries, including omission, and its
+gameplay retention is the §8 value of 24 hours rather than the unrelated 30-day consent period.
+
+**Browser connection failures.** `connection.failure` gains two event-scoped transport outcomes,
+`CLIENT_NETWORK` and `CLIENT_TIMEOUT`. They do not join the platform `ErrorCode` enumeration and
+cannot appear in an API envelope. This lets the browser report offline/DNS and its own deadline
+without falsely saying the platform returned `SERVICE_UNAVAILABLE`; platform responses continue
+to carry their real closed error code.
 
 ## 2026-08-20 — `db-schema.md` 1.8.0 (additive) — `accounts.email`
 

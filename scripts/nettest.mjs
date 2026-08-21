@@ -793,7 +793,7 @@ console.log('\nlag compensation');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
-// Protocol v2 — the Bomb wire (wire-protocol.md §8, bomb-rules.md §11)
+// Protocol v3 — the Bomb wire plus tactical ping (wire-protocol.md §8, bomb-rules.md §11)
 // ═══════════════════════════════════════════════════════════════════════════════════════
 //
 // Everything below asserts a SPECIFIC decoded value out of REAL bytes. "It encoded without
@@ -813,10 +813,10 @@ function wireEntity(id, over = {}) {
   return Object.assign(e, over);
 }
 
-console.log('\nprotocol v2 — version and the append-only rule');
+console.log('\nprotocol v3 — version and the append-only rule');
 
 {
-  eq('PROTOCOL_VERSION', PROTOCOL_VERSION, 2);
+  eq('PROTOCOL_VERSION', PROTOCOL_VERSION, 3);
 
   // §7 G3 / §9.2: the interact field is APPENDED. Its index IS its bit in the field mask, so
   // an insert anywhere before it silently reassigns the meaning of every later field on every
@@ -904,7 +904,7 @@ console.log('\nprotocol v2 — version and the append-only rule');
   eq('v1 welcome carries no version, and says so rather than guessing', oldW.protocolVersion, null);
 }
 
-console.log('\nprotocol v2 — the packed interact byte (§8.5)');
+console.log('\nprotocol v3 — the packed interact byte (§8.5)');
 
 {
   // Bit boundaries, both ends of both fields. The packing is kind in bits 0-1 and progress in
@@ -950,7 +950,7 @@ console.log('\nprotocol v2 — the packed interact byte (§8.5)');
   eq('flags bit 7 is still spare (no new flag bit was taken)', used & 0x80, 0);
 }
 
-console.log('\nprotocol v2 — appended event kinds (§8.7)');
+console.log('\nprotocol v3 — appended event kinds (§8.7)');
 
 {
   const events = [
@@ -1036,7 +1036,7 @@ console.log('\nprotocol v2 — appended event kinds (§8.7)');
   else bad('an out-of-range code never becomes an event', JSON.stringify(first.events));
 }
 
-console.log('\nprotocol v2 — MSG_MATCHSTATE (§8.6)');
+console.log('\nprotocol v3 — MSG_MATCHSTATE (§8.6)');
 
 {
   const full = {
@@ -1111,7 +1111,7 @@ console.log('\nprotocol v2 — MSG_MATCHSTATE (§8.6)');
   eq('a truncated match state is refused outright', decodeMatchState(bent.slice(0, 40)), null);
 }
 
-console.log('\nprotocol v2 — MSG_OUTCOME (§8.9)');
+console.log('\nprotocol v3 — MSG_OUTCOME (§8.9)');
 
 {
   const ULID = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
@@ -1161,7 +1161,7 @@ console.log('\nprotocol v2 — MSG_OUTCOME (§8.9)');
   eq('and stays aborted', forfeit.terminationReason, 'aborted');
 }
 
-console.log('\nprotocol v2 — the handshake (§8.2, §8.3, §8.4)');
+console.log('\nprotocol v3 — the handshake (§8.2, §8.3, §8.4)');
 
 {
   const h = decodeHello(encodeHello(2, 'st_abc123'));
@@ -1264,7 +1264,7 @@ console.log('\nprotocol v2 — the handshake (§8.2, §8.3, §8.4)');
   if (!rejected) ok('a matching version is not rejected');
   else bad('a matching version is accepted', 'the server rejected a client speaking its own version');
   eq('the connection survives', s.server.clients.size, 1);
-  eq('the server kept the ticket for G2 to validate', c.session.ticket, 'st_good_client');
+  eq('the server retains the decoded ticket after the admission gate', c.session.ticket, 'st_good_client');
   eq('the welcome names the negotiated version', c.client.welcome?.protocolVersion, PROTOCOL_VERSION);
   eq('and the server tick rate', c.client.welcome?.serverTickRateHz, 120);
   eq('the client was not rejected', c.client.rejected, null);
@@ -1290,7 +1290,7 @@ console.log('\nprotocol v2 — the handshake (§8.2, §8.3, §8.4)');
   eq('and never adopts an entity from it', client.entityId, 0);
 }
 
-console.log('\nprotocol v2 — the per-recipient bomb-position filter (§8.6, §8.8)');
+console.log('\nprotocol v3 — the per-recipient bomb-position filter (§8.6, §8.8)');
 
 {
   // THE high-risk part, proved the only way that means anything: by decoding the bytes two
@@ -1572,7 +1572,7 @@ console.log('\nprotocol v2 — the per-recipient bomb-position filter (§8.6, §
   eq('the TDM welcome still carries its kill limit', s.conns[0].client.killLimit > 0, true);
 }
 
-console.log('\nprotocol v2 — objective evidence (match-result.md §7)');
+console.log('\nprotocol v3 — objective evidence (match-result.md §7)');
 
 {
   const s = await makeSession({ clients: 1 });
@@ -1666,7 +1666,7 @@ console.log('\nprotocol v2 — objective evidence (match-result.md §7)');
 
 
 // ══════════════════════════════════════════════════════════════════════════════════════
-// protocol v2 — driven by the REAL ruleset, and scanned on EVERY frame
+// protocol v3 — driven by the REAL ruleset, and scanned on EVERY frame
 //
 // Everything below answers the same two lessons from the P3.A4 review:
 //
@@ -1733,7 +1733,7 @@ const TEAM_NAMES_TEST = ['alpha', 'bravo'];
 const teamOf = (game, team) => game.entities.filter((e) => e.team === team);
 const killVia = (game, victim) => game.bus.emit('kill', { victim, attacker: null, weaponId: 'ar_vector', headshot: false, distance: 12 });
 
-console.log('\nprotocol v2 — the bomb position on EVERY frame, not just MSG_MATCHSTATE (§8.6, §8.8)');
+console.log('\nprotocol v3 — the bomb position on EVERY frame, not just MSG_MATCHSTATE (§8.6, §8.8)');
 
 {
   // C1. `bombDropped` is in `EV_VEC3` and `EV_SPATIAL`, so it carries the true coordinates in
@@ -1830,7 +1830,7 @@ console.log('\nprotocol v2 — the bomb position on EVERY frame, not just MSG_MA
   eq('with no position', B.client.matchState?.bombPosition, null);
 }
 
-console.log('\nprotocol v2 — the ruleset\'s own payload reaches the wire intact (§8.7)');
+console.log('\nprotocol v3 — the ruleset\'s own payload reaches the wire intact (§8.7)');
 
 {
   // C4 + C2 + C5, all against what `src/game/bomb.js` really emits. Nothing here builds an
@@ -1906,7 +1906,7 @@ console.log('\nprotocol v2 — the ruleset\'s own payload reaches the wire intac
   eq('and still encodes as something the decoder can read', fallback, REFUSAL_REASONS[0]);
 }
 
-console.log('\nprotocol v2 — MSG_OUTCOME actually leaves the server (§8.9)');
+console.log('\nprotocol v3 — MSG_OUTCOME actually leaves the server (§8.9)');
 
 {
   // C6. A full match used to produce message types {2, 3, 7} and not one MSG_OUTCOME, because
@@ -1973,7 +1973,7 @@ console.log('\nprotocol v2 — MSG_OUTCOME actually leaves the server (§8.9)');
   eq('and is not a draw', sent[1]?.reason, 'no-contest');
 }
 
-console.log('\nprotocol v2 — the appended interact field carries something (§8.5)');
+console.log('\nprotocol v3 — the appended interact field carries something (§8.5)');
 
 {
   // C7. The one entity field that justified PROTOCOL_VERSION -> 2 was `packInteract(0, 0)` on
@@ -2015,7 +2015,7 @@ console.log('\nprotocol v2 — the appended interact field carries something (§
   eq('and it agrees with the ruleset it came from', progressed?.progress, rules.progressOf(carrier.id) || progressed?.progress);
 }
 
-console.log('\nprotocol v2 — the handshake gates allocation (§8.2, §9.5)');
+console.log('\nprotocol v3 — the handshake gates allocation (§8.2, §9.5)');
 
 {
   // C3. The gate gated nothing: `addClient` allocated the entity and sent the welcome before
@@ -2115,7 +2115,7 @@ console.log('\nprotocol v2 — the handshake gates allocation (§8.2, §9.5)');
   eq('and receives no welcome', frames2.filter((b) => new DataView(b).getUint8(0) === MSG_WELCOME).length, 0);
 }
 
-console.log('\nprotocol v2 — malformed frames close the connection (§8.11)');
+console.log('\nprotocol v3 — malformed frames close the connection (§8.11)');
 
 {
   // C10. `decodeWelcome` was the one decoder with no minimum-length check, because it accepts
@@ -2146,7 +2146,7 @@ console.log('\nprotocol v2 — malformed frames close the connection (§8.11)');
   eq('with no version, which is what marks it as v1', decodeWelcome(encodeWelcome({}).slice(0, WELCOME_BYTES_V1))?.protocolVersion, null);
 }
 
-console.log('\nprotocol v2 — the two guards nothing was testing (§4, §8.8)');
+console.log('\nprotocol v3 — the two guards nothing was testing (§4, §8.8)');
 
 {
   // C8, first half: `_canSee` requires a LIVING viewer — "elimination is not a licence to
@@ -2209,7 +2209,7 @@ console.log('\nprotocol v2 — the two guards nothing was testing (§4, §8.8)')
   }
 }
 
-console.log('\nprotocol v2 — a viewer with no side is authorised for nothing (§8.6)');
+console.log('\nprotocol v3 — a viewer with no side is authorised for nothing (§8.6)');
 
 {
   // C11. `role === 'none'` fell through the `bomb.state === 'planted'` short-circuit and was
@@ -2252,6 +2252,305 @@ console.log('\nprotocol v2 — a viewer with no side is authorised for nothing (
   try { s.server.tick(); } catch (e) { threw = e; }
   if (threw) bad('a session on an entity with no _edge does not kill the tick loop', `${threw.constructor.name}: ${threw.message}`);
   else ok('a session on an entity with no _edge map does not kill the tick loop for everyone else');
+}
+
+console.log('\nprotocol v3 — a HUMAN can plant, with the key HELD over the real wire (bomb-rules §6.4)');
+
+/**
+ * The rig this section needed, and the reason the old coverage proved nothing.
+ *
+ * `bombtest.mjs` and `wstest.mjs` both plant by calling `rules.requestInteract(...)` in a loop.
+ * That is the bot's path — `botManager.js` calls it in-process — and it is precisely the half
+ * of the system that was never broken. The broken half is everything before it: a key held
+ * down, through `Player._refreshHeldState`, `_buildLocalCommand`, `MultiplayerSession.step`,
+ * `encodeCommands`, the transport, `decodeCommands`, and `GameServer._applyCommand`. Nothing
+ * in this rig constructs a command field by hand and nothing calls `requestInteract`.
+ *
+ * TWO games, deliberately. The client game holds the `Player` whose input is read and whose
+ * command is encoded; the server game holds the authoritative entity and the real `BombRules`.
+ * The only thing joining them is the bytes, so a held state that reached the ruleset can only
+ * have arrived through the wire.
+ */
+async function makeHeldPlantRig({ bots = 7 } = {}) {
+  const { Player } = await import('../src/player/player.js');
+  const { MultiplayerSession } = await import('../src/net/session.js');
+
+  const s = await makeBombSession({ bots });
+  const g = s.game;
+  const rules = s.rules;
+  const humans = [];
+  let ms = 0;
+
+  /** A server-side `Player`, a socket, and a real `MultiplayerSession` driving it. */
+  async function addHuman({ team, position, label }) {
+    const entity = new Player(g);
+    await entity.init();
+    g.addEntity(entity);
+    entity.team = team;
+    g.weapons.giveLoadout(entity, ['ar_vector', 'pistol_sidewinder']);
+    entity.respawn();
+    // Bots shoot. A test about a 3- or 7-second interaction must not fail because somebody
+    // won a gunfight during it — and if the human dies anyway, that is asserted as a
+    // control rather than silently changing what the test measures.
+    entity.maxHealth = 1e6;
+    entity.health = 1e6;
+    entity.position.set(position.x, position.y, position.z);
+    entity.velocity.set(0, 0, 0);
+
+    const [cT, sT] = createLoopbackPair({});
+    const session = s.server.addClient(sT, entity);
+    s.server._onMessage(session, encodeHello(PROTOCOL_VERSION, `st_${label}`));
+
+    // ── the client, which is a real one ──────────────────────────────────────────────
+    const clientGame = new Game({ headless: true });
+    await clientGame.initHeadless({ presenter: new NullPresenter() });
+    clientGame.startMatch({ mode: 'bomb', botCount: 0, seed: 7 });
+    clientGame.state = 'playing';
+    clientGame.paused = false;
+
+    // The browser's input device, stood in for. `isDown('interact')` is a real method on a
+    // real key binding (`settings.js` binds KeyE); headless has no device at all, and
+    // `_refreshHeldState` returns early without one.
+    const down = new Set();
+    clientGame.input = {
+      fire: false, aim: false, firePressed: false, aimPressed: false,
+      isDown: (k) => down.has(k),
+      wasPressed: () => false,
+      wasReleased: () => false,
+      consumeWheel: () => 0,
+      consumeLook: (out) => { out.x = 0; out.y = 0; return out; },
+    };
+
+    const mp = new MultiplayerSession(clientGame, cT);
+    mp.connected = true;
+
+    const row = {
+      entity, session, cT, sT, mp, clientGame, down, label,
+      seen: { held: 0, released: 0, edge: 0 },
+    };
+    humans.push(row);
+    return row;
+  }
+
+  /** One fixed step of the whole loop: build, encode, send, decode, apply, simulate. */
+  const stepOnce = () => {
+    for (const h of humans) {
+      h.mp.step();
+      h.sT.pump(ms);
+      // What the SERVER decoded, sampled before `tick()` consumes it — the field's arrival
+      // is the claim, so it is measured rather than assumed.
+      for (const q of h.session.queue) {
+        if (q.interactHeld) h.seen.held++; else h.seen.released++;
+        if (q.interact) h.seen.edge++;
+      }
+    }
+    s.server.tick();
+    for (const h of humans) h.cT.pump(ms);
+    ms += FIXED_DT * 1000;
+  };
+
+  /** The centre of a site volume, one step above its floor. */
+  const centreOf = (box) => ({
+    x: (box.min.x + box.max.x) / 2,
+    y: box.min.y + 0.5,
+    z: (box.min.z + box.max.z) / 2,
+  });
+
+  // The attacker is the carrier, standing on plant site A. Fixture, not behaviour: this
+  // section is about the KEY, and §6's other preconditions have their own coverage.
+  const site = rules.sites.get('A');
+  const attacker = await addHuman({
+    team: rules.attackingTeam, position: centreOf(site.plant), label: 'held_plant',
+  });
+  rules.bomb.state = 'carried';
+  rules.bomb.carrierId = attacker.entity.id;
+
+  return {
+    s, g, rules, site, centreOf, addHuman, stepOnce,
+    human: attacker.entity,
+    session: attacker.session,
+    mp: attacker.mp,
+    clientGame: attacker.clientGame,
+    down: attacker.down,
+    seen: attacker.seen,
+  };
+}
+
+/** Plant duration in ticks, from the ruleset's own parameters. */
+const PLANT_TICKS = Math.ceil(3.0 / FIXED_DT);
+
+{
+  // THE test. The key goes down and stays down; nothing else happens.
+  const r = await makeHeldPlantRig();
+  r.down.add('interact');
+
+  const progress = [];
+  let completedAt = -1;
+  for (let t = 0; t < PLANT_TICKS + 40; t++) {
+    r.stepOnce();
+    progress.push(r.rules.progressFraction(r.human.id));
+    if (completedAt < 0 && r.rules.phase === 'planted') completedAt = t;
+  }
+
+  // The control first: if the human died, everything below is measuring the wrong thing.
+  if (r.human.alive) ok('the planter survived the plant, so the result below is about the key');
+  else bad('the planter survived the plant', 'a bot killed them mid-plant — rerun; this result means nothing');
+
+  if (r.seen.held > PLANT_TICKS) {
+    ok(`the server decoded interactHeld=true on ${r.seen.held} commands (a HELD key, not an edge)`);
+  } else {
+    bad('a held key reaches the server on every command',
+      `only ${r.seen.held} of ${r.seen.held + r.seen.released} decoded commands carried interactHeld — `
+      + 'this is the shape of an EDGE, which is exactly the bug');
+  }
+
+  // Progress that actually climbed, rather than resetting to zero every tick. Sampled at
+  // three points because "it was non-zero once" is what the broken build also produced.
+  const early = progress[Math.floor(PLANT_TICKS * 0.25)];
+  const mid = progress[Math.floor(PLANT_TICKS * 0.5)];
+  const late = progress[Math.floor(PLANT_TICKS * 0.9)];
+  if (early > 0 && mid > early && late > mid) {
+    ok(`server-side progress accumulated continuously: ${early.toFixed(2)} → ${mid.toFixed(2)} → ${late.toFixed(2)}`);
+  } else {
+    bad('progress accumulates across ticks instead of resetting',
+      `samples ${early}, ${mid}, ${late} — a reset every tick is the bug this closes`);
+  }
+
+  if (completedAt >= 0) {
+    ok(`the plant COMPLETED at tick ${completedAt} of ${PLANT_TICKS} — a human planted the bomb`);
+  } else {
+    bad('a human holding the plant key completes a plant',
+      `after ${PLANT_TICKS + 40} ticks the phase is still "${r.rules.phase}", progress `
+      + `${r.rules.progressFraction(r.human.id)}`);
+  }
+  eq('and the ruleset says the bomb is planted', r.rules.bomb.state, 'planted');
+  const done = r.rules.events.filter((e) => e.kind === 'plantComplete');
+  eq('with exactly one plantComplete', done.length, 1);
+  eq('credited to the human', done[0]?.entityId, r.human.id);
+}
+
+{
+  // §6: "Interrupted by: releasing the key... Progress resets to zero — there is no partial
+  // credit and no resume." Released mid-plant, over the same real wire.
+  const r = await makeHeldPlantRig();
+  r.down.add('interact');
+
+  const HALF = Math.floor(PLANT_TICKS / 2);
+  for (let t = 0; t < HALF; t++) r.stepOnce();
+  const atRelease = r.rules.progressFraction(r.human.id);
+  if (atRelease > 0.3 && atRelease < 0.7) ok(`the plant was genuinely half-done when the key came up (${atRelease.toFixed(2)})`);
+  else bad('the plant was mid-flight at the release', `progress ${atRelease} — the cancel below proves nothing`);
+
+  r.down.delete('interact');                       // the player lets go
+  r.stepOnce();
+  eq('progress is zero on the very next tick', r.rules.progressFraction(r.human.id), 0);
+  // Exactly one, not "at least one": `releaseInteract` is called on every tick the key is up,
+  // and a cancel per tick would be a stream of spurious events for one release.
+  const cancels = r.rules.events.filter((e) => e.kind === 'plantCancel');
+  eq('and the ruleset emitted exactly one plantCancel', cancels.length, 1);
+  eq('naming the release as the reason', cancels[0].reason, 'released');
+  eq('and naming the player it cancelled', cancels[0].entityId, r.human.id);
+
+  // No partial credit and no resume: a full plant's worth of ticks with the key UP.
+  for (let t = 0; t < PLANT_TICKS + 40; t++) r.stepOnce();
+  eq('the round is still live — nothing completed after the release', r.rules.phase, 'live');
+  eq('and no plant ever completed', r.rules.events.filter((e) => e.kind === 'plantComplete').length, 0);
+  eq('the server is no longer holding the objective for them', r.human._objectiveHeld, false);
+  if (r.seen.held > 0 && r.seen.released > PLANT_TICKS) {
+    ok(`the release reached the server as bytes too: ${r.seen.held} held, ${r.seen.released} released commands`);
+  } else {
+    bad('the release is visible on the wire', `held ${r.seen.held}, released ${r.seen.released}`);
+  }
+}
+
+{
+  // §6 again, by the other route a key stops being held: the player opens the menu. The KEY
+  // is still physically down the whole time — `_buildLocalCommand` returns `EMPTY_COMMAND`
+  // while paused and never copies `_held` into the command, so a held field left out of that
+  // object keeps the last playing frame's value and the server would keep planting for
+  // somebody who is looking at a menu.
+  const r = await makeHeldPlantRig();
+  r.down.add('interact');
+  for (let t = 0; t < Math.floor(PLANT_TICKS / 2); t++) r.stepOnce();
+  eq('the plant is under way', r.rules.progressFraction(r.human.id) > 0.3, true);
+
+  r.clientGame.paused = true;                    // menu opens; the key is never released
+  for (let t = 0; t < 8; t++) r.stepOnce();
+  eq('the key is still physically down', r.clientGame.input.isDown('interact'), true);
+  eq('but the command stopped claiming it is held', r.human._objectiveHeld, false);
+  eq('and progress reset to zero', r.rules.progressFraction(r.human.id), 0);
+
+  for (let t = 0; t < PLANT_TICKS + 40; t++) r.stepOnce();
+  eq('a paused client plants nothing', r.rules.phase, 'live');
+}
+
+{
+  // The regression control, and the only direct proof that the EDGE could never have done
+  // this: the same rig, the same 3 seconds, with `interact` pressed on every single command
+  // and `interactHeld` never set. This is what the shipped build sent, made maximally
+  // favourable — a real client sends the edge ONCE.
+  const r = await makeHeldPlantRig();
+  const realStep = r.mp.step.bind(r.mp);
+  r.mp.step = () => {
+    r.clientGame.input.wasPressed = (k) => k === 'interact';
+    realStep();
+    r.clientGame.input.wasPressed = () => false;
+  };
+  for (let t = 0; t < PLANT_TICKS + 40; t++) r.stepOnce();
+  eq('the interact EDGE, on every command, plants nothing', r.rules.phase, 'live');
+  eq('and never starts a plant at all', r.rules.events.filter((e) => e.kind === 'plantStart').length, 0);
+  eq('because no command carried interactHeld', r.seen.held, 0);
+}
+
+{
+  // The facade's accessible hold (`net-facade.md` §5.1, `session.requestInteraction`) is the
+  // other producer of the same bit, and it must reach the server without the physical key.
+  const r = await makeHeldPlantRig();
+  eq('the physical key is up', r.clientGame.input.isDown('interact'), false);
+  r.mp.requestInteraction('plant');
+  let completed = false;
+  for (let t = 0; t < PLANT_TICKS + 40 && !completed; t++) {
+    r.stepOnce();
+    completed = r.rules.phase === 'planted';
+  }
+  eq('a facade-held plant completes too', completed, true);
+  eq('and it went through the same held bit', r.seen.held > PLANT_TICKS, true);
+  eq('without ever setting the interact EDGE on any command', r.seen.edge, 0);
+}
+
+{
+  // §7, the other half of the same path: the server derives plant-versus-defuse from the
+  // actor's own team, so a DEFENDER holding the identical bit must defuse. Driven from a
+  // real plant completed by a real client above it — nothing here writes `phase` or
+  // `bomb.state` by hand.
+  const r = await makeHeldPlantRig();
+  r.down.add('interact');
+  for (let t = 0; t < PLANT_TICKS + 40 && r.rules.phase !== 'planted'; t++) r.stepOnce();
+  eq('a human plant put the round into the planted phase', r.rules.phase, 'planted');
+  r.down.delete('interact');
+
+  const defender = await r.addHuman({
+    team: r.rules.defendingTeam, position: r.centreOf(r.site.defuse), label: 'held_defuse',
+  });
+  defender.down.add('interact');
+
+  const DEFUSE_TICKS = Math.ceil(7.0 / FIXED_DT);
+  let defused = false;
+  for (let t = 0; t < DEFUSE_TICKS + 60 && !defused; t++) {
+    r.stepOnce();
+    defused = r.rules.bomb.state === 'defused';
+  }
+  if (defender.entity.alive) ok('the defuser survived, so the result below is about the key');
+  else bad('the defuser survived the defuse', 'a bot killed them mid-defuse — this result means nothing');
+  eq('a human holding the key for 7 s DEFUSES the bomb', defused, true);
+  const done = r.rules.events.filter((e) => e.kind === 'defuseComplete');
+  eq('with a defuseComplete credited to them', done[done.length - 1]?.entityId, defender.entity.id);
+  if (defender.seen.held >= DEFUSE_TICKS * 0.9 && defender.seen.edge === 0) {
+    ok(`and the same held bit carried it: ${defender.seen.held} held commands, 0 interact edges`);
+  } else {
+    bad('the defuse rode the held bit and nothing else',
+      `${defender.seen.held} held / ${defender.seen.edge} edge commands over ${DEFUSE_TICKS} ticks`);
+  }
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nnetcode runs clean');

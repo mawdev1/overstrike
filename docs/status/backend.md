@@ -164,7 +164,23 @@ Recorded here rather than fixed, because editing those files under an in-flight 
 two lanes produce a tree neither one tested. Both were found by adversarial re-review and both
 reproduce at HEAD.
 
-### D1 — nothing in the shipping game can plant or defuse
+### D1 — nothing in the shipping game can plant or defuse — **CLOSED 2026-08-21**
+
+**Closed.** `HELD_BITS` gained `interactHeld` at bit 8, the command's held field widened u8 → u16
+at offset 11 (`COMMAND_BYTES` 30 → 31, folded into the already-unreleased `PROTOCOL_VERSION = 3`),
+`Player._refreshHeldState`/`_buildLocalCommand` read the key as a hold,
+`MultiplayerSession.step` ORs in the facade's accessible intent, and `GameServer._applyCommand`
+reads `cmd.interactHeld` instead of the `interact` EDGE. Bits 0–7 keep their indices and their
+byte, so no pre-existing bit moved (§7 G3). `nettest.mjs` now drives a real `MultiplayerSession`
+over a real transport into a real `GameServer` and real `BombRules`, in two separate `Game`s, and
+proves: a held key completes a plant (382 ticks), a released key cancels it with reason
+`released` and never resumes, a paused client stops holding without releasing the key, the
+`interact` edge on every command plants nothing, the facade's hold plants, and a defender holding
+the same bit defuses. The diagnosis below is kept as the record of what was wrong.
+
+The one behaviour change outside Bomb: `MultiplayerSession.step` used to overwrite `cmd.interact`
+(the edge) with a hold, so `Player._interact()` fired on every tick the use key was down. The
+edge is now the edge again and `_interact()` fires once per press.
 
 CORRECTED 2026-08-21, and the correction narrows it rather than dismissing it. At the time this
 was written `requestInteract` had no production caller at all. It now has one: `botManager.js`

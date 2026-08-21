@@ -272,6 +272,16 @@ const _PROBE_Z = [0, 0, 0, 1, -1];
 const EMPTY_COMMAND = {
   crouchPressed: false,
   jump: false, reload: false, melee: false, grenade: false, interact: false,
+  /**
+   * The one HELD field this object carries, and it has to.
+   *
+   * `_buildLocalCommand` returns here without copying `_held` into the command, so a held
+   * field left out of this object keeps whatever the last playing frame put in it. For the
+   * plant key that is not a stale value, it is a rule violation: `bomb-rules.md` §6 makes
+   * opening the menu mid-plant an interruption, and a sticky `interactHeld` would keep the
+   * server accumulating progress for a player who is not holding anything.
+   */
+  interactHeld: false,
   inspect: false, killstreak: false, lastWeapon: false, slot: -1,
   sprintDown: false, sprintUp: false, wheel: 0,
   firePressed: false, aimButtonPressed: false,
@@ -283,7 +293,7 @@ const EMPTY_HELD = {
   wishForward: 0, wishRight: 0,
   crouchHeld: false, toggleAdsMode: false, aimButtonHeld: false,
   fireHeld: false, sprintKeyHeld: false, breathHold: false,
-  leanKeyHeld: false, leanRightKeyHeld: false,
+  leanKeyHeld: false, leanRightKeyHeld: false, interactHeld: false,
 };
 
 // Candidate method names on systems written by other engineers. We never assume
@@ -1102,6 +1112,11 @@ export class Player {
     cmd.breathHold = h.breathHold;
     cmd.leanKeyHeld = h.leanKeyHeld;
     cmd.leanRightKeyHeld = h.leanRightKeyHeld;
+    // §6.4 "plant key held continuously". The EDGE (`cmd.interact`, set above from
+    // `wasPressed`) still means "tapped the use key" and still drives `_interact()`; this is
+    // the separate fact the Bomb ruleset needs, and the only one the server may accumulate
+    // plant or defuse progress from.
+    cmd.interactHeld = h.interactHeld;
 
     cmd.deltaYaw = 0;
     cmd.deltaPitch = 0;
@@ -1166,6 +1181,9 @@ export class Player {
     h.breathHold = i.isDown('sprint');
     h.leanKeyHeld = i.isDown('lean');
     h.leanRightKeyHeld = i.isDown('right');
+    // The physical key, read as a HOLD every substep — `wasPressed('interact')` is cleared
+    // once per rendered frame and is the wrong question for §6.4 entirely.
+    h.interactHeld = i.isDown('interact');
   }
 
   /**

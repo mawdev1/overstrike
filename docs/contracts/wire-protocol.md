@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.6.0 |
+| **Version** | 1.9.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -61,12 +61,14 @@ exactly is an enum or is passed through `quantiseCommand`.
 | `MSG_WELCOME` | 3 | s→c | 15 |
 | `MSG_LOADOUT` | 4 | c→s | 3 |
 
-Protocol v2 adds `MSG_HELLO` (5), `MSG_REJECT` (6), `MSG_MATCHSTATE` (7), and `MSG_OUTCOME` (8)
+Protocol v2 adds `MSG_HELLO` (5), `MSG_REJECT` (6), `MSG_MATCHSTATE` (7), and `MSG_OUTCOME` (8).
+Protocol v3 adds the coordinate-free client `MSG_TACTICAL_PING` (9) intent and the
+server-positioned, same-team-only `MSG_TACTICAL_PING_EVENT` (10).
 — see §8.
 
 ## 4. Commands (c→s)
 
-Header: `u8 type`, `u8 flags (reserved, 0)`, `u32 count`. Then `count × 30` bytes:
+Header: `u8 type`, `u8 flags (reserved, 0)`, `u32 count`. Then `count × 31` bytes:
 
 | Offset | Type | Field |
 |---:|---|---|
@@ -74,16 +76,52 @@ Header: `u8 type`, `u8 flags (reserved, 0)`, `u32 count`. Then `count × 30` byt
 | 4 | u32 | `tick` |
 | 8 | u8 | move direction index into `MOVE_DIRS` |
 | 9 | u16 | edge bits → `EDGE_BITS` |
-| 11 | u8 | held bits → `HELD_BITS` |
-| 12 | i8 | `slot` (−1 = none) |
-| 13 | i8 | `wheel`, clamped ±127 |
-| 14 | f32 | `deltaYaw` |
-| 18 | f32 | `deltaPitch` |
-| 22 | f32 | `baseYaw` — checksum, not source of truth |
-| 26 | f32 | `basePitch` — checksum, not source of truth |
+| 11 | u16 | held bits → `HELD_BITS` — **u8 before v3** |
+| 13 | i8 | `slot` (−1 = none) |
+| 14 | i8 | `wheel`, clamped ±127 |
+| 15 | f32 | `deltaYaw` |
+| 19 | f32 | `deltaPitch` |
+| 23 | f32 | `baseYaw` — checksum, not source of truth |
+| 27 | f32 | `basePitch` — checksum, not source of truth |
 
 **`EDGE_BITS` and `HELD_BITS` order is part of the wire format. Append, never insert.**
 The bit index *is* the meaning; inserting a field silently reassigns every field after it.
+Both tables are bounds-checked against their 16-bit field at import: a ninth held field was
+unaddable before v3, and a seventeenth would encode as `false` forever with no error at all.
+
+### 4.2 The held field is a u16 from v3 — `interactHeld` (REQ-CC-041)
+
+`bomb-rules.md` §6.4 requires the plant key **held continuously**, and no field on the wire
+could say so. `interact` is `EDGE_BITS` bit 5 — a press — and `HELD_BITS` was 8 entries in a
+`setUint8`, full. `server.js` read the edge as a hold, so a key held for the full 3 s of a
+plant produced one `true` and then `false` on ~360 consecutive commands: progress reset every
+tick and **a human could never plant or defuse**. Bots were unaffected because `botManager.js`
+calls `BombRules.requestInteract` in-process and never encodes a command.
+
+`interactHeld` is `HELD_BITS` **bit 8**, and the held field widens u8 → u16 at offset 11.
+
+**No pre-existing bit moved (§7 G3).** The wire is little-endian, so bits 0–7 of the u16 *are*
+byte 11 — the same offset with the same value the u8 had — and bits 0–7 keep their indices.
+What moves is everything after: `slot` 12→13, `wheel` 13→14, the four floats 14/18/22/26 →
+15/19/23/27, and `COMMAND_BYTES` 30 → 31.
+
+**Why moving those offsets is legal here and would not be in a snapshot.** A command batch has
+never been decodable by prefix: `decodeCommands` requires `6 + n × COMMAND_BYTES` **exactly**
+and throws otherwise, so no peer has ever read a command by reading a prefix of it and no
+older peer can misread a longer one — it is refused at the handshake by `MSG_HELLO` /
+`MSG_REJECT` before any command is decoded. `MSG_WELCOME` is the opposite case, which is why
+v1's 15 bytes are still a strict prefix of v2's 21.
+
+**Why not `flags` bit 7.** That spare bit (§5.1, §8.5) is in the per-entity `flags` byte of a
+**snapshot** — server→client. A hold is a client→server fact, and the only spare bit going the
+other way is the `MSG_COMMANDS` header's reserved `flags`, which is **per batch**, not per
+command: a batch carries 1–16 commands from different ticks, and the whole point of §6.4 is
+that each tick states whether the key was still down. A per-batch bit could not say that.
+
+**Why not a spare `EDGE_BITS` bit.** Three are free, and it would have cost zero bytes — but
+`EDGE_BITS` means "went down this frame", cleared by `Input.endFrame()` once per rendered
+frame. A hold in that table would be a field whose value contradicts the table's name and the
+decoder's contract, and the next reader would treat it as an edge exactly as `server.js` did.
 
 **Absolute aim is a checksum.** Deltas alone are lossy under packet loss: one dropped command
 and the server's aim is permanently offset from the client's with nothing to notice. The
@@ -196,6 +234,8 @@ intentions. This is the byte layout. `PROTOCOL_VERSION` becomes **2** only when 
 | `MSG_REJECT` | 6 | s→c | 4 + `n` (reason) |
 | `MSG_MATCHSTATE` | 7 | s→c | 41 |
 | `MSG_OUTCOME` | 8 | s→c | 32 |
+| `MSG_TACTICAL_PING` | 9 | c→s | 2 |
+| `MSG_TACTICAL_PING_EVENT` | 10 | s→c | 18 |
 
 ### 8.2 `MSG_HELLO` — authenticated handshake (closes G1 + G2)
 
@@ -446,6 +486,17 @@ everything the results screen needs.
 Sent once per round end and once per match end, immediately before the corresponding
 `MSG_MATCHSTATE` phase change, so a client that renders on outcome always has the state to go
 with it.
+
+### 8.9.1 Tactical ping intent and event (P2.B3)
+
+The two-byte client intent is `{ type:u8=9, kind:u8 }`, where kind is the closed vocabulary
+`location=0`, `danger=1`, `objective=2`. It carries no position or target. The server accepts
+at most one ping per player per 1,500 ms and only from a living, authenticated entity.
+
+The 18-byte server event is `{ type:u8=10, senderId:u32, kind:u8, x:f32, y:f32, z:f32 }`.
+Coordinates come from the authoritative server entity at acceptance time. The event is sent
+only to authenticated entities on the sender's team (including the sender); the opposing team
+receives no frame. Invalid kinds, dead senders, and rate-window attempts are inert.
 
 ### 8.10 Clock domains (REQ-CC-012)
 

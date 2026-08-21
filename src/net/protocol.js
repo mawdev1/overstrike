@@ -33,6 +33,13 @@
  * constant, because a wire change that ships without a version is a client and a server
  * quietly disagreeing about what a byte means.
  *
+ * Version 3 adds the tactical-ping intent/event pair, and the held interact bit: `HELD_BITS`
+ * gains `interactHeld` at bit 8 and the command's held field widens from u8 to u16, taking
+ * `COMMAND_BYTES` from 30 to 31. Without it `bomb-rules.md` §6.4 ("plant key held
+ * continuously") had nothing on the wire to stand on and no human could ever complete a plant.
+ * Document semantic versions are tracked separately in docs/contracts; this integer is only
+ * binary compatibility.
+ *
  * **Version 2 — negotiated.** `MSG_HELLO` (§8.2) is the client's opening frame and carries the
  * version it was built against; `MSG_WELCOME` (§8.4) carries the server's back. A mismatch is
  * answered with `MSG_REJECT(PROTOCOL_VERSION_MISMATCH)` and a closed socket, in that order,
@@ -44,7 +51,7 @@
  * appended `interact` entity field, eleven appended event kinds, `MSG_MATCHSTATE` with its
  * per-recipient bomb-position filter, and `MSG_OUTCOME`.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // ── message types ─────────────────────────────────────────────────────────────────────
 export const MSG_COMMANDS = 1;
@@ -89,6 +96,53 @@ export const MSG_REJECT = 6;
 export const MSG_MATCHSTATE = 7;
 /** s→c, once per round end and once per match end: who won, why, and of which match. */
 export const MSG_OUTCOME = 8;
+/** c→s, rate-limited tactical intent. The server supplies the authoritative position. */
+export const MSG_TACTICAL_PING = 9;
+/** s→c, team-filtered authoritative tactical cue. */
+export const MSG_TACTICAL_PING_EVENT = 10;
+
+export const TACTICAL_PING_KINDS = Object.freeze(['location', 'danger', 'objective']);
+
+export function encodeTacticalPingIntent(kind = 'location') {
+  const index = TACTICAL_PING_KINDS.indexOf(kind);
+  if (index < 0) throw new TypeError('unsupported tactical ping kind');
+  const out = new ArrayBuffer(2);
+  const view = new DataView(out);
+  view.setUint8(0, MSG_TACTICAL_PING);
+  view.setUint8(1, index);
+  return out;
+}
+
+export function decodeTacticalPingIntent(data) {
+  if (data?.byteLength !== 2) return null;
+  const view = new DataView(data);
+  if (view.getUint8(0) !== MSG_TACTICAL_PING) return null;
+  const kind = TACTICAL_PING_KINDS[view.getUint8(1)];
+  return kind ? { kind } : null;
+}
+
+export function encodeTacticalPingEvent({ senderId = 0, kind = 'location', position } = {}) {
+  const out = new ArrayBuffer(18);
+  const view = new DataView(out);
+  view.setUint8(0, MSG_TACTICAL_PING_EVENT);
+  view.setUint32(1, senderId >>> 0, true);
+  view.setUint8(5, Math.max(0, TACTICAL_PING_KINDS.indexOf(kind)));
+  view.setFloat32(6, Number(position?.x) || 0, true);
+  view.setFloat32(10, Number(position?.y) || 0, true);
+  view.setFloat32(14, Number(position?.z) || 0, true);
+  return out;
+}
+
+export function decodeTacticalPingEvent(data) {
+  if (data?.byteLength !== 18) return null;
+  const view = new DataView(data);
+  if (view.getUint8(0) !== MSG_TACTICAL_PING_EVENT) return null;
+  const kind = TACTICAL_PING_KINDS[view.getUint8(5)];
+  if (!kind) return null;
+  return { senderId: view.getUint32(1, true), kind, position: {
+    x: view.getFloat32(6, true), y: view.getFloat32(10, true), z: view.getFloat32(14, true),
+  } };
+}
 
 /** `errors.md` codes this layer can produce. Strings, because that is what the wire carries. */
 export const REJECT_PROTOCOL_VERSION_MISMATCH = 'PROTOCOL_VERSION_MISMATCH';
@@ -280,11 +334,46 @@ export const EDGE_BITS = [
   'killstreak', 'lastWeapon', 'sprintDown', 'sprintUp', 'firePressed', 'aimButtonPressed',
 ];
 
-/** Held fields, in bit order. Same rule. */
+/**
+ * Held fields, in bit order. Same rule.
+ *
+ * **`interactHeld` is bit 8, and it is why the held field is a u16.** `bomb-rules.md` §6.4
+ * requires the plant key to be **held continuously**, and until v3 there was no field on the
+ * wire that could say so: `interact` is an EDGE (bit 5 of `EDGE_BITS`), a press, and these
+ * eight were 8 of 8 bits of a `setUint8`. `server.js` read the edge as if it were a hold, so a
+ * key held down produced exactly one `true` and then `false` on every later command — progress
+ * reset every tick and a human plant could never complete. Bots were unaffected because
+ * `botManager.js` calls `requestInteract` in-process and never touches the wire.
+ *
+ * `interact` (the edge) is untouched and still means "tapped the use key" — doors, pickups,
+ * `Player._interact`. The two are different facts and both are on the wire.
+ */
 export const HELD_BITS = [
   'crouchHeld', 'toggleAdsMode', 'aimButtonHeld', 'fireHeld',
   'sprintKeyHeld', 'breathHold', 'leanKeyHeld', 'leanRightKeyHeld',
+  'interactHeld',
 ];
+
+/**
+ * The bit tables have to FIT the integers they are written into, and nothing said so.
+ *
+ * `HELD_BITS` reached 8 of 8 bits and the ninth field was simply not addable — which is the
+ * state that produced a mode where a human could not plant. A table that silently overflows
+ * writes bit 16 of a u16 as nothing at all: `held |= 1 << 16` is a number the `setUint16`
+ * truncates away, so the field would encode as `false` on every command, forever, with no
+ * error anywhere. Loud at import time instead, where the person adding the field is looking.
+ */
+export function assertFitsBits(name, table, bits) {
+  if (table.length > bits) {
+    throw new RangeError(
+      `${name} has ${table.length} entries and its wire field is ${bits} bits. Widen the field and `
+      + 'bump PROTOCOL_VERSION — a table that overflows encodes the extra fields as false, forever, '
+      + 'with no error anywhere.');
+  }
+  return table.length;
+}
+assertFitsBits('EDGE_BITS', EDGE_BITS, 16);
+assertFitsBits('HELD_BITS', HELD_BITS, 16);
 
 /**
  * The nine legal (wishForward, wishRight) pairs.
@@ -320,7 +409,20 @@ export function moveDirIndex(wishForward, wishRight) {
   return best;
 }
 
-export const COMMAND_BYTES = 30;
+/**
+ * 31 since v3: the held field widened from u8 to u16 (offset 11–12) to carry `interactHeld`.
+ *
+ * Bits 0–7 of that u16 are byte 11 on a little-endian wire — the exact byte the u8 was, with
+ * the exact same value — so every pre-existing held bit keeps its index AND its offset, per
+ * §7 G3. What moved is everything AFTER it: `slot` 12→13, `wheel` 13→14, and the four floats
+ * 14/18/22/26 → 15/19/23/27.
+ *
+ * That movement is safe here and would not be safe in a snapshot, because a command batch is
+ * never partially decodable: `decodeCommands` requires `6 + n * COMMAND_BYTES` exactly and
+ * throws otherwise, so no peer has ever read a command by prefix. A peer that disagrees about
+ * this number is refused at the handshake by `MSG_HELLO`/`MSG_REJECT` before a command is read.
+ */
+export const COMMAND_BYTES = 31;
 
 /**
  * Most commands one packet may carry.
@@ -382,9 +484,10 @@ export function encodeCommands(commands) {
     for (let i = 0; i < EDGE_BITS.length; i++) if (c[EDGE_BITS[i]]) edges |= (1 << i);
     v.setUint16(o, edges, true); o += 2;
 
+    // u16 since v3. Little-endian, so byte 11 is still bits 0–7 — see `COMMAND_BYTES`.
     let held = 0;
     for (let i = 0; i < HELD_BITS.length; i++) if (c[HELD_BITS[i]]) held |= (1 << i);
-    v.setUint8(o, held); o += 1;
+    v.setUint16(o, held, true); o += 2;
 
     v.setInt8(o, c.slot ?? -1); o += 1;
     v.setInt8(o, Math.max(-127, Math.min(127, c.wheel || 0))); o += 1;
@@ -442,7 +545,7 @@ export function decodeCommands(buf) {
     const edges = v.getUint16(o, true); o += 2;
     for (let b = 0; b < EDGE_BITS.length; b++) cmd[EDGE_BITS[b]] = !!(edges & (1 << b));
 
-    const held = v.getUint8(o); o += 1;
+    const held = v.getUint16(o, true); o += 2;
     for (let b = 0; b < HELD_BITS.length; b++) cmd[HELD_BITS[b]] = !!(held & (1 << b));
 
     cmd.slot = v.getInt8(o); o += 1;

@@ -78,6 +78,18 @@ export class MultiplayerSession {
     /** Newest round or match outcome, or null. */
     this.outcome = null;
 
+    /** Held objective intent supplied by the facade. The server still derives which
+     * interaction is legal from authoritative role/phase and validates every tick. */
+    this.interactionKind = null;
+
+    transport.onClose?.((info) => {
+      const wasConnected = this.connected;
+      this.connected = false;
+      this.game.bus?.emit?.('netDisconnected', {
+        reason: info?.reason || 'socket-closed', code: info?.code ?? null, wasConnected,
+      });
+    });
+
     this.net.onSnapshot((snap) => this._onSnapshot(snap));
     this.net.onMatchState((s) => {
       this.matchState = s;
@@ -87,6 +99,7 @@ export class MultiplayerSession {
       this.outcome = o;
       this.game.bus?.emit?.(o.scope === 'match' ? 'matchOutcome' : 'roundOutcome', o);
     });
+    this.net.onTacticalPing((ping) => this.game.bus?.emit?.('tacticalPing', ping));
     this.net.onReject((r) => {
       this.connected = false;
       this.game.bus?.emit?.('netRejected', r);
@@ -208,6 +221,16 @@ export class MultiplayerSession {
     // the same reason `_refreshHeldState` exists on the single-player path.
     p._refreshHeldState?.();
     const cmd = p._buildLocalCommand();
+    // Plant/defuse is a held interaction (§6/§7), not a one-frame edge. `_buildLocalCommand`
+    // has already read the physical key as a hold (`interactHeld`, `HELD_BITS` bit 8); the
+    // facade can hold the same intent for an accessible control, so the two are OR'd.
+    //
+    // This used to write `cmd.interact`, which is the EDGE bit — the only interact field the
+    // wire had — so it overwrote the tap edge with a hold AND still arrived at the server as
+    // one `true` followed by `false` on every subsequent command. The server's
+    // `_objectiveHeld = !!cmd.interact` then reset the plant every tick and no human could
+    // finish one. Both facts now have their own bit and neither overwrites the other.
+    cmd.interactHeld = !!cmd.interactHeld || !!this.interactionKind;
     // A fresh object per command: `_cmdScratch` is reused in place, and the unacked
     // queue keeps commands for resending and replay, so handing it the scratch would
     // give every queued command the newest command's contents.
@@ -231,9 +254,20 @@ export class MultiplayerSession {
     this.transport.send(encodeLoadout(idx[0], idx[1]));
   }
 
+  requestInteraction(kind) {
+    if (kind !== 'plant' && kind !== 'defuse') return false;
+    this.interactionKind = kind;
+    return true;
+  }
+
+  releaseInteraction() { this.interactionKind = null; }
+
+  requestTacticalPing(kind = 'location') { return this.net.sendTacticalPing(kind); }
+
   _onSnapshot(snap) {
-    if (!this.synced) { this._syncToServer(snap); return; }
-    this.prediction?.reconcile(snap);
+    if (!this.synced) this._syncToServer(snap);
+    else this.prediction?.reconcile(snap);
+    this.game.bus?.emit?.('netSnapshot', { tick: snap.tick, keyframe: !!snap.keyframe });
     if (snap.events?.length) this._replayEvents(snap.events);
   }
 
@@ -256,6 +290,7 @@ export class MultiplayerSession {
     const mineId = this.net.entityId;
 
     for (const ev of events) {
+      g.bus?.emit?.('netEvent', ev);
       switch (ev.kind) {
         case 'hitmarker':
           present.hitmarker(ev.headshot, null, false, ev.absorbed);

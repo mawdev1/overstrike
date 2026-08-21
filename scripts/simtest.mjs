@@ -15,7 +15,7 @@ import { defineSnapshot } from '../src/core/snapshot.js';
 import {
   encodeCommands, decodeCommands, quantiseCommand, moveDirIndex, MOVE_DIRS,
   encodeSnapshot, decodeSnapshot, EDGE_BITS, HELD_BITS, COMMAND_BYTES,
-  MAX_COMMANDS_PER_BATCH,
+  MAX_COMMANDS_PER_BATCH, assertFitsBits,
 } from '../src/net/protocol.js';
 import { createLoopbackPair } from '../src/net/transport.js';
 import { WEAPON_LIST } from '../src/weapons/weaponDefs.js';
@@ -449,6 +449,7 @@ const sampleCommand = (seq = 1) => ({
   sprintDown: true, sprintUp: false, firePressed: true, aimButtonPressed: false,
   crouchHeld: true, toggleAdsMode: false, aimButtonHeld: true, fireHeld: true,
   sprintKeyHeld: false, breathHold: true, leanKeyHeld: false, leanRightKeyHeld: true,
+  interactHeld: true,
   slot: 2, wheel: -1,
   deltaYaw: 0.0125, deltaPitch: -0.004,
   baseYaw: 1.25, basePitch: -0.1,
@@ -474,6 +475,91 @@ test('a command round-trips every field', () => {
   }
   for (const k of EDGE_BITS) assertEq(got[k], sent[k], `edge ${k} did not survive`);
   for (const k of HELD_BITS) assertEq(got[k], sent[k], `held ${k} did not survive`);
+});
+
+/**
+ * The pre-v3 held layout, frozen by hand.
+ *
+ * Written out rather than derived from `HELD_BITS`, because a test that reads the table it is
+ * checking cannot notice the table being reordered — which is exactly what §7 G3 forbids and
+ * exactly what widening the field u8 → u16 could have done by accident. These eight names, in
+ * this order, at these bit indices, are what a v2 build put in the single byte at offset 11.
+ */
+const HELD_BITS_BEFORE_V3 = [
+  'crouchHeld', 'toggleAdsMode', 'aimButtonHeld', 'fireHeld',
+  'sprintKeyHeld', 'breathHold', 'leanKeyHeld', 'leanRightKeyHeld',
+];
+/** Offsets into one command, from `wire-protocol.md` §4. */
+const HELD_OFFSET = 11;
+
+test('§7 G3: every pre-v3 held bit keeps its bit index AND its byte', () => {
+  for (let i = 0; i < HELD_BITS_BEFORE_V3.length; i++) {
+    const name = HELD_BITS_BEFORE_V3[i];
+    assertEq(HELD_BITS[i], name, `HELD_BITS[${i}] is no longer "${name}" — a bit was inserted, not appended`);
+
+    // One field true, nothing else. Built from the wire's own name list so a field added
+    // tomorrow cannot be left out of the "everything else is false" half.
+    const cmd = { seq: 1, tick: 1, wishForward: 0, wishRight: 0, slot: -1, wheel: 0 };
+    for (const k of EDGE_BITS) cmd[k] = false;
+    for (const k of HELD_BITS) cmd[k] = false;
+    cmd[name] = true;
+
+    const buf = encodeCommands([cmd]);
+    const v = new DataView(buf);
+    // The byte a v2 decoder would have read, with the value a v2 encoder would have written.
+    assertEq(v.getUint8(6 + HELD_OFFSET), 1 << i, `held "${name}" is no longer bit ${i} of byte ${HELD_OFFSET}`);
+    // And the appended half is untouched by any of them.
+    assertEq(v.getUint8(6 + HELD_OFFSET + 1), 0, `held "${name}" leaked into the appended byte`);
+
+    const [got] = decodeCommands(buf);
+    for (const k of HELD_BITS) assertEq(got[k], k === name, `decoding "${name}" also set "${k}"`);
+  }
+});
+
+test('a bit table that outgrows its wire field is refused, loudly', () => {
+  // The failure this prevents is silent, which is why it is a throw and not a comment: an
+  // overflowing table writes `held |= 1 << 16`, the `setUint16` truncates it away, and the
+  // field is `false` on every command forever with nothing anywhere to notice. `HELD_BITS`
+  // sat at 8 of 8 bits and the ninth field — the one §6.4 needs — was simply unaddable.
+  const seventeen = Array.from({ length: 17 }, (_, i) => `bit${i}`);
+  let threw = null;
+  try { assertFitsBits('TEST_BITS', seventeen, 16); } catch (e) { threw = e; }
+  assert(threw instanceof RangeError, 'a 17-entry table for a 16-bit field was accepted');
+  assert(threw.message.includes('TEST_BITS') && threw.message.includes('17'),
+    `the refusal does not name the table or its size: ${threw?.message}`);
+  assertEq(assertFitsBits('TEST_BITS', seventeen.slice(0, 16), 16), 16, 'a table that FITS was refused');
+  // And the real tables are inside their field, which is the invariant the wire depends on.
+  assertEq(assertFitsBits('EDGE_BITS', EDGE_BITS, 16), EDGE_BITS.length, 'EDGE_BITS overflows its u16');
+  assertEq(assertFitsBits('HELD_BITS', HELD_BITS, 16), HELD_BITS.length, 'HELD_BITS overflows its u16');
+});
+
+test('§7 G3: interactHeld is bit 8, and lives entirely in the appended byte', () => {
+  assertEq(HELD_BITS.indexOf('interactHeld'), 8, 'interactHeld is not bit 8');
+  const cmd = { seq: 1, tick: 1, wishForward: 0, wishRight: 0, slot: -1, wheel: 0 };
+  for (const k of EDGE_BITS) cmd[k] = false;
+  for (const k of HELD_BITS) cmd[k] = false;
+  cmd.interactHeld = true;
+  const buf = encodeCommands([cmd]);
+  const v = new DataView(buf);
+  assertEq(v.getUint8(6 + HELD_OFFSET), 0, 'interactHeld touched the pre-v3 held byte');
+  assertEq(v.getUint8(6 + HELD_OFFSET + 1), 1, 'interactHeld is not bit 0 of the appended byte');
+  const [got] = decodeCommands(buf);
+  assertEq(got.interactHeld, true, 'interactHeld did not survive the wire');
+  assertEq(got.interact, false, 'the interact EDGE was set by a held-only command');
+});
+
+test('§7 G3: the edge bits and everything before them did not move either', () => {
+  // The other half of the append rule: widening a field in the middle must not disturb what
+  // sits in FRONT of it. Byte 8 is the move enum, 9–10 the edge u16, all three unmoved.
+  const cmd = { seq: 0x11223344, tick: 0x55667788, wishForward: 0, wishRight: 0, slot: -1, wheel: 0 };
+  for (const k of EDGE_BITS) cmd[k] = false;
+  for (const k of HELD_BITS) cmd[k] = false;
+  cmd.interact = true;                       // EDGE_BITS[5] — the press, still a press
+  const v = new DataView(encodeCommands([cmd]));
+  assertEq(v.getUint32(6 + 0, true), 0x11223344, 'seq moved off offset 0');
+  assertEq(v.getUint32(6 + 4, true), 0x55667788, 'tick moved off offset 4');
+  assertEq(v.getUint8(6 + 8), 0, 'the move direction enum moved off offset 8');
+  assertEq(v.getUint16(6 + 9, true), 1 << 5, 'the edge bits moved off offset 9');
 });
 
 test('every movement direction survives EXACTLY, diagonals included', () => {

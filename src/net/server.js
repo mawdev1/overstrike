@@ -25,6 +25,9 @@ import {
   encodeMatchState, encodeOutcome, MATCHSTATE_BYTES, INTERACT_PROGRESS_MAX, packInteract,
   REJECT_PROTOCOL_VERSION_MISMATCH, REJECT_SESSION_TOKEN_INVALID, BOMB_STATES, PHASES,
   INTERACT_KINDS, CANCEL_REASONS, REFUSAL_REASONS, OUTCOME_REASONS,
+  REJECT_AUTH_SESSION_REPLACED,
+  W_RECONNECT,
+  MSG_TACTICAL_PING, decodeTacticalPingIntent, encodeTacticalPingEvent,
 } from './protocol.js';
 import { LagCompensation } from './lagcomp.js';
 import { INTERP_DELAY_MS } from './client.js';
@@ -93,6 +96,9 @@ const MAX_QUEUED_COMMANDS = 32;
  * ordinary burstiness never trips it.
  */
 const COMMAND_BACKLOG_TARGET = 8;
+
+/** A socket that never authenticates must not occupy connection state indefinitely. */
+export const HELLO_TIMEOUT_MS = 5_000;
 
 /**
  * Ceiling on the round trip a client may claim, in ms.
@@ -165,6 +171,7 @@ class ClientSession {
     this.pendingBaselines = new Map();
     /** Weapon ids this client chose, so a respawn does not silently rearm them. */
     this.loadout = null;
+    this.lastTacticalPingAt = -Infinity;
     /**
      * Set once this connection has been refused (§8.3). A rejected socket is closed
      * immediately, but a frame already in flight can still arrive — and a client that
@@ -174,14 +181,8 @@ class ClientSession {
     this.rejected = null;
     /** The version this client said it speaks, or null if it never sent a hello. */
     this.helloVersion = null;
-    /**
-     * The session ticket from `MSG_HELLO`, held but NOT yet validated.
-     *
-     * Version negotiation (G1) and authentication (G2) share the frame, and only G1 lands
-     * here. Storing the ticket without checking it is deliberate and inert: nothing reads it,
-     * so nothing can be fooled by it. When G2 lands it validates against the platform between
-     * the version check and entity creation, per §8.2's ordering.
-     */
+    /** The signed session ticket decoded from `MSG_HELLO`; `_onHello` verifies and consumes it
+     * before this session can receive an entity. Retained for connection diagnostics only. */
     this.ticket = null;
     /**
      * Last `MSG_MATCHSTATE` sent to THIS client, as bytes.
@@ -197,6 +198,8 @@ class ClientSession {
       matchStates: 0, outcomes: 0, rejectedMessages: 0,
       /** Frames that arrived before a hello. Each one closes the connection (§8.2). */
       preHelloMessages: 0,
+      loadouts: 0,
+      tacticalPings: 0, tacticalPingsRateLimited: 0,
     };
   }
 }
@@ -226,6 +229,14 @@ export class ObjectiveEvidence {
     this.limit = limit;
     this.rows = [];
     this.dropped = 0;
+    this.combatSamples = [];
+    this.droppedCombatSamples = 0;
+    this.combatObserved = 0;
+    this.connectionFacts = [];
+    this.droppedConnectionFacts = 0;
+    this.antiCheatFlags = [];
+    this.droppedAntiCheatFlags = 0;
+    this._nextEventSeq = 0;
     this.rulesetVersion = null;
     this.serverBuild = null;
     this.matchId = null;
@@ -233,6 +244,18 @@ export class ObjectiveEvidence {
 
   /** Identify the match this record belongs to. Called once, when the match is known. */
   identify({ matchId = null, rulesetVersion = null, serverBuild = null } = {}) {
+    if (matchId != null && matchId !== this.matchId) {
+      this.rows.length = 0;
+      this.dropped = 0;
+      this.combatSamples.length = 0;
+      this.droppedCombatSamples = 0;
+      this.combatObserved = 0;
+      this.connectionFacts.length = 0;
+      this.droppedConnectionFacts = 0;
+      this.antiCheatFlags.length = 0;
+      this.droppedAntiCheatFlags = 0;
+      this._nextEventSeq = 0;
+    }
     if (matchId != null) this.matchId = matchId;
     if (rulesetVersion != null) this.rulesetVersion = rulesetVersion;
     if (serverBuild != null) this.serverBuild = serverBuild;
@@ -250,6 +273,7 @@ export class ObjectiveEvidence {
     const p = row.position;
     const out = {
       seq: this.rows.length,
+      eventSeq: this._nextEventSeq++,
       kind: String(row.kind ?? 'unknown'),
       tick: row.tick | 0,
       serverTimeMs: row.serverTimeMs | 0,
@@ -279,8 +303,61 @@ export class ObjectiveEvidence {
   /** Rows of one kind. `evidence.of('plantComplete').length` is the authoritative plant count. */
   of(kind) { return this.rows.filter((r) => r.kind === kind); }
 
+  /** Bounded authoritative combat/position sample; final counters live in combatSummary. */
+  recordCombat(row = {}) {
+    // §7 asks for compact combat samples, not an unbounded duplicate of every ballistic
+    // event. Kills are always retained; shots and damage are sampled deterministically.
+    this.combatObserved++;
+    if (row.kind !== 'kill' && this.combatObserved % 16 !== 0) return null;
+    if (this.combatSamples.length >= this.limit) { this.droppedCombatSamples++; return null; }
+    const position = row.position;
+    const targetPosition = row.targetPosition;
+    const out = {
+      seq: this.combatSamples.length, eventSeq: this._nextEventSeq++,
+      kind: String(row.kind ?? 'unknown'),
+      tick: row.tick | 0, serverTimeMs: row.serverTimeMs | 0,
+      actorId: row.actorId ? row.actorId >>> 0 : null,
+      targetId: row.targetId ? row.targetId >>> 0 : null,
+      weaponId: row.weaponId ?? null, amount: Math.max(0, Math.round(Number(row.amount) || 0)),
+      headshot: !!row.headshot,
+      position: position ? { x: round3(position.x), y: round3(position.y), z: round3(position.z) } : null,
+      targetPosition: targetPosition
+        ? { x: round3(targetPosition.x), y: round3(targetPosition.y), z: round3(targetPosition.z) } : null,
+    };
+    this.combatSamples.push(out);
+    return out;
+  }
+
+  recordConnection(row = {}) {
+    if (this.connectionFacts.length >= this.limit) { this.droppedConnectionFacts++; return null; }
+    const out = { seq: this.connectionFacts.length, eventSeq: this._nextEventSeq++,
+      kind: String(row.kind ?? 'unknown'), tick: row.tick == null ? null : row.tick | 0,
+      serverTimeMs: row.serverTimeMs == null ? null : row.serverTimeMs | 0,
+      accountId: row.accountId ?? null, entityId: row.entityId ? row.entityId >>> 0 : null,
+      at: row.at ?? null, reason: row.reason ?? null };
+    this.connectionFacts.push(out);
+    return out;
+  }
+
+  recordAntiCheat(row = {}) {
+    if (this.antiCheatFlags.length >= this.limit) { this.droppedAntiCheatFlags++; return null; }
+    const out = { seq: this.antiCheatFlags.length, eventSeq: this._nextEventSeq++,
+      kind: String(row.kind ?? 'unknown'), tick: row.tick == null ? null : row.tick | 0,
+      serverTimeMs: row.serverTimeMs == null ? null : row.serverTimeMs | 0,
+      accountId: row.accountId ?? null, severity: row.severity ?? null,
+      details: row.details ?? null };
+    this.antiCheatFlags.push(out);
+    return out;
+  }
+
   /** The serialisable record. What `evidenceRef` ultimately points at. */
   toJSON() {
+    const eventTimeline = [
+      ...this.rows.map((row) => ({ channel: 'objective', ...row })),
+      ...this.combatSamples.map((row) => ({ channel: 'combat', ...row })),
+      ...this.connectionFacts.map((row) => ({ channel: 'connection', ...row })),
+      ...this.antiCheatFlags.map((row) => ({ channel: 'antiCheat', ...row })),
+    ].sort((a, b) => a.eventSeq - b.eventSeq);
     return {
       version: 1,
       matchId: this.matchId,
@@ -288,6 +365,15 @@ export class ObjectiveEvidence {
       serverBuild: this.serverBuild,
       protocolVersion: PROTOCOL_VERSION,
       objectives: this.rows,
+      eventTimeline,
+      combatSamples: this.combatSamples,
+      combatSampling: { observed: this.combatObserved, every: 16,
+        retained: this.combatSamples.length, killsAlwaysRetained: true },
+      droppedCombatSamples: this.droppedCombatSamples,
+      connectionFacts: this.connectionFacts,
+      droppedConnectionFacts: this.droppedConnectionFacts,
+      antiCheatFlags: this.antiCheatFlags,
+      droppedAntiCheatFlags: this.droppedAntiCheatFlags,
       droppedRows: this.dropped,
     };
   }
@@ -299,8 +385,12 @@ export class GameServer {
   /**
    * @param {Game} game a Game that has already had `initHeadless()` run on it
    */
-  constructor(game) {
+  constructor(game, { ticketVerifier = null, matchBinder = null,
+    clock = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) } = {}) {
     this.game = game;
+    this.ticketVerifier = ticketVerifier;
+    this.matchBinder = matchBinder;
+    this._clock = clock;
     this.clients = new Map();
     /** Feedback recorded by `RecordingPresenter`, drained into each snapshot. */
     this._pendingEvents = [];
@@ -322,6 +412,7 @@ export class GameServer {
     this.unmappedReasons = new Set();
     /** The planter or defuser who decided the current round — `MSG_OUTCOME.actorId` (§8.9). */
     this._lastObjectiveActor = 0;
+    this._sentMatchOutcome = false;
 
     // The Bomb ruleset (`src/game/match.js`) announces every objective fact on the bus, and
     // this is the ONE place it becomes both a wire event and an evidence row — see
@@ -331,6 +422,15 @@ export class GameServer {
     // where outcomes come from today — nothing in `src/` emits `outcome`, which is why relying
     // on it alone meant a whole match produced zero `MSG_OUTCOME`. See `_outcomeFromObjective`.
     game.bus?.on('outcome', (p) => this.sendOutcome(p));
+    // TDM has no objective state machine: its canonical terminal fact is Game.matchEnd.
+    // Bomb reaches this event too, after its objective `matchEnd`, so the shared sent flag
+    // makes this a fallback rather than a duplicate terminal frame.
+    game.bus?.on('matchStart', () => { this._sentMatchOutcome = false; });
+    game.bus?.on('matchEnd', (p) => {
+      if (!this._sentMatchOutcome) this._outcomeFromObjective({ kind: 'matchEnd' }, {
+        ...p, scope: 'match', roundsPlayed: p?.rounds?.length ?? 0,
+      });
+    });
 
     // `Player.respawn` re-gives the DEFAULT loadout, so a client's chosen guns would
     // survive exactly until its first death. Re-arm it every time it comes back.
@@ -351,6 +451,10 @@ export class GameServer {
     // client-side consumer (killfeed, XP pops, streak chips, damage arrows) already
     // listens to, so the client can simply re-emit and light all of them up at once.
     game.bus?.on('kill', (p) => {
+      this.evidence.recordCombat({ kind: 'kill', tick: game.tick,
+        serverTimeMs: this.serverTimeMs(), actorId: p?.attacker?.id, targetId: p?.victim?.id,
+        weaponId: p?.weaponId, headshot: p?.headshot, position: p?.attacker?.position,
+        targetPosition: p?.victim?.position });
       this._record({
         kind: 'kill', to: null,
         killerId: p?.attacker?.id ?? 0,
@@ -358,6 +462,13 @@ export class GameServer {
         headshot: !!p?.headshot,
       });
     });
+    game.bus?.on('shot', (p) => this.evidence.recordCombat({ kind: 'shot', tick: game.tick,
+      serverTimeMs: this.serverTimeMs(), actorId: p?.shooter?.id, weaponId: p?.weaponId,
+      position: p?.shooter?.position }));
+    game.bus?.on('damage', (p) => this.evidence.recordCombat({ kind: 'damage', tick: game.tick,
+      serverTimeMs: this.serverTimeMs(), actorId: p?.attacker?.id, targetId: p?.target?.id,
+      weaponId: p?.weaponId, amount: p?.amount, position: p?.attacker?.position,
+      targetPosition: p?.target?.position }));
     game.bus?.on('roundEnd', (result) => {
       const reasonCode = result?.reason === 'time' ? 1 : result?.reason === 'draw' ? 2 : 0;
       // Defer until the end of this server tick. Match hears `kill` before GameServer and
@@ -411,6 +522,12 @@ export class GameServer {
     session.pendingEntity = entity;
     this.clients.set(id, session);
     transport.onMessage((data) => this._onMessage(session, data));
+    session.helloTimer = setTimeout(() => {
+      if (!session.authenticated && !session.rejected) {
+        this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID);
+      }
+    }, HELLO_TIMEOUT_MS);
+    session.helloTimer.unref?.();
     return session;
   }
 
@@ -459,7 +576,7 @@ export class GameServer {
       killLimit: mode === 'bomb' ? 0 : (match?.killLimit ?? 75),
       protocolVersion: PROTOCOL_VERSION,
       mode,
-      flags: 0,
+      flags: session.isReconnect ? W_RECONNECT : 0,
       serverTickRateHz: Math.round(1 / FIXED_DT),
     }));
   }
@@ -484,12 +601,15 @@ export class GameServer {
    * `MSG_HELLO` (§8.2). **The version check precedes the ticket check**, because a client that
    * disagrees about the layout cannot be trusted to have encoded the ticket where we read it.
    *
-   * Step 2 of §8.2 — validating the ticket — is G2 and is not implemented here; the ticket is
-   * stored unread. Step 3 (session replacement) is G2. Step 4 — creating the entity and
-   * welcoming — happens HERE now, after the version check, which is the ordering the section
-   * states; it used to happen in `addClient` before a single byte had been read.
+   * Step 2 validates and atomically consumes the signed ticket through `ticketVerifier`, then
+   * `matchBinder` checks its exact allocation roster/team/loadout authority. Step 3 replaces an
+   * existing account session newest-wins without duplicating its body. Step 4 — creating or
+   * re-binding the entity and welcoming — happens HERE, after those gates; it used to happen in
+   * `addClient` before a single byte had been read.
    */
-  _onHello(session, data) {
+  async _onHello(session, data) {
+    if (session.authenticating) return;
+    session.authenticating = true;
     const hello = decodeHello(data);
     // A known type at the wrong length means a desynced stream (§8.11): close it.
     if (!hello) { this.rejectClient(session, REJECT_PROTOCOL_VERSION_MISMATCH); return; }
@@ -499,6 +619,28 @@ export class GameServer {
       return;
     }
     session.ticket = hello.ticket;
+    if (this.ticketVerifier) {
+      const identity = await this.ticketVerifier(hello.ticket);
+      if (!identity) { this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID); return; }
+      if (this.matchBinder && this.matchBinder(identity) !== true) {
+        this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID); return;
+      }
+      const duplicate = [...this.clients.values()].find((other) => other !== session
+        && other.authenticated && other.identity?.sub === identity.sub);
+      session.identity = identity;
+      // Frozen policy: the newest authenticated connection wins. Transfer the existing body
+      // synchronously before closing the old transport so reconnect cannot briefly create a
+      // duplicate entity (the ws `close` callback runs later).
+      if (duplicate) {
+        const rebound = duplicate.entity;
+        this.rejectClient(duplicate, REJECT_AUTH_SESSION_REPLACED);
+        duplicate.entity = null;
+        if (rebound) {
+          session.pendingEntity = rebound;
+          session.isReconnect = true;
+        }
+      }
+    }
     // A second hello on an established session re-welcomes and nothing more. Allocating again
     // would give one socket two entities, which is a way to be in two places at once.
     if (!session.authenticated) {
@@ -506,8 +648,11 @@ export class GameServer {
       if (!entity) { this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID); return; }
       session.entity = entity;
       session.authenticated = true;
+      clearTimeout(session.helloTimer);
+      session.helloTimer = null;
     }
     this._sendWelcome(session);
+    session.authenticating = false;
   }
 
   /**
@@ -525,8 +670,14 @@ export class GameServer {
   }
 
   removeClient(session) {
+    clearTimeout(session.helloTimer);
+    session.helloTimer = null;
     this.clients.delete(session.id);
-    if (session.entity) this.lag.forget(session.entity.id);
+    if (session.entity) {
+      this.game.match?.bombRules?.releaseInteract?.(session.entity);
+      session.entity._objectiveHeld = false;
+      this.lag.forget(session.entity.id);
+    }
     session.transport.close();
   }
 
@@ -538,7 +689,10 @@ export class GameServer {
     if (data.byteLength < 1) return;
     const v = new DataView(data);
     const type = v.getUint8(0);
-    if (type === MSG_HELLO) { this._onHello(session, data); return; }
+    if (type === MSG_HELLO) {
+      void this._onHello(session, data).catch(() => this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID));
+      return;
+    }
     // §8.2: `MSG_HELLO` is **the first frame on the socket. Anything else before it closes the
     // connection.** Not "is ignored" — an unauthenticated peer that is allowed to keep talking
     // is an unauthenticated peer, and §8.11's "unknown type is ignored" is about a KNOWN
@@ -549,6 +703,7 @@ export class GameServer {
       return;
     }
     if (type === MSG_LOADOUT) { this._applyLoadout(session, data); return; }
+    if (type === MSG_TACTICAL_PING) { this._applyTacticalPing(session, data); return; }
     // §8.11: an unknown type is ignored, not fatal. Additive message types must not break an
     // older peer mid-match — that is what version negotiation is for, at the handshake.
     if (type !== MSG_COMMANDS) return;
@@ -572,6 +727,27 @@ export class GameServer {
       session.queue.shift();
       session.stats.backlogTrimmed = (session.stats.backlogTrimmed ?? 0) + 1;
     }
+  }
+
+  _applyTacticalPing(session, data) {
+    const intent = decodeTacticalPingIntent(data);
+    const entity = session.entity;
+    if (!intent || !entity?.alive || !entity.position
+      || (entity.team !== 0 && entity.team !== 1)) return false;
+    const at = this._clock();
+    if (at - session.lastTacticalPingAt < 1500) {
+      session.stats.tacticalPingsRateLimited++;
+      return false;
+    }
+    session.lastTacticalPingAt = at;
+    const event = encodeTacticalPingEvent({ senderId: entity.id, kind: intent.kind,
+      position: entity.position });
+    for (const peer of this.clients.values()) {
+      if (peer.rejected || !peer.authenticated || peer.entity?.team !== entity.team) continue;
+      peer.transport.send(event);
+    }
+    session.stats.tacticalPings++;
+    return true;
   }
 
   /**
@@ -610,6 +786,13 @@ export class GameServer {
     const pair = decodeLoadout(data);
     const e = session.entity;
     if (!pair || !e) return;
+    session.stats.loadouts++;
+    // Internet sessions are armed from the signed lobby allocation. A client frame may ask
+    // to reapply that choice after local recovery, but may never replace it.
+    if (session.identity) {
+      this.reapplyLoadout(session);
+      return;
+    }
     const ids = pair
       .map((i) => WEAPON_BY_WIRE_IDX[i]?.id)
       .filter((id) => id && WEAPONS[id]?.class !== 'grenade');
@@ -804,6 +987,10 @@ export class GameServer {
    */
   sendOutcome(o) {
     if (!o) return null;
+    if (o.scope === 'match') {
+      if (this._sentMatchOutcome) return null;
+      this._sentMatchOutcome = true;
+    }
     const buf = encodeOutcome(o);
     for (const session of this.clients.values()) {
       if (session.rejected || !session.authenticated) continue;
@@ -1102,6 +1289,7 @@ export class GameServer {
     h.breathHold = cmd.breathHold;
     h.leanKeyHeld = cmd.leanKeyHeld;
     h.leanRightKeyHeld = cmd.leanRightKeyHeld;
+    h.interactHeld = cmd.interactHeld;
 
     // The aim checksum has to be compared against the aim the CLIENT was describing, which
     // is its aim BEFORE this command's delta — `MultiplayerSession.sendCommand` stamps
@@ -1117,6 +1305,29 @@ export class GameServer {
 
     e.applyCommand(cmd);
     e._firePressedThisFrame = !!cmd.firePressed;
+
+    // Bomb interaction is held intent. The command carries only whether the key is held;
+    // the server derives plant versus defuse from its own role/phase, then BombRules checks
+    // team, life, carrier, volume and grounded state again. A modified client cannot choose
+    // the privileged branch. Releasing clears all progress; a command-less tick reuses the
+    // last held state just like movement/fire, and disconnect explicitly releases it.
+    //
+    // **`interactHeld`, not `interact`.** `interact` is an EDGE bit: a client holding the key
+    // sends it `true` on the press command and `false` on all ~360 commands after it, so this
+    // read one `true`, then reset the plant on the very next tick, every tick — §6.4 requires
+    // the key held continuously and the wire had no field that could say so until v3. Bots
+    // planted because `botManager` calls `requestInteract` directly and never encodes a
+    // command; humans could not plant or defuse at all.
+    const rules = this.game.match?.bombRules;
+    if (rules) {
+      e._objectiveHeld = !!cmd.interactHeld;
+      if (cmd.interactHeld) {
+        const kind = e.team === rules.attackingTeam ? 'plant' : 'defuse';
+        rules.requestInteract(e, kind);
+      } else {
+        rules.releaseInteract(e);
+      }
+    }
 
     // Deltas alone are lossy: lose one command and the server's aim sits permanently offset
     // from the client's, with nothing to notice. Compare against what the client says its
@@ -1156,6 +1367,16 @@ export class GameServer {
     // client, so one session attached to an entity without an `_edge` map — a bot, a stand-in,
     // anything that is not a `Player` — took the tick loop down for the whole server, not just
     // for itself.
+    const rules = this.game.match?.bombRules;
+    if (rules) {
+      if (e._objectiveHeld && e.alive) {
+        const kind = e.team === rules.attackingTeam ? 'plant' : 'defuse';
+        rules.requestInteract(e, kind);
+      } else {
+        if (!e.alive) e._objectiveHeld = false;
+        rules.releaseInteract(e);
+      }
+    }
     if (!e._edge) return;
     for (const k of Object.keys(e._edge)) e._edge[k] = false;
     e._edge.slot = -1;
