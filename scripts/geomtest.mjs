@@ -25,6 +25,7 @@
  *   node scripts/geomtest.mjs --only=seam     # one section (seam|overlap|float|align|open|thin|sym)
  */
 import fs from 'node:fs';
+import { MAP_MANIFEST } from '../src/world/level.js';
 
 const only = (process.argv.find((a) => a.startsWith('--only=')) || '').split('=')[1];
 const cache = process.argv.slice(2).find((a) => !a.startsWith('--')) || null;
@@ -615,7 +616,82 @@ if (R.sym.length) {
   console.log('');
 }
 
+// ── verdict ──────────────────────────────────────────────────────────────────────────
+// Until now this file exited on `typeof failures === 'number'` for a `failures` that was
+// never declared anywhere in it, so it exited 0 unconditionally and was reported as a
+// passing guard on that basis. It is a guard now. The split below is deliberate:
+//
+// DEFECT — only what map-data.md §3.1 and §3.6 make binding, so no threshold in this file
+// is inventing a rule:
+//   §3.1 "No box may be authored with min > max on any axis; the guard rejects it rather
+//        than letting the spatial hash silently drop it."      -> DEGENERATE
+//   §3.1 "Every box carries a `surface` tag."                  -> UNTAGGED
+//   §3.1 "Renderer-only meshes never participate in collision. Decorative geometry that
+//        is not added as a box does not block, and geometry added as a box always blocks.
+//        No third state."                                      -> DUPLICATE / ENTOMBED /
+//        A collider that is an exact copy of another, sits wholly inside another, or lies
+//        wholly beneath the ground plane blocks nothing that is not already blocked: it is
+//        in the hash and decides nothing, which is precisely the third state §3.1 forbids.
+//                                                                 BURIED
+//   §3.6 `colliders: 1200` — "bounded by query performance", every move/raycast/losClear
+//        scales with box count, so inert colliders are spend against a binding budget for
+//        no return.                                            -> COLLIDER BUDGET
+//   §3.1 an authored opening that does not intersect its own wall band is a hole the
+//        builder never cut — the box blocks where the author declared a gap.
+//                                                                 DEAD OPENING
+//
+// ADVISORY — real measurements, but no rule in §3.1/§3.6 sets a tolerance for them, and
+// on The Square each has a legitimate authored reading: the seams are the 0.35 m reveal
+// under every glass pane, the 20 "isolated" colliders are those same panes sitting in
+// their frames, the deep overlaps are ordinary pilaster/wall joins, the 0.20 m panels are
+// roof and canopy slabs (thickness is maptest's penetration constant, not a §3.6 budget),
+// and site/mirror symmetry belongs to mapbalance §7. Calling any of them fatal here would
+// be this file inventing a contract. They stay printed above, in full, and unenforced.
+const fatal = [];
+if (only) {
+  console.log(`(--only=${only}: sections were skipped, so no verdict is issued.)\n`);
+  process.exit(0);
+}
+const untagged = boxes.filter((b) => typeof b.surface !== 'string' || !b.surface.trim());
+const contained = (s, big) => [0, 1, 2].every((k) => s.min[k] >= big.min[k] - 1e-6
+  && s.max[k] <= big.max[k] + 1e-6);
+// Mutually contained means identical, which DUPLICATE already owns; don't bill it twice.
+const entombed = R.overlap.filter((o) => o.small !== o.big
+  && contained(o.small, o.big) && !contained(o.big, o.small));
+const deadOpenings = R.openings.filter((o) => o.dead);
+const colliderBudget = MAP_MANIFEST?.budgets?.colliders;
+
+for (const b of R.degen) fatal.push(`DEGENERATE ${fmt(b.thin, 4)}m ${tag(b)} ${pos(b)} — §3.1 malformed box`);
+for (const b of untagged) fatal.push(`UNTAGGED ${tag(b)} ${pos(b)} — §3.1 every box carries a surface tag`);
+for (const l of R.dup) fatal.push(`DUPLICATE ×${l.length} ${pos(l[0])} — ${l.map(tag).join(' | ')} — §3.1 inert collider`);
+for (const o of entombed) fatal.push(`ENTOMBED ${tag(o.small)} ${pos(o.small)} lies wholly inside ${tag(o.big)} ${pos(o.big)} — §3.1 inert collider, §3.6 collider budget`);
+for (const b of R.buried) fatal.push(`BURIED ${tag(b)} ${pos(b)} — wholly below the ground plane; §3.1 inert collider`);
+for (const o of deadOpenings) fatal.push(`DEAD OPENING ${o.op.frame || 'hole'} ${fmt(o.op.a0)}..${fmt(o.op.a1)} y ${fmt(o.op.y0)}..${fmt(o.op.y1)} @ ${o.wall.src} — does not intersect its wall band`);
+if (!Number.isFinite(colliderBudget)) {
+  fatal.push('COLLIDER BUDGET — MAP_MANIFEST.budgets.colliders is absent or not finite; §3.6 requires it');
+} else if (N > colliderBudget) {
+  fatal.push(`COLLIDER BUDGET ${N} colliders exceeds the §3.6 allocation of ${colliderBudget}`);
+}
+
+console.log('── VERDICT');
+console.log(`  advisory: ${R.seam.length} seam pairs, ${R.overlap.length} overlapping pairs, `
+  + `${R.floating.filter((f) => f.contacts === 0).length} isolated colliders, ${R.align.length} alignment near-misses, `
+  + `${R.thin.length} sub-${PEN}m panels, ${R.sym.length} mirror near-misses`);
+console.log(`  §3.6 colliders ${N} / ${Number.isFinite(colliderBudget) ? colliderBudget : '??'}`);
+// Honest about the half of §3.6 this harness does not measure. §3.6 also names geomtest as
+// the harness for drawCalls/triangles/materials/lights and for the ARCHITECTURE.md §11
+// whole-scene ceiling under a running match. None of that is measurable from a headless
+// collider dump — it needs the ref-integrated-1080p render profile — and nothing in this
+// file measures it. That guard line is UNPROVEN; it is not silently reported as met.
+console.log('  §3.6 drawCalls/triangles/materials/lights and the ARCHITECTURE.md §11 whole-scene');
+console.log('       ceiling: NOT MEASURED here — no render profile in a headless dump. UNPROVEN.');
+if (fatal.length) {
+  console.error(`\n✗ GEOMETRY AUDIT FAILED — ${fatal.length} defect(s) against map-data.md §3.1/§3.6:`);
+  for (const f of fatal) console.error(`  - ${f}`);
+} else {
+  console.log(`\n✓ GEOMETRY AUDIT PASSED — 0 defects against map-data.md §3.1/§3.6 over ${N} colliders.`);
+}
 // A headless `Game` keeps a live handle, so this never exited on its own — two runs were
 // found still alive after 75 minutes with their output complete. Every other harness here
 // ends with an explicit exit; this one now does too, and reports a status while it is at it.
-process.exit(typeof failures === 'number' && failures > 0 ? 1 : 0);
+process.exit(fatal.length > 0 ? 1 : 0);
