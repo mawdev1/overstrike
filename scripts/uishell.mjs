@@ -11,6 +11,9 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
 
+import { BRIDGED_KEYS, SETTING_BRIDGE, toGameValue, toShellValue } from '../src/ui/shell/settingsBridge.js';
+import { mouseCode } from '../src/core/mouseCodes.js';
+import { SETTINGS_BY_KEY } from '../src/ui/shell/settings/inventory.js';
 import {
   BINDING_ACTIONS,
   RESERVED_BINDING_CODES,
@@ -255,6 +258,76 @@ async function modelChecks() {
     receiveRateHz: 20, baselineState: 'synced', keyframes: 2, discarded: 1,
     accessToken: 'must-not-copy', rawIp: '203.0.113.8', accountId: '01J00000000000000000000001',
   };
+  // ── mouse bind codes ──────────────────────────────────────────────────────────────────
+  //
+  // Five call sites each computed `Mouse${button + 1}`, giving Mouse1=left, Mouse2=MIDDLE,
+  // Mouse3=right. Every FPS — and this codebase's own defaults, which pair `fire: Mouse1` with
+  // `aim: Mouse2` — mean left/right. So aim-down-sights sat on the middle button and right-click
+  // did nothing, while firing worked because left is Mouse1 either way. The five sites agreed
+  // with each other, so nothing was inconsistent for a test to catch; they were uniformly wrong.
+  check(mouseCode(0) === 'Mouse1' && mouseCode(2) === 'Mouse2' && mouseCode(1) === 'Mouse3',
+    'Mouse1/2/3 are left/right/middle — the order players and the default binds assume',
+    JSON.stringify([mouseCode(0), mouseCode(1), mouseCode(2)]));
+  check(mouseCode(3) === 'Mouse4' && mouseCode(4) === 'Mouse5',
+    'side buttons keep their conventional numbers');
+  check(mouseCode(5) === null && mouseCode(-1) === null && mouseCode(1.5) === null
+    && mouseCode(undefined) === null,
+  'anything outside the five real buttons yields no bind code at all');
+  {
+    // The pairing this exists to protect, read from the real binding defaults.
+    const aim = BINDING_ACTIONS.find((action) => action.id === 'aim');
+    const fire = BINDING_ACTIONS.find((action) => action.id === 'fire');
+    check(fire?.primary === 'Mouse1' && aim?.primary === 'Mouse2',
+      'CONTROL: fire and aim still default to the left and right buttons',
+      JSON.stringify({ fire: fire?.primary, aim: aim?.primary }));
+    check(mouseCode(2) === aim?.primary,
+      'pressing the physical right button produces exactly the code aim is bound to',
+      `${mouseCode(2)} vs ${aim?.primary}`);
+  }
+
+  // ── the shell⇄game settings bridge ────────────────────────────────────────────────────
+  //
+  // The pause menu writes to `game.settings`, which persists to localStorage and nowhere else,
+  // and the shell pushed its snapshot into that same object on every game creation. So every
+  // change made in-game was overwritten the next time a match or practice started, and never
+  // reached the player's account — "my settings aren't being saved".
+  //
+  // Fixing it needs the INVERSE of 54 entries, a third of them scaled or enum⇄boolean. A hand
+  // written inverse is how the two halves drift, and a wrong transform does not throw — it
+  // quietly rescales someone's sensitivity. So every key is round-tripped against its real
+  // default from the settings inventory.
+  {
+    const missing = BRIDGED_KEYS.filter((key) => !SETTINGS_BY_KEY[key]);
+    check(missing.length === 0,
+      'every bridged key is a real setting in the inventory', missing.join(', '));
+
+    const lossy = [];
+    for (const key of BRIDGED_KEYS) {
+      const original = SETTINGS_BY_KEY[key]?.defaultValue;
+      if (original === undefined) continue;
+      const round = toShellValue(key, toGameValue(key, original));
+      if (JSON.stringify(round) !== JSON.stringify(original)) {
+        lossy.push(`${key}: ${JSON.stringify(original)} -> ${JSON.stringify(round)}`);
+      }
+    }
+    check(lossy.length === 0,
+      'every bridged setting survives shell -> game -> shell unchanged', lossy.join('; '));
+
+    // The transforms that actually do something. Identity keys would pass the round-trip above
+    // even if the table dropped them, so the scaled and enum pairs are named explicitly.
+    check(toGameValue('brightness', 80) === 0.8 && toShellValue('brightness', 0.8) === 80,
+      'percent settings scale to a fraction for the game and back');
+    check(toGameValue('toggleAds', 'toggle') === true && toShellValue('toggleAds', false) === 'hold',
+      'toggleAds maps between the enum the shell stores and the boolean the game wants');
+    check(toGameValue('maxFps', 'off') === 0 && toShellValue('maxFps', 0) === 'off',
+      'maxFps off maps to 0 and back, rather than to NaN');
+
+    // The gate belongs with the feature flags, not in the table — an impure entry here is the
+    // one most likely to be wrong and the hardest to test.
+    check(typeof SETTING_BRIDGE.mode?.toGame !== 'function',
+      'the bridge table stays pure: no feature-flag logic inside it');
+  }
+
   const diagnosticsController = createSettingsController({ storage: new MemoryStorage(), eventTarget: null });
   diagnosticsController.setSessionDiagnostics(measuredDiagnostics);
   const sanitizedDiagnostics = diagnosticsController.getSnapshot().byScope.SESSION.diagnostics;
@@ -955,7 +1028,11 @@ async function browserChecks() {
       facade.emit('matchState', { phase: 'live' });
       window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowRight', cancelable: true }));
       window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowLeft', cancelable: true }));
-      window.dispatchEvent(new MouseEvent('mousedown', { button: 2, cancelable: true }));
+      // DOM button 1 is the middle button, which is `Mouse3` — Mouse1/2/3 are left/right/middle,
+      // the convention every FPS uses and the one `mouseCode` now implements. This dispatched
+      // button 2 (the RIGHT button) while binding Mouse3, which only lined up under the old
+      // `button + 1` arithmetic that put aim-down-sights on the middle button.
+      window.dispatchEvent(new MouseEvent('mousedown', { button: 1, cancelable: true }));
       const diagnosticsDuring = runtimeDiagnostics;
       const during = { authority: progression.getAuthority(), kills: progression.data.lifetime.kills,
         matches: progression.data.lifetime.matches, xp: progression.data.xp };

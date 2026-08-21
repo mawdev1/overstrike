@@ -1,3 +1,4 @@
+import { mouseCode } from '../../core/mouseCodes.js';
 const MIN_LOGICAL_CORES = 2;
 const MIN_DEVICE_MEMORY_GB = 8;
 
@@ -238,7 +239,7 @@ export function createGameRuntime({
           };
           window.addEventListener('keydown', spectatorKeyHandler);
           tacticalMouseHandler = (event) => {
-            const code = `Mouse${event.button + 1}`;
+            const code = mouseCode(event.button);
             if (candidate?.settings?.actionFor?.(code) === 'tacticalPing'
               && facade.requestTacticalPing?.('location')) event.preventDefault();
           };

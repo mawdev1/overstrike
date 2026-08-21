@@ -12,6 +12,7 @@ import { mountAppShell } from './ui/shell/index.js';
 import { createGameRuntime, identifyRuntimeClient } from './ui/shell/gameRuntime.js';
 import { createSettingsController } from './ui/shell/settings/index.js';
 import { createLobbyShellAdapter } from './ui/lobby/index.js';
+import { BRIDGED_KEYS, toGameValue, toShellValue } from './ui/shell/settingsBridge.js';
 
 const PROF = (globalThis.__BOOTPROF__ = {
   moduleEval: +performance.now().toFixed(1),
@@ -132,77 +133,51 @@ function applyDocumentPreference(key, value) {
   }
 }
 
+/**
+ * Set while the shell is pushing its snapshot into the game, so the write-back below ignores
+ * the echo. Without it, one shell change becomes shell → game → shell → game forever.
+ */
+let applyingShellSettings = false;
+const bridgedGames = new WeakSet();
+
 function configureGameFromSettings(game) {
   if (!game?.settings) return;
   const snapshot = settings.getSnapshot();
   const values = snapshot.values;
   game.clientFeatureFlags = featureFlags.snapshot().flags;
-  const mapping = {
-    sensitivity: values.sensitivity,
-    adsSensitivity: values.adsSensitivity,
-    invertY: values.invertY,
-    toggleAds: values.toggleAds === 'toggle',
-    toggleCrouch: values.toggleCrouch === 'toggle',
-    autoSprint: values.autoSprint,
-    fov: values.fov,
-    renderScale: values.renderScale / 100,
-    shadows: values.shadows,
-    shadowQuality: values.shadowQuality,
-    postFx: values.postFx,
-    filmGrain: values.filmGrain / 100,
-    motionBlur: values.motionBlur,
-    vignette: values.vignette,
-    maxFps: values.maxFps === 'off' ? 0 : Number(values.maxFps),
-    showFps: values.showFps,
-    masterVolume: values.masterVolume / 100,
-    sfxVolume: values.sfxVolume / 100,
-    musicVolume: values.musicVolume / 100,
-    uiVolume: values.uiVolume / 100,
-    announcerVolume: values.announcerVolume / 100,
-    subtitles: values.subtitles,
-    closedCaptions: values.closedCaptions,
-    subtitleSize: values.subtitleSize,
-    captionBackground: values.captionBackground / 100,
-    captionDirection: values.captionDirection,
-    cameraShake: values.cameraShake / 100,
-    viewBob: values.viewBob / 100,
-    weaponSway: values.weaponSway / 100,
-    flashIntensity: values.flashIntensity / 100,
-    screenEffectIntensity: values.screenEffectIntensity / 100,
-    crosshairStyle: values.crosshairStyle,
-    crosshairColor: values.crosshairColor,
-    crosshairOpacity: values.crosshairOpacity / 100,
-    crosshairSize: values.crosshairSize / 100,
-    crosshairThickness: values.crosshairThickness,
-    crosshairGap: values.crosshairGap,
-    crosshairOutline: values.crosshairOutline,
-    showMinimap: values.showMinimap,
-    showDamageNumbers: values.showDamageNumbers,
-    hudScale: values.hudScale / 100,
-    hudTextSize: values.hudTextSize,
-    minimapRotation: values.minimapRotation,
-    showKillfeed: values.showKillfeed,
-    showObjectiveMarkers: values.showObjectiveMarkers,
-    damageVignette: values.damageVignette,
-    colorVisionPreset: values.colorVisionPreset,
-    reduceMotion: values.reduceMotion,
-    networkDiagnosticsOverlay: values.networkDiagnosticsOverlay,
-    brightness: values.brightness / 100,
-    difficulty: values.difficulty,
-    botCount: values.botCount,
-    killLimit: values.killLimit,
-    mode: featureFlags.isEnabled('mode.bomb.enabled') && featureFlags.isEnabled('map.the_square.enabled')
-      ? values.mode : 'tdm',
-  };
-  for (const [key, value] of Object.entries(mapping)) game.settings.set(key, value);
-  if (game.canvas?.style) game.canvas.style.filter = `brightness(${mapping.brightness})`;
+  applyingShellSettings = true;
+  try {
+    for (const key of BRIDGED_KEYS) {
+      game.settings.set(key, toGameValue(key, values[key]));
+    }
+    // The one gated read: an unshipped mode must not load even if the stored value names it.
+    // The WRITE below is deliberately ungated — the player chose it and the UI accepted it.
+    if (!(featureFlags.isEnabled('mode.bomb.enabled') && featureFlags.isEnabled('map.the_square.enabled'))) {
+      game.settings.set('mode', 'tdm');
+    }
+    if (game.canvas?.style) {
+      game.canvas.style.filter = `brightness(${toGameValue('brightness', values.brightness)})`;
+    }
 
-  const binds = {};
-  for (const [action, slots] of Object.entries(snapshot.bindings)) {
-    if (slots.primary) binds[slots.primary] = action;
-    if (slots.secondary) binds[slots.secondary] = action;
+    const binds = {};
+    for (const [action, slots] of Object.entries(snapshot.bindings)) {
+      if (slots.primary) binds[slots.primary] = action;
+      if (slots.secondary) binds[slots.secondary] = action;
+    }
+    game.settings.set('binds', binds);
+  } finally {
+    applyingShellSettings = false;
   }
-  game.settings.set('binds', binds);
+
+  // Write-back, subscribed once per game instance. This is what makes a change in the pause
+  // menu outlive the match it was made in.
+  if (!bridgedGames.has(game)) {
+    bridgedGames.add(game);
+    game.settings.onChange?.((key, value) => {
+      if (applyingShellSettings || key === '*' || !BRIDGED_KEYS.includes(key)) return;
+      try { settings.set(key, toShellValue(key, value)); } catch { /* rejected by the shell's own validation */ }
+    });
+  }
 }
 
 const settings = createSettingsController({

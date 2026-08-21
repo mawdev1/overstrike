@@ -5,6 +5,7 @@
  * controller via `consumeLook()`. Raw deltas are never smoothed here — smoothing is a
  * camera concern and would add input latency for everyone if done at this layer.
  */
+import { mouseCode } from './mouseCodes.js';
 export class Input {
   constructor(game, canvas) {
     this.game = game;
@@ -183,7 +184,7 @@ export class Input {
     if (e.button >= 0 && e.button < this.buttons.length) {
       this.buttons[e.button] = true;
       this.buttonsPressed[e.button] = true;
-      const action = this.settings.actionFor(`Mouse${e.button + 1}`);
+      const action = this.settings.actionFor(mouseCode(e.button));
       if (action) {
         this.actions.add(action);
         this.pressed.add(action);
@@ -196,7 +197,7 @@ export class Input {
     if (e.button >= 0 && e.button < this.buttons.length) {
       this.buttons[e.button] = false;
       this.buttonsReleased[e.button] = true;
-      const action = this.settings.actionFor(`Mouse${e.button + 1}`);
+      const action = this.settings.actionFor(mouseCode(e.button));
       if (action) {
         if (!this._actionHeld(action)) {
           this.actions.delete(action);
@@ -219,7 +220,7 @@ export class Input {
   _actionHeld(action) {
     for (const code of this.codes) if (this.settings.actionFor(code) === action) return true;
     for (let button = 0; button < this.buttons.length; button += 1) {
-      if (this.buttons[button] && this.settings.actionFor(`Mouse${button + 1}`) === action) return true;
+      if (this.buttons[button] && this.settings.actionFor(mouseCode(button)) === action) return true;
     }
     return false;
   }

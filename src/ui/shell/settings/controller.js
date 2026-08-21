@@ -1,3 +1,4 @@
+import { mouseCode } from '../../../core/mouseCodes.js';
 import {
   BINDING_ACTIONS,
   BINDINGS_BY_ID,
@@ -275,7 +276,7 @@ function captureCode(input) {
   if (!input) return null;
   if (input.type === 'wheel') return input.deltaY < 0 ? 'WheelUp' : 'WheelDown';
   if (input.type === 'mousedown' || input.type === 'pointerdown') {
-    return input.button >= 0 && input.button <= 4 ? `Mouse${input.button + 1}` : null;
+    return mouseCode(input.button);
   }
   return input.code || null;
 }
