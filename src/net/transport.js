@@ -51,11 +51,13 @@ export class LoopbackTransport {
     this._peer = null;
     this._inbox = [];          // { at, data } — sorted by arrival
     this._handler = null;
+    this._closeHandler = null;
     this.closed = false;
     this.stats = { sent: 0, received: 0, dropped: 0, bytesSent: 0 };
   }
 
   onMessage(fn) { this._handler = fn; }
+  onClose(fn) { this._closeHandler = fn; }
 
   send(data) {
     if (this.closed || !this._peer) return;
@@ -99,7 +101,12 @@ export class LoopbackTransport {
     if (loss !== undefined) s.loss = loss;
   }
 
-  close() { this.closed = true; this._inbox.length = 0; }
+  close(reason = 'closed') {
+    if (this.closed) return;
+    this.closed = true;
+    this._inbox.length = 0;
+    this._closeHandler?.({ reason, code: null });
+  }
 }
 
 /**
@@ -116,6 +123,7 @@ export class WebSocketTransport {
     this.url = url;
     this.closed = false;
     this._handler = null;
+    this._closeHandler = null;
     this._queue = [];
     this.stats = { sent: 0, received: 0, dropped: 0, bytesSent: 0 };
 
@@ -131,10 +139,15 @@ export class WebSocketTransport {
         console.error('[net:ws] message handler threw', e);
       }
     };
-    this.ws.onclose = () => { this.closed = true; };
+    this.ws.onclose = (event) => {
+      if (this.closed) return;
+      this.closed = true;
+      this._closeHandler?.({ reason: event.reason || 'socket-closed', code: event.code });
+    };
   }
 
   onMessage(fn) { this._handler = fn; }
+  onClose(fn) { this._closeHandler = fn; }
 
   send(data) {
     if (this.closed) return;
@@ -152,5 +165,10 @@ export class WebSocketTransport {
 
   pump() { /* the socket delivers itself */ }
 
-  close() { this.closed = true; try { this.ws.close(); } catch { /* already gone */ } }
+  close(reason = 'client-close') {
+    if (this.closed) return;
+    try { this.ws.close(1000, String(reason).slice(0, 123)); } catch { /* already gone */ }
+    this.closed = true;
+    this._closeHandler?.({ reason, code: 1000 });
+  }
 }

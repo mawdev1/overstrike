@@ -13,6 +13,7 @@
  */
 import {
   MSG_SNAPSHOT, MSG_WELCOME, MSG_REJECT, MSG_MATCHSTATE, MSG_OUTCOME,
+  MSG_TACTICAL_PING_EVENT, encodeTacticalPingIntent, decodeTacticalPingEvent,
   encodeCommands, decodeSnapshot, quantiseCommand, encodeHello, decodeWelcome, decodeReject,
   decodeMatchState, decodeOutcome, PROTOCOL_VERSION, upgradeMessage,
   REJECT_PROTOCOL_VERSION_MISMATCH, WELCOME_BYTES_V1, WELCOME_BYTES_V2,
@@ -62,6 +63,7 @@ export class NetClient {
     this._onWelcome = null;
     this._onMatchState = null;
     this._onOutcome = null;
+    this._onTacticalPing = null;
     this._onReject = null;
     /** The server's match seed. Shot spread is addressed by it — see GameServer._sendWelcome. */
     this.matchSeed = null;
@@ -85,6 +87,14 @@ export class NetClient {
     /** Newest decoded `MSG_OUTCOME`, or null. */
     this.outcome = null;
 
+    // Five-second measured diagnostics used by the public facade. These samples are
+    // client observations, never server claims or UI smoothing.
+    this._sentAt = new Map();
+    this._rttSamples = [];
+    this._snapshotSamples = [];
+    this._keyframes = 0;
+    this._baselineState = 'keyframe-pending';
+
     transport.onMessage((data) => this._onMessage(data));
   }
 
@@ -95,6 +105,7 @@ export class NetClient {
   onMatchState(fn) { this._onMatchState = fn; }
   /** Called with each decoded `MSG_OUTCOME` — round and match results. */
   onOutcome(fn) { this._onOutcome = fn; }
+  onTacticalPing(fn) { this._onTacticalPing = fn; }
   /** Called once if the connection is refused. Terminal: the socket is already closing. */
   onReject(fn) { this._onReject = fn; }
 
@@ -103,10 +114,17 @@ export class NetClient {
    *
    * Carries the version this build speaks so the server can refuse it before either side
    * decodes anything the other might mean differently — which is the whole of G1. The ticket
-   * rides along for G2; today the server stores it and does not read it.
+   * rides alongside it and the server verifies/consumes it before allocating an entity.
    */
   sendHello(ticket = '') {
     this.transport.send(encodeHello(PROTOCOL_VERSION, ticket));
+  }
+
+  sendTacticalPing(kind = 'location') {
+    if (this.rejected || !this.entityId) return false;
+    if (!['location', 'danger', 'objective'].includes(kind)) return false;
+    this.transport.send(encodeTacticalPingIntent(kind));
+    return true;
   }
 
   /**
@@ -218,6 +236,13 @@ export class NetClient {
       return;
     }
 
+    if (type === MSG_TACTICAL_PING_EVENT) {
+      const ping = decodeTacticalPingEvent(data);
+      if (!ping) { this._malformed(MSG_TACTICAL_PING_EVENT, data.byteLength); return; }
+      this._onTacticalPing?.(ping);
+      return;
+    }
+
     // §8.11: an unknown type is ignored. Additive types must not break an older peer.
     if (type !== MSG_SNAPSHOT) return;
 
@@ -232,6 +257,12 @@ export class NetClient {
     if (snap.tick < this.latestTick) { this.stats.discarded++; return; }
     this.latestTick = snap.tick;
     this.latestAtMs = now();
+    this._snapshotSamples.push({ at: this.latestAtMs, tick: snap.tick });
+    while (this._snapshotSamples.length && this._snapshotSamples[0].at < this.latestAtMs - 5000) {
+      this._snapshotSamples.shift();
+    }
+    if (snap.keyframe) this._keyframes++;
+    this._baselineState = snap.keyframe || base ? 'synced' : 'keyframe-pending';
 
     this.snapshots.push(snap);
     // Keep a couple of seconds; interpolation only ever reaches back INTERP_DELAY_MS, and
@@ -239,6 +270,14 @@ export class NetClient {
     while (this.snapshots.length > 64) this.snapshots.shift();
 
     if (snap.lastCommandSeq > this.lastAckedSeq) {
+      const sentAt = this._sentAt.get(snap.lastCommandSeq);
+      if (sentAt !== undefined) {
+        this._rttSamples.push({ at: this.latestAtMs, value: Math.max(0, this.latestAtMs - sentAt) });
+      }
+      while (this._rttSamples.length && this._rttSamples[0].at < this.latestAtMs - 5000) {
+        this._rttSamples.shift();
+      }
+      for (const seq of this._sentAt.keys()) if (seq <= snap.lastCommandSeq) this._sentAt.delete(seq);
       this.lastAckedSeq = snap.lastCommandSeq;
       const before = this.unacked.length;
       // Everything the server has consumed can stop being resent — and, for Phase 6,
@@ -264,11 +303,55 @@ export class NetClient {
     // predicts from exactly what the server will decode.
     quantiseCommand(cmd);
     this.unacked.push(cmd);
+    this._sentAt.set(cmd.seq, now());
+    if (this._sentAt.size > 512) this._sentAt.delete(this._sentAt.keys().next().value);
 
     const batch = this.unacked.slice(-(REDUNDANT_COMMANDS + 1));
     this.transport.send(encodeCommands(batch));
     this.stats.sent++;
     return cmd;
+  }
+
+  /** Measured transport/snapshot window for net-facade §5.2. */
+  diagnostics(at = now()) {
+    while (this._rttSamples.length && this._rttSamples[0].at < at - 5000) this._rttSamples.shift();
+    while (this._snapshotSamples.length && this._snapshotSamples[0].at < at - 5000) this._snapshotSamples.shift();
+    const rtt = this._rttSamples.map((row) => row.value);
+    const rttMs = rtt.length ? rtt.reduce((sum, n) => sum + n, 0) / rtt.length : 0;
+    const jitterMs = rtt.length > 1
+      ? rtt.slice(1).reduce((sum, n, i) => sum + Math.abs(n - rtt[i]), 0) / (rtt.length - 1)
+      : 0;
+    const snaps = this._snapshotSamples;
+    const span = snaps.length > 1 ? Math.max(1, snaps[snaps.length - 1].at - snaps[0].at) : 5000;
+    const receiveRateHz = snaps.length > 1 ? ((snaps.length - 1) * 1000) / span : 0;
+    let expected = 0;
+    let missing = 0;
+    const gaps = [];
+    for (let i = 1; i < snaps.length; i++) {
+      const gap = snaps[i].tick - snaps[i - 1].tick;
+      if (gap > 0) gaps.push(gap);
+    }
+    const nominal = gaps.length ? Math.min(...gaps) : 0;
+    if (nominal > 0) {
+      for (const gap of gaps) {
+        const slots = Math.max(1, Math.round(gap / nominal));
+        expected += slots;
+        missing += slots - 1;
+      }
+    }
+    const snapshotAgeMs = this.latestAtMs ? Math.max(0, at - this.latestAtMs) : Infinity;
+    return {
+      sampledAt: at,
+      windowMs: 5000,
+      rttMs,
+      jitterMs,
+      lossPct: expected ? (missing / expected) * 100 : 0,
+      snapshotAgeMs,
+      receiveRateHz,
+      baselineState: snapshotAgeMs > 5000 ? 'lost' : this._baselineState,
+      keyframes: this._keyframes,
+      discarded: this.stats.discarded,
+    };
   }
 
   /**

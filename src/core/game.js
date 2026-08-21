@@ -3,6 +3,7 @@ import { Engine } from './engine.js';
 import { Input } from './input.js';
 import { EventBus } from './events.js';
 import { Settings } from './settings.js';
+import { advancesLocalReferee } from './refereeAuthority.js';
 import { createRNG } from './rng.js';
 import { assets } from './assets.js';
 import { LivePresenter, NullPresenter } from './presenter.js';
@@ -20,7 +21,7 @@ import { AudioEngine } from '../audio/audio.js';
 import { HUD } from '../ui/hud.js';
 import { Menu } from '../ui/menu.js';
 import { Match } from '../game/match.js';
-import { normalizeKillLimit } from '../game/modes.js';
+import { normalizeKillLimit, normalizeModeId } from '../game/modes.js';
 import { WEAPON_LIST } from '../weapons/weaponDefs.js';
 import { BotModel } from '../ai/botModel.js';
 
@@ -404,9 +405,10 @@ export class Game {
     if (opts.botCount !== undefined) this.settings.set('botCount', opts.botCount);
     if (opts.difficulty !== undefined) this.settings.set('difficulty', opts.difficulty);
     if (opts.killLimit !== undefined) this.settings.set('killLimit', normalizeKillLimit(opts.killLimit));
-    // Team Deathmatch is the sole ruleset. Old callers may still pass a stale mode id;
-    // normalize it here so settings, events, and every subsystem agree on the same mode.
-    this.settings.set('mode', 'tdm');
+    // Resolve the closed two-mode table once before any subsystem resets. Unknown/stale
+    // values fall back to TDM, while the authored Bomb entry remains selectable.
+    const mode = normalizeModeId(opts.mode ?? this.settings.get('mode'));
+    this.settings.set('mode', mode);
 
     // Deliberately NOT resetting `_entityIdSeq` here. The Player is constructed once at
     // boot and keeps its id for the process; restarting the sequence per match would hand
@@ -427,7 +429,7 @@ export class Game {
     this.input?.requestLock();
     this.audio?.resume();
     this.bus.emit('matchStart', {
-      mode: 'tdm',
+      mode: this.match.modeId,
       killLimit: this.match.killLimit,
       scores: this.match.scores,
     });
@@ -602,7 +604,11 @@ export class Game {
     this._safe('bots', 'fixed', this.bots, 'fixedUpdate', dt);
     this._safe('weapons', 'fixed', this.weapons, 'fixedUpdate', dt);
     this._safe('projectiles', 'fixed', this.projectiles, 'fixedUpdate', dt);
-    this._safe('match', 'fixed', this.match, 'fixedUpdate', dt);
+    // A network client predicts movement/weapon feel, never the referee. Advancing its local
+    // Match would independently expire timers, award score and call endMatch/toMenu before an
+    // authoritative MSG_OUTCOME arrived. Dedicated servers and practice have no `this.net` and
+    // continue to run the complete rules clock.
+    if (advancesLocalReferee(this.net)) this._safe('match', 'fixed', this.match, 'fixedUpdate', dt);
 
     this._enforceWorldBounds();
   }

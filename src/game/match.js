@@ -148,6 +148,7 @@ export class Match {
     this._onSpawn = this._onSpawn.bind(this);
     this._onShot = this._onShot.bind(this);
     this._onHit = this._onHit.bind(this);
+    this._onRoundStart = this._onRoundStart.bind(this);
   }
 
   async init() {
@@ -167,6 +168,7 @@ export class Match {
     this._unsub.push(bus.on('spawn', this._onSpawn));
     this._unsub.push(bus.on('shot', this._onShot));
     this._unsub.push(bus.on('hit', this._onHit));
+    this._unsub.push(bus.on('roundStart', this._onRoundStart));
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -365,12 +367,14 @@ export class Match {
       name: entity.name || (entity.isPlayer ? 'YOU' : `BOT ${entity.id}`),
       isPlayer: !!entity.isPlayer,
       team: entity.team,
-      kills: 0, deaths: 0, assists: 0, score: 0,
+      kills: 0, deaths: 0, assists: 0, suicides: 0, teamKills: 0, score: 0,
       streak: 0, bestStreak: 0, headshots: 0, longshots: 0,
       longestShot: 0, shotsFired: 0, shotsHit: 0, damageDealt: 0,
       captures: 0, defends: 0, confirms: 0, denies: 0,
       // bomb-rules §10 — completions only.
       plants: 0, defuses: 0, roundWins: 0, clutches: 0,
+      roundsPlayed: 0,
+      weapons: new Map(),
       streaksEarned: 0, tier: 0,
       lastKillTime: -99, multiCount: 0, lastKilledBy: -1,
       _hitThisShot: false,
@@ -432,8 +436,8 @@ export class Match {
     if (!st) return;
     st.shotsFired++;
     st._hitThisShot = false;
-    if (st.isPlayer && p.weaponId) {
-      const w = this._weaponRow(p.weaponId);
+    if (p.weaponId) {
+      const w = this._weaponRow(p.weaponId, st);
       w.shotsFired++;
     }
   }
@@ -448,10 +452,8 @@ export class Match {
     // One shot counts once, however many pellets connected.
     st._hitThisShot = true;
     st.shotsHit++;
-    if (st.isPlayer) {
-      const id = p.weaponId || shooter?.weapon?.def?.id;
-      if (id) this._weaponRow(id).shotsHit++;
-    }
+    const id = p.weaponId || shooter?.weapon?.def?.id;
+    if (id) this._weaponRow(id, st).shotsHit++;
   }
 
   _onDamage(p) {
@@ -523,8 +525,10 @@ export class Match {
 
     // ---- attacker bookkeeping
     if (suicide) {
+      vst.suicides++;
       this._addScore(vst, SCORE.suicidePenalty, null);
     } else if (friendly) {
+      ast.teamKills++;
       this._addScore(ast, SCORE.teamKillPenalty, null);
       if (attacker.isPlayer) this.notice('FRIENDLY FIRE', 'Watch your fire', 1.4);
     } else if (ast) {
@@ -540,7 +544,7 @@ export class Match {
         award += SCORE.headshot;
         ast.headshots++;
         label = 'HEADSHOT';
-        if (attacker.isPlayer) this._weaponRow(p.weaponId).headshots++;
+        this._weaponRow(p.weaponId, ast).headshots++;
       }
 
       const dist = p.distance || 0;
@@ -579,7 +583,7 @@ export class Match {
       this._addScore(ast, award, null);
       if (label && attacker.isPlayer) this.notice(label, `+${award}`, 1.2);
 
-      if (attacker.isPlayer && p.weaponId) this._weaponRow(p.weaponId).kills++;
+      if (p.weaponId) this._weaponRow(p.weaponId, ast).kills++;
 
       if (this._firstBlood) {
         this._firstBlood = false;
@@ -658,11 +662,33 @@ export class Match {
     });
   }
 
-  _weaponRow(id) {
+  _weaponRow(id, stats = null) {
     if (!id) id = 'unknown';
-    let row = this._playerWeapons.get(id);
-    if (!row) this._playerWeapons.set(id, (row = { kills: 0, headshots: 0, shotsFired: 0, shotsHit: 0 }));
+    const rows = stats?.weapons ?? this._playerWeapons;
+    let row = rows.get(id);
+    if (!row) rows.set(id, (row = { kills: 0, headshots: 0, shotsFired: 0, shotsHit: 0 }));
     return row;
+  }
+
+  _onRoundStart() {
+    for (const stats of this._book.values()) stats.roundsPlayed++;
+  }
+
+  /** Canonical match-result.md §4.1 counters for one authoritative entity. */
+  canonicalStatsFor(entity) {
+    const stats = entity ? this._book.get(entity.id) : null;
+    const weapons = {};
+    for (const [id, row] of stats?.weapons ?? []) weapons[id] = {
+      shots: row.shotsFired, hits: row.shotsHit, kills: row.kills, headshots: row.headshots,
+    };
+    return {
+      kills: stats?.kills ?? 0, deaths: stats?.deaths ?? 0, assists: stats?.assists ?? 0,
+      suicides: stats?.suicides ?? 0, teamKills: stats?.teamKills ?? 0,
+      headshots: stats?.headshots ?? 0, shotsFired: stats?.shotsFired ?? 0,
+      shotsHit: stats?.shotsHit ?? 0, damageDealt: Math.round(stats?.damageDealt ?? 0),
+      plants: stats?.plants ?? 0, defuses: stats?.defuses ?? 0,
+      roundsPlayed: stats?.roundsPlayed ?? 0, score: stats?.score ?? 0, weapons,
+    };
   }
 
   _addMoment(type, label, detail, weight) {
@@ -1200,11 +1226,15 @@ export class Match {
   }
 
   _awardProgression(outcome) {
+    // Network results are applied by the platform's atomic result/career transaction. A
+    // modified localStorage blob and this local simulation must have no write or presentation
+    // authority over an authenticated match.
+    if (this.game.progressionAuthority === 'server') return null;
     const player = this.game.player;
     const st = player ? this._book.get(player.id) : null;
     if (!st) return null;
     const weapons = {};
-    for (const [id, row] of this._playerWeapons) {
+    for (const [id, row] of st.weapons) {
       weapons[id] = { kills: row.kills, headshots: row.headshots, shotsFired: row.shotsFired, shotsHit: row.shotsHit };
     }
     return progression.recordMatch({

@@ -97,6 +97,7 @@ export class Prediction {
       lastError: 0, shotsRejected: 0, worstAt: null, worstLivingAt: null,
       respawnCorrections: 0,
     };
+    this.correctionSamples = [];
   }
 
   /**
@@ -288,6 +289,16 @@ export class Prediction {
     const e = this.entity;
     const g = this.game;
     this.stats.corrections++;
+    const error = Math.hypot(
+      wire.x - mine.player.position.x,
+      wire.y - mine.player.position.y,
+      wire.z - mine.player.position.z,
+    );
+    const at = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.correctionSamples.push({ at, error });
+    while (this.correctionSamples.length && this.correctionSamples[0].at < at - 5000) {
+      this.correctionSamples.shift();
+    }
 
     // Rewind to our own recorded state at the acked command — which carries all ~70
     // fields, not just the dozen the wire has room for — and then overwrite exactly the

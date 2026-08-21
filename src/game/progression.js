@@ -1,7 +1,7 @@
 /**
  * OVERSTRIKE — persistent player progression.
  *
- * Everything lives in one localStorage blob (`overstrike.progress.v1`). The store is
+ * Practice progression lives in one localStorage blob (`overstrike.progress.v1`). The store is
  * treated as hostile input: any missing, mistyped or out-of-range field is coerced back
  * onto the defaults rather than throwing, so a corrupt save degrades to a fresh profile
  * instead of a black screen.
@@ -131,18 +131,62 @@ export class Progression {
     /** @type {null | ((id:string, level:number) => void)} */
     this.onUnlock = null;
 
+    this.authority = 'practice-unverified';
     this.data = makeDefaults();
+    this._practiceData = this.data;
     /** @type {Array<object>|null} weapon defs registered by the weapon system. */
     this._weaponDefs = null;
     this._saveQueued = false;
     this._flush = () => { this._saveQueued = false; this._write(); };
 
     this.load();
+    this._practiceData = this.data;
   }
+
+  /**
+   * Network matches are server-authoritative. Swap the visible projection away from the
+   * hostile practice blob before any menu/HUD system is constructed. Career totals are
+   * mode-scoped because the platform contract explicitly forbids summing modes; rank, XP and
+   * unlocks remain neutral until the platform publishes an authoritative inventory/rank field.
+   */
+  beginAuthoritativeSession(career = null, mode = null) {
+    if (this.authority === 'practice-unverified') this._practiceData = this.data;
+    const projected = makeDefaults();
+    const totals = mode && career?.modes?.[mode]?.totals;
+    const weaponTotals = mode && career?.modes?.[mode]?.weapons;
+    if (totals && typeof totals === 'object' && !Array.isArray(totals)) {
+      for (const key of LIFETIME_KEYS) {
+        if (Object.hasOwn(totals, key)) projected.lifetime[key] = Math.max(0, num(totals[key]));
+      }
+      // Platform naming is frozen independently from the old practice store.
+      projected.lifetime.playtime = Math.max(0, num(totals.timePlayedSec));
+    }
+    if (weaponTotals && typeof weaponTotals === 'object' && !Array.isArray(weaponTotals)) {
+      for (const [id, row] of Object.entries(weaponTotals)) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+        projected.weapons[id] = { xp: 0, kills: Math.max(0, num(row.kills)),
+          headshots: Math.max(0, num(row.headshots)), shotsFired: Math.max(0, num(row.shots)),
+          shotsHit: Math.max(0, num(row.hits)) };
+      }
+    }
+    this.authority = 'server';
+    this.data = projected;
+    return this.data;
+  }
+
+  endAuthoritativeSession() {
+    if (this.authority !== 'server') return this.data;
+    this.authority = 'practice-unverified';
+    this.data = this._practiceData || makeDefaults();
+    return this.data;
+  }
+
+  getAuthority() { return this.authority; }
 
   // ------------------------------------------------------------------ storage
 
   load() {
+    if (this.authority === 'server') return false;
     const fresh = makeDefaults();
     let parsed = null;
     try {
@@ -192,6 +236,7 @@ export class Progression {
   }
 
   save() {
+    if (this.authority !== 'practice-unverified') return;
     // Coalesce bursts of writes (a match end touches a dozen fields) into one flush.
     this.data.updatedAt = Date.now();
     if (this._saveQueued) return;
@@ -201,6 +246,7 @@ export class Progression {
   }
 
   _write() {
+    if (this.authority !== 'practice-unverified') return;
     try {
       if (typeof localStorage === 'undefined' || typeof localStorage.setItem !== 'function') return;
       localStorage.setItem(this.key, JSON.stringify(this.data));
@@ -211,6 +257,7 @@ export class Progression {
   }
 
   reset() {
+    if (this.authority !== 'practice-unverified') return this.data;
     this.data = makeDefaults();
     try { localStorage?.removeItem(this.key); } catch { /* ignore */ }
     this._write();
@@ -243,6 +290,7 @@ export class Progression {
     const needed = maxed ? 0 : CUMULATIVE[level + 1] - base;
     const into = this.data.xp - base;
     return {
+      authority: this.authority,
       level,
       rank: this.getRankName(level),
       xp: this.data.xp,
@@ -258,6 +306,10 @@ export class Progression {
    * @returns {{ gained:number, xp:number, level:number, prevLevel:number, leveledUp:boolean, unlocked:string[] }}
    */
   addXp(amount, reason = '') {
+    if (this.authority !== 'practice-unverified') {
+      return { gained: 0, reason, xp: this.data.xp, level: this.data.level,
+        prevLevel: this.data.level, leveledUp: false, unlocked: [] };
+    }
     const gained = Math.max(0, Math.round(num(amount)));
     const prevLevel = this.data.level;
     if (gained > 0) {
@@ -428,6 +480,7 @@ export class Progression {
    * @returns {{ xp:number, breakdown:object, levelUp:object, medals:Array<object> }}
    */
   recordMatch(stats = {}) {
+    if (this.authority !== 'practice-unverified') return null;
     const s = stats || {};
     const kills = Math.max(0, Math.round(num(s.kills)));
     const deaths = Math.max(0, Math.round(num(s.deaths)));

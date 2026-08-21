@@ -8,6 +8,7 @@
  * Run:  node server/index.js [--port=8080] [--bots=8] [--killlimit=75] [--mode=tdm|bomb]
  */
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { Game } from '../src/core/game.js';
 import { RecordingPresenter } from '../src/core/presenter.js';
@@ -15,6 +16,14 @@ import { GameServer } from '../src/net/server.js';
 import { Player } from '../src/player/player.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
 import { normalizeKillLimit } from '../src/game/modes.js';
+import { createMatchTicketVerifier, expireUnjoinedSeats } from './tickets.js';
+import { buildCanonicalTerminalResult } from './result.js';
+import { liveWeaponId } from '../platform/src/shared/liveCatalog.js';
+import { createLogger } from '../platform/src/core/logger.js';
+import { createObservability, parseTraceparent,
+  traceparentForCorrelation } from '../platform/src/core/observability.js';
+
+process.env.OVERSTRIKE_STRUCTURED_LOGS = 'true';
 
 const arg = (k, d) => {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${k}=`));
@@ -37,12 +46,61 @@ const PORT = arg('port', Number(process.env.PORT) || 8080);
  * protocol with no end-to-end coverage over a real socket at all (`wire-protocol.md` §9.6).
  */
 const MODE = argStr('mode', 'tdm');
+let activeMode = MODE;
 const BOTS = arg('bots', 8);
 const MAX_CLIENTS = arg('maxclients', 12);
+const GAME_REGION = process.env.OVERSTRIKE_REGION || 'iad';
+let draining = process.env.OVERSTRIKE_DRAINING === 'true';
 /** First team to this many kills wins the round. */
 const KILL_LIMIT = normalizeKillLimit(arg('killlimit', 75));
 /** Round length in seconds. 0 keeps the mode's own limit. Short rounds are for testing. */
 const TIME_LIMIT = arg('timelimit', 0);
+const DEBUG_CONTROL_SECRET = process.env.OVERSTRIKE_DEBUG_CONTROL_SECRET || null;
+const opsLogger = createLogger({ service: 'match-server', level: process.env.OVERSTRIKE_LOG_LEVEL || 'info' });
+const SERVER_LOG_FIELDS = new Set(['correlationId', 'matchId', 'mode', 'colliders', 'spawns',
+  'botCount', 'clientCount', 'capacity', 'tickHz', 'tick', 'ticksDropped', 'outcome',
+  'restartInMs', 'errorCode', 'networkClass', 'port', 'signal']);
+const serverLog = (level, event, fields = {}) => opsLogger[level](event,
+  Object.fromEntries(Object.entries(fields).filter(([key]) => SERVER_LOG_FIELDS.has(key))));
+const safeErrorCode = (error) => {
+  const candidate = String(error?.code || error?.name || 'INTERNAL_ERROR').toUpperCase();
+  return /^[A-Z][A-Z0-9_]{1,63}$/.test(candidate) ? candidate : 'INTERNAL_ERROR';
+};
+const networkClass = (address) => {
+  const value = String(address || '').replace(/^::ffff:/, '');
+  if (value === '::1' || value.startsWith('127.')) return 'loopback';
+  if (value.startsWith('10.') || value.startsWith('192.168.')
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(value) || /^f[cd][0-9a-f]{2}:/i.test(value)) {
+    return 'private';
+  }
+  return value ? 'public' : 'unknown';
+};
+const observability = createObservability({ service: 'match-server', logger: opsLogger });
+const CORRELATION_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+const correlationOf = (req, fallback) => CORRELATION_RE.test(String(req.headers['x-correlation-id'] || ''))
+  ? String(req.headers['x-correlation-id']) : fallback;
+const traceOf = (req, correlationId) => parseTraceparent(req.headers.traceparent)
+  ? String(req.headers.traceparent).trim().toLowerCase() : traceparentForCorrelation(correlationId, 'platform');
+const PLATFORM_CONTROL_URL = process.env.OVERSTRIKE_PLATFORM_CONTROL_URL || null;
+const PUBLIC_WS_URL = process.env.OVERSTRIKE_PUBLIC_WS_URL || `ws://127.0.0.1:${PORT}`;
+const SERVER_ID = process.env.OVERSTRIKE_SERVER_ID || `dev-server-${PORT}`;
+if (process.env.NODE_ENV === 'production' && (!PLATFORM_CONTROL_URL || !process.env.OVERSTRIKE_PUBLIC_WS_URL
+  || !process.env.OVERSTRIKE_SERVER_ID)) {
+  throw new Error('OVERSTRIKE_PLATFORM_CONTROL_URL, OVERSTRIKE_PUBLIC_WS_URL and OVERSTRIKE_SERVER_ID are required in production');
+}
+
+function debugAuthorized(req) {
+  if (process.env.NODE_ENV !== 'production') return true;
+  const presented = Buffer.from(String(req.headers.authorization || ''));
+  const expected = Buffer.from(DEBUG_CONTROL_SECRET ? `Bearer ${DEBUG_CONTROL_SECRET}` : '');
+  return expected.length > 0 && presented.length === expected.length && timingSafeEqual(presented, expected);
+}
+
+function controlAuthorized(req) {
+  const presented = Buffer.from(String(req.headers.authorization || ''));
+  const expected = Buffer.from(`Bearer ${MATCH_CONTROL_SECRET}`);
+  return presented.length === expected.length && timingSafeEqual(presented, expected);
+}
 
 const game = new Game({ headless: true });
 // Not a NullPresenter: the server has no screen, but its clients do, and the feedback
@@ -64,8 +122,66 @@ if (TIME_LIMIT > 0) game.match.timeLimit = TIME_LIMIT;
 // every human properly instead of pinning one of them to team 0 forever.
 game.player = null;
 
-const server = new GameServer(game);
-console.log(`[server] map built: ${game.world.boxes.length} colliders, ${game.world.spawnPoints.length} spawns, ${BOTS} bots`);
+const MATCH_TICKET_SECRET = process.env.OVERSTRIKE_MATCH_TICKET_SECRET
+  || (process.env.NODE_ENV === 'production' ? null : 'DEV-ONLY-INSECURE-TOKEN-SECRET-do-not-ship');
+if (!MATCH_TICKET_SECRET) throw new Error('OVERSTRIKE_MATCH_TICKET_SECRET is required in production');
+const MATCH_CONTROL_SECRET = process.env.OVERSTRIKE_MATCH_CONTROL_SECRET
+  || (process.env.NODE_ENV === 'production' ? null : 'DEV-ONLY-INSECURE-MATCH-CONTROL-SECRET-do-not-ship');
+if (!MATCH_CONTROL_SECRET) throw new Error('OVERSTRIKE_MATCH_CONTROL_SECRET is required in production');
+const REQUIRE_MATCH_TICKETS = process.env.NODE_ENV === 'production'
+  || Boolean(process.env.OVERSTRIKE_MATCH_TICKET_SECRET);
+let boundMatch = null;
+let lastReleasedMatchId = null;
+const matchTicketVerifier = REQUIRE_MATCH_TICKETS ? createMatchTicketVerifier({
+  secret: MATCH_TICKET_SECRET,
+  matchId: process.env.OVERSTRIKE_MATCH_ID || null,
+  roomId: process.env.OVERSTRIKE_ROOM_ID || null,
+  consume: PLATFORM_CONTROL_URL ? async (claims) => {
+    const response = await fetch(`${PLATFORM_CONTROL_URL.replace(/\/$/, '')}/v1/control/match-tickets/consume`, {
+      method: 'POST', headers: { authorization: `Bearer ${MATCH_CONTROL_SECRET}`,
+        'content-type': 'application/json', 'x-client-build': '1.0.0' },
+      body: JSON.stringify({ jti: claims.jti, accountId: claims.sub,
+        roomId: claims.roomId, matchId: claims.matchId }),
+    });
+    return response.status === 204;
+  } : null,
+}) : null;
+function activateAllocation(allocation, trace = {}) {
+  boundMatch = {
+    matchId: allocation.matchId, roomId: allocation.roomId, mode: allocation.mode,
+    mapId: allocation.mapId, mapVersion: allocation.mapVersion,
+    rulesetVersion: allocation.rulesetVersion, serverBuild: allocation.serverBuild,
+    region: allocation.region, status: 'allocated', startedAt: Date.now(),
+    correlationId: trace.correlationId || allocation.matchId,
+    traceparent: trace.traceparent || traceparentForCorrelation(trace.correlationId || allocation.matchId),
+    roster: new Map(allocation.roster.map((seat) => [seat.accountId, {
+      displayName: seat.displayName, team: seat.team, primaryIdx: seat.primaryIdx, secondaryIdx: seat.secondaryIdx,
+      joined: false, connected: false, released: false, graceEndsAt: null,
+      connectBy: Date.now() + 60_000, joinedAt: null, connectedAt: null,
+      connectedMs: 0, disconnectedAt: null,
+    }])),
+  };
+  activeMode = allocation.mode;
+  game.startMatch({ mode: activeMode, killLimit: KILL_LIMIT, botCount: BOTS, difficulty: 'regular' });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  if (TIME_LIMIT > 0) game.match.timeLimit = TIME_LIMIT;
+  server?.evidence?.identify?.({ matchId: allocation.matchId,
+    rulesetVersion: allocation.rulesetVersion, serverBuild: allocation.serverBuild });
+}
+const server = new GameServer(game, {
+  ticketVerifier: matchTicketVerifier,
+  matchBinder: REQUIRE_MATCH_TICKETS ? (identity) => {
+    if (!boundMatch || boundMatch.status === 'ended') return false;
+    const seat = boundMatch.roster.get(identity.sub);
+    return Boolean(seat && boundMatch.matchId === identity.matchId
+      && boundMatch.roomId === identity.roomId && boundMatch.mode === identity.mode
+      && seat.team === identity.team && seat.primaryIdx === identity.primaryIdx
+      && seat.secondaryIdx === identity.secondaryIdx);
+  } : null,
+});
+serverLog('info', 'server.map_ready', { colliders: game.world.boxes.length,
+  spawns: game.world.spawnPoints.length, botCount: BOTS, mode: MODE });
 
 // ── debug accounting ──────────────────────────────────────────────────────────────────
 //
@@ -103,13 +219,40 @@ game.bus?.on('damage', (e) => {
 // doing nothing, and not one shot registering, because on that server no shot COULD
 // register. A machine kept warm for hours makes this the normal case, not the edge case.
 const INTERMISSION_MS = 10000;
+const RECONNECT_GRACE_MS = 90_000;
+const heldEntities = new Map();
 let restartAt = 0;
 let matchesPlayed = 1;
 
 game.bus?.on('matchEnd', (result) => {
   if (restartAt) return;
+  if (boundMatch) {
+    observability.recordSpan({ correlationId: boundMatch.correlationId,
+      traceparent: boundMatch.traceparent, tier: 'match-server', name: 'match.terminal',
+      attributes: { component: 'match-authority', outcome: result?.reason || 'unknown' } });
+    boundMatch.status = 'ended';
+    const byAccount = new Map([...server.clients.values()]
+      .filter((client) => client.identity?.sub && client.entity)
+      .map((client) => [client.identity.sub, client.entity]));
+    for (const [accountId, held] of heldEntities) if (!byAccount.has(accountId)) byAccount.set(accountId, held.entity);
+    try {
+      boundMatch.result = buildCanonicalTerminalResult({ allocation: boundMatch,
+        matchResult: result, match: game.match, entitiesByAccount: byAccount,
+        evidence: server.evidence, endedAt: Date.now() });
+    } catch (error) {
+      // An incomplete evidence record cannot certify completed stats. Publishing `ended` with
+      // no result makes the control plane take its existing aborted/no-contest path instead.
+      boundMatch.result = null;
+      serverLog('error', 'match.terminal_refused', { correlationId: boundMatch.correlationId,
+        matchId: boundMatch.matchId, errorCode: safeErrorCode(error) });
+    }
+    serverLog('info', 'match.awaiting_release', { correlationId: boundMatch.correlationId,
+      matchId: boundMatch.matchId, outcome: boundMatch.result?.winnerTeam || 'uncertified' });
+    return;
+  }
   restartAt = Date.now() + INTERMISSION_MS;
-  console.log(`[server] match ended (${result?.reason ?? 'unknown'}) — restarting in ${INTERMISSION_MS / 1000}s`);
+  serverLog('info', 'match.ended', { outcome: result?.reason || 'unknown',
+    restartInMs: INTERMISSION_MS });
 });
 
 function restartMatch() {
@@ -119,7 +262,7 @@ function restartMatch() {
   // stamps its commands and its interpolation against the server tick, so rewinding it
   // strands them in a future the server no longer has snapshots for.
   const keepTick = game.tick;
-  game.startMatch({ mode: MODE, killLimit: KILL_LIMIT, botCount: BOTS, difficulty: 'regular' });
+  game.startMatch({ mode: activeMode, killLimit: KILL_LIMIT, botCount: BOTS, difficulty: 'regular' });
   game.tick = keepTick;
   game.match.phase = 'live';
   game.match.countdown = 0;
@@ -146,7 +289,8 @@ function restartMatch() {
   // The seed changed, and shot spread is addressed by it — see `GameServer._sendWelcome`.
   server.broadcastWelcome();
   matchesPlayed++;
-  console.log(`[server] match ${matchesPlayed} started — ${server.clients.size} clients, ${BOTS} bots`);
+  serverLog('info', 'match.started', { clientCount: server.clients.size, botCount: BOTS,
+    mode: activeMode });
 }
 
 /** The side with fewer live entities, so a joiner evens the match out rather than stacking it. */
@@ -174,6 +318,32 @@ let last = process.hrtime.bigint();
 let behind = 0;
 
 function pump() {
+  const wallNow = Date.now();
+  expireUnjoinedSeats(boundMatch?.roster, wallNow);
+  for (const [accountId, held] of heldEntities) {
+    if (held.expiresAt > wallNow) continue;
+    heldEntities.delete(accountId);
+    game.removeEntity(held.entity);
+    const seat = boundMatch?.roster.get(accountId);
+    if (seat) { seat.released = true; seat.connected = false; seat.graceEndsAt = held.expiresAt; }
+  }
+  // Allocation publishes handoffs before browsers have loaded the engine. The referee clock
+  // must not spend that loading interval deciding a match with nobody in it. Begin only once
+  // every roster seat has either authenticated or expired; WELCOME is sent directly during
+  // HELLO, so clients can finish connecting while fixed simulation remains held here.
+  if (boundMatch?.status === 'allocated') {
+    const seats = [...boundMatch.roster.values()];
+    const commandedAccounts = new Set([...server.clients.values()]
+      .filter((client) => client.authenticated && client.identity?.sub && client.stats.loadouts > 0)
+      .map((client) => client.identity.sub));
+    if (!commandedAccounts.size
+      || ![...boundMatch.roster].every(([accountId, seat]) => seat.released
+        || commandedAccounts.has(accountId))) return;
+    boundMatch.status = 'in-progress';
+    boundMatch.startedAt = wallNow;
+    serverLog('info', 'match.started', { clientCount: server.clients.size,
+      botCount: BOTS, mode: activeMode, correlationId: boundMatch.correlationId });
+  }
   if (restartAt && Date.now() >= restartAt) restartMatch();
   const now = process.hrtime.bigint();
   const dt = Number(now - last) / 1e9;
@@ -215,11 +385,12 @@ class WsServerTransport {
       try { this._handler?.(ab); } catch (e) {
         // A malformed message must not take the process down: on a server that is one
         // client ending the match for everyone.
-        console.error('[server] message handler threw', e.message);
+        serverLog('warn', 'transport.message_error', { errorCode: safeErrorCode(e) });
       }
     });
     sock.on('close', () => { this.closed = true; });
-    sock.on('error', (e) => { this.closed = true; console.error('[server] socket error', e.message); });
+    sock.on('error', (e) => { this.closed = true;
+      serverLog('warn', 'transport.socket_error', { errorCode: safeErrorCode(e) }); });
   }
 
   onMessage(fn) { this._handler = fn; }
@@ -236,11 +407,142 @@ class WsServerTransport {
 }
 
 const http_ = http.createServer((req, res) => {
+  const controlStartedAt = Date.now();
+  if (req.url === '/control/allocate' && req.method === 'POST') {
+    if (!controlAuthorized(req)) { res.writeHead(401); res.end(); return; }
+    if (draining) { res.writeHead(503); res.end(); return; }
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 16_384) req.destroy();
+    });
+    req.on('end', () => {
+      let allocation;
+      try { allocation = JSON.parse(raw); } catch { res.writeHead(400); res.end(); return; }
+      const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+        && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+      const accountIds = Array.isArray(allocation.roster) ? allocation.roster.map((seat) => seat.accountId) : [];
+      const validRoster = Array.isArray(allocation.roster) && allocation.roster.length >= 1
+        && allocation.roster.length <= MAX_CLIENTS && allocation.roster.every((seat) =>
+          exactKeys(seat, ['accountId', 'displayName', 'team', 'primaryIdx', 'secondaryIdx'])
+          && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(seat.accountId) && ['alpha', 'bravo'].includes(seat.team)
+          && typeof seat.displayName === 'string' && seat.displayName.length >= 1 && seat.displayName.length <= 32
+          && liveWeaponId('primary', seat.primaryIdx) && liveWeaponId('secondary', seat.secondaryIdx))
+        && new Set(accountIds).size === accountIds.length;
+      if (!exactKeys(allocation, ['matchId', 'roomId', 'mode', 'mapId', 'mapVersion',
+        'rulesetVersion', 'serverBuild', 'region', 'roster'])
+        || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(allocation.matchId)
+        || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(allocation.roomId)
+        || !['tdm', 'bomb'].includes(allocation.mode)
+        || allocation.mapId !== 'the-square' || allocation.mapVersion !== '1.0.0'
+        || allocation.rulesetVersion !== `${allocation.mode}-1.0.0`
+        || allocation.serverBuild !== '1.0.0'
+        || allocation.region !== GAME_REGION || !validRoster) {
+        res.writeHead(422); res.end(); return;
+      }
+      if (allocation.matchId === lastReleasedMatchId) { res.writeHead(409); res.end(); return; }
+      if (boundMatch && boundMatch.status !== 'ended') {
+        const same = boundMatch.matchId === allocation.matchId && boundMatch.roomId === allocation.roomId;
+        res.writeHead(same ? 200 : 409, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: same, matchId: boundMatch.matchId })); return;
+      }
+      if ([...server.clients.values()].some((client) => client.authenticated)) {
+        res.writeHead(409); res.end(); return;
+      }
+      if (matchTicketVerifier && !matchTicketVerifier.bindAllocation(allocation)) {
+        res.writeHead(409); res.end(); return;
+      }
+      const correlationId = correlationOf(req, allocation.matchId);
+      const traceparent = traceOf(req, correlationId);
+      activateAllocation(allocation, { correlationId, traceparent });
+      observability.recordSpan({ correlationId, traceparent, tier: 'match-server',
+        name: 'control.allocate', durationMs: Date.now() - controlStartedAt,
+        attributes: { component: 'match-control', status: 201 } });
+      res.writeHead(201, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, matchId: boundMatch.matchId, capacity: MAX_CLIENTS,
+        region: GAME_REGION, traceSpans: observability.timelineSpans(correlationId) }));
+    });
+    return;
+  }
+  if (req.url === '/control/status' && req.method === 'GET') {
+    if (!controlAuthorized(req)) { res.writeHead(401); res.end(); return; }
+    const correlationId = boundMatch?.correlationId || correlationOf(req, null);
+    if (correlationId) observability.recordSpan({ correlationId,
+      traceparent: boundMatch?.traceparent || traceOf(req, correlationId), tier: 'match-server',
+      name: 'control.status', durationMs: Date.now() - controlStartedAt,
+      attributes: { component: 'match-control', status: 200 } });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    const authenticated = [...server.clients.values()].filter((client) => client.authenticated).length;
+    res.end(JSON.stringify({ ok: true, region: GAME_REGION, capacity: MAX_CLIENTS,
+      connected: authenticated, available: Math.max(0, MAX_CLIENTS - authenticated),
+      draining, matchId: boundMatch?.matchId ?? null, roomId: boundMatch?.roomId ?? null,
+      status: boundMatch?.status ?? 'idle', phase: game.match?.phase ?? null,
+      result: boundMatch?.result ?? null,
+      traceSpans: correlationId ? observability.timelineSpans(correlationId) : [],
+      seats: boundMatch ? [...boundMatch.roster].map(([accountId, seat]) => ({
+        accountId, connected: seat.connected, released: seat.released,
+        graceEndsAt: seat.graceEndsAt ? new Date(seat.graceEndsAt).toISOString() : null,
+      })) : [] }));
+    return;
+  }
+  if (req.url === '/control/release' && req.method === 'POST') {
+    if (!controlAuthorized(req)) { res.writeHead(401); res.end(); return; }
+    let raw = '';
+    req.setEncoding('utf8'); req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      let input;
+      try { input = JSON.parse(raw); } catch { res.writeHead(400); res.end(); return; }
+      if (!input || Object.keys(input).length !== 1
+        || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(input.matchId)) { res.writeHead(422); res.end(); return; }
+      // Authenticated release is idempotent across process restart. An idle authority has no
+      // allocation to corrupt; returning 204 lets a platform terminal saga recover after the
+      // first release succeeded but its durable room reopen did not.
+      if (!boundMatch) { lastReleasedMatchId = input.matchId; res.writeHead(204); res.end(); return; }
+      if (input.matchId !== boundMatch.matchId) { res.writeHead(404); res.end(); return; }
+      if (boundMatch.status !== 'ended' && [...server.clients.values()].some((client) => client.authenticated)) { res.writeHead(409); res.end(); return; }
+      const correlationId = boundMatch.correlationId || correlationOf(req, input.matchId);
+      observability.recordSpan({ correlationId, traceparent: boundMatch.traceparent,
+        tier: 'match-server', name: 'control.release', durationMs: Date.now() - controlStartedAt,
+        attributes: { component: 'match-control', status: 204 } });
+      for (const client of [...server.clients.values()]) server.removeClient(client);
+      for (const held of heldEntities.values()) game.removeEntity(held.entity);
+      heldEntities.clear();
+      lastReleasedMatchId = boundMatch.matchId;
+      matchTicketVerifier?.releaseAllocation?.(boundMatch.matchId);
+      boundMatch = null;
+      res.writeHead(204); res.end();
+    });
+    return;
+  }
+  if (req.url === '/control/metrics' && req.method === 'GET') {
+    if (!controlAuthorized(req)) { res.writeHead(401); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(observability.snapshot()));
+    return;
+  }
+  if (req.url === '/control/drain' && req.method === 'POST') {
+    if (!controlAuthorized(req)) { res.writeHead(401); res.end(); return; }
+    let raw = ''; req.setEncoding('utf8'); req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      let input;
+      try { input = JSON.parse(raw); } catch { res.writeHead(400); res.end(); return; }
+      if (!input || Object.keys(input).length !== 1 || typeof input.draining !== 'boolean') {
+        res.writeHead(422); res.end(); return;
+      }
+      draining = input.draining;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, draining }));
+    });
+    return;
+  }
   // Fly health checks and anything else curious. Cheap, and it makes "is the match
   // actually ticking" answerable without a game client.
   if (req.url === '/health' || req.url === '/' || req.url.startsWith('/health?')) {
     // Debug-only detail, opt-in via `?debug=1`. See the accounting block above.
-    const debug = req.url.includes('debug=1') ? {
+    // Never expose combat coordinates, identities or damage accounting in production: it is
+    // deliberately a local acceptance surface and would otherwise be a public wallhack.
+    const debug = debugAuthorized(req) && req.url.includes('debug=1') ? {
       entities: game.entities.map((e) => ({
         id: e.id,
         kind: e.isPlayer ? 'player' : 'bot',
@@ -260,13 +562,18 @@ const http_ = http.createServer((req, res) => {
       sessionRtt: [...server.clients.values()].map((c) => ({
         id: c.id, entity: c.entity?.id, rttMs: +c.rttMs.toFixed(1),
         queued: c.queue.length, lastCommandSeq: c.lastCommandSeq,
+        accountId: c.identity?.sub ?? null, claimedTeam: c.identity?.team ?? null,
+        team: c.entity?.team ?? null, primaryIdx: c.identity?.primaryIdx ?? null,
+        secondaryIdx: c.identity?.secondaryIdx ?? null,
       })),
       matchPhase: game.match?.phase ?? null,
     } : undefined;
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      debug,
-      ok: true,
+    // Public liveness is intentionally one bit. Match phase, score, capacity, entity counts
+    // and command/session activity are all relayable live-match intelligence. The same local
+    // acceptance surface remains available only through the authenticated debug request.
+    if (!debug) { res.end(JSON.stringify({ ok: true })); return; }
+    res.end(JSON.stringify({ ok: true, debug,
       tick: game.tick,
       uptimeSec: Math.round(process.uptime()),
       clients: server.clients.size,
@@ -303,12 +610,15 @@ const wss = new WebSocketServer({
 });
 
 wss.on('connection', (sock, req) => {
-  if (server.clients.size >= MAX_CLIENTS) {
+  // Pre-HELLO sockets have a short deadline in GameServer and do not consume a player slot.
+  // Counting them here let twelve idle TCP peers permanently deny every legitimate player.
+  const authenticatedClients = [...server.clients.values()].filter((client) => client.authenticated).length;
+  if (authenticatedClients >= MAX_CLIENTS) {
     sock.close(1013, 'server full');
     return;
   }
   const transport = new WsServerTransport(sock);
-  const who = req.socket.remoteAddress;
+  const peerClass = networkClass(req.socket.remoteAddress);
 
   /**
    * Every connection gets its OWN entity — but **not until it has said hello** (§8.2 step 4:
@@ -320,18 +630,58 @@ wss.on('connection', (sock, req) => {
    * `GameServer._onHello`, which runs it only after the version check passes.
    */
   const makeEntity = () => {
+    const accountId = session.identity?.sub;
+    const allocationSeat = boundMatch?.roster.get(accountId);
+    const held = heldEntities.get(accountId);
+    if (held && held.expiresAt > Date.now()) {
+      heldEntities.delete(accountId);
+      session.isReconnect = true;
+      if (allocationSeat) {
+        allocationSeat.connected = true; allocationSeat.connectedAt = Date.now();
+        allocationSeat.disconnectedAt = null; allocationSeat.graceEndsAt = null;
+      }
+      server.evidence.recordConnection({ kind: 'reconnected', accountId,
+        entityId: held.entity.id, at: new Date().toISOString() });
+      serverLog('info', 'client.reconnected', { networkClass: peerClass,
+        clientCount: server.clients.size, correlationId: boundMatch?.correlationId });
+      return held.entity;
+    }
+    if (held) {
+      heldEntities.delete(session.identity.sub);
+      game.removeEntity(held.entity);
+    }
+    // A roster seat may allocate once. After its held body expires it is released, never
+    // silently turned into a fresh Bomb life by a late reconnect ticket.
+    if (REQUIRE_MATCH_TICKETS && (!allocationSeat || allocationSeat.released || allocationSeat.joined)) return null;
     const entity = new Player(game);
     entity.init();
     game.addEntity(entity);
-    game.weapons.giveLoadout(entity, ['ar_vector', 'pistol_sidewinder']);
+    const primary = liveWeaponId('primary', session.identity?.primaryIdx ?? 0);
+    const secondary = liveWeaponId('secondary', session.identity?.secondaryIdx ?? 0);
+    if (!primary || !secondary) throw new Error('verified ticket carried an unavailable loadout');
     // Pick a side BEFORE spawning. `Player.respawn` prefers spawn points matching the
     // entity's team, so a joiner that spawns first and is balanced afterwards materialises
     // in the enemy's half. And a joiner left on the default team 0 could not damage — or
     // be damaged by — anyone else who joined, since `damageScale` returns 0 for a
     // teammate and the hit is then discarded entirely.
-    entity.team = smallerTeam();
+    entity.team = session.identity ? (session.identity.team === 'bravo' ? 1 : 0) : smallerTeam();
     entity.respawn?.();
-    console.log(`[server] client ${session.id} joined from ${who} as entity ${entity.id} (${server.clients.size} online)`);
+    // Respawn equips defaults, so the signed allocation must be applied afterwards and stored
+    // for every subsequent spawn. Browser MSG_LOADOUT cannot override this authoritative pair.
+    session.loadout = [primary, secondary];
+    game.weapons.giveLoadout(entity, session.loadout);
+    if (allocationSeat) {
+      allocationSeat.joined = true;
+      allocationSeat.connected = true;
+      allocationSeat.joinedAt = Date.now();
+      allocationSeat.connectedAt = allocationSeat.joinedAt;
+      allocationSeat.disconnectedAt = null;
+      allocationSeat.graceEndsAt = null;
+      server.evidence.recordConnection({ kind: 'connected', accountId,
+        entityId: entity.id, at: new Date(allocationSeat.joinedAt).toISOString() });
+    }
+    serverLog('info', 'client.joined', { networkClass: peerClass,
+      clientCount: server.clients.size, correlationId: boundMatch?.correlationId });
     return entity;
   };
 
@@ -341,23 +691,64 @@ wss.on('connection', (sock, req) => {
     server.removeClient(session);
     // Only what the handshake actually allocated. A socket that never said hello has no
     // entity, and `removeEntity(undefined)` is a way to find that out at runtime.
-    if (session.entity) game.removeEntity(session.entity);
-    console.log(`[server] client ${session.id} left (${server.clients.size} online)`);
+    if (session.entity && session.identity?.sub) {
+      const seat = boundMatch?.roster.get(session.identity.sub);
+      const expiresAt = Date.now() + RECONNECT_GRACE_MS;
+      heldEntities.set(session.identity.sub, {
+        entity: session.entity, expiresAt,
+      });
+      if (seat) {
+        const at = Date.now();
+        if (seat.connectedAt) seat.connectedMs += Math.max(0, at - seat.connectedAt);
+        seat.connected = false; seat.connectedAt = null; seat.disconnectedAt = at;
+        seat.graceEndsAt = expiresAt;
+        server.evidence.recordConnection({ kind: 'disconnected', accountId: session.identity.sub,
+          entityId: session.entity.id, at: new Date(at).toISOString(), reason: 'socket-close' });
+      }
+    } else if (session.entity) game.removeEntity(session.entity);
+    serverLog('info', 'client.left', { networkClass: peerClass,
+      clientCount: server.clients.size, correlationId: boundMatch?.correlationId });
   });
 });
 
+let registered = false;
+async function announceMatchServer() {
+  if (!PLATFORM_CONTROL_URL) return;
+  const path = registered ? '/v1/control/match-servers/heartbeat' : '/v1/control/match-servers/register';
+  const body = registered
+    ? { serverId: SERVER_ID, capacity: MAX_CLIENTS, inUse: boundMatch ? MAX_CLIENTS : 0,
+      status: draining ? 'draining' : 'healthy' }
+    : { serverId: SERVER_ID, region: GAME_REGION, address: PUBLIC_WS_URL,
+      capacity: MAX_CLIENTS, build: '1.0.0' };
+  try {
+    const response = await fetch(new URL(path, PLATFORM_CONTROL_URL), {
+      method: 'POST', headers: { authorization: `Bearer ${MATCH_CONTROL_SECRET}`,
+        'content-type': 'application/json', 'x-client-build': '1.0.0' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(2_500),
+    });
+    if (response.ok) registered = true;
+    else if (response.status === 404) registered = false;
+  } catch { /* startup/redeploy overlap: the next heartbeat retries */ }
+}
+
 http_.listen(PORT, '0.0.0.0', () => {
-  console.log(`[server] listening on :${PORT} (tick ${(1 / FIXED_DT).toFixed(0)} Hz, max ${MAX_CLIENTS} clients)`);
+  serverLog('info', 'server.listening', { port: PORT,
+    tickHz: Number((1 / FIXED_DT).toFixed(0)), capacity: MAX_CLIENTS });
+  void announceMatchServer();
 });
+const registrationTimer = setInterval(() => void announceMatchServer(), 5_000);
+registrationTimer.unref();
 
 // A status line often enough to be useful in `fly logs`, rarely enough to be readable.
 setInterval(() => {
-  console.log(`[server] tick ${game.tick} | ${server.clients.size} clients | scores ${(game.match?.scores ?? []).join(':')}${behind ? ` | ${behind} ticks dropped` : ''}`);
+  serverLog('info', 'server.status', { tick: game.tick, clientCount: server.clients.size,
+    ticksDropped: behind });
 }, 30000).unref();
 
 const shutdown = (sig) => {
-  console.log(`[server] ${sig} — shutting down`);
+  serverLog('info', 'server.shutdown', { signal: sig });
   clearInterval(timer);
+  clearInterval(registrationTimer);
   for (const s of [...server.clients.values()]) server.removeClient(s);
   wss.close();
   http_.close(() => process.exit(0));

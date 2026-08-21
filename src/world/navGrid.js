@@ -367,7 +367,11 @@ export class NavGrid {
       ? ` — hints: +${hs.forcedWalkable} walkable, -${hs.forcedBlocked} blocked, `
         + `${hs.linksResolved}/${hs.linkHints} links, ${hs.coverApplied}/${hs.coverHints} cover`
       : ` — no manifest nav hints (${hs.source})`;
-    console.info(
+    if (typeof process !== 'undefined' && process.env?.OVERSTRIKE_STRUCTURED_LOGS === 'true') {
+      console.info(JSON.stringify({ ts: new Date().toISOString(), level: 'info', service: 'match-server',
+        event: 'nav.baked', cols: this.cols, rows: this.rows, cellMeters: CELL, walkable,
+        bakeMs: Number(this.stats.bakeMs.toFixed(1)), hintSource: hs.source }));
+    } else console.info(
       `[nav] baked ${this.cols}x${this.rows} @ ${CELL}m — ${walkable} walkable nodes in ${this.stats.bakeMs.toFixed(1)} ms${hintNote}`,
     );
   }

@@ -998,7 +998,7 @@ export class Engine {
     this.aoPass.enabled = on;
     this.compositePass.enabled = true; // always on — it also owns fade-to-black
     const u = this.compositePass.uniforms;
-    u.uGrain.value = on && s.get('filmGrain') ? 0.035 : 0.0;
+    u.uGrain.value = on ? 0.035 * Math.max(0, Math.min(1, Number(s.get('filmGrain')) || 0)) : 0.0;
     u.uVignette.value = s.get('vignette') ? 0.85 : 0.0;
     u.uAberration.value = on ? 0.0016 : 0.0;
     // With bloom off its target still holds whatever it last wrote, so the composite has
