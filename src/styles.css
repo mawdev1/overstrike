@@ -439,10 +439,13 @@ html.os-prefer-reduced-motion *::after {
   width: 0;
   height: 0;
   --sp: 6px;              /* gap from centre, written by JS */
-  --xh-len: calc(var(--hud-s) * 0.42);
-  --xh-w: calc(var(--hud-s) * 0.1);
+  --xh-size: 1;
+  --xh-thickness: 2;
+  --xh-opacity: 1;
+  --xh-len: calc(var(--hud-s) * 0.42 * var(--xh-size));
+  --xh-w: calc(var(--xh-thickness) * 1px);
   --xh-color: var(--acc);
-  opacity: 1;
+  opacity: var(--xh-opacity);
   transition: opacity var(--t-fast) var(--e-out);
   will-change: opacity;
 }
@@ -456,6 +459,7 @@ html.os-prefer-reduced-motion *::after {
   border-radius: 0.5px;
   transition: background var(--t-xf) linear;
 }
+.xh[data-outline="off"] i { box-shadow: none; }
 .xh .xh-t { left: 0; top: 0; width: var(--xh-w); height: var(--xh-len);
   transform: translate(-50%, calc(-100% - var(--sp))); }
 .xh .xh-b { left: 0; top: 0; width: var(--xh-w); height: var(--xh-len);
@@ -1343,6 +1347,37 @@ html.os-prefer-reduced-motion *::after {
 .hud-perf b { color: var(--acc); font-weight: 600; }
 .hud-perf .bad { color: var(--amber); }
 .hud-perf .worse { color: var(--dmg); }
+.hud-perf:not(.fps-on) > span:not(.p-net) { display: none; }
+.hud-perf[data-network="off"] .p-net { display: none; }
+
+.hud-captions {
+  --caption-bg: .75;
+  position: absolute;
+  z-index: 8;
+  left: 50%;
+  bottom: calc(var(--hud-s) * 4.8);
+  transform: translateX(-50%);
+  max-width: min(42rem, 80vw);
+  padding: .35em .7em;
+  background: rgba(4, 7, 10, var(--caption-bg));
+  color: var(--fg);
+  font: 700 calc(var(--hud-s) * .72)/1.3 var(--f-ui);
+  text-align: center;
+  letter-spacing: .04em;
+}
+.hud-captions:empty { display: none; }
+.hud-captions[data-size="small"] { font-size: calc(var(--hud-s) * .58); }
+.hud-captions[data-size="large"] { font-size: calc(var(--hud-s) * .88); }
+.hud-captions[data-size="extraLarge"] { font-size: calc(var(--hud-s) * 1.05); }
+
+#hud[data-hud-text-size="small"] { font-size: .86em; }
+#hud[data-hud-text-size="large"] { font-size: 1.16em; }
+#hud[data-hud-text-size="extraLarge"] { font-size: 1.32em; }
+#hud[data-objective-markers="minimal"] .bomb-world-markers { display: none; }
+
+html[data-color-vision="deuteranopia"] { --team-a:#66c2ff;--team-b:#ffcf66;--dmg:#ff9f43; }
+html[data-color-vision="protanopia"] { --team-a:#4fc3f7;--team-b:#ffd166;--dmg:#ffb347; }
+html[data-color-vision="tritanopia"] { --team-a:#7ee081;--team-b:#ff7eb6;--dmg:#ff5f8f; }
 
 /* ========================================================== death screen ==
    Death is the strongest beat the 2D layer owns. The world desaturates and

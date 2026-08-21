@@ -6,6 +6,10 @@ const field = Object.freeze({
   enum: (values, nullable = false) => ({ type: 'enum', values, nullable }),
 });
 
+export const CONNECTION_FAILURE_CODES = Object.freeze([
+  ...PLATFORM_ERROR_CODES, 'CLIENT_NETWORK', 'CLIENT_TIMEOUT',
+]);
+
 export const CLIENT_ERROR_CLASSES = Object.freeze([
   'webgl-init', 'asset-decode', 'net-decode', 'unhandled-rejection', 'render-loop', 'other',
 ]);
@@ -69,7 +73,7 @@ export const TELEMETRY_REGISTRY = Object.freeze({
   },
   'connection.failure': {
     version: 1, privacy: 'personal', fields: {
-      stage: field.enum(['platform', 'lobby', 'match']), code: field.enum(PLATFORM_ERROR_CODES),
+      stage: field.enum(['platform', 'lobby', 'match']), code: field.enum(CONNECTION_FAILURE_CODES),
     },
   },
   'settings.friction': {

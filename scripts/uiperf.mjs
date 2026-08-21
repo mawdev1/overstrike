@@ -532,12 +532,12 @@ try {
       g.setPaused(false);
       for (const b of g.bots.bots) { const st = g.match.statsFor(b); if (st) { st.kills = 2; st.deaths = 3; } }
       const me = g.match.statsFor(g.player);
-      me.kills = g.match.mode.scoreLimit; me.score = 4200; me.headshots = 6;
+      me.kills = g.match.killLimit; me.score = 4200; me.headshots = 6;
       me.shotsFired = 90; me.shotsHit = 44; me.bestStreak = 5;
       // Team modes end on `match.scores`, not on one operator's kill count.
-      g.match.scores[0] = g.match.mode.scoreLimit;
+      g.match.scores[0] = g.match.killLimit;
       g.match._checkEnd();
-      if (g.state !== 'gameover') g.match._end({ reason: 'score', winner: 0 });
+      if (g.state !== 'gameover') g.match._end({ reason: 'killLimit', winner: 0, winnerTeam: 0 });
     });
     await page.waitForTimeout(500);
     await shot('30-end-results', '.menu');

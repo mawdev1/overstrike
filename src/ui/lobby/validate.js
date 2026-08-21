@@ -1,4 +1,4 @@
-/** Contract validators for realtime-lobby.md 1.7.0. */
+/** Contract validators for realtime-lobby.md 1.8.0. */
 
 import { PLATFORM_ERROR_CODES, PLATFORM_ERROR_SPECS } from '../platform/errors.js';
 
@@ -26,6 +26,7 @@ const LOADOUT_KEYS = ['primaryIdx', 'secondaryIdx'];
 const COUNTDOWN_KEYS = ['endsAt', 'requiredReady', 'currentReady'];
 const CHAT_KEYS = ['id', 'accountId', 'displayName', 'text', 'ts', 'filtered'];
 const ENVELOPE_KEYS = ['t', 'seq', 'ts', 'correlationId', 'd'];
+const PING_KINDS = ['attack-a', 'attack-b', 'defend-a', 'defend-b', 'regroup', 'enemy-spotted'];
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isString = (value) => typeof value === 'string' && value.length > 0;
@@ -177,7 +178,8 @@ function validateError(value, path) {
 }
 
 function validateSnapshot(value, path) {
-  exactKeys(value, ['protocol', 'serverTime', 'heartbeatMs', 'graceMs', 'you', 'room', 'roster', 'countdown', 'chatHistory'], [], path);
+  exactKeys(value, ['protocol', 'serverTime', 'heartbeatMs', 'graceMs', 'you', 'room', 'roster',
+    'countdown', 'chatHistory', 'mutedAccountIds', 'pingCatalog', 'loadoutCatalog'], [], path);
   if (value.protocol !== 1 || !isIso(value.serverTime) || !isInt(value.heartbeatMs, 1) || !isInt(value.graceMs, 1)) fail(path, 'lobby snapshot metadata', value);
   exactKeys(value.you, ['accountId', 'team', 'ready', 'isOwner', 'seatHeldUntil'], [], `${path}.you`);
   if (!isId(value.you.accountId) || !oneOf(value.you.team, ['alpha', 'bravo', 'unassigned'])
@@ -196,6 +198,39 @@ function validateSnapshot(value, path) {
   }
   if (!Array.isArray(value.chatHistory) || value.chatHistory.length > 50) fail(`${path}.chatHistory`, 'array <= 50', value.chatHistory);
   value.chatHistory.forEach((item, index) => validateChatMessage(item, `${path}.chatHistory[${index}]`));
+  if (!Array.isArray(value.mutedAccountIds) || !value.mutedAccountIds.every(isId)
+    || new Set(value.mutedAccountIds).size !== value.mutedAccountIds.length
+    || value.mutedAccountIds.includes(value.you.accountId)) fail(`${path}.mutedAccountIds`, 'unique non-self account ULIDs', value.mutedAccountIds);
+  exactKeys(value.pingCatalog, ['version', 'kinds'], [], `${path}.pingCatalog`);
+  if (value.pingCatalog.version !== 1 || !Array.isArray(value.pingCatalog.kinds)
+    || value.pingCatalog.kinds.length !== PING_KINDS.length
+    || PING_KINDS.some((kind) => !value.pingCatalog.kinds.includes(kind))) fail(`${path}.pingCatalog`, 'closed ping catalog v1', value.pingCatalog);
+  exactKeys(value.loadoutCatalog, ['version', 'primary', 'secondary'], [], `${path}.loadoutCatalog`);
+  if (!isString(value.loadoutCatalog.version)) fail(`${path}.loadoutCatalog.version`, 'non-empty string', value.loadoutCatalog.version);
+  for (const slot of ['primary', 'secondary']) {
+    const items = value.loadoutCatalog[slot];
+    if (!Array.isArray(items) || items.length < 1) fail(`${path}.loadoutCatalog.${slot}`, 'non-empty catalog', items);
+    const indices = new Set();
+    for (let i = 0; i < items.length; i++) {
+      exactKeys(items[i], ['idx', 'label', 'eligible'], [], `${path}.loadoutCatalog.${slot}[${i}]`);
+      if (!isInt(items[i].idx) || indices.has(items[i].idx) || !isString(items[i].label)
+        || typeof items[i].eligible !== 'boolean') fail(`${path}.loadoutCatalog.${slot}[${i}]`, 'unique loadout item', items[i]);
+      indices.add(items[i].idx);
+    }
+    const selected = value.roster.find((item) => item.isLocal)?.loadout?.[`${slot}Idx`];
+    if (!items.some((item) => item.idx === selected && item.eligible)) fail(`${path}.loadoutCatalog.${slot}`, 'eligible local selection', selected);
+  }
+}
+
+function validatePingTarget(value, path) {
+  exactKeys(value, ['kind'], value?.kind === 'site' ? ['site'] : ['x', 'y', 'z'], path);
+  if (value.kind === 'site') {
+    exactKeys(value, ['kind', 'site'], [], path);
+    if (!oneOf(value.site, ['A', 'B'])) fail(`${path}.site`, 'A|B', value.site);
+  } else if (value.kind === 'world') {
+    exactKeys(value, ['kind', 'x', 'y', 'z'], [], path);
+    if (!['x', 'y', 'z'].every((key) => Number.isFinite(value[key]) && Math.abs(value[key]) <= 1000)) fail(path, 'bounded world vector', value);
+  } else fail(`${path}.kind`, 'site|world', value.kind);
 }
 
 function validateHandoff(value, path) {
@@ -207,9 +242,11 @@ function validateHandoff(value, path) {
     if (!isString(value[key])) fail(`${path}.${key}`, 'non-empty string', value[key]);
   }
   if (!isId(value.matchId)) fail(`${path}.matchId`, 'ULID', value.matchId);
-  let serverProtocol = null;
-  try { serverProtocol = new URL(value.serverUrl).protocol; } catch { /* reported below */ }
-  if (serverProtocol !== 'wss:') fail(`${path}.serverUrl`, 'wss URL', value.serverUrl);
+  let serverUrl = null;
+  try { serverUrl = new URL(value.serverUrl); } catch { /* reported below */ }
+  const loopbackWs = serverUrl?.protocol === 'ws:'
+    && ['localhost', '127.0.0.1', '[::1]', '::1'].includes(serverUrl.hostname);
+  if (serverUrl?.protocol !== 'wss:' && !loopbackWs) fail(`${path}.serverUrl`, 'wss URL (or loopback ws)', value.serverUrl);
   if (!oneOf(value.mode, ['tdm', 'bomb'])) fail(`${path}.mode`, 'tdm or bomb', value.mode);
   if (!isIso(value.expiresAt) || !isInt(value.reconnectGraceMs, 1)
     || !isInt(value.protocolVersion, 1) || !isInt(value.spectatorPolicyVersion, 1)
@@ -275,7 +312,15 @@ export function validateLobbyFrame(frame) {
     case 'match.failed': validateError(d, path); break;
     case 'chat.message': validateChatMessage(d, path); break;
     case 'chat.removed': exactKeys(d, ['id', 'reason'], [], path); if (!isId(d.id) || !isString(d.reason)) fail(path, 'chat removal', d); break;
-    case 'ping.placed': exactKeys(d, ['accountId', 'kind'], ['target'], path); if (!isId(d.accountId) || !isString(d.kind)) fail(path, 'ping', d); break;
+    case 'ping.placed':
+      exactKeys(d, ['accountId', 'kind'], ['target'], path);
+      if (!isId(d.accountId) || !PING_KINDS.includes(d.kind)) fail(path, 'closed ping kind', d);
+      if (Object.hasOwn(d, 'target')) validatePingTarget(d.target, `${path}.target`);
+      break;
+    case 'mute.changed':
+      exactKeys(d, ['accountId', 'muted'], [], path);
+      if (!isId(d.accountId) || typeof d.muted !== 'boolean') fail(path, 'mute projection', d);
+      break;
     case 'error': validateError(d, path); break;
     case 'heartbeat': exactKeys(d, ['serverTime'], [], path); if (!isIso(d.serverTime)) fail(`${path}.serverTime`, 'ISO timestamp', d.serverTime); break;
     default: return { known: false, frame };

@@ -1178,6 +1178,7 @@ function renderChat({ route, view, actions, isFeatureEnabled }) {
         onConfirm: () => actions.submit('reportPlayer', {
           subjectAccountId: accountId,
           category: category.value,
+          ...(message.id ? { chatMessageId: message.id } : {}),
           description: description.value || undefined,
         }, {
           onSuccess: (result) => {

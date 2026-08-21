@@ -753,7 +753,8 @@ export function mountAppShell({
     }
     const task = (async () => {
       try {
-        const runtime = await loadGameRuntime({ handoff, shell: controller });
+        const runtime = await loadGameRuntime({ handoff, shell: controller,
+          firstMatch: signupCompletedAt !== null });
         activeHandoff = handoff;
         runtimeLoaded = true;
         surface.hidden = true;
@@ -951,6 +952,7 @@ export function mountAppShell({
       featureFlags: featureFlags?.snapshot?.() || featureFlags?.getSnapshot?.() || null,
     }),
     isFeatureEnabled,
+    enterGame,
     setView,
     injectFixture(target, fixtureOrVariant = 'ready', data) {
       let fixture;

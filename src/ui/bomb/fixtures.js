@@ -22,7 +22,7 @@ export function baseBombMatchState(overrides = {}) {
     rulesetVersion: 'bomb-1.0.0',
     region: 'yyz',
     serverBuild: 'fixture-build',
-    protocolVersion: 2,
+    protocolVersion: 3,
     phase: 'live',
     phaseEndsAt: SERVER_NOW + 105_000,
     teams: {

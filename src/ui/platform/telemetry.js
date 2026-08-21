@@ -1,5 +1,7 @@
 import { createUlidFactory, isUlid } from './ids.js';
-import { TELEMETRY_REGISTRY, sanitizeTelemetryPayload } from './telemetry-registry.js';
+import {
+  CONNECTION_FAILURE_CODES, TELEMETRY_REGISTRY, sanitizeTelemetryPayload,
+} from './telemetry-registry.js';
 import { PLATFORM_ERROR_CODES } from './errors.js';
 
 const QUEUE_KEY = 'overstrike.telemetry.queue.v1';
@@ -12,6 +14,8 @@ const MAX_AGE_MS = 30 * 60 * 1000;
 const RETRY_MS = 30 * 1000;
 const encoder = new TextEncoder();
 const ERROR_CODES = new Set(PLATFORM_ERROR_CODES);
+const CONNECTION_CODES = new Set(CONNECTION_FAILURE_CODES);
+const UNLOAD_CREDENTIAL_MS = 14 * 60 * 1000;
 
 const ROUTE_STEPS = Object.freeze({
   welcome: ['internal', 'landing'],
@@ -65,8 +69,6 @@ export class TelemetryClient {
    * @param {{client: import('./client.js').PlatformClient, storage?: Storage|null,
    * navigator?: Navigator|null, document?: Document|null, window?: Window|null,
    * now?: () => number, ulid?: () => string, cadenceMs?: number,
-   * beaconUrl?: string|((meta: {correlationId: string, clientBuild: string,
-   * privacy: 'internal'|'personal'}) => string),
    * onConsentRequired?: (reason: string) => void}} options
    */
   constructor(options) {
@@ -79,9 +81,8 @@ export class TelemetryClient {
     this.now = options.now || Date.now;
     this.ulid = options.ulid || createUlidFactory();
     this.cadenceMs = options.cadenceMs ?? 10_000;
-    // No default is safe: the ordinary route requires two headers sendBeacon cannot set.
-    // Until a frozen beacon ingress exists, fail closed and retain the queue for normal flush.
-    this.beaconUrl = options.beaconUrl || null;
+    this.unloadCredentialUntil = 0;
+    this.unloadCredentialFlight = null;
     this.onConsentRequired = options.onConsentRequired || (() => {});
     this.enabled = true;
     this.queue = { internal: [], personal: [] };
@@ -96,7 +97,11 @@ export class TelemetryClient {
     };
     this.onPageHide = () => this.flushBeacon();
     this.unsubscribeSession = this.client.session?.subscribe?.((event) => {
-      if (event.type === 'revoked') this.setConsent({ telemetryPersonal: null });
+      if (event.type === 'authenticated') void this.refreshUnloadCredential();
+      if (event.type === 'revoked') {
+        this.unloadCredentialUntil = 0;
+        this.setConsent({ telemetryPersonal: null });
+      }
     }) || null;
     this.#restore();
   }
@@ -204,7 +209,7 @@ export class TelemetryClient {
   }
 
   recordConnectionFailure({ stage, code }) {
-    if (!ERROR_CODES.has(code)) return false;
+    if (!CONNECTION_CODES.has(code)) return false;
     return this.record('connection.failure', { stage, code });
   }
 
@@ -226,6 +231,7 @@ export class TelemetryClient {
     this.timer = setInterval(() => { void this.flush(); }, this.cadenceMs);
     this.document?.addEventListener?.('visibilitychange', this.onVisibility);
     this.window?.addEventListener?.('pagehide', this.onPageHide);
+    if (this.client.session?.accessToken) void this.refreshUnloadCredential();
     return this;
   }
 
@@ -249,26 +255,42 @@ export class TelemetryClient {
     return this.flushFlight;
   }
 
-  /**
-   * Hidden/pagehide delivery uses sendBeacon as required. Browsers cannot attach custom headers
-   * to a beacon, so deployments should provide `beaconUrl` pointing at an ingress that supplies
-   * X-Correlation-Id and X-Client-Build before forwarding to the platform route.
-   */
+  /** Acquire the short-lived, httpOnly credential used only by the unload ingress. */
+  refreshUnloadCredential() {
+    if (!this.client.session?.accessToken) return Promise.resolve(false);
+    if (this.unloadCredentialUntil > this.now()) return Promise.resolve(true);
+    if (this.unloadCredentialFlight) return this.unloadCredentialFlight;
+    this.unloadCredentialFlight = this.client.request('/v1/telemetry/unload/credential', {
+      method: 'POST', auth: true, maxAttempts: 1,
+    }).then((response) => {
+      if (response.status !== 204) return false;
+      this.unloadCredentialUntil = this.now() + UNLOAD_CREDENTIAL_MS;
+      return true;
+    }).catch(() => false).finally(() => { this.unloadCredentialFlight = null; });
+    return this.unloadCredentialFlight;
+  }
+
+  /** Response-independent, best-effort delivery to the one frozen same-origin beacon ingress. */
   flushBeacon() {
-    if (!this.beaconUrl || typeof this.navigator?.sendBeacon !== 'function') return false;
+    if (typeof this.navigator?.sendBeacon !== 'function') return false;
     let sentAny = false;
     for (const privacy of ['internal', 'personal']) {
       const selected = this.#select(privacy);
       if (!selected.length) continue;
+      // While signed in, personal attribution must come from the scoped cookie. Before signup,
+      // the signed receipt + clientSessionId remain the subject exactly as on the normal route.
+      if (privacy === 'personal' && this.client.session?.accessToken
+        && this.unloadCredentialUntil <= this.now()) continue;
       let correlationId = this.ulid();
       const eventIds = new Set(selected.map((item) => item.event.correlationId));
       while (eventIds.has(correlationId)) correlationId = this.ulid();
-      const body = this.#body(privacy, selected.map((item) => item.event));
-      const url = typeof this.beaconUrl === 'function'
-        ? this.beaconUrl({ correlationId, clientBuild: this.client.clientBuild, privacy }) : this.beaconUrl;
+      let deliveryId = this.ulid();
+      while (eventIds.has(deliveryId) || deliveryId === correlationId) deliveryId = this.ulid();
+      const body = { ...this.#body(privacy, selected.map((item) => item.event)),
+        correlationId, deliveryId, clientBuild: this.client.clientBuild };
       let accepted = false;
       try {
-        accepted = this.navigator.sendBeacon(url,
+        accepted = this.navigator.sendBeacon(`${this.client.baseUrl || ''}/v1/telemetry/unload`,
           new Blob([JSON.stringify(body)], { type: 'application/json' }));
       } catch { accepted = false; }
       if (accepted) {
@@ -287,6 +309,9 @@ export class TelemetryClient {
       if (!selected.length) continue;
       const body = this.#body(privacy, selected.map((item) => item.event));
       try {
+        if (privacy === 'personal' && this.client.session?.accessToken) {
+          await this.refreshUnloadCredential();
+        }
         const response = await this.client.request('/v1/telemetry/client', {
           method: 'POST', body, auth: privacy === 'personal', maxAttempts: 1,
         });

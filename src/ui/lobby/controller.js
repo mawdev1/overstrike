@@ -9,7 +9,13 @@ const DEFAULT_CLOCK = Object.freeze({
   clearTimeout: (id) => clearTimeout(id),
 });
 const CLIENT_TYPES = new Set(['team.request', 'ready.set', 'loadout.set', 'launch.request',
-  'chat.send', 'ping.send', 'state.resync', 'heartbeat.ack', 'leave']);
+  'chat.send', 'ping.send', 'mute.set', 'state.resync', 'heartbeat.ack', 'leave']);
+const PING_KINDS = new Set(['attack-a', 'attack-b', 'defend-a', 'defend-b', 'regroup', 'enemy-spotted']);
+const CLOSE_ERRORS = Object.freeze({
+  4001: 'SESSION_TOKEN_INVALID', 4002: 'SLOT_RESERVATION_EXPIRED', 4003: 'ROOM_NOT_FOUND',
+  4004: 'ROOM_FULL', 4005: 'SANCTIONED', 4006: 'ROOM_REMOVED', 4007: 'ROOM_CLOSED',
+  4008: 'AUTH_SESSION_REPLACED', 4009: 'RECONNECT_GRACE_EXPIRED', 4010: 'PROTOCOL_VERSION_MISMATCH',
+});
 const UTC_MILLIS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const isUtcMillis = (value) => {
   if (typeof value !== 'string' || !UTC_MILLIS_RE.test(value)) return false;
@@ -17,10 +23,20 @@ const isUtcMillis = (value) => {
   return Number.isFinite(millis) && new Date(millis).toISOString() === value;
 };
 
-function socketUrl(base, ticket) {
+function socketUrl(base, lastSeq = null) {
   const url = new URL(base, globalThis.location?.href || 'http://localhost/');
-  url.searchParams.set('ticket', ticket);
+  if (Number.isInteger(lastSeq) && lastSeq >= 0) url.searchParams.set('lastSeq', String(lastSeq));
   return url.toString();
+}
+
+function socketProtocols(ticket) {
+  return ['overstrike-lobby-v1', `overstrike-ticket.${ticket}`];
+}
+
+function secureSocketProtocol(value) {
+  const url = new URL(value, globalThis.location?.href || 'http://localhost/');
+  if (url.protocol === 'wss:') return true;
+  return url.protocol === 'ws:' && ['localhost', '127.0.0.1', '[::1]', '::1'].includes(url.hostname);
 }
 
 function validateTicket(ticket, { requireGraceEndsAt = false } = {}) {
@@ -33,8 +49,7 @@ function validateTicket(ticket, { requireGraceEndsAt = false } = {}) {
       && !isUtcMillis(ticket.graceEndsAt))) {
     throw new TypeError('A valid lobby socket URL, ticket, and expiry are required.');
   }
-  const protocol = new URL(ticket.lobbySocketUrl, globalThis.location?.href || 'http://localhost/').protocol;
-  if (protocol !== 'wss:') throw new TypeError('Lobby socket URL must use wss.');
+  if (!secureSocketProtocol(ticket.lobbySocketUrl)) throw new TypeError('Lobby socket URL must use wss (except loopback development).');
   return ticket;
 }
 
@@ -45,7 +60,18 @@ function validateIntent(t, d) {
   if (t === 'ready.set' && (keys.length !== 1 || typeof d.ready !== 'boolean')) throw new TypeError('ready.set requires a boolean.');
   if (t === 'loadout.set' && (keys.length !== 2 || !Number.isInteger(d.primaryIdx) || d.primaryIdx < 0 || !Number.isInteger(d.secondaryIdx) || d.secondaryIdx < 0)) throw new TypeError('loadout.set requires non-negative indices.');
   if (t === 'chat.send' && (keys.length !== 1 || typeof d.text !== 'string' || d.text.length < 1 || d.text.length > 200)) throw new TypeError('chat.send requires 1–200 characters.');
-  if (t === 'ping.send' && (!keys.includes('kind') || typeof d.kind !== 'string' || !d.kind || keys.some((key) => !['kind', 'target'].includes(key)))) throw new TypeError('ping.send requires a kind and optional target.');
+  if (t === 'ping.send' && (!keys.includes('kind') || !PING_KINDS.has(d.kind) || keys.some((key) => !['kind', 'target'].includes(key)))) throw new TypeError('ping.send requires a catalog kind and optional target.');
+  if (t === 'ping.send' && Object.hasOwn(d, 'target')) {
+    const target = d.target;
+    const validSite = target && typeof target === 'object' && !Array.isArray(target)
+      && Object.keys(target).length === 2 && target.kind === 'site' && ['A', 'B'].includes(target.site);
+    const validWorld = target && typeof target === 'object' && !Array.isArray(target)
+      && Object.keys(target).length === 4 && target.kind === 'world'
+      && ['x', 'y', 'z'].every((key) => Number.isFinite(target[key]) && Math.abs(target[key]) <= 1000);
+    if (!validSite && !validWorld) throw new TypeError('ping.send target must be a site or bounded world coordinate.');
+  }
+  if (t === 'mute.set' && (keys.length !== 2 || typeof d.accountId !== 'string'
+    || !d.accountId || typeof d.muted !== 'boolean')) throw new TypeError('mute.set requires an accountId and boolean.');
   if (t === 'state.resync' && (keys.length !== 1 || !Number.isInteger(d.lastSeq) || d.lastSeq < 0)) throw new TypeError('state.resync requires a non-negative lastSeq.');
   if (['launch.request', 'heartbeat.ack', 'leave'].includes(t) && keys.length !== 0) throw new TypeError(`${t} requires an empty payload.`);
 }
@@ -135,11 +161,21 @@ export function createLobbyController({
     }
   };
 
-  function send(t, d, { correlationId = createCorrelationId(), pending = false } = {}) {
+  function send(t, d, { correlationId = createCorrelationId(), pending = false,
+    traceparent = null } = {}) {
     validateIntent(t, d);
     if (typeof correlationId !== 'string' || !correlationId) throw new TypeError('Lobby correlationId is required.');
     if (!socket || socket.readyState !== 1) throw new Error('Lobby socket is not open.');
-    const frame = { t, correlationId, d: copy(d) };
+    const trace = traceparent || (() => {
+      const bytes = new Uint8Array(24);
+      globalThis.crypto?.getRandomValues?.(bytes);
+      // Environments without Web Crypto are test-only; the non-zero fallback is still a valid
+      // W3C envelope and correlation remains the durable join key.
+      if (!bytes.some(Boolean)) bytes.fill(1);
+      const hex = [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+      return `00-${hex.slice(0, 32)}-${hex.slice(32)}-01`;
+    })();
+    const frame = { t, correlationId, traceparent: trace, d: copy(d) };
     socket.send(JSON.stringify(frame));
     if (pending) {
       state.pending[correlationId] = { t, d: copy(d), accountId: state.you?.accountId || null };
@@ -255,7 +291,8 @@ export function createLobbyController({
     if (Date.parse(ticket.expiresAt) <= clock.now()) throw new Error('Lobby ticket expired before use.');
     state.status = reconnect ? 'reconnecting' : 'connecting';
     emit();
-    socket = webSocketFactory(socketUrl(ticket.lobbySocketUrl, ticket.lobbyTicket));
+    socket = webSocketFactory(socketUrl(ticket.lobbySocketUrl,
+      reconnect ? state.lastSeq : null), socketProtocols(ticket.lobbyTicket));
     const attachedSocket = socket;
     socketTimer = clock.setTimeout(() => {
       socketTimer = null;
@@ -283,7 +320,7 @@ export function createLobbyController({
       finishWelcome(new Error('Lobby socket closed before synchronization.'));
       if (reconnect && state.reconnect) {
         reconnectFailed(Object.assign(new Error(event?.reason || 'Lobby reconnect socket closed.'), {
-          code: event?.code === 4009 ? 'RECONNECT_GRACE_EXPIRED' : 'CLIENT_NETWORK',
+          code: CLOSE_ERRORS[event?.code] || 'CLIENT_NETWORK',
         }), generation);
       } else beginReconnect(event);
     });
@@ -380,17 +417,15 @@ export function createLobbyController({
     leave() { return send('leave', {}); },
     setMuted(accountId, muted = true) {
       if (typeof accountId !== 'string' || !accountId) throw new TypeError('accountId is required.');
-      const set = new Set(state.mutedAccountIds);
-      if (muted) set.add(accountId); else set.delete(accountId);
-      state.mutedAccountIds = [...set];
-      if (muted) state.chatHistory = state.chatHistory.filter((message) => message.accountId !== accountId);
-      emit();
+      return send('mute.set', { accountId, muted }, { pending: true });
     },
     reportPlayer(payload = {}) {
       if (typeof reportAdapter !== 'function') return Promise.reject(new Error('Player reporting is unavailable.'));
       if (typeof payload.subjectAccountId !== 'string' || !payload.subjectAccountId
         || !['cheating', 'harassment', 'offensive-name', 'griefing', 'other'].includes(payload.category)
         || (payload.matchId !== undefined && (typeof payload.matchId !== 'string' || !payload.matchId))
+        || (payload.chatMessageId !== undefined
+          && (typeof payload.chatMessageId !== 'string' || !payload.chatMessageId))
         || (payload.description !== undefined && typeof payload.description !== 'string')) {
         return Promise.reject(new TypeError('Invalid player report.'));
       }
@@ -399,6 +434,7 @@ export function createLobbyController({
         category: payload.category,
       };
       if (payload.matchId !== undefined) body.matchId = payload.matchId;
+      if (payload.chatMessageId !== undefined) body.chatMessageId = payload.chatMessageId;
       if (payload.description !== undefined) body.description = payload.description;
       return Promise.resolve(reportAdapter(body));
     },

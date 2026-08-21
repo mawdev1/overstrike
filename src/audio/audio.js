@@ -163,6 +163,7 @@ const SURFACE_SOUND = {
 };
 
 const EMPTY = Object.freeze({});
+const ANNOUNCER_SOUNDS = new Set(['matchStart', 'matchEnd', 'streakReady', 'killConfirm']);
 
 /* ---------------------------------------------------------------- *
  * Module scratch — never allocate in a per-frame path.
@@ -198,6 +199,8 @@ export class AudioEngine {
     this._master = 0.8;
     this._sfx = 1.0;
     this._music = 0.45;
+    this._ui = 0.8;
+    this._announcer = 1.0;
 
     /** @type {any[]} live voices */
     this.voices = [];
@@ -353,6 +356,8 @@ export class AudioEngine {
     const m = s.get('masterVolume'); if (typeof m === 'number') this._master = clamp(m, 0, 1);
     const x = s.get('sfxVolume'); if (typeof x === 'number') this._sfx = clamp(x, 0, 1);
     const u = s.get('musicVolume'); if (typeof u === 'number') this._music = clamp(u, 0, 1);
+    const ui = s.get('uiVolume'); if (typeof ui === 'number') this._ui = clamp(ui, 0, 1);
+    const ann = s.get('announcerVolume'); if (typeof ann === 'number') this._announcer = clamp(ann, 0, 1);
     this.music.volume = this._music;
   }
 
@@ -361,7 +366,8 @@ export class AudioEngine {
     if (!s || typeof s.onChange !== 'function') return;
     try {
       this._unsubs.push(s.onChange((key) => {
-        if (key !== '*' && key !== 'masterVolume' && key !== 'sfxVolume' && key !== 'musicVolume') return;
+        if (key !== '*' && !['masterVolume', 'sfxVolume', 'musicVolume', 'uiVolume',
+          'announcerVolume'].includes(key)) return;
         this._readSettings();
         this._applyVolumes(0.08);
       }));
@@ -692,6 +698,7 @@ export class AudioEngine {
       src.playbackRate.value = clamp(rate, 0.25, 4);
 
       let vol = (o.volume != null ? o.volume : 1);
+      if (o.ui) vol *= o.channel === 'announcer' ? (this._announcer ?? 1) : (this._ui ?? 1);
       if (!o.ui) vol *= 1 + (Math.random() * 2 - 1) * GAIN_SCATTER;
 
       // Air absorption + occlusion decide the per-voice lowpass.
@@ -782,6 +789,11 @@ export class AudioEngine {
 
       this.voices.push(voice);
       if (hrtf) this._hrtfVoices++;
+      this.game?.bus?.emit?.('audioCaption', {
+        name,
+        channel: o.channel || (o.ui ? 'ui' : 'sfx'),
+        position: pos ? { x: pos.x, y: pos.y, z: pos.z } : null,
+      });
       return voice;
     } catch (err) {
       try { src && src.disconnect(); } catch { /* ignore */ }
@@ -804,6 +816,7 @@ export class AudioEngine {
       priority: o.priority != null ? o.priority : (PRIORITY[name] ?? 86),
       scatter: o.scatter != null ? o.scatter : 0.012,
       ui: true,
+      channel: o.channel || (ANNOUNCER_SOUNDS.has(name) ? 'announcer' : 'ui'),
     });
   }
 

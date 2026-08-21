@@ -72,6 +72,7 @@ export class Minimap {
     this._pulse = 0;
     this._cssSize = 0;
     this._visible = true;
+    this._orientation = 'playerUp';
     this._uav = false;
     this._callout = '';
 
@@ -162,6 +163,11 @@ export class Minimap {
     if (this._visible === v) return;
     this._visible = v;
     this.el.classList.toggle('off', !v);
+  }
+
+  setOrientation(value) {
+    this._orientation = value === 'northUp' ? 'northUp' : 'playerUp';
+    this.el.dataset.orientation = this._orientation;
   }
 
   /* ------------------------------------------------------------- contacts */
@@ -491,7 +497,8 @@ export class Minimap {
     const cy = H / 2;
     const R = W * 0.5;
     const s = (W * 0.5) / VIEW_RADIUS;      // pixels per metre on screen
-    const yaw = me.yaw || 0;
+    const playerYaw = me.yaw || 0;
+    const yaw = this._orientation === 'northUp' ? 0 : playerYaw;
     const cosY = Math.cos(yaw);
     const sinY = Math.sin(yaw);
 
@@ -611,6 +618,7 @@ export class Minimap {
     const pr = W * 0.036;
     ctx.save();
     ctx.translate(cx, cy);
+    if (this._orientation === 'northUp') ctx.rotate(-playerYaw);
     ctx.beginPath();
     ctx.moveTo(0, -pr * 1.35);
     ctx.lineTo(pr * 0.92, pr * 0.95);

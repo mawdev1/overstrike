@@ -8,6 +8,7 @@ import {
   validateLobbyFrame,
 } from '../src/ui/lobby/index.js';
 import { createLobbyStub, LOBBY_SCENARIO_NAMES } from '../platform/src/modules/stubs/lobby.js';
+import { publicLoadoutCatalog } from '../platform/src/shared/liveCatalog.js';
 
 let checks = 0;
 const check = (condition, message) => { assert.ok(condition, message); checks++; };
@@ -50,7 +51,7 @@ function member(accountId, { local = false, owner = false, team = 'alpha', ready
   return {
     accountId, displayName: local ? 'Local Player' : 'Other Player', team, ready,
     isOwner: owner, isLocal: local, connection: 'connected', estimatedRttMs: 24,
-    loadout: { primaryIdx: 0, secondaryIdx: 1 }, joinedAt: iso(-60_000),
+    loadout: { primaryIdx: 0, secondaryIdx: 0 }, joinedAt: iso(-60_000),
   };
 }
 
@@ -62,7 +63,9 @@ function snapshot(roomId = ROOM_ALPHA, chatHistory = []) {
   return {
     protocol: 1, serverTime: iso(), heartbeatMs: 15000, graceMs: 90000,
     you: { accountId: ACCOUNT_LOCAL, team: 'alpha', ready: false, isOwner: true, seatHeldUntil: null },
-    room: room(roomId), roster, countdown: null, chatHistory,
+    room: room(roomId), roster, countdown: null, chatHistory, mutedAccountIds: [],
+    pingCatalog: { version: 1, kinds: ['attack-a', 'attack-b', 'defend-a', 'defend-b', 'regroup', 'enemy-spotted'] },
+    loadoutCatalog: publicLoadoutCatalog(),
   };
 }
 
@@ -80,7 +83,7 @@ function handoff() {
     matchId: MATCH_ALPHA, serverUrl: 'wss://match.example/ws', sessionTicket: 'match-secret',
     expiresAt: iso(60_000), reconnectGraceMs: 90000, mapId: 'the-square', mapVersion: '1.0.0',
     mode: 'tdm', rulesetVersion: 'tdm-1.0.0', region: 'yyz', serverBuild: '2026.08.20',
-    protocolVersion: 2, series: { roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, overtime: false },
+    protocolVersion: 3, series: { roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, overtime: false },
     spectatorPolicyVersion: 1,
     sites: [
       { id: 'site-A', site: 'A', callout: 'Civic Hall', center: { x: 0, y: 0, z: 0 }, box },
@@ -253,7 +256,8 @@ async function controllerChecks() {
   invalidTicketController.destroy();
   const controller = createLobbyController({
     roomId: ROOM_ALPHA, clock, random: () => 0.5, createCorrelationId: correlationId,
-    webSocketFactory(url) { const socket = new FakeSocket(url); sockets.push(socket); return socket; },
+    webSocketFactory(url, protocols) { const socket = new FakeSocket(url); socket.protocols = protocols;
+      sockets.push(socket); return socket; },
     reconnectTicket: async ({ attempt }) => ({
       lobbySocketUrl: 'wss://lobby.example/v1/lobby', lobbyTicket: `fresh-${attempt}`,
       expiresAt: iso(30_000), graceEndsAt: iso(90_000),
@@ -267,7 +271,9 @@ async function controllerChecks() {
   });
   equal(sockets.length, 1, 'connect must construct one socket');
   const initialUrl = new URL(sockets[0].url);
-  equal(initialUrl.searchParams.get('ticket'), 'initial-secret', 'ticket must use the contracted socket query');
+  equal(initialUrl.searchParams.get('ticket'), null, 'ticket must never enter the socket URL');
+  equal(sockets[0].protocols, ['overstrike-lobby-v1', 'overstrike-ticket.initial-secret'],
+    'ticket uses the WebSocket protocol header rather than URL/history');
   equal(initialUrl.searchParams.get('old'), '1', 'socket URL parameters must be preserved');
   sockets[0].open();
   sockets[0].receive(frame('lobby.welcome', 0, snapshot()));
@@ -320,11 +326,11 @@ async function controllerChecks() {
   sockets[0].receive(frame('ready.changed', 9, { accountId: ACCOUNT_LOCAL, ready: false, clearedReason: 'loadout-change' }));
   check(controller.getSnapshot().notice.includes('loadout-change'), 'readiness invalidation reason must remain visible');
 
-  const loadoutId = controller.setLoadout({ primaryIdx: 2, secondaryIdx: 3 });
+  const loadoutId = controller.setLoadout({ primaryIdx: 1, secondaryIdx: 0 });
   equal(controller.getSnapshot().roster[0].loadout.primaryIdx, 0, 'loadout request must preserve authoritative values');
-  equal(controller.getSnapshot().optimistic.loadout, { primaryIdx: 2, secondaryIdx: 3 }, 'loadout request must expose separate pending values');
+  equal(controller.getSnapshot().optimistic.loadout, { primaryIdx: 1, secondaryIdx: 0 }, 'loadout request must expose separate pending values');
   const updatedLocal = member(ACCOUNT_LOCAL, { local: true, owner: true, team: 'bravo' });
-  updatedLocal.loadout = { primaryIdx: 2, secondaryIdx: 3 };
+  updatedLocal.loadout = { primaryIdx: 1, secondaryIdx: 0 };
   sockets[0].receive(frame('roster.delta', 10, { added: [], updated: [updatedLocal], removed: [] }, loadoutId));
   equal(Object.keys(controller.getSnapshot().pending).length, 0, 'authoritative roster delta must settle loadout');
 
@@ -333,19 +339,25 @@ async function controllerChecks() {
     id: CHAT_LOCAL, accountId: ACCOUNT_LOCAL, displayName: 'Local Player', text: 'hello room', ts: iso(), filtered: false,
   }, chatId));
   equal(controller.getSnapshot().chatHistory.at(-1).text, 'hello room', 'chat confirmation must append authoritative message');
-  controller.setMuted(ACCOUNT_OTHER, true);
-  sockets[0].receive(frame('chat.message', 12, {
+  const muteId = controller.setMuted(ACCOUNT_OTHER, true);
+  sockets[0].receive(frame('mute.changed', 12, { accountId: ACCOUNT_OTHER, muted: true }, muteId));
+  sockets[0].receive(frame('chat.message', 13, {
     id: CHAT_OTHER, accountId: ACCOUNT_OTHER, displayName: 'Other Player', text: 'muted', ts: iso(), filtered: false,
   }));
   check(!controller.getSnapshot().chatHistory.some((item) => item.id === CHAT_OTHER), 'muted account messages must not render');
-  sockets[0].receive(frame('chat.removed', 13, { id: CHAT_LOCAL, reason: 'moderated' }));
+  sockets[0].receive(frame('chat.removed', 14, { id: CHAT_LOCAL, reason: 'moderated' }));
   equal(controller.getSnapshot().chatHistory.length, 0, 'moderation retraction must remove shipped chat');
 
-  const pingId = controller.sendPing('site-a');
-  sockets[0].receive(frame('ping.placed', 14, { accountId: ACCOUNT_LOCAL, kind: 'site-a' }, pingId));
+  const pingId = controller.sendPing('attack-a');
+  sockets[0].receive(frame('ping.placed', 15, { accountId: ACCOUNT_LOCAL, kind: 'attack-a' }, pingId));
   equal(Object.keys(controller.getSnapshot().pending).length, 0, 'authoritative ping must settle pending intent');
-  await controller.reportPlayer({ subjectAccountId: ACCOUNT_OTHER, category: 'griefing', description: 'Blocked team route.' });
-  equal(reports[0], { subjectAccountId: ACCOUNT_OTHER, category: 'griefing', description: 'Blocked team route.' }, 'report adapter must receive only contracted HTTP fields');
+  await controller.reportPlayer({ subjectAccountId: ACCOUNT_OTHER, category: 'griefing',
+    chatMessageId: CHAT_OTHER, description: 'Blocked team route.' });
+  equal(reports[0], { subjectAccountId: ACCOUNT_OTHER, category: 'griefing',
+    chatMessageId: CHAT_OTHER, description: 'Blocked team route.' },
+  'report adapter must preserve the evidence-linked chat message id');
+  await rejects(() => controller.reportPlayer({ subjectAccountId: ACCOUNT_OTHER, category: 'griefing',
+    chatMessageId: '' }), TypeError, 'report chat message ids must be non-empty strings');
   await rejects(() => controller.reportPlayer({ subjectAccountId: ACCOUNT_OTHER, category: 'invented' }), TypeError, 'report categories must be closed');
 
   sockets[0].receive(frame('heartbeat', 15, { serverTime: iso(15_000) }));
@@ -370,7 +382,8 @@ async function controllerChecks() {
   equal(clock.runNext(), 1000, 'first reconnect attempt must start after one second');
   await flush();
   equal(sockets.length, 2, 'unexpected close must request and open a fresh-ticket socket');
-  equal(new URL(sockets[1].url).searchParams.get('ticket'), 'fresh-1', 'reconnect must not replay consumed ticket');
+  equal(new URL(sockets[1].url).searchParams.get('ticket'), null, 'reconnect URL contains no credential');
+  equal(sockets[1].protocols[1], 'overstrike-ticket.fresh-1', 'reconnect must not replay consumed ticket');
   sockets[1].open();
   equal(sockets[1].sent[0].t, 'state.resync', 'reconnected socket must request authoritative state');
   equal(sockets[1].sent[0].d.lastSeq, 22, 'reconnect resync must name last incorporated sequence');
@@ -637,7 +650,12 @@ async function shellAdapterChecks() {
 
   const teamConfirmation = adapter.setTeam({ roomId: ROOM_ALPHA, team: 'bravo' });
   const teamId = sockets[0].sent.at(-1).correlationId;
-  equal(sockets[0].sent.at(-1), { t: 'team.request', correlationId: teamId, d: { team: 'bravo' } }, 'shell team payload must map to exact realtime intent');
+  const teamIntent = sockets[0].sent.at(-1);
+  equal({ t: teamIntent.t, correlationId: teamIntent.correlationId, d: teamIntent.d },
+    { t: 'team.request', correlationId: teamId, d: { team: 'bravo' } },
+    'shell team payload must map to exact realtime intent');
+  check(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/.test(teamIntent.traceparent),
+    'shell team intent carries a valid W3C launch trace context');
   equal(adapter.getLobbySnapshotNow().roster[0].team, 'alpha', 'adapter must not replace authoritative roster with pending team');
   equal(adapter.getLobbySnapshotNow().optimistic.team, 'bravo', 'adapter must retain separate pending team treatment');
   sockets[0].receive(frame('team.changed', 2, { accountId: ACCOUNT_LOCAL, team: 'bravo', byServer: false }, teamId));
@@ -648,15 +666,15 @@ async function shellAdapterChecks() {
   equal(sockets[0].sent.at(-1).d, { ready: true }, 'shell ready payload must drop roomId on the realtime wire');
   sockets[0].receive(frame('ready.changed', 3, { accountId: ACCOUNT_LOCAL, ready: true }, readyId));
   await readyConfirmation;
-  const loadoutConfirmation = adapter.setLoadout({ roomId: ROOM_ALPHA, primaryIdx: 2, secondaryIdx: 3 });
+  const loadoutConfirmation = adapter.setLoadout({ roomId: ROOM_ALPHA, primaryIdx: 1, secondaryIdx: 0 });
   const loadoutId = sockets[0].sent.at(-1).correlationId;
-  equal(sockets[0].sent.at(-1).d, { primaryIdx: 2, secondaryIdx: 3 }, 'shell loadout must map only exact indices');
+  equal(sockets[0].sent.at(-1).d, { primaryIdx: 1, secondaryIdx: 0 }, 'shell loadout must map only exact indices');
   sockets[0].receive(frame('ready.changed', 4, {
     accountId: ACCOUNT_LOCAL, ready: false, clearedReason: 'loadout-change',
   }, loadoutId));
   check(Object.hasOwn(adapter.getLobbySnapshotNow().pending, loadoutId), 'correlated readiness clearing must not falsely confirm loadout');
   const changedLocal = member(ACCOUNT_LOCAL, { local: true, owner: true, team: 'bravo', ready: true });
-  changedLocal.loadout = { primaryIdx: 2, secondaryIdx: 3 };
+  changedLocal.loadout = { primaryIdx: 1, secondaryIdx: 0 };
   sockets[0].receive(frame('roster.delta', 5, { added: [], updated: [changedLocal], removed: [] }, loadoutId));
   await loadoutConfirmation;
 
@@ -672,17 +690,20 @@ async function shellAdapterChecks() {
   sockets[0].receive(frame('chat.message', 8, { id: CHAT_ADAPTER, accountId: ACCOUNT_LOCAL,
     displayName: 'Local Player', text: 'adapter chat', ts: iso(), filtered: false }, chatId));
   await chatConfirmation;
-  const pingConfirmation = adapter.sendPing({ roomId: ROOM_ALPHA, kind: 'site-a' });
+  const pingConfirmation = adapter.sendPing({ roomId: ROOM_ALPHA, kind: 'attack-a' });
   const pingId = sockets[0].sent.at(-1).correlationId;
-  equal(sockets[0].sent.at(-1).d, { kind: 'site-a' }, 'shell ping must preserve the exact controller-supplied kind');
-  sockets[0].receive(frame('ping.placed', 9, { accountId: ACCOUNT_LOCAL, kind: 'site-a' }, pingId));
+  equal(sockets[0].sent.at(-1).d, { kind: 'attack-a' }, 'shell ping must preserve the exact controller-supplied kind');
+  sockets[0].receive(frame('ping.placed', 9, { accountId: ACCOUNT_LOCAL, kind: 'attack-a' }, pingId));
   await pingConfirmation;
-  adapter.mutePlayer({ roomId: ROOM_ALPHA, accountId: ACCOUNT_OTHER, muted: true });
+  const mutePromise = adapter.mutePlayer({ roomId: ROOM_ALPHA, accountId: ACCOUNT_OTHER, muted: true });
+  const muteId = sockets[0].sent.at(-1).correlationId;
+  sockets[0].receive(frame('mute.changed', 10, { accountId: ACCOUNT_OTHER, muted: true }, muteId));
+  await mutePromise;
   check(adapter.getLobbySnapshotNow().mutedAccountIds.includes(ACCOUNT_OTHER), 'shell mute must update controller display filtering');
   await adapter.reportPlayer({ subjectAccountId: ACCOUNT_OTHER, category: 'griefing' });
   equal(reports, [{ subjectAccountId: ACCOUNT_OTHER, category: 'griefing' }], 'shell report must retain the exact HTTP report body');
 
-  sockets[0].receive(frame('match.ready', 10, handoff()));
+  sockets[0].receive(frame('match.ready', 11, handoff()));
   equal(handoffs.length, 1, 'match.ready must trigger the shell handoff seam exactly once');
   const active = await adapter.getActiveMatch();
   equal(active.handoff.matchId, MATCH_ALPHA, 'match loading must consume the validated in-memory handoff');

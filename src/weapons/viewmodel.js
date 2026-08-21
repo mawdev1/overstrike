@@ -1187,7 +1187,8 @@ export class Viewmodel {
       this._lastPitch = owner.pitch;
       this._haveLast = true;
     }
-    const swayScale = (1 - ads) * (1 - this.lowerAmount);
+    const settingSway = clamp(Number(this.game?.settings?.get?.('weaponSway')) || 0, 0, 1);
+    const swayScale = (1 - ads) * (1 - this.lowerAmount) * settingSway;
     this.swayX = damp(this.swayX, clamp(-dYaw * 2.4, -0.05, 0.05), 9, dt);
     this.swayY = damp(this.swayY, clamp(-dPitch * 2.0, -0.05, 0.05), 9, dt);
 
@@ -1203,12 +1204,12 @@ export class Viewmodel {
     this.bobPhase += dt * (7.0 + bobSpeed * 5.5) * (bobSpeed > 0.02 ? 1 : 0.0);
     this.breathPhase += dt * 1.35;
 
-    const bobAmp = bobSpeed * 0.016 * (1 - ads * 0.88) * (1 - this.lowerAmount);
+    const bobAmp = bobSpeed * 0.016 * (1 - ads * 0.88) * (1 - this.lowerAmount) * settingSway;
     const bobX = Math.sin(this.bobPhase) * bobAmp;
     const bobY = -Math.abs(Math.cos(this.bobPhase)) * bobAmp * 0.9;
-    const breath = Math.sin(this.breathPhase) * 0.0026 * (1 - ads * 0.55) * (1 - bobSpeed * 0.5);
-    const idleX = Math.sin(this.time * 0.72) * 0.0022 * (1 - ads) * (1 - bobSpeed);
-    const idleY = Math.cos(this.time * 0.53) * 0.0018 * (1 - ads) * (1 - bobSpeed);
+    const breath = Math.sin(this.breathPhase) * 0.0026 * (1 - ads * 0.55) * (1 - bobSpeed * 0.5) * settingSway;
+    const idleX = Math.sin(this.time * 0.72) * 0.0022 * (1 - ads) * (1 - bobSpeed) * settingSway;
+    const idleY = Math.cos(this.time * 0.53) * 0.0018 * (1 - ads) * (1 - bobSpeed) * settingSway;
 
     // ---------------------------------------------------------- pose blend
     // hip -> ADS. The ADS position is derived from the optic so the reticle lands on

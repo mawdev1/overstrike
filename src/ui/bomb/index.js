@@ -23,6 +23,7 @@ export {
 export {
   buildLocalBombSample,
   createLocalBombHud,
+  buildFacadeBombSample,
   projectLocalSiteMarker,
   resolveManifestCallout,
   sitesFromManifest,

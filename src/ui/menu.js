@@ -188,7 +188,7 @@ export class Menu {
    */
   _progSig() {
     const d = progression.data;
-    return `${d.level}|${d.xp}|${d.updatedAt}`;
+    return `${progression.getAuthority()}|${d.level}|${d.xp}|${d.updatedAt}`;
   }
 
   /* ======================================================================
@@ -356,11 +356,13 @@ export class Menu {
     const st = progression.getStats();
 
     d.lvl.textContent = String(sum.level);
-    d.title.textContent = sum.rank;
+    d.title.textContent = sum.authority === 'server' ? 'SERVER CAREER' : sum.rank;
     d.bar.style.setProperty('--f', sum.ratio.toFixed(3));
     d.into.textContent = fmtInt(sum.intoLevel);
     d.need.textContent = sum.maxed ? '—' : fmtInt(sum.needed);
-    if (sum.maxed) {
+    if (sum.authority === 'server') {
+      d.next.textContent = 'LOADOUT AND UNLOCKS ARE SERVER-AUTHORITATIVE';
+    } else if (sum.maxed) {
       d.next.innerHTML = `<b>MAX RANK</b> — level ${LEVEL_MAX} reached.`;
     } else {
       const nxt = progression.getNextUnlock(WEAPON_LIST);
@@ -393,7 +395,9 @@ export class Menu {
         <div class="ch-v num">${fmtInt(c.value)} / ${fmtInt(c.goal)}</div>
       </div>`;
     }
-    d.challenges.innerHTML = ch || '<div class="mouse-note">No challenges registered.</div>';
+    d.challenges.innerHTML = sum.authority === 'server'
+      ? '<div class="mouse-note">Practice challenges are not used in authenticated matches.</div>'
+      : ch || '<div class="mouse-note">No challenges registered.</div>';
   }
 
   /* ------------------------------------------------- pause status panel -- */
@@ -1458,7 +1462,7 @@ export class Menu {
   _refreshHeader() {
     const sum = progression.getSummary();
     this.el.sysLvl.textContent = String(sum.level);
-    this.el.sysRank.textContent = sum.rank;
+    this.el.sysRank.textContent = sum.authority === 'server' ? 'SERVER' : sum.rank;
     this.el.sysXp.style.setProperty('--f', sum.ratio.toFixed(3));
   }
 

@@ -363,38 +363,60 @@ async function testTelemetryPrivacyAndBatches() {
   retryTelemetry.stop();
 }
 
-async function testBeaconFailsClosedWithoutIngress() {
+async function testFrozenUnloadIngress() {
   const storage = new MemoryStorage();
-  let beaconCalls = 0;
+  const beaconCalls = [];
   let normalCalls = 0;
   const client = {
-    baseUrl: 'https://platform.invalid', clientBuild: '1',
+    baseUrl: '', clientBuild: '1',
     request: async (_path, options) => {
       normalCalls += 1;
       return { status: 202, data: { accepted: options.body.events.length, rejected: 0,
         consentReceiptError: null, correlationId: '00000000000000000000000000' } };
     },
   };
-  const navigator = { sendBeacon: () => { beaconCalls += 1; return true; } };
+  const navigator = { sendBeacon: (url, body) => { beaconCalls.push({ url, body }); return true; } };
   const telemetry = createTelemetryClient({ client, storage, navigator, document: null, window: null,
     ulid });
   telemetry.record('client.fps', { p50: 60, p01: 20, windowSec: 10 });
-  assert.equal(telemetry.flushBeacon(), false);
-  assert.equal(beaconCalls, 0, 'ordinary route is never used for a headerless beacon');
-  await telemetry.flush();
-  assert.equal(normalCalls, 1, 'the record remains available for a compliant normal flush');
+  assert.equal(telemetry.flushBeacon(), true);
+  assert.equal(beaconCalls[0].url, '/v1/telemetry/unload');
+  const body = JSON.parse(await beaconCalls[0].body.text());
+  assert.equal(body.clientBuild, '1');
+  assert.match(body.correlationId, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+  assert.match(body.deliveryId, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+  assert.notEqual(body.correlationId, body.deliveryId);
+  assert.equal(body.events.length, 1);
+  assert.equal(normalCalls, 0, 'beacon delivery does not masquerade as a normal request');
 
-  let beaconUrl = null;
-  const configured = createTelemetryClient({ client, storage: new MemoryStorage(), navigator,
-    document: null, window: null, ulid,
-    beaconUrl: (meta) => {
-      beaconUrl = `/beacon?build=${encodeURIComponent(meta.clientBuild)}&cid=${meta.correlationId}`;
-      return beaconUrl;
+  const personalCalls = [];
+  const signedInClient = {
+    baseUrl: '', clientBuild: '1', session: { accessToken: 'memory-only-token' },
+    request: async (path, options) => {
+      personalCalls.push({ path, options });
+      return { status: 204, data: null };
     },
-  });
-  configured.record('client.fps', { p50: 60, p01: 20, windowSec: 10 });
-  assert.equal(configured.flushBeacon(), true);
-  assert.match(beaconUrl, /^\/beacon\?build=1&cid=[0-9A-HJKMNP-TV-Z]{26}$/);
+  };
+  const signedIn = createTelemetryClient({ client: signedInClient,
+    storage: new MemoryStorage(), navigator, document: null, window: null, ulid });
+  signedIn.setConsent({ telemetryPersonal: true, receipt: 'signed-receipt' });
+  signedIn.record('flow.step', { step: 'signin', outcome: 'viewed', errorCode: null });
+  assert.equal(signedIn.flushBeacon(), false,
+    'signed-in personal delivery waits for the subject-bound httpOnly credential');
+  assert.equal(await signedIn.refreshUnloadCredential(), true);
+  assert.equal(personalCalls[0].path, '/v1/telemetry/unload/credential');
+  assert.equal(personalCalls[0].options.auth, true);
+  assert.equal(signedIn.flushBeacon(), true);
+  const personalBody = JSON.parse(await beaconCalls.at(-1).body.text());
+  assert.equal(personalBody.clientSessionId, signedIn.getClientSessionId());
+  assert.equal(personalBody.consentReceipt, 'signed-receipt');
+
+  const signedOut = createTelemetryClient({ client, storage: new MemoryStorage(), navigator,
+    document: null, window: null, ulid });
+  signedOut.setConsent({ telemetryPersonal: true, receipt: 'session-bound-receipt' });
+  signedOut.record('flow.step', { step: 'signup', outcome: 'viewed', errorCode: null });
+  assert.equal(signedOut.flushBeacon(), true,
+    'signed-out personal delivery remains receipt and client-session bound');
 }
 
 function testHighLevelTelemetryHooks() {
@@ -420,6 +442,9 @@ function testHighLevelTelemetryHooks() {
   assert.equal(telemetry.recordReturnOutcome({ outcome: 'completed', returnedToLobby: true }), true);
   assert.equal(telemetry.recordSettingsFriction({ category: 'accessibility',
     duringFirstSession: true }), true);
+  assert.equal(telemetry.recordConnectionFailure({ stage: 'platform', code: 'CLIENT_NETWORK' }), true);
+  assert.equal(telemetry.recordConnectionFailure({ stage: 'match', code: 'CLIENT_TIMEOUT' }), true);
+  assert.equal(telemetry.recordConnectionFailure({ stage: 'match', code: 'CLIENT_PROTOCOL' }), false);
   const persisted = [...storage.values.values()].join('\n');
   assert.equal(persisted.includes('raw error message'), false);
   assert.equal(persisted.includes('raw text'), false);
@@ -429,6 +454,19 @@ async function testShellContractMappings() {
   const calls = [];
   const telemetryCalls = [];
   const settingsCalls = [];
+  const correlationId = '00000000000000000000000000';
+  const timestamp = new Date().toISOString();
+  const profile = (consent = null, embedded = false) => ({ accountId: 'account-a', displayName: 'Player',
+    createdAt: timestamp, privacy: { presenceVisibility: 'everyone', statsVisibility: 'everyone' },
+    consent, moderation: { status: 'clear', activeSanctions: [] },
+    flags: { nameChangeAvailableAt: null, setupNextStep: null },
+    ...(embedded ? {} : { correlationId }) });
+  const room = (roomId = 'room-a') => ({ roomId, name: 'Fixture room', region: 'yyz',
+    mapId: 'the-square', mapVersion: '1.0.0', mode: 'bomb', rulesetVersion: 'bomb-1.0.0',
+    build: '1.0.0', status: 'open', capacity: 8, playerCount: 2, joinable: true,
+    joinBlockedReason: null, hasPassword: false, ownerAccountId: 'account-a', estimatedRttMs: null,
+    settings: { killLimit: null, roundsToWin: 7, maxRounds: 12, roundLengthSec: 105,
+      backfill: false, requiredReady: 2, minPlayers: 2 } });
   const telemetry = {
     getClientSessionId: () => '00000000000000000000000123',
     setConsent: (value) => telemetryCalls.push(['consent', value]),
@@ -439,42 +477,56 @@ async function testShellContractMappings() {
     session: { announceRevocation: (id) => telemetryCalls.push(['revoked', id]) },
     request: async (path, options = {}) => {
       calls.push({ path, options });
-      let responseData = { correlationId: '00000000000000000000000000' };
+      let responseData = { correlationId };
+      if (path === '/v1/onboarding/eligibility') responseData = {
+        eligible: true, receipt: 'eligibility-receipt', expiresAt: timestamp,
+        policyVersion: 1, correlationId,
+      };
       if (path.startsWith('/v1/onboarding/consent')) responseData = {
         telemetryPersonal: options.body?.telemetryPersonal ?? false,
-        policyVersion: 1, decidedAt: new Date().toISOString(), subject: 'client-session',
-        receipt: 'receipt', correlationId: '00000000000000000000000000',
+        policyVersion: 1, decidedAt: timestamp,
+        ...(options.method === 'PUT' ? {} : { currentPolicyVersion: 1 }),
+        subject: 'client-session',
+        receipt: 'receipt', correlationId,
       };
-      if (path === '/v1/rooms') responseData = { items: [{ roomId: 'room-a', mapId: 'map-a',
-        playerCount: 2, capacity: 8 }], nextCursor: null,
-      correlationId: '00000000000000000000000000' };
+      if (path === '/v1/rooms') responseData = { items: [room()], nextCursor: null, correlationId };
       if (path.startsWith('/v1/presence/online')) responseData = { items: [{
         accountId: 'account-online', displayName: 'Online Player', state: 'online',
         joinable: false, roomId: null,
-      }], nextCursor: null, correlationId: '00000000000000000000000000' };
+      }], nextCursor: null, correlationId };
       if (path === '/v1/rooms' && options.method === 'POST') responseData = {
-        room: { roomId: 'room-created' }, roster: [], countdown: null,
-        reservationId: 'reservation-created', expiresAt: new Date().toISOString(),
+        room: room('room-created'), roster: [], countdown: null,
+        reservationId: 'reservation-created', expiresAt: timestamp,
         lobbySocketUrl: 'wss://lobby.example/ws', lobbyTicket: 'ticket-created',
-        correlationId: '00000000000000000000000000',
+        correlationId,
+      };
+      if (path === '/v1/rooms/room-a/team') responseData = {
+        ...room(), roster: [], countdown: null, correlationId,
       };
       if (path === '/v1/auth/sessions') responseData = { sessions: [{ sessionId: 'session-a',
-        deviceLabel: 'Browser', isCurrent: false }], correlationId: '00000000000000000000000000' };
+        deviceLabel: 'Browser', userAgentClass: 'browser', ipClass: 'public',
+        createdAt: timestamp, lastSeenAt: timestamp, isCurrent: false }], correlationId };
       if (path === '/v1/profile/me/settings') responseData = { schemaVersion: 1, version: 2,
         values: { sensitivity: 1, keybinds: { jump: { primary: 'Space', secondary: null } } },
-        updatedAt: new Date().toISOString(), correlationId: '00000000000000000000000000' };
-      return { data: responseData, status: path.includes('/sessions/') ? 204 : 200,
-        headers: new Headers({ ETag: '"1"' }) };
+        updatedAt: timestamp, correlationId };
+      const empty = path.includes('/sessions/') || path.endsWith('/leave')
+        || path.endsWith('/recovery/complete') || path.endsWith('/verify/complete')
+        || path.endsWith('/terms/accept');
+      return { data: empty ? null : responseData, status: empty ? 204 : 200,
+        correlationId, headers: new Headers({ ETag: '"1"' }) };
     },
     signIn: async (body) => {
       calls.push({ path: '/v1/auth/signin', options: { body } });
-      return { data: { profile: { accountId: 'account-a', consent: null }, consentReceipt: null } };
+      return { data: { accessToken: 'token', expiresAt: timestamp,
+        session: { sessionId: 'session-a', deviceLabel: 'Browser', createdAt: timestamp },
+        profile: profile(null, true), consentReceipt: null, correlationId } };
     },
     signUp: async (body) => {
       calls.push({ path: '/v1/auth/signup', options: { body } });
-      return { data: { profile: { accountId: 'account-a', consent: {
-        telemetryPersonal: true, policyVersion: 1, decidedAt: new Date().toISOString(),
-      } }, consentReceipt: 'account-receipt' } };
+      const consent = { telemetryPersonal: true, policyVersion: 1, decidedAt: timestamp };
+      return { data: { accessToken: 'token', expiresAt: timestamp,
+        session: { sessionId: 'session-a', deviceLabel: 'Browser', createdAt: timestamp },
+        profile: profile(consent, true), consentReceipt: 'account-receipt', correlationId } };
     },
     signOut: async ({ all }) => { calls.push({ path: all ? 'signOutAll' : 'signOut' });
       return { data: null, status: 204 }; },
@@ -516,7 +568,8 @@ async function testShellContractMappings() {
   assert.equal(calls.at(-1).options.idempotent, true);
   const sessions = await api.listSessions();
   assert.deepEqual(sessions.sessions[0], {
-    sessionId: 'session-a', deviceLabel: 'Browser', isCurrent: false,
+    sessionId: 'session-a', deviceLabel: 'Browser', userAgentClass: 'browser', ipClass: 'public',
+    createdAt: timestamp, lastSeenAt: timestamp, isCurrent: false,
     id: 'session-a', device: 'Browser', current: false,
   });
   await api.revokeSession({ sessionId: 'session-a' });
@@ -536,6 +589,173 @@ async function testShellContractMappings() {
   await api.signOutAll();
   assert.equal(calls.at(-1).path, 'signOutAll');
   assert.equal(api.sendChat, undefined, 'WebSocket chat is not invented as an HTTP endpoint');
+}
+
+async function testLegacyProgressionImportStaysUnverified() {
+  const lifetimeKeys = ['kills', 'deaths', 'assists', 'headshots', 'longshots', 'shotsFired',
+    'shotsHit', 'wins', 'losses', 'draws', 'matches', 'playtime', 'longestShot', 'bestStreak',
+    'score', 'captures', 'confirms', 'denies', 'streaksEarned'];
+  const weaponKeys = ['xp', 'kills', 'headshots', 'shotsFired', 'shotsHit'];
+  const authData = () => ({ accessToken: 'token', expiresAt: '2026-08-21T01:00:00.000Z',
+    session: { sessionId: '01J00000000000000000000004', deviceLabel: 'Browser',
+      createdAt: '2026-08-21T00:00:00.000Z' },
+    profile: { accountId: '01J00000000000000000000001', displayName: 'Player',
+      createdAt: '2026-08-21T00:00:00.000Z',
+      privacy: { presenceVisibility: 'everyone', statsVisibility: 'everyone' }, consent: null,
+      moderation: { status: 'clear', activeSanctions: [] },
+      flags: { nameChangeAvailableAt: null, setupNextStep: null } },
+    consentReceipt: null, correlationId: '01J00000000000000000000002' });
+  const values = new Map([['overstrike.progress.v1', JSON.stringify({
+    schema: 1, xp: 999999999, lifetime: { kills: 999999999 },
+    weapons: { rifle: { kills: 999999999 } },
+  })]]);
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+  };
+  const calls = [];
+  const client = {
+    sessionState: { authenticated: true },
+    async signIn() {
+      return { data: authData() };
+    },
+    async request(path, options = {}) {
+      calls.push({ path, options });
+      assert.equal(path, '/v1/profile/me/progression-import');
+      return { status: 200, correlationId: '01J00000000000000000000002', headers: new Headers(),
+        data: { source: 'localStorage:overstrike.progress.v1', verified: false,
+          importedAt: '2026-08-21T00:00:00.000Z', data: { schema: 1, xp: 999999999,
+            lifetime: Object.fromEntries(lifetimeKeys.map((key) => [key,
+              key === 'kills' ? 999999999 : 0])),
+            weapons: { rifle: Object.fromEntries(weaponKeys.map((key) => [key,
+              key === 'kills' ? 999999999 : 0])) },
+            challenges: [] },
+          alreadyImported: false, correlationId: '01J00000000000000000000002' } };
+    },
+  };
+  const api = createShellApi({ client, legacyStorage: storage });
+  const result = await api.signIn({ email: 'person@example.test', password: 'secret' });
+  assert.equal(result.profile.accountId, '01J00000000000000000000001');
+  assert.equal(calls.length, 1, 'authenticated migration imports the legacy blob exactly once');
+  assert.equal(calls[0].options.body.progress.lifetime.kills, 999999999,
+    'client forwards hostile legacy data without treating it as authoritative locally');
+  assert.equal(values.has('overstrike.progress.v1'), true,
+    'one-shot import preserves the local practice blob');
+  assert.equal(values.get('overstrike.progress.imported.v1'), 'done');
+  await api.signIn({ email: 'person@example.test', password: 'secret' });
+  assert.equal(calls.length, 1, 'the separate completion marker prevents repeated imports');
+
+  const rejecting = createShellApi({ client: { ...client,
+    request: async () => ({ status: 200, headers: new Headers(),
+      correlationId: '01J00000000000000000000003', data: {
+        source: 'localStorage:overstrike.progress.v1', verified: true,
+        data: {}, alreadyImported: false,
+      } }) }, legacyStorage: {
+    getItem: (key) => key === 'overstrike.progress.v1' ? '{"xp":1}' : null,
+    setItem() {},
+  } });
+  await assert.rejects(() => rejecting.signIn({ email: 'person@example.test', password: 'secret' }),
+    (error) => error.code === 'CLIENT_PROTOCOL',
+    'the client refuses a server projection that promotes modified legacy data to verified');
+}
+
+async function testClosedShellSuccessSchemas() {
+  const response = (data, status = 200) => ({ data, status, headers: new Headers(),
+    correlationId: '01J00000000000000000000009' });
+  const rejected = async (body, invoke, clientExtras = {}) => {
+    const api = createShellApi({ client: {
+      sessionState: { authenticated: true },
+      request: async () => response(body),
+      ...clientExtras,
+    }, legacyStorage: null, telemetry: { getClientSessionId: () => '01J00000000000000000000008',
+      setConsent() {} } });
+    await assert.rejects(() => invoke(api), (error) => error.code === 'CLIENT_PROTOCOL');
+  };
+
+  await rejected({ version: 1, evaluatedAt: '2026-08-21T00:00:00.000Z',
+    expiresAt: '2026-08-21T01:00:00.000Z', flags: {}, correlationId: 'c', rolloutRules: [] },
+  (api) => api.getFlags());
+  await rejected({ telemetryPersonal: false, policyVersion: 1,
+    decidedAt: '2026-08-21T00:00:00.000Z', subject: 'account', correlationId: 'c' },
+  (api) => api.getConsent());
+  await rejected({ items: 'not-an-array', nextCursor: null, correlationId: 'c' },
+    (api) => api.listRooms());
+  await rejected({ matchId: 'm', roomId: 'r', graceEndsAt: 12,
+    serverNow: '2026-08-21T00:00:00.000Z', correlationId: 'c' },
+  (api) => api.getActiveMatch());
+  await rejected({ matchId: 'm', status: 'pending', mode: 'bomb', mapId: 'the-square',
+    mapVersion: '1.0.0', startedAt: null, endedAt: null, retryAfterMs: 2000,
+    correlationId: 'c', clientWinner: 'alpha' }, (api) => api.getMatch({ matchId: 'm' }));
+  await rejected({ schemaVersion: 1, version: 2, values: {},
+    updatedAt: '2026-08-21T00:00:00.000Z', correlationId: 'c', accountId: 'leak' },
+  (api) => api.getSettings());
+  await rejected(null, (api) => api.signIn({ email: 'person@example.test', password: 'secret' }), {
+    signIn: async () => response({ accessToken: 'token' }),
+  });
+
+  await rejected({ eligible: true, receipt: 'r', expiresAt: '2026-02-30T00:00:00.000Z',
+    policyVersion: 1, correlationId: 'c' }, (api) => api.checkEligibility({
+    dateOfBirth: '1990-01-01', jurisdiction: 'CA-ON',
+  }));
+  await rejected({ available: false, policy: { rule: 'reserved', detail: 'leak' },
+    correlationId: 'c' }, (api) => api.checkDisplayName({ displayName: 'Staff' }));
+  await rejected({ correlationId: 'c', accepted: true },
+    (api) => api.startRecovery({ email: 'person@example.test' }));
+  await rejected({ version: 1, url: '/legal/terms/v1',
+    publishedAt: '2026-08-21T00:00:00+00:00', correlationId: 'c' },
+  (api) => api.getTerms());
+  await rejected({ items: [{ accountId: 'a', displayName: 'Player', state: 'online',
+    joinable: false, roomId: null, email: 'leak@example.test' }], nextCursor: null,
+    correlationId: 'c' }, (api) => api.getOnlinePresence());
+  await rejected({ sessions: [{ sessionId: 's', deviceLabel: 'Browser',
+    userAgentClass: 'browser', ipClass: 'public', createdAt: '2026-08-21T00:00:00.000Z',
+    lastSeenAt: '2026-08-21T00:00:00.000Z', isCurrent: false, ip: '203.0.113.1' }],
+    correlationId: 'c' }, (api) => api.listSessions());
+
+  const invalidEmptyApi = createShellApi({ client: {
+    sessionState: { authenticated: true }, session: { announceRevocation() {} },
+    request: async () => response({ correlationId: 'c' }, 200),
+  }, legacyStorage: null });
+  await assert.rejects(() => invalidEmptyApi.leaveRoom({ roomId: 'r' }),
+    (error) => error.code === 'CLIENT_PROTOCOL');
+}
+
+async function testColdProfileRestoreRequestsOwnProfileOnce() {
+  const correlationId = '01J00000000000000000000009';
+  const at = '2026-08-21T00:00:00.000Z';
+  const own = { accountId: 'account-a', displayName: 'Player', createdAt: at,
+    privacy: { presenceVisibility: 'everyone', statsVisibility: 'everyone' }, consent: null,
+    moderation: { status: 'clear', activeSanctions: [] },
+    flags: { nameChangeAvailableAt: null, setupNextStep: null }, correlationId };
+  const paths = [];
+  const api = createShellApi({ client: { sessionState: { authenticated: true },
+    request: async (path) => { paths.push(path); return { status: 200, correlationId,
+      headers: new Headers(), data: path === '/v1/profile/me' ? own : {
+        accountId: 'account-a', displayName: 'Player', createdAt: at, stats: null,
+        presence: { state: 'online', joinable: false, roomId: null }, correlationId,
+      } }; } }, legacyStorage: null });
+  await api.getProfile();
+  assert.equal(paths.filter((path) => path === '/v1/profile/me').length, 1,
+    'cold/deep-link profile restore makes exactly one own-profile request');
+}
+
+async function testMalformedAuthCannotMutateSession() {
+  const session = new SessionState({ window: null, BroadcastChannel: null });
+  const client = createPlatformClient({ clientBuild: '1', session, ulid,
+    fetch: async (_url, init) => {
+      const correlationId = init.headers.get('X-Correlation-Id');
+      return new Response(JSON.stringify({ accessToken: 'attacker-token',
+        expiresAt: '2026-08-21T01:00:00.000Z', session: { sessionId: 's' },
+        profile: {}, consentReceipt: null, correlationId }), { status: 200, headers: {
+        'Content-Type': 'application/json', 'X-Correlation-Id': correlationId,
+      } });
+    } });
+  const api = createShellApi({ client, legacyStorage: null });
+  await assert.rejects(() => api.signIn({ email: 'person@example.test', password: 'secret' }),
+    (error) => error.code === 'CLIENT_PROTOCOL');
+  assert.equal(session.snapshot().authenticated, false,
+    'malformed auth success is refused before the access token mutates session state');
+  client.close();
 }
 
 function testRegistryIsClosed() {
@@ -582,9 +802,13 @@ await testRetryPolicy();
 await testTimeout();
 await testClosedProtocolAndCrossTabRevocation();
 await testTelemetryPrivacyAndBatches();
-await testBeaconFailsClosedWithoutIngress();
+await testFrozenUnloadIngress();
 testHighLevelTelemetryHooks();
 await testShellContractMappings();
+await testLegacyProgressionImportStaysUnverified();
+await testClosedShellSuccessSchemas();
+await testColdProfileRestoreRequestsOwnProfileOnce();
+await testMalformedAuthCannotMutateSession();
 testRegistryIsClosed();
 testFeatureFlagsAndTelemetryKillSwitch();
 console.log('platform CX client: all checks passed');

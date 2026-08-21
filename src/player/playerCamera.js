@@ -345,6 +345,8 @@ export class PlayerCamera {
 
     this.swayTime += dt;
     this._updateFov(dt);
+    const viewBobScale = clamp(Number(game.settings?.get?.('viewBob')) || 0, 0, 1);
+    const shakeScale = clamp(Number(game.settings?.get?.('cameraShake')) || 0, 0, 1);
 
     if (this.deathCam) {
       this._updateDeathCam(dt);
@@ -363,8 +365,8 @@ export class PlayerCamera {
     const adsCut = 1 - clamp(p.adsAmount, 0, 1) * 0.8;
     const dr1 = Math.sin(this.swayTime * 0.73) * Math.cos(this.swayTime * 0.41);
     const dr2 = Math.sin(this.swayTime * 0.53 + 1.7);
-    const idleYaw = dr1 * T.SWAY_IDLE * DEG * adsCut;
-    const idlePitch = dr2 * T.SWAY_IDLE * 0.7 * DEG * adsCut;
+    const idleYaw = dr1 * T.SWAY_IDLE * DEG * adsCut * viewBobScale;
+    const idlePitch = dr2 * T.SWAY_IDLE * 0.7 * DEG * adsCut * viewBobScale;
 
     // ── figure-eight view bob, locked to distance travelled ──
     const grounded = p.grounded && p.moveState !== 'mantle';
@@ -372,7 +374,7 @@ export class PlayerCamera {
     if (grounded && speed > 0.4) this.bobPhase += speed * T.BOB_WAVE * dt;
     const stance = lerp(1, T.BOB_CROUCH_MUL, p.crouchFrac) * (1 - p.slideAmount * 0.85);
     const targetAmp = (grounded && speed > 0.4)
-      ? T.BOB_AMP * clamp(speed / T.BOB_REF_SPEED, 0, 1.6) * stance * (1 - clamp(p.adsAmount, 0, 1) * T.BOB_ADS_CUT)
+      ? T.BOB_AMP * clamp(speed / T.BOB_REF_SPEED, 0, 1.6) * stance * (1 - clamp(p.adsAmount, 0, 1) * T.BOB_ADS_CUT) * viewBobScale
       : 0;
     this.bobAmp = damp(this.bobAmp, targetAmp, T.BOB_RATE, dt);
     const bobK = this.bobAmp / T.BOB_AMP;
@@ -390,7 +392,7 @@ export class PlayerCamera {
     if (this.shakeTime > 0) {
       this.shakeTime -= dt;
       const k = clamp(this.shakeTime / this.shakeDur, 0, 1);
-      const a = this.shakeAmp * k * k;
+      const a = this.shakeAmp * k * k * shakeScale;
       const st = (this.shakeDur - this.shakeTime) + this.shakeSeed;
       shakeX = Math.sin(st * 61.7) * Math.sin(st * 23.1) * a * T.SHAKE_POS;
       shakeY = Math.sin(st * 47.3 + 1.9) * a * T.SHAKE_POS;

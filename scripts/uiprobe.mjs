@@ -174,9 +174,9 @@ try {
   assert(await page.locator('.panel.on .modes').isVisible(), 'play panel opened');
 
   const modeIds = await page.locator('.mode-card').evaluateAll((els) => els.map((e) => e.dataset.mode));
-  assert(modeIds.length >= 5, 'every mode from MODE_LIST is offered', modeIds.join(','));
-  const WANT_MODE = 'ffa';
-  assert(modeIds.includes(WANT_MODE), `mode "${WANT_MODE}" is selectable`);
+  assert(modeIds.length === 1 && modeIds[0] === 'tdm', 'TDM is the only offered game mode', modeIds.join(','));
+  const WANT_MODE = 'tdm';
+  assert(modeIds.includes(WANT_MODE), 'Team Deathmatch is selectable');
   await page.locator(`.mode-card[data-mode="${WANT_MODE}"]`).click();
   assert(await settingOf('mode') === WANT_MODE, 'clicking a mode card writes settings.mode');
 
@@ -191,12 +191,23 @@ try {
   const WANT_BOTS = 4;
   assert(await settingOf('botCount') === WANT_BOTS, 'bot-count slider writes settings.botCount');
 
+  const killSlider = page.locator('.panel.on input[type=range][data-setting="killLimit"]').first();
+  await killSlider.focus();
+  await page.evaluate(() => {
+    const el = document.querySelector('.panel.on input[type=range][data-setting="killLimit"]');
+    el.value = '25';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  const WANT_KILL_LIMIT = 25;
+  assert(await settingOf('killLimit') === WANT_KILL_LIMIT, 'kill-limit slider writes settings.killLimit');
+
   const WANT_DIFF = 'hardened';
   await page.locator(`.panel.on .seg[data-setting="difficulty"] button[data-value="${WANT_DIFF}"]`).first().click();
   assert(await settingOf('difficulty') === WANT_DIFF, 'difficulty segment writes settings.difficulty');
   assert((await page.locator('.diff-hint').textContent()).length > 10, 'difficulty hint describes the choice');
   const sum = await page.locator('.panel.on .deploy-sum').textContent();
-  assert(/4 BOTS/.test(sum) && /HARDENED/.test(sum), 'deploy summary reflects the choices', sum.trim());
+  assert(/FIRST TO 25/.test(sum) && /4 BOTS/.test(sum) && /HARDENED/.test(sum),
+    'deploy summary reflects the TDM rules', sum.trim());
 
   /* ------------------------------------------------------------- loadout */
   section('LOADOUT');
@@ -234,6 +245,7 @@ try {
     return {
       state: g.state,
       modeId: g.match.modeId,
+      killLimit: g.match.killLimit,
       botCount: g.match.botCount,
       bots: g.bots?.bots?.length ?? -1,
       difficulty: g.match.difficulty,
@@ -245,6 +257,7 @@ try {
   assert(started.state === 'playing', 'DEPLOY put the game into play', started.state);
   assert(!started.menuOpen, 'menu closed on deploy');
   assert(started.modeId === WANT_MODE, 'chosen mode reached the match', started.modeId);
+  assert(started.killLimit === WANT_KILL_LIMIT, 'chosen kill limit reached the match', String(started.killLimit));
   assert(started.botCount === WANT_BOTS, 'chosen bot count reached the match', String(started.botCount));
   assert(started.bots === WANT_BOTS, 'bot manager actually spawned that many', String(started.bots));
   assert(started.difficulty === WANT_DIFF, 'chosen difficulty reached the match', started.difficulty);
@@ -259,7 +272,7 @@ try {
   assert(await page.locator('.minimap canvas').isVisible(), 'minimap canvas visible');
 
   const topMode = await page.locator('.score-mid .mode').textContent();
-  assert(/FREE-FOR-ALL/i.test(topMode), 'HUD names the running mode', topMode.trim());
+  assert(/TEAM DEATHMATCH/i.test(topMode), 'HUD names the running mode', topMode.trim());
 
   /* ------------------------------------------------------------- combat */
   section('LIVE HUD READOUTS');
@@ -446,7 +459,7 @@ try {
   assert(await page.locator('.menu.open.pause').isVisible(), 'pause shell is open');
   assert(await page.locator('.panel.on .situation').isVisible(), 'pause opens on the situation panel');
   const siMode = await page.locator('.si-mode').textContent();
-  assert(/FREE-FOR-ALL/i.test(siMode), 'situation panel names the live mode', siMode.trim());
+  assert(/TEAM DEATHMATCH/i.test(siMode), 'situation panel names the live mode', siMode.trim());
   assert((await page.locator('.si-cells > div').count()) >= 6, 'situation shows the player line');
   assert((await page.locator('.panel.on .btn.cta').count()) === 0, 'no stray QUICK DEPLOY in the pause shell');
   await shot('04-pause');
@@ -549,6 +562,9 @@ try {
 
   /* -------------------------------------------------------------- resume */
   section('RESUME');
+  // Headless Chromium cannot grant pointer lock. Model the successful browser gesture so
+  // this section tests Menu/Game resume state rather than the runner's display server.
+  await page.evaluate(() => { window.__GAME__.input.requestLock = () => Promise.resolve(true); });
   await page.locator('.menu-nav .mi', { hasText: 'RESUME' }).first().click();
   await page.waitForTimeout(400);
   assert(await state() === 'playing', 'RESUME returns to play');
@@ -593,14 +609,15 @@ try {
   section('MATCH END');
   await page.evaluate(() => {
     const g = window.__GAME__;
-    // Push the mode over its own score limit and let the real referee end it.
+    // Push the team to the configured kill limit and let the real referee end it.
     for (const b of g.bots.bots) { const st = g.match.statsFor(b); if (st) st.kills = 0; }
     const me = g.match.statsFor(g.player);
-    me.kills = g.match.mode.scoreLimit;
+    me.kills = g.match.killLimit;
     me.score = 4200;
     me.headshots = 6;
     me.shotsFired = 90;
     me.shotsHit = 44;
+    g.match.scores[g.player.team] = g.match.killLimit;
     g.match._checkEnd();
   });
   await page.waitForTimeout(900);
@@ -615,8 +632,8 @@ try {
   assert(/^\+\d/.test(xpTotal.trim()), 'match XP reported from progression.recordMatch()', xpTotal.trim());
   assert((await page.locator('.xr').count()) > 0, 'XP breakdown rows rendered');
   assert((await page.locator('.moment').count()) > 0, 'best moments rendered');
-  assert((await page.locator('.results th.tm').count()) === 0,
-    'free-for-all drops the meaningless TEAM column');
+  assert((await page.locator('.results th.tm').count()) === 1,
+    'TDM results include the team column');
   await page.waitForTimeout(1400);   // let the verdict entrance finish
   await shot('07-matchend');
 
@@ -627,10 +644,12 @@ try {
   const again = await page.evaluate(() => ({
     state: window.__GAME__.state,
     mode: window.__GAME__.match.modeId,
+    killLimit: window.__GAME__.match.killLimit,
     bots: window.__GAME__.bots.bots.length,
   }));
   assert(again.state === 'playing', 'PLAY AGAIN restarts a match', again.state);
   assert(again.mode === WANT_MODE, 'the chosen mode is kept', again.mode);
+  assert(again.killLimit === WANT_KILL_LIMIT, 'the chosen kill limit is kept', String(again.killLimit));
   assert(again.bots === WANT_BOTS, 'the chosen bot count is kept', String(again.bots));
 
   /* ----------------------------------------------------------- quit to menu */
@@ -658,6 +677,7 @@ try {
       hudScale: s.get('hudScale'),
       crosshairColor: s.get('crosshairColor'),
       mode: s.get('mode'),
+      killLimit: s.get('killLimit'),
       loadoutPrimary: s.get('loadoutPrimary'),
       jump: s.get('binds').KeyJ,
     };
@@ -665,6 +685,7 @@ try {
   assert(Math.abs(after.hudScale - 1.4) < 0.001, 'hudScale survived a reload', String(after.hudScale));
   assert(String(after.crosshairColor).toLowerCase() === '#ffb347', 'crosshair colour survived a reload');
   assert(after.mode === WANT_MODE, 'mode choice survived a reload', after.mode);
+  assert(after.killLimit === WANT_KILL_LIMIT, 'kill limit survived a reload', String(after.killLimit));
   if (pickId) assert(after.loadoutPrimary === pickId, 'loadout survived a reload', after.loadoutPrimary);
   assert(after.jump === 'jump', 'rebinding survived a reload');
   const restoredMode = await page.locator('.mode-card.on').getAttribute('data-mode');

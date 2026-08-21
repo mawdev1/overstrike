@@ -9,6 +9,16 @@ const NEVER_RETRY = new Set(['PROTOCOL_VERSION_MISMATCH', 'UNSUPPORTED_CLIENT', 
 const decoder = new TextDecoder();
 
 const sleepDefault = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const TRACEPARENT = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
+
+function randomHex(bytes) {
+  const data = new Uint8Array(bytes);
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(data);
+  else for (let i = 0; i < bytes; i++) data[i] = Math.floor(Math.random() * 256);
+  return [...data].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+const createTraceparent = () => `00-${randomHex(16)}-${randomHex(8)}-01`;
 
 /** @param {Headers} headers @param {unknown} body */
 function attachBody(headers, body, correlationId) {
@@ -59,6 +69,7 @@ function requestSignal(external, timeoutMs) {
  * @property {number} [timeoutMs]
  * @property {number} [maxAttempts]
  * @property {string} [correlationId]
+ * @property {string} [traceparent] W3C trace context; one value is retained across retries.
  */
 
 /** @template T @typedef {{data: T, status: number, headers: Headers, correlationId: string}} PlatformResponse */
@@ -68,6 +79,7 @@ export class PlatformClient {
   /**
    * @param {{baseUrl?: string, clientBuild: string, fetch?: typeof fetch, timeoutMs?: number,
    * maxAttempts?: number, session?: SessionState, ulid?: () => string,
+   * traceparent?: () => string,
    * locks?: {request: (name: string, options: object, callback: () => Promise<unknown>) => Promise<unknown>}|null,
    * sleep?: (ms: number) => Promise<void>, random?: () => number}} options
    */
@@ -90,6 +102,7 @@ export class PlatformClient {
     }
     this.session = options.session || new SessionState();
     this.ulid = options.ulid || createUlidFactory();
+    this.traceparent = options.traceparent || createTraceparent;
     this.sleep = options.sleep || sleepDefault;
     this.random = options.random || Math.random;
     this.locks = options.locks === undefined ? globalThis.navigator?.locks : options.locks;
@@ -108,6 +121,10 @@ export class PlatformClient {
     const method = (options.method || 'GET').toUpperCase();
     const correlationId = options.correlationId || this.ulid();
     if (!isUlid(correlationId)) throw new TypeError('correlationId must be a ULID.');
+    const traceparent = options.traceparent || this.traceparent();
+    if (!TRACEPARENT.test(traceparent) || /^00-0{32}-|^00-[0-9a-f]{32}-0{16}-/.test(traceparent)) {
+      throw new TypeError('traceparent must be valid W3C trace context.');
+    }
     if (options.idempotencyKey !== undefined
       && (typeof options.idempotencyKey !== 'string' || options.idempotencyKey.length === 0)) {
       throw new TypeError('idempotencyKey must be a non-empty string.');
@@ -128,7 +145,7 @@ export class PlatformClient {
     for (let attempt = 1; ; attempt += 1) {
       try {
         return await this.#once(path, {
-          ...options, method, correlationId, timeoutMs: requestTimeout,
+          ...options, method, correlationId, traceparent, timeoutMs: requestTimeout,
         }, tokenAtStart);
       } catch (error) {
         if (error instanceof PlatformError && error.code === 'AUTH_TOKEN_EXPIRED'
@@ -136,7 +153,8 @@ export class PlatformClient {
           // If another request already rotated the token, this response used the old token and
           // can retry directly. Otherwise every waiter joins the one refresh promise.
           if (this.session.accessToken === tokenAtStart) await this.#refreshSingleFlight();
-          return this.request(path, { ...options, method, correlationId, maxAttempts: 1, _afterRefresh: true });
+          return this.request(path, { ...options, method, correlationId, traceparent,
+            maxAttempts: 1, _afterRefresh: true });
         }
         // A response may arrive after another request has refreshed or replaced the token.
         // Never let a stale (including initially tokenless) request clear the newer session.
@@ -155,6 +173,12 @@ export class PlatformClient {
     const result = await this.request('/v1/auth/signin', {
       ...options, method: 'POST', body: credentials, auth: false, maxAttempts: 1,
     });
+    if (options.validateSuccess && !options.validateSuccess(result.data, result)) {
+      throw new PlatformClientError('CLIENT_PROTOCOL',
+        'The platform returned an invalid success projection.', {
+          correlationId: result.correlationId,
+        });
+    }
     this.#adoptAuth(result.data);
     return result;
   }
@@ -163,17 +187,29 @@ export class PlatformClient {
     const result = await this.request('/v1/auth/signup', {
       ...options, method: 'POST', body: fields, auth: false, maxAttempts: 1,
     });
+    if (options.validateSuccess && !options.validateSuccess(result.data, result)) {
+      throw new PlatformClientError('CLIENT_PROTOCOL',
+        'The platform returned an invalid success projection.', {
+          correlationId: result.correlationId,
+        });
+    }
     this.#adoptAuth(result.data);
     return result;
   }
 
   async refresh() { return this.#refreshSingleFlight(); }
 
-  async signOut({ all = false, signal } = {}) {
+  async signOut({ all = false, signal, validateSuccess = null } = {}) {
     try {
       const result = await this.request(all ? '/v1/auth/signout-all' : '/v1/auth/signout', {
         method: 'POST', body: {}, signal, maxAttempts: 1,
       });
+      if (validateSuccess && !validateSuccess(result.data, result)) {
+        throw new PlatformClientError('CLIENT_PROTOCOL',
+          'The platform returned an invalid success projection.', {
+            correlationId: result.correlationId,
+          });
+      }
       this.session.clear(all ? 'signed-out-all' : 'signed-out', true, all);
       return result;
     } catch (error) {
@@ -188,6 +224,7 @@ export class PlatformClient {
   async #once(path, options, tokenOverride) {
     const headers = new Headers(options.headers || {});
     headers.set('X-Correlation-Id', options.correlationId);
+    headers.set('Traceparent', options.traceparent);
     headers.set('X-Client-Build', this.clientBuild);
     if (options.idempotencyKey) headers.set('Idempotency-Key', options.idempotencyKey);
     headers.delete('Authorization');

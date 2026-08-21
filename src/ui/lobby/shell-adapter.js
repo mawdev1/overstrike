@@ -85,11 +85,11 @@ export function createLobbyShellAdapter({
     return JSON.stringify(visual);
   };
 
-  const socketFactory = webSocketFactory || ((url) => {
+  const socketFactory = webSocketFactory || ((url, protocols) => {
     if (typeof globalThis.WebSocket !== 'function') {
       throw unavailable('This browser does not provide WebSocket lobby transport.');
     }
-    return new globalThis.WebSocket(url);
+    return new globalThis.WebSocket(url, protocols);
   });
 
   const publish = (snapshot, expectedGeneration) => {
@@ -281,7 +281,11 @@ export function createLobbyShellAdapter({
       const correlationId = controller.sendPing(payload.kind, payload.target);
       return controller.waitForCorrelation(correlationId);
     },
-    mutePlayer(payload = {}) { return assertRoom(active, payload).setMuted(payload.accountId, payload.muted); },
+    mutePlayer(payload = {}) {
+      const controller = assertRoom(active, payload);
+      const correlationId = controller.setMuted(payload.accountId, payload.muted);
+      return controller.waitForCorrelation(correlationId);
+    },
     reportPlayer(payload = {}) { return assertRoom(active).reportPlayer(payload); },
     cancelLobbyReconnect(payload = {}) { return assertRoom(active, payload).cancelReconnect(); },
     async leaveRoom(payload = {}) {

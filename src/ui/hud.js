@@ -50,6 +50,13 @@ const GREN_WARN_LIFE = 0.28;
 
 /** Mirrors Match.LONGSHOT_DISTANCE — kept local so the HUD stays import-light. */
 const LONGSHOT_M = 45;
+const CAPTION_LABELS = Object.freeze({
+  matchStart: 'Match started', matchEnd: 'Match ended', streakReady: 'Killstreak ready',
+  killConfirm: 'Kill confirmed', explosion: 'Explosion', rifle: 'Rifle fire', smg: 'SMG fire',
+  lmg: 'LMG fire', sniper: 'Sniper fire', shotgun: 'Shotgun fire', pistol: 'Pistol fire',
+  grenadeBounce: 'Grenade bouncing', footstepConcrete: 'Footsteps', footstepDirt: 'Footsteps',
+  hurt: 'Player hurt', death: 'Player eliminated', lowAmmo: 'Low ammunition',
+});
 
 /** Human-readable label for a KeyboardEvent.code. Shared with the menu. */
 export function keyLabel(code) {
@@ -166,6 +173,11 @@ export class HUD {
     this._xhHitT = 0;
     this._noticeClear = 0;
     this._showDnums = true;
+    this._flashIntensity = 1;
+    this._screenEffectIntensity = 1;
+    this._damageVignetteScale = 1;
+    this._captionT = 0;
+    this._networkOverlay = 'off';
     this._magSize = 30;
     this._equip = null;         // { lethal, tactical } pushed by WeaponSystem
     this._unsubs = [];
@@ -267,8 +279,14 @@ export class HUD {
       <span><b class="p-fps">0</b> FPS</span>
       <span class="p-ms">0.0 ms</span>
       <span class="p-dc">0 dc</span>
-      <span class="p-tri">0 tri</span>`);
+      <span class="p-tri">0 tri</span>
+      <span class="p-net"></span>`);
     r.appendChild(perf);
+
+    const captions = mk('hud-captions', '', 'div');
+    captions.setAttribute('role', 'status');
+    captions.setAttribute('aria-live', 'polite');
+    r.appendChild(captions);
 
     // ---- ammo ----
     const ammo = mk('hud-ammo brk', `
@@ -420,7 +438,7 @@ export class HUD {
 
     // ---- ref table (queried exactly once) ----
     this.el = {
-      root: r, vignette, flash, blind, top, perf, ammo, health, xh, hitmark, arcs,
+      root: r, vignette, flash, blind, top, perf, captions, ammo, health, xh, hitmark, arcs,
       notice, streak, death, center, streaks, uav, scope,
       scopeBreath: scope.querySelector('.scope-breath'),
       scopeBreathFill: scope.querySelector('.scope-breath .fil'),
@@ -436,6 +454,7 @@ export class HUD {
       pMs: perf.querySelector('.p-ms'),
       pDc: perf.querySelector('.p-dc'),
       pTri: perf.querySelector('.p-tri'),
+      pNet: perf.querySelector('.p-net'),
       ammoMag: ammo.querySelector('.ammo-mag'),
       ammoRes: ammo.querySelector('.ammo-res'),
       ammoName: ammo.querySelector('.wn'),
@@ -568,6 +587,11 @@ export class HUD {
     });
 
     on('notice', (p) => this.notice(p?.text, p?.sub, p?.duration));
+    on('audioCaption', (p) => this._showAudioCaption(p));
+    on('tacticalPing', (p) => {
+      const label = p?.kind === 'danger' ? 'DANGER' : p?.kind === 'objective' ? 'OBJECTIVE' : 'LOCATION';
+      this.notice(`TEAM PING · ${label}`, p?.senderId ? `PLAYER ${p.senderId}` : '', 1.8);
+    });
 
     on('killstreak', (p) => {
       if (p?.entity && p.entity === this.game?.player) {
@@ -617,8 +641,12 @@ export class HUD {
      ====================================================================== */
 
   _applyAllSettings() {
-    for (const k of ['hudScale', 'crosshairStyle', 'crosshairColor', 'showMinimap', 'showFps',
-      'showDamageNumbers', 'binds']) {
+    for (const k of ['hudScale', 'hudTextSize', 'crosshairStyle', 'crosshairColor',
+      'crosshairOpacity', 'crosshairSize', 'crosshairThickness', 'crosshairGap',
+      'crosshairOutline', 'showMinimap', 'minimapRotation', 'showFps', 'showDamageNumbers',
+      'showKillfeed', 'showObjectiveMarkers', 'damageVignette', 'flashIntensity',
+      'screenEffectIntensity', 'captionBackground', 'subtitleSize', 'networkDiagnosticsOverlay',
+      'binds']) {
       this._applySetting(k, this.game?.settings?.get?.(k));
     }
   }
@@ -630,6 +658,9 @@ export class HUD {
         document.documentElement.style.setProperty('--hud-scale', String(v ?? 1));
         // The em-derived crosshair gap changed; re-measure on the next frame.
         requestAnimationFrame(() => this._onResize());
+        break;
+      case 'hudTextSize':
+        this.el.root.dataset.hudTextSize = String(v || 'default');
         break;
       case 'crosshairStyle': {
         const style = String(v ?? 'dynamic');
@@ -649,15 +680,66 @@ export class HUD {
         }
         break;
       }
+      case 'crosshairOpacity':
+        this.el.xh.style.setProperty('--xh-opacity', String(v ?? 1));
+        break;
+      case 'crosshairSize':
+        this.el.xh.style.setProperty('--xh-size', String(v ?? 1));
+        break;
+      case 'crosshairThickness':
+        this.el.xh.style.setProperty('--xh-thickness', String(v ?? 2));
+        break;
+      case 'crosshairGap':
+        this.el.xh.style.setProperty('--xh-gap', `${Number(v) || 0}px`);
+        this._gapPx = Number(v) || 0;
+        this._c.spread = -1;
+        break;
+      case 'crosshairOutline':
+        this.el.xh.dataset.outline = v === false ? 'off' : 'on';
+        break;
       case 'showMinimap':
         this.minimap.setVisible(v !== false);
         break;
+      case 'minimapRotation':
+        this.minimap.setOrientation(v);
+        break;
       case 'showFps':
-        this.el.perf.classList.toggle('on', v !== false);
+        this.el.perf.classList.toggle('fps-on', v !== false);
+        this.el.perf.classList.toggle('on', v !== false || this._networkOverlay !== 'off');
         break;
       case 'showDamageNumbers':
         this._showDnums = v !== false;
         if (!this._showDnums) for (const d of this._dnums) this._freeDnum(d);
+        break;
+      case 'showKillfeed':
+        this.killfeedUI.el.hidden = v === false;
+        break;
+      case 'showObjectiveMarkers':
+        this.el.root.dataset.objectiveMarkers = v === 'minimal' ? 'minimal' : 'full';
+        break;
+      case 'damageVignette':
+        this._damageVignetteScale = v === 'off' ? 0 : v === 'low' ? 0.4 : 1;
+        this._c.vignette = -1;
+        break;
+      case 'flashIntensity':
+        this._flashIntensity = Math.max(0, Math.min(1, Number(v) || 0));
+        break;
+      case 'screenEffectIntensity':
+        this._screenEffectIntensity = Math.max(0, Math.min(1, Number(v) || 0));
+        this._c.vignette = -1;
+        break;
+      case 'captionBackground':
+        this.el.captions.style.setProperty('--caption-bg', String(v ?? 0.75));
+        break;
+      case 'subtitleSize':
+        this.el.captions.dataset.size = String(v || 'default');
+        break;
+      case 'networkDiagnosticsOverlay':
+        this._networkOverlay = ['compact', 'full'].includes(v) ? v : 'off';
+        this.el.perf.dataset.network = this._networkOverlay;
+        this.el.perf.classList.toggle('on', this._networkOverlay !== 'off'
+          || this.game?.settings?.get?.('showFps') !== false);
+        this._c.perf = '';
         break;
       case 'binds':
         // Binding labels are read lazily. Invalidate prompt caches so a visible reload or
@@ -973,6 +1055,10 @@ export class HUD {
     this._tickBlind(dt);
     this._tickDeath(dt);
     this._tickCrosshairHit(dt);
+    if (this._captionT > 0) {
+      this._captionT = Math.max(0, this._captionT - dt);
+      if (this._captionT === 0) this.el.captions.textContent = '';
+    }
 
     this.killfeedUI.update(dt);
 
@@ -1409,7 +1495,8 @@ export class HUD {
   }
 
   _writeVignette(t) {
-    const v = Math.round(clamp01(t) * 50) / 50;
+    const v = Math.round(clamp01(t) * this._damageVignetteScale
+      * this._screenEffectIntensity * 50) / 50;
     if (v !== this._c.vignette) {
       this._c.vignette = v;
       this.el.vignette.style.opacity = String(v);
@@ -1533,7 +1620,8 @@ export class HUD {
     }
     this._blind = Math.max(0, this._blind - dt * this._blindDecay);
     // Ease out hard so the recovery reads as sight returning, not a linear wipe.
-    const v = Math.round(Math.pow(this._blind, 0.65) * 50) / 50;
+    const v = Math.round(Math.pow(this._blind, 0.65) * this._flashIntensity
+      * this._screenEffectIntensity * 50) / 50;
     if (v !== this._c.blind) { this._c.blind = v; this.el.blind.style.opacity = String(v); }
   }
 
@@ -1665,7 +1753,7 @@ export class HUD {
       return;
     }
     this._flash = Math.max(0, this._flash - dt * 2.6);
-    const v = Math.round(this._flash * 40) / 40;
+    const v = Math.round(this._flash * this._screenEffectIntensity * 40) / 40;
     if (v !== this._c.flash) { this._c.flash = v; this.el.flash.style.opacity = String(v * 0.85); }
   }
 
@@ -1720,7 +1808,12 @@ export class HUD {
     this._perfAcc = 0;
     const s = this.game?.engine?.stats;
     if (!s) return;
-    const sig = `${s.fps}|${s.frameMs.toFixed(1)}|${s.drawCalls}|${s.triangles}`;
+    const net = this.game?.netFacade?.netStats;
+    const netText = this._networkOverlay === 'off' || !net ? ''
+      : this._networkOverlay === 'compact'
+        ? `${Math.round(net.rttMs ?? 0)} ms · ${Number(net.lossPct ?? 0).toFixed(1)}% loss`
+        : `${net.region || '—'} · ${Math.round(net.rttMs ?? 0)} ms · ${Number(net.jitterMs ?? 0).toFixed(1)} ms jitter · ${Number(net.lossPct ?? 0).toFixed(1)}% loss · ${Number(net.receiveRateHz ?? 0).toFixed(1)} Hz`;
+    const sig = `${s.fps}|${s.frameMs.toFixed(1)}|${s.drawCalls}|${s.triangles}|${netText}`;
     if (sig === this._c.perf) return;
     this._c.perf = sig;
     this.el.pFps.textContent = String(s.fps | 0);
@@ -1728,6 +1821,23 @@ export class HUD {
     this.el.pMs.textContent = `${s.frameMs.toFixed(1)} ms`;
     this.el.pDc.textContent = `${s.drawCalls | 0} dc`;
     this.el.pTri.textContent = `${formatK(s.triangles | 0)} tri`;
+    this.el.pNet.textContent = netText;
+  }
+
+  _showAudioCaption(payload) {
+    const channel = payload?.channel;
+    const settings = this.game?.settings;
+    if (channel === 'announcer' ? settings?.get?.('subtitles') !== true
+      : settings?.get?.('closedCaptions') !== true) return;
+    const label = CAPTION_LABELS[payload?.name];
+    if (!label) return;
+    let direction = '';
+    if (settings?.get?.('captionDirection') === true && payload?.position) {
+      const bearing = this._bearingTo(payload.position.x, payload.position.z);
+      if (bearing != null) direction = bearing < -25 ? ' [LEFT]' : bearing > 25 ? ' [RIGHT]' : ' [AHEAD]';
+    }
+    this.el.captions.textContent = `${label}${direction}`;
+    this._captionT = channel === 'announcer' ? 2.6 : 1.5;
   }
 
   /* -------------------------------------------------------------- helpers */

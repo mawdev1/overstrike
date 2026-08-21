@@ -12,7 +12,7 @@ export function createLobbyState(roomId = null) {
     status: 'idle', roomId, protocol: null, lastSeq: null,
     serverTime: null, heartbeatMs: null, graceMs: null,
     you: null, room: null, roster: [], presence: {}, countdown: null,
-    chatHistory: [], mutedAccountIds: [], pending: {},
+    chatHistory: [], mutedAccountIds: [], pingCatalog: null, loadoutCatalog: null, pending: {},
     countdownRemainingMs: null, handoff: null, failure: null,
     reconnect: null, notice: null,
   };
@@ -50,6 +50,9 @@ function replaceSnapshot(state, d, seq) {
   state.countdown = copy(d.countdown);
   state.countdownRemainingMs = null;
   state.chatHistory = copy(d.chatHistory);
+  state.mutedAccountIds = copy(d.mutedAccountIds);
+  state.pingCatalog = copy(d.pingCatalog);
+  state.loadoutCatalog = copy(d.loadoutCatalog);
   state.pending = {};
   state.failure = null;
   state.notice = null;
@@ -186,6 +189,17 @@ export function reduceLobbyFrame(state, rawFrame) {
     case 'ping.placed': {
       const confirmed = settleWhen(state, frame.correlationId, (pending) => pending.t === 'ping.send'
         && pending.accountId === d.accountId && pending.d.kind === d.kind);
+      if (confirmed) return { state, confirmed };
+      break;
+    }
+    case 'mute.changed': {
+      const values = new Set(state.mutedAccountIds);
+      if (d.muted) values.add(d.accountId); else values.delete(d.accountId);
+      state.mutedAccountIds = [...values];
+      if (d.muted) state.chatHistory = state.chatHistory.filter((item) => item.accountId !== d.accountId);
+      const confirmed = settleWhen(state, frame.correlationId, (pending) => pending.t === 'mute.set'
+        && pending.accountId === state.you?.accountId && pending.d.accountId === d.accountId
+        && pending.d.muted === d.muted);
       if (confirmed) return { state, confirmed };
       break;
     }

@@ -2,9 +2,12 @@
 
 # Frontend status — [CX] Codex
 
-**Updated:** 2026-08-20
-**Phase:** P1 — forced contract freeze; connected-flow acceptance review
-**Overall:** BLOCKED AT H1.1/H1.2 — the headers are frozen by explicit override, but stub/live parity, result-submission exactness, auth/consent adapter parity, and P1 CX deliverables do not pass
+**Updated:** 2026-08-21
+**Phase:** P3 machine-gate closure; P1 production-readiness hold
+**Overall:** P0/P1 CODE-COMPLETE LOCALLY; P2/P3 MACHINE GATES IMPLEMENTED. Deployment and human gates remain explicit below; one latest PostgreSQL occupied-server isolation rerun is not yet green.
+
+The historical blocker tables below are retained as review history, not the current verdict.
+The current verdict is this header plus the dated closure addenda at the end of the file.
 
 ---
 
@@ -579,11 +582,10 @@ rows, and the platform gate is **not** claimed complete until the CC dependencie
 
 ## P2/P3 Codex frontend and map implementation snapshot
 
-The Codex-owned P2 and P3 implementation is now present as contract-driven islands with strict
-authority boundaries. This section supersedes earlier dated statements that the lobby reducer,
-Square producer, and Bomb presentation package were absent. It does **not** relabel missing
-CC-owned services, protocol/facade code, autonomous Bomb bots, human approvals, or release
-hardware evidence as frontend completion.
+The Codex-owned P2 and P3 implementation is now present with the CC-owned live authority seams
+integrated and executable. This section supersedes earlier dated statements that the lobby,
+Square, facade, autonomous Bomb actors, or result lifecycle were absent. Human playtest approval
+and supported-hardware evidence remain separate release evidence.
 
 P2 delivered in the CX lane:
 
@@ -609,10 +611,11 @@ P2 delivered in the CX lane:
   cleared reasons, countdown/allocation/reconnect states, authoritative loadout options, isolated
   chat, mute/report/ping entry points, rate-limit/error treatment, and focus-safe suppression of
   heartbeat-only subtree replacement.
-- Local mute remains explicitly local display suppression; canned ping/target vocabulary, loadout
-  catalogue, terminal close mapping, and server enforcement are blocked by `REQ-CC-065`. Cold-page
-  reconnect semantics and mounted report/presence/room/browser-WebSocket surfaces are recorded in
-  `REQ-CC-062/066`. Real handoff remains fail-closed until the CC-owned match facade exists.
+- Mute is now an acknowledged, persisted server intent; ping kinds/targets and loadouts come from
+  closed server-owned catalogs, and reserved socket closes map to typed errors. The mounted live
+  service provides authenticated presence/recent encounters, rooms, reports, lobby tickets,
+  caller-relative snapshots, cold/warm reconnect, countdown/allocation, active-match discovery,
+  account-bound match reconnect tickets, and the separately keyed match-ticket handoff.
 
 P3 delivered in the CX lane:
 
@@ -642,11 +645,14 @@ P3 delivered in the CX lane:
   subtree is exposed while legacy decorative HUD content remains hidden from assistive technology.
 - The shared scoreboard now reads Bomb round wins, phase time, roles, alive counts, objective state,
   plants/defuses, and compact history, retains TDM behavior, follows the current scoreboard binding,
-  and renders latency only with complete measured-freshness metadata. Multiplayer mounting remains
-  fail-closed until the CC-owned `src/net/facade.js` exists; `REQ-CC-064/067` records the live
-  freshness/privacy/reconnect projection, spectator-policy, and autonomous objective-bot work.
-  `REQ-CC-063/069` records the absent nav-bake artifact/freshness tooling and mandatory Square-aware
-  CI/performance registration.
+  and renders latency only with complete measured-freshness metadata. The production entry now
+  lazy-loads `src/net/facade.js` only for authoritative handoffs, injects the authenticated
+  reconnect provider, and mounts the Bomb HUD projection without pulling Three.js into shell or
+  local-practice boot. Hidden Bomb data is purged and the spectator phase matrix has one policy.
+- Objective-aware bots execute both sites, escort/lurk/recover/hold/retake/defuse roles, and finish
+  a legal autonomous series without test teleportation. The dedicated server emits one stable,
+  independently reconstructable terminal result/evidence record and the platform retains it in
+  the same transaction as career application and outbox events.
 
 Verification at this snapshot:
 
@@ -660,12 +666,59 @@ Verification at this snapshot:
   dense maximum sightline is below 48 m, and the latest deterministic balance arm is within every
   implemented spawn-quality threshold.
 - `node --test src/ui/scoreboard.test.mjs`: **PASS — 5/5**.
-- `npm run check`: **PASS — 85 modules / 226 imports**. `npm run build`: **PASS — 101 modules**,
+- `npm run lobbytest`: **PASS — 53 assertions** over real HTTP, six lobby WebSockets, reverse-order
+  six-seat match admission, mode/team/loadout identity binding, occupied-server isolation, match
+  entity reclaim, exact create/join idempotency, privacy, recent encounters, mute persistence,
+  report dedupe, authority rebuild, replay refusal, and three-miss live-server SIGKILL reaping.
+- `node scripts/pgtest.mjs --lobby-only`: **PASS — 52 live assertions on PostgreSQL 16**,
+  including durable active-roster hydration and terminal no-contest persistence after server death.
+- `npm run check`: **PASS — 86 modules / 229 imports**. `npm run build`: **PASS — 101 modules**,
   with the game runtime retained as a separate lazy chunk.
 - `npm run platformtest`, `bombtest`, and `tdmtest`: **PASS** at the tested shared-tree snapshot.
 
-Codex's owned P2/P3 source slice is implemented and locally green. Overall P2/P3 roadmap gates
-remain **partial / externally blocked**, not complete: H2.1–H2.3 require mounted live/stub services;
-H3.1/H3.2 require lane-legal nav bake/tooling and enforced scene budgets; H3.3 requires autonomous
-objective-playing bots and the live facade; H3.4 plus art/accessibility/commercial approval and real
-supported-hardware/browser evidence remain human/joint release work.
+Additional closure evidence: `bombbottest` passes 43 checks over a 10-round autonomous series;
+`siteoutcome --matches=200 --strict` passes 2,085 measured rounds with both sites inside the frozen
+45–55% envelope; `mapperf` measures the real WebGL scene at 45/7,305 map-only and 96/14,865
+integrated p95 draw/triangle counts and rejects a 248-draw degraded control; `facadetest` passes 44
+checks including an exact platform-minted ticket through HELLO and the verifier; and
+`completiontest` passes the real self-registration → handoff → matchEnd → evidence/result apply →
+authenticated release → room reopen → distinct rematch path.
+
+All P2/P3 machine-owned gates in this snapshot are implemented and locally green, including the
+deterministic nav bake/freshness artifact, measured scene budgets, autonomous Bomb match, live
+facade, six-seat admission/reconnect/death recovery, and normal completion/rematch. The remaining
+P3 evidence is human-only: H3.4 real-player playtest approval and supported physical GPU/browser/
+assistive-technology evidence. Those are not inferred from SwiftShader or scripted fixtures.
+
+## 2026-08-21 — P1 authority/client/observability re-audit
+
+The stale P1 blockers at the top of the historical review are closed in the current tree:
+
+- Shell success projections are validated as closed typed responses before mutation on the
+  high-risk auth/consent/flags/profile/settings/rooms/career/match paths. Unknown, omitted and
+  wrong-typed 2xx responses raise `CLIENT_PROTOCOL`; optional presence loading no longer swallows
+  a protocol violation.
+- Authenticated network matches switch the singleton progression view away from hostile
+  `overstrike.progress.v1` before constructing the game. Local match awards/writes are disabled,
+  mode-scoped server career/weapon totals are projected, and the unchanged blob returns only as
+  explicitly labelled practice/unverified data after exit. Its one-time authenticated import is
+  permanently `verified:false` and separate from authoritative career/result tables.
+- Runtime exit consumes the deduplicated server facade terminal fact and carries exact match,
+  termination, reason, completion, mode and the shell-owned first-match marker. A local simulation
+  `toMenu` payload cannot claim network completion.
+- One real six-client launch supplies a non-derived W3C trace and retains the same trace ID through
+  client, platform and game-server spans plus the durable allocation event. The service-only
+  incident response is correlation-indexed and contains no event payload or actor/subject ID.
+
+Latest P1 evidence: `platformtest` **2,494/0 across 15 suites** in memory; the PostgreSQL platform
+aggregate **2,918/0 across 15 suites** after 23 migrations through 0024; `uishell` **1,283
+assertions**; `identitytest` **13/13**; `authtest` **391/391**; `viteproxytest`, the typed platform
+client suite, `facadetest` **50/50**, `matchtest`, and `check` (**86 modules / 230 imports**) green.
+
+This does not manufacture external or human evidence. Production remains held until Supabase URL/
+service-role configuration exists, all nine legacy identities are cut over, Resend From/API-key
+verification and recovery canaries deliver, and the secret alert webhook is configured/probed.
+D6 still requires professional legal review before P8/P11. H3.4 still requires real-player and
+physical supported GPU/browser/assistive-technology evidence. The latest full PostgreSQL command's
+platform portion is green but its separate P2 occupied-server second-room assertion is **57/58**;
+that rerun must be green before the all-phase machine aggregate is called complete.

@@ -768,6 +768,168 @@ async function browserChecks() {
     equal(await page.evaluate(() => window.__HARNESS_RUNTIME_LOADS__), 1, 'match runtime loader must be single-flight');
     equal(requests.filter((url) => /\/src\/core\/game\.js(?:\?|$)/.test(url)).length, 1, 'game module must be requested exactly once');
 
+    const liveSettingAdapters = await page.evaluate(async () => {
+      const { HUD } = await import('/src/ui/hud.js');
+      const values = new Map([
+        ['showFps', false], ['subtitles', true], ['closedCaptions', true],
+        ['captionDirection', true],
+      ]);
+      const root = document.createElement('div');
+      const xh = document.createElement('div');
+      const perf = document.createElement('div');
+      const captions = document.createElement('div');
+      const killfeed = document.createElement('div');
+      const calls = [];
+      const hud = Object.create(HUD.prototype);
+      hud.game = { settings: { get: (key) => values.get(key) },
+        player: { yaw: 0, position: { x: 0, z: 0 } } };
+      hud.el = { root, xh, perf, captions };
+      hud.killfeedUI = { el: killfeed };
+      hud.minimap = { setVisible: (value) => calls.push(['visible', value]),
+        setOrientation: (value) => calls.push(['orientation', value]) };
+      hud._c = { spread: 0, vignette: 0, perf: '' };
+      hud._networkOverlay = 'off';
+      hud._gapPx = 6;
+      hud._applySetting('crosshairOpacity', 0.65);
+      hud._applySetting('crosshairSize', 1.4);
+      hud._applySetting('crosshairThickness', 4);
+      hud._applySetting('crosshairGap', 11);
+      hud._applySetting('crosshairOutline', false);
+      hud._applySetting('minimapRotation', 'northUp');
+      hud._applySetting('showKillfeed', false);
+      hud._applySetting('showObjectiveMarkers', 'minimal');
+      hud._applySetting('damageVignette', 'low');
+      hud._applySetting('flashIntensity', 0.3);
+      hud._applySetting('screenEffectIntensity', 0.5);
+      hud._applySetting('captionBackground', 0.6);
+      hud._applySetting('subtitleSize', 'large');
+      hud._applySetting('networkDiagnosticsOverlay', 'compact');
+      hud._showAudioCaption({ name: 'explosion', channel: 'sfx', position: { x: -4, z: 0 } });
+      return {
+        opacity: xh.style.getPropertyValue('--xh-opacity'),
+        size: xh.style.getPropertyValue('--xh-size'),
+        thickness: xh.style.getPropertyValue('--xh-thickness'),
+        gap: xh.style.getPropertyValue('--xh-gap'), outline: xh.dataset.outline,
+        calls, killfeedHidden: killfeed.hidden, markers: root.dataset.objectiveMarkers,
+        vignette: hud._damageVignetteScale, flash: hud._flashIntensity,
+        effects: hud._screenEffectIntensity, captionBg: captions.style.getPropertyValue('--caption-bg'),
+        captionSize: captions.dataset.size, caption: captions.textContent,
+        network: perf.dataset.network, perfVisible: perf.classList.contains('on'),
+      };
+    });
+    equal(liveSettingAdapters, {
+      opacity: '0.65', size: '1.4', thickness: '4', gap: '11px', outline: 'off',
+      calls: [['orientation', 'northUp']], killfeedHidden: true, markers: 'minimal',
+      vignette: 0.4, flash: 0.3, effects: 0.5, captionBg: '0.6', captionSize: 'large',
+      caption: 'Explosion [LEFT]', network: 'compact', perfVisible: true,
+    }, 'graphics, HUD, caption, minimap, objective and network settings apply to live runtime adapters');
+
+    const runtimeAuthority = await page.evaluate(async () => {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true,
+        value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36' });
+      localStorage.setItem('overstrike.progress.v1', JSON.stringify({
+        schema: 1, xp: 999999999, lifetime: { kills: 999999999, matches: 999999999 },
+      }));
+      const [{ createGameRuntime }, { progression }] = await Promise.all([
+        import('/src/ui/shell/gameRuntime.js'), import('/src/game/progression.js'),
+      ]);
+      progression.endAuthoritativeSession();
+      progression.load();
+      const listeners = new Map();
+      const bus = {
+        on(name, fn) { let set = listeners.get(name); if (!set) listeners.set(name, (set = new Set())); set.add(fn); return () => set.delete(fn); },
+        once(name, fn) { const off = this.on(name, (payload) => { off(); fn(payload); }); return off; },
+        emit(name, payload) { for (const fn of [...(listeners.get(name) || [])]) fn(payload); },
+      };
+      class FakeGame {
+        constructor() {
+          this.bus = bus;
+          this.menu = { close() {} };
+          this.hud = { scoreboard: { setVisible() {} }, notice() {} };
+          this.settings = { actionFor: (code) => code === 'ArrowLeft' ? 'spectatePrevious'
+            : code === 'ArrowRight' ? 'spectateNext' : code === 'Mouse3' ? 'tacticalPing' : null };
+        }
+        async init() {}
+        startMatch() {}
+        dispose() {}
+      }
+      const facadeListeners = new Map();
+      let spectatorCycles = 0;
+      let tacticalPings = 0;
+      const startupOrder = [];
+      const facade = {
+        netStats: { sampledAt: 1200, windowMs: 5000, region: 'yyz', rttMs: 24,
+          jitterMs: 3, lossPct: 0.5, receiveRateHz: 20 },
+        bindGame() {}, async reserve() { startupOrder.push('reserve-ticket'); },
+        async promoteReservation() { startupOrder.push('promote-session'); }, disconnect() {},
+        cycleSpectator(direction) { spectatorCycles += direction; return true; },
+        requestTacticalPing(kind) { if (kind === 'location') tacticalPings++; return true; },
+        on(name, fn) { facadeListeners.set(name, fn); return () => facadeListeners.delete(name); },
+        emit(name, payload) { facadeListeners.get(name)?.(payload); },
+      };
+      const canvas = document.createElement('canvas');
+      canvas.requestPointerLock = async () => {};
+      if (typeof globalThis.WebGL2RenderingContext !== 'function') {
+        Object.defineProperty(globalThis, 'WebGL2RenderingContext', { configurable: true,
+          value: function WebGL2RenderingContext() {} });
+      }
+      const gameLayer = document.createElement('div');
+      const shellRoot = document.createElement('div');
+      document.body.append(canvas, gameLayer, shellRoot);
+      let finish;
+      let runtimeDiagnostics = null;
+      const exited = new Promise((resolve) => { finish = resolve; });
+      const runtime = createGameRuntime({ canvas, gameLayer, shellRoot, networkFacade: facade,
+        loadGame: async () => { startupOrder.push('load-game'); return { Game: FakeGame }; }, onExit: finish,
+        onNetworkDiagnostics: (value) => { runtimeDiagnostics = value; } });
+      const capability = runtime.inspectCapabilities();
+      if (!capability.supported) throw new Error(`runtime harness capability: ${JSON.stringify(capability)}`);
+      const matchId = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+      await runtime.enter({ handoff: { matchId, mode: 'bomb' }, firstMatch: true,
+        serverCareer: { modes: { bomb: { totals: { kills: 4, matches: 2, timePlayedSec: 60 } } } } });
+      facade.emit('matchState', { phase: 'live' });
+      window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowRight', cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowLeft', cancelable: true }));
+      window.dispatchEvent(new MouseEvent('mousedown', { button: 2, cancelable: true }));
+      const diagnosticsDuring = runtimeDiagnostics;
+      const during = { authority: progression.getAuthority(), kills: progression.data.lifetime.kills,
+        matches: progression.data.lifetime.matches, xp: progression.data.xp };
+      facade.emit('matchEnded', { matchId, winner: 'alpha', outcomeReason: 'score',
+        terminationReason: 'completed' });
+      // A duplicate/later terminal cannot rewrite the first authoritative lifecycle fact.
+      facade.emit('matchEnded', { matchId, winner: null, outcomeReason: 'no-contest',
+        terminationReason: 'aborted' });
+      const outcome = await exited;
+      window.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowRight', cancelable: true }));
+      return { during, outcome, diagnosticsDuring, diagnosticsAfter: runtimeDiagnostics,
+        capabilityOsMajor: capability.observed.osMajor, startupOrder,
+        spectatorCycles, tacticalPings, afterAuthority: progression.getAuthority(),
+        stored: JSON.parse(localStorage.getItem('overstrike.progress.v1')) };
+    });
+    equal(runtimeAuthority.during, { authority: 'server', kills: 4, matches: 2, xp: 0 },
+      'network runtime replaces modified localStorage with a mode-scoped server career projection');
+    equal(runtimeAuthority.capabilityOsMajor, null,
+      'Chromium reduced macOS 10_15_7 UA is treated as unknown instead of falsely rejecting modern Macs');
+    equal(runtimeAuthority.startupOrder, ['reserve-ticket', 'load-game', 'promote-session'],
+      'cold authoritative entry consumes its launch ticket before loading Game and promotes after initialization');
+    equal(runtimeAuthority.outcome, {
+      reason: 'to-menu', outcome: 'completed', completed: true, mode: 'bomb', firstMatch: true,
+      matchId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', winner: 'alpha', outcomeReason: 'score',
+      terminationReason: 'completed',
+    }, 'production runtime onExit carries the deduped authoritative terminal lifecycle shape');
+    equal(runtimeAuthority.afterAuthority, 'practice-unverified',
+      'leaving the network runtime restores the explicitly unverified practice projection');
+    equal(runtimeAuthority.spectatorCycles, 0,
+      'spectate next/previous bindings reach the facade and are removed on runtime exit');
+    equal(runtimeAuthority.tacticalPings, 1,
+      'bound Mouse3 emits one coordinate-free tactical intent and is removed on runtime exit');
+    equal(runtimeAuthority.diagnosticsDuring.rttMs, 24,
+      'network runtime forwards measured facade diagnostics to the settings session adapter');
+    equal(runtimeAuthority.diagnosticsAfter, null,
+      'network diagnostics are cleared when the authoritative runtime exits');
+    equal(runtimeAuthority.stored.lifetime.kills, 999999999,
+      'network runtime never rewrites or promotes the modified practice blob');
+
     equal(errors, [], 'browser console/page/request errors occurred');
 
     // Exercise the deployed entrypoint as well as the isolated shell mount above. This catches
@@ -811,8 +973,10 @@ async function browserChecks() {
           accessToken: 'fixture-access-token',
           expiresAt: '2026-08-20T18:00:00.000Z',
           session: { sessionId, deviceLabel: 'Acceptance browser', createdAt: '2026-08-20T16:00:00.000Z' },
-          profile: { accountId, displayName: 'Fixture Player', flags: { setupNextStep: null },
-            presence: { roomId: null }, consent: null },
+          profile: { accountId, displayName: 'Fixture Player', createdAt: '2026-08-20T16:00:00.000Z',
+            privacy: { statsVisibility: 'everyone', presenceVisibility: 'everyone' }, consent: null,
+            moderation: { status: 'clear', activeSanctions: [] },
+            flags: { nameChangeAvailableAt: null, setupNextStep: null } },
           consentReceipt: null,
         });
       }
@@ -824,8 +988,9 @@ async function browserChecks() {
       }
       if (url.pathname === '/v1/profile/me') {
         return respond(200, { accountId, displayName: 'Fixture Player', createdAt: '2026-08-20T16:00:00.000Z',
-          privacy: { statsVisibility: 'public', presenceVisibility: 'public' }, presence: { roomId: null },
-          consent: null, flags: { setupNextStep: null } });
+          privacy: { statsVisibility: 'everyone', presenceVisibility: 'everyone' },
+          consent: null, moderation: { status: 'clear', activeSanctions: [] },
+          flags: { nameChangeAvailableAt: null, setupNextStep: null } });
       }
       if (url.pathname === `/v1/profile/${accountId}`) {
         return respond(200, { accountId, displayName: 'Fixture Player', createdAt: '2026-08-20T16:00:00.000Z',
@@ -833,7 +998,8 @@ async function browserChecks() {
       }
       if (url.pathname === '/v1/onboarding/consent') {
         return respond(200, { telemetryPersonal: false, policyVersion: 1,
-          decidedAt: '2026-08-20T16:01:00.000Z', subject: 'account', receipt: 'fixture-decline-receipt' });
+          decidedAt: '2026-08-20T16:01:00.000Z', currentPolicyVersion: 1,
+          subject: 'account', receipt: 'fixture-decline-receipt' });
       }
       if (url.pathname === '/v1/profile/me/settings') {
         return respond(200, { schemaVersion: ROAMING_SETTINGS_SCHEMA_VERSION, version: 1,
@@ -869,14 +1035,17 @@ async function browserChecks() {
             'telemetry.client.enabled': true,
           } });
       }
+      if (url.pathname === '/v1/telemetry/unload/credential') return respond(204, {});
       if (url.pathname === '/v1/matches/active') return respond(204, {});
       if (url.pathname === `/v1/profile/${accountId}/stats`) {
         const totals = { kills: 10, deaths: 5, assists: 2, suicides: 0, teamKills: 0,
           headshots: 3, shotsFired: 50, shotsHit: 20, damageDealt: 1000, plants: 0,
           defuses: 0, matches: 2, wins: 1, losses: 1, draws: 0, roundsPlayed: 0,
           timePlayedSec: 600 };
-        return respond(200, { modes: { tdm: { accountId, mode: 'tdm',
-          statDefinitionVersion: '1.0.0', totals, weapons: {} } } });
+        return respond(200, { accountId, modes: {
+          tdm: { accountId, mode: 'tdm', statDefinitionVersion: '1.0.0', totals, weapons: {} },
+          bomb: { accountId, mode: 'bomb', statDefinitionVersion: '1.0.0', totals, weapons: {} },
+        } });
       }
       return respond(404, { error: { code: 'NOT_FOUND', message: 'Not found.', correlationId,
         retryable: false, retryAfterMs: null, details: {} } });
@@ -884,6 +1053,9 @@ async function browserChecks() {
     const productionPage = await productionContext.newPage();
     const productionResources = [];
     productionPage.on('request', (request) => productionResources.push(request.url()));
+    productionPage.on('response', (response) => {
+      if (response.status() >= 400) productionErrors.push(`response.${response.status()}: ${response.url()}`);
+    });
     productionPage.on('pageerror', (error) => productionErrors.push(`pageerror: ${error.message}`));
     productionPage.on('console', (message) => {
       if (message.type() === 'error') productionErrors.push(`console.error: ${message.text()}`);
@@ -893,7 +1065,7 @@ async function browserChecks() {
     await productionPage.waitForFunction(() => document.querySelector('#shell-root')?.dataset.variant !== 'loading');
     equal(productionRequests[0]?.path, '/v1/auth/refresh', 'cold protected entry must refresh before issuing protected loaders');
     equal(productionRequests.filter(({ path: requestPath }) => requestPath.startsWith(`/v1/profile/${accountId}/stats`)).length,
-      1, 'cold restore must issue the preserved route loader exactly once');
+      1, `cold restore must issue the preserved route loader exactly once; requests=${JSON.stringify(productionRequests)}`);
     equal(await productionPage.locator('#shell-root').getAttribute('data-route'), 'career.overview', 'authenticated cold refresh must preserve its deep link');
     equal(await productionPage.locator('main').count(), 1, 'production entry must expose one main landmark');
     equal(await productionPage.locator('h1').count(), 1, 'production entry must expose one page h1');

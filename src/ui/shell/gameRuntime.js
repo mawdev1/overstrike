@@ -22,7 +22,14 @@ export function identifyRuntimeClient(nav = globalThis.navigator) {
   const windows = ua.match(/Windows NT (\d+)/);
   const mac = ua.match(/Mac OS X (\d+)[_.]/);
   if (windows) { os = 'windows'; osMajor = Number(windows[1]); }
-  else if (mac) { os = 'macos'; osMajor = Number(mac[1]); }
+  else if (mac) {
+    os = 'macos';
+    osMajor = Number(mac[1]);
+    // Chromium's reduced desktop UA deliberately freezes every modern macOS release at
+    // 10_15_7. Treat that value as unknown instead of rejecting supported Mac players as
+    // Catalina; Safari still exposes a usable OS major and remains enforceable here.
+    if (/(?:Chrome|Chromium|Edg)\//.test(ua) && /Mac OS X 10_15_7/.test(ua)) osMajor = null;
+  }
   else if (/Linux/.test(ua) && !/Android/.test(ua)) os = 'linux';
   return Object.freeze({ browser, browserMajor, os, osMajor });
 }
@@ -47,7 +54,9 @@ export function inspectRuntimeCapabilities({ canvas = null } = {}) {
     reasons.push('browser-version');
   }
   if (client.os === 'other' || (client.os === 'windows' && client.osMajor < 10)
-    || (client.os === 'macos' && client.osMajor < 13)) reasons.push('os-version');
+    || (client.os === 'macos' && client.osMajor !== null && client.osMajor < 13)) {
+    reasons.push('os-version');
+  }
   if (knownNumber(nav?.hardwareConcurrency) && nav.hardwareConcurrency < MIN_LOGICAL_CORES) {
     reasons.push('cpu-cores');
   }
@@ -83,7 +92,11 @@ export function createGameRuntime({
   bootText = null,
   onExit = null,
   configureGame = null,
+  networkFacade = null,
+  loadNetworkFacade = null,
+  loadGame = () => import('../../core/game.js'),
   onUnsupported = null,
+  onNetworkDiagnostics = null,
 } = {}) {
   if (!(canvas instanceof HTMLCanvasElement)) throw new TypeError('A game canvas is required.');
   if (!(gameLayer instanceof HTMLElement)) throw new TypeError('A game layer is required.');
@@ -91,6 +104,13 @@ export function createGameRuntime({
 
   let game = null;
   let starting = null;
+  let activeNetworkFacade = null;
+  let activeProgression = null;
+  let stopTerminalListener = null;
+  let stopDiagnosticsListener = null;
+  let spectatorKeyHandler = null;
+  let tacticalMouseHandler = null;
+  let terminalExitTimer = null;
 
   function setProgress(value, label = 'Loading match') {
     const amount = Math.max(0, Math.min(1, Number(value) || 0));
@@ -118,7 +138,8 @@ export function createGameRuntime({
     if (boot) boot.hidden = true;
   }
 
-  async function enter({ matchOptions = {}, onProgress = null } = {}) {
+  async function enter({ matchOptions = {}, handoff = null, onProgress = null,
+    serverCareer = null, firstMatch = false } = {}) {
     if (game) return game;
     if (starting) return starting;
 
@@ -152,10 +173,29 @@ export function createGameRuntime({
 
     starting = (async () => {
       let candidate = null;
+      let facade = null;
       try {
         // This is the only game-engine edge reachable from the platform shell.
-        const { Game } = await import('../../core/game.js');
+        const networked = handoff && handoff.fixture !== true && handoff.localPractice !== true;
+        if (networked) {
+          const { progression } = await import('../../game/progression.js');
+          progression.beginAuthoritativeSession(serverCareer, handoff.mode);
+          activeProgression = progression;
+          facade = networkFacade ?? await loadNetworkFacade?.();
+          if (!facade?.reserve || !facade?.promoteReservation) {
+            const error = new Error('The authoritative match network adapter is unavailable.');
+            error.code = 'FEATURE_DISABLED';
+            throw error;
+          }
+          // Consume the 60-second single-use ticket before importing/initializing the renderer.
+          // The lightweight reservation sends no gameplay commands, so the server holds its
+          // referee clock until the initialized client is promoted and begins input.
+          await facade.reserve(handoff);
+        }
+        const { Game } = await loadGame();
         candidate = new Game(canvas);
+        candidate.progressionAuthority = networked ? 'server' : 'practice-unverified';
+        if (networked) candidate.netFacade = facade;
         globalThis.__GAME__ = candidate;
         await candidate.init((value, label) => {
           setProgress(value, label);
@@ -163,15 +203,100 @@ export function createGameRuntime({
         });
         candidate.menu?.close?.();
         configureGame?.(candidate);
-        candidate.bus?.once?.('toMenu', () => queueMicrotask(() => {
+        let authoritativeTerminal = null;
+        if (networked && typeof facade?.on === 'function') {
+          stopTerminalListener = facade.on('matchEnded', (terminal) => {
+            if (authoritativeTerminal || terminal?.matchId !== handoff.matchId) return;
+            if (!['completed', 'aborted', 'invalidated'].includes(terminal.terminationReason)) return;
+            authoritativeTerminal = Object.freeze({
+              matchId: terminal.matchId,
+              winner: terminal.winner ?? null,
+              outcomeReason: terminal.outcomeReason ?? null,
+              terminationReason: terminal.terminationReason,
+            });
+            candidate.hud?.scoreboard?.setVisible?.(true);
+            candidate.hud?.notice?.('MATCH COMPLETE', 'Returning to results', 1.2);
+            clearTimeout(terminalExitTimer);
+            terminalExitTimer = setTimeout(() => {
+              terminalExitTimer = null;
+              candidate.bus?.emit?.('toMenu', { authoritative: true });
+            }, 1200);
+          });
+          const publishDiagnostics = () => onNetworkDiagnostics?.(facade.netStats);
+          stopDiagnosticsListener = facade.on('matchState', publishDiagnostics);
+          spectatorKeyHandler = (event) => {
+            if (event.repeat) return;
+            const action = candidate?.settings?.actionFor?.(event.code);
+            if (action === 'tacticalPing') {
+              if (facade.requestTacticalPing?.('location')) event.preventDefault();
+              return;
+            }
+            if (action !== 'spectatePrevious' && action !== 'spectateNext') return;
+            if (facade.cycleSpectator?.(action === 'spectatePrevious' ? -1 : 1)) {
+              event.preventDefault();
+            }
+          };
+          window.addEventListener('keydown', spectatorKeyHandler);
+          tacticalMouseHandler = (event) => {
+            const code = `Mouse${event.button + 1}`;
+            if (candidate?.settings?.actionFor?.(code) === 'tacticalPing'
+              && facade.requestTacticalPing?.('location')) event.preventDefault();
+          };
+          window.addEventListener('mousedown', tacticalMouseHandler);
+        }
+        candidate.bus?.once?.('toMenu', (localOutcome) => queueMicrotask(() => {
+          // Never turn a local simulation payload into a completed network result. Only the
+          // facade's server-derived terminal event can do that.
+          const terminal = networked ? authoritativeTerminal : null;
+          const terminationReason = terminal?.terminationReason ?? null;
+          const outcome = networked
+            ? terminationReason === 'completed' ? 'completed'
+              : ['aborted', 'invalidated'].includes(terminationReason) ? 'aborted' : null
+            : (typeof localOutcome?.outcome === 'string' ? localOutcome.outcome : null);
+          const exitOutcome = Object.freeze({
+            reason: 'to-menu',
+            ...(outcome ? { outcome } : {}),
+            completed: networked ? terminationReason === 'completed'
+              : localOutcome?.completed === true,
+            mode: networked ? handoff.mode : (localOutcome?.mode ?? matchOptions.mode ?? null),
+            firstMatch: firstMatch === true,
+            ...(terminal || {}),
+          });
           exit();
-          onExit?.({ reason: 'to-menu' });
+          onExit?.(exitOutcome);
         }));
         if (boot) boot.hidden = true;
-        candidate.startMatch(matchOptions);
+        candidate.startMatch({
+          ...matchOptions,
+          mode: networked ? handoff.mode : matchOptions.mode,
+          botCount: networked ? 0 : matchOptions.botCount,
+        });
+        if (networked) {
+          if (!facade?.bindGame) {
+            const error = new Error('The authoritative match network adapter is unavailable.');
+            error.code = 'FEATURE_DISABLED';
+            throw error;
+          }
+          facade.bindGame(candidate);
+          await facade.promoteReservation();
+          activeNetworkFacade = facade;
+        }
         game = candidate;
         return candidate;
       } catch (error) {
+        stopTerminalListener?.();
+        stopTerminalListener = null;
+        stopDiagnosticsListener?.();
+        stopDiagnosticsListener = null;
+        if (spectatorKeyHandler) window.removeEventListener('keydown', spectatorKeyHandler);
+        spectatorKeyHandler = null;
+        if (tacticalMouseHandler) window.removeEventListener('mousedown', tacticalMouseHandler);
+        tacticalMouseHandler = null;
+        clearTimeout(terminalExitTimer);
+        terminalExitTimer = null;
+        activeProgression?.endAuthoritativeSession?.();
+        activeProgression = null;
+        facade?.disconnect?.('runtime-start-failed');
         candidate?.dispose?.();
         if (globalThis.__GAME__ === candidate) delete globalThis.__GAME__;
         revealShell();
@@ -185,9 +310,24 @@ export function createGameRuntime({
   }
 
   function exit() {
+    stopTerminalListener?.();
+    stopTerminalListener = null;
+    stopDiagnosticsListener?.();
+    stopDiagnosticsListener = null;
+    onNetworkDiagnostics?.(null);
+    if (spectatorKeyHandler) window.removeEventListener('keydown', spectatorKeyHandler);
+    spectatorKeyHandler = null;
+    if (tacticalMouseHandler) window.removeEventListener('mousedown', tacticalMouseHandler);
+    tacticalMouseHandler = null;
+    clearTimeout(terminalExitTimer);
+    terminalExitTimer = null;
+    activeNetworkFacade?.disconnect?.('runtime-exit');
+    activeNetworkFacade = null;
     game?.dispose?.();
     if (globalThis.__GAME__ === game) delete globalThis.__GAME__;
     game = null;
+    activeProgression?.endAuthoritativeSession?.();
+    activeProgression = null;
     setProgress(0, 'Loading match runtime');
     revealShell();
   }

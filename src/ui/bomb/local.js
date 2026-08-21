@@ -5,6 +5,7 @@ import { renderBombHudHtml } from './view.js';
 
 const TEAM_IDS = Object.freeze(['alpha', 'bravo']);
 const LOCAL_RENDER_INTERVAL = 1 / 20;
+const LIVE_FRESHNESS_MS = 750;
 
 const _eye = new THREE.Vector3();
 const _target = new THREE.Vector3();
@@ -265,6 +266,28 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
   });
 }
 
+/** Build the same presentation input from Contract 6's server-derived live views. */
+export function buildFacadeBombSample(game, facade, nowMs = performance.now(), transient = {}) {
+  const state = facade?.matchState;
+  if (!state || state.mode !== 'bomb') return null;
+  const sites = Array.isArray(state.sites) ? state.sites : [];
+  return Object.freeze({
+    matchState: state,
+    netState: facade.state,
+    netStats: facade.netStats,
+    reconnect: facade.reconnect,
+    nowMs,
+    freshnessThresholdMs: LIVE_FRESHNESS_MS,
+    localAuthority: false,
+    bindings: bindingMap(game),
+    preferences: localPreferences(game),
+    siteMarkers: sites.map((site) => projectLocalSiteMarker(game, site)).filter(Boolean),
+    typedEvent: transient.typedEvent || null,
+    outcomeEvent: transient.outcomeEvent || null,
+    cue: transient.cue || null,
+  });
+}
+
 function eventProjection(row) {
   if (!row?.kind) return {};
   const cueKinds = new Set([
@@ -289,7 +312,8 @@ function eventProjection(row) {
 }
 
 /** Mount the local-practice adapter without importing or imitating the CC-owned net facade. */
-export function createLocalBombHud({ game, root, document: documentRef = globalThis.document } = {}) {
+export function createLocalBombHud({ game, root, facade = game?.netFacade ?? null,
+  document: documentRef = globalThis.document } = {}) {
   if (!root || !documentRef) throw new TypeError('Local Bomb HUD requires a root and document.');
   const mount = documentRef.createElement('div');
   mount.className = 'bomb-hud-mount';
@@ -310,9 +334,34 @@ export function createLocalBombHud({ game, root, document: documentRef = globalT
     unsubs.push(on('matchStart', () => { transient = {}; lastMarkup = ''; accumulator = LOCAL_RENDER_INTERVAL; }));
     unsubs.push(on('toMenu', () => { transient = {}; lastMarkup = ''; mount.hidden = true; }));
   }
+  const facadeOn = facade?.on?.bind(facade);
+  if (facadeOn) {
+    const cue = (type) => (payload) => {
+      transient = type === 'interactionRefused'
+        ? { typedEvent: { type, ...payload } }
+        : type === 'roundEnded' || type === 'matchEnded'
+          ? { outcomeEvent: { type, ...payload } }
+          : { cue: { type: payload?.kind || type } };
+      transientUntil = performance.now() + (type.endsWith('Ended') ? 4_000 : 1_800);
+      accumulator = LOCAL_RENDER_INTERVAL;
+    };
+    unsubs.push(facadeOn('interactionRefused', cue('interactionRefused')));
+    unsubs.push(facadeOn('roundEnded', cue('roundEnded')));
+    unsubs.push(facadeOn('matchEnded', cue('matchEnded')));
+    unsubs.push(facadeOn('event', cue('event')));
+    unsubs.push(facadeOn('stateChange', () => { accumulator = LOCAL_RENDER_INTERVAL; }));
+  }
+  const onClick = (event) => {
+    if (event.target?.closest?.('[data-bomb-action="cancel-connection"]')) {
+      facade?.disconnect?.('player-cancelled');
+    }
+  };
+  mount.addEventListener('click', onClick);
 
   const update = (dt = LOCAL_RENDER_INTERVAL) => {
-    const active = game?.match?.modeId === 'bomb' && ['playing', 'paused'].includes(game?.state);
+    const networkBomb = facade?.descriptor?.mode === 'bomb';
+    const active = (networkBomb || game?.match?.modeId === 'bomb')
+      && ['playing', 'paused'].includes(game?.state);
     mount.hidden = !active;
     root.classList.toggle('bomb-mode', active);
     root.removeAttribute('aria-hidden');
@@ -327,7 +376,9 @@ export function createLocalBombHud({ game, root, document: documentRef = globalT
     accumulator %= LOCAL_RENDER_INTERVAL;
     const nowMs = performance.now();
     if (transientUntil && nowMs >= transientUntil) { transient = {}; transientUntil = 0; }
-    const sample = buildLocalBombSample(game, nowMs, transient);
+    const sample = networkBomb
+      ? buildFacadeBombSample(game, facade, nowMs, transient)
+      : buildLocalBombSample(game, nowMs, transient);
     if (!sample) return null;
     const model = projectBombPresentation(sample);
     const markup = renderBombHudHtml(model);
@@ -342,6 +393,6 @@ export function createLocalBombHud({ game, root, document: documentRef = globalT
     element: mount,
     update,
     reset() { transient = {}; transientUntil = 0; lastMarkup = ''; accumulator = LOCAL_RENDER_INTERVAL; mount.innerHTML = ''; },
-    destroy() { for (const off of unsubs) off?.(); mount.remove(); },
+    destroy() { for (const off of unsubs) off?.(); mount.removeEventListener('click', onClick); mount.remove(); },
   });
 }

@@ -9,27 +9,6 @@ import {
 } from './inventory.js';
 import { createSettingsController, sanitizeSessionDiagnostics } from './controller.js';
 
-// These values are fully validated/persisted/roamed, but the current local-practice engine has
-// no truthful consumer for them yet. Keep the controls usable for account portability while
-// labelling that boundary instead of pretending the legacy runtime applies them live.
-const LOCAL_RUNTIME_PENDING = new Set([
-  'cameraShake', 'viewBob', 'weaponSway', 'brightness', 'flashIntensity',
-  'screenEffectIntensity', 'filmGrain', 'motionBlur', 'uiVolume', 'announcerVolume', 'subtitles',
-  'closedCaptions', 'subtitleSize', 'captionBackground', 'captionDirection',
-  'crosshairOpacity', 'crosshairSize', 'crosshairThickness', 'crosshairGap',
-  'crosshairOutline', 'hudTextSize', 'minimapRotation', 'showKillfeed',
-  'showObjectiveMarkers', 'damageVignette', 'colorVisionPreset',
-  'networkDiagnosticsOverlay',
-]);
-
-// These bindings are part of the roaming control document, but their gameplay/chat/spectator
-// adapters arrive in later phases. Persist them without claiming that today's runtime consumes
-// them live.
-const LOCAL_RUNTIME_PENDING_ACTIONS = new Set([
-  'tacticalEquipment', 'textChat', 'teamChat', 'tacticalPing',
-  'muteCurrentTarget', 'spectatePrevious', 'spectateNext',
-]);
-
 const STYLES = `
 .os-settings{--set-accent:var(--os-accent,#8ef7c4);--set-border:var(--os-border,rgba(142,247,196,.17));--set-soft:var(--os-border-soft,rgba(233,241,247,.08));color:var(--os-fg,#e9f1f7);background:transparent;font:500 1rem/1.45 var(--f-ui,system-ui,sans-serif);max-width:76rem;margin:auto;padding:clamp(1rem,3vw,2rem)}
 .os-settings *{box-sizing:border-box}.os-settings button,.os-settings input,.os-settings select{font:inherit}
@@ -90,14 +69,14 @@ function renderSetting(definition, snapshot) {
   const enabled = !definition.enabledWhen
     || snapshot.values[definition.enabledWhen.key] === definition.enabledWhen.equals;
   const id = `os-setting-${definition.key}`;
-  const runtimeNote = LOCAL_RUNTIME_PENDING.has(definition.key)
-    ? '<span role="status">Saved now; local-practice preview pending.</span>'
-    : '';
+  const runtimeNote = definition.unavailableReason
+    ? `<span role="status">Unavailable: ${escapeHtml(definition.unavailableReason)}</span>`
+    : '<span role="status">Applies live in the match runtime.</span>';
   return `
     <div class="os-setting" data-setting-row="${definition.key}">
       <div>
         <div class="os-setting__name" id="${id}-label">${escapeHtml(definition.label)}</div>
-        <div class="os-setting__meta">${scopeBadge(definition.scope)}<span>${escapeHtml(definition.key)}</span>${definition.readOnly ? '<span>Fixed</span>' : ''}${runtimeNote}${!enabled && definition.enabledWhen ? `<span role="status">Unavailable while ${escapeHtml(SETTINGS_BY_KEY[definition.enabledWhen.key]?.label || definition.enabledWhen.key)} is off.</span>` : ''}</div>
+        <div class="os-setting__meta">${scopeBadge(definition.scope)}<span>${escapeHtml(definition.key)}</span>${definition.readOnly ? '<span>Unavailable</span>' : ''}${runtimeNote}${!enabled && definition.enabledWhen ? `<span role="status">Unavailable while ${escapeHtml(SETTINGS_BY_KEY[definition.enabledWhen.key]?.label || definition.enabledWhen.key)} is off.</span>` : ''}</div>
       </div>
       <div class="os-setting__control" aria-labelledby="${id}-label">
         ${settingControl(definition, value, enabled, id)}
@@ -108,10 +87,11 @@ function renderSetting(definition, snapshot) {
 
 function renderBinding(action, snapshot) {
   const value = snapshot.bindings[action.id];
-  const fixed = Boolean(action.fixed);
-  const runtimeNote = LOCAL_RUNTIME_PENDING_ACTIONS.has(action.id)
-    ? '<span role="status">Saved now; live adapter pending.</span>'
-    : '';
+  const unavailable = Boolean(action.unavailableReason);
+  const fixed = Boolean(action.fixed || unavailable);
+  const runtimeNote = unavailable
+    ? `<span role="status">Unavailable: ${escapeHtml(action.unavailableReason)}</span>`
+    : '<span role="status">Active in the match runtime.</span>';
   return `
     <div class="os-setting" data-binding-row="${action.id}">
       <div>

@@ -119,6 +119,10 @@ function applyDocumentPreference(key, value) {
     root.dataset.colorVision = value;
   } else if (key === 'subtitleSize') {
     root.dataset.subtitleSize = value;
+  } else if (key === 'hudTextSize') {
+    root.dataset.hudTextSize = value;
+  } else if (key === 'brightness') {
+    root.style.setProperty('--os-game-brightness', `${Number(value) / 100}`);
   } else if (['cameraShake', 'viewBob', 'weaponSway', 'flashIntensity',
     'screenEffectIntensity', 'captionBackground'].includes(key)) {
     root.style.setProperty(`--os-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`,
@@ -145,9 +149,7 @@ function configureGameFromSettings(game) {
     shadows: values.shadows,
     shadowQuality: values.shadowQuality,
     postFx: values.postFx,
-    // The legacy renderer exposes grain as a boolean. Preserve its on/off boundary while the
-    // exact percentage remains available to shell/CSS consumers through the controller.
-    filmGrain: values.filmGrain > 0,
+    filmGrain: values.filmGrain / 100,
     motionBlur: values.motionBlur,
     vignette: values.vignette,
     maxFps: values.maxFps === 'off' ? 0 : Number(values.maxFps),
@@ -155,11 +157,37 @@ function configureGameFromSettings(game) {
     masterVolume: values.masterVolume / 100,
     sfxVolume: values.sfxVolume / 100,
     musicVolume: values.musicVolume / 100,
+    uiVolume: values.uiVolume / 100,
+    announcerVolume: values.announcerVolume / 100,
+    subtitles: values.subtitles,
+    closedCaptions: values.closedCaptions,
+    subtitleSize: values.subtitleSize,
+    captionBackground: values.captionBackground / 100,
+    captionDirection: values.captionDirection,
+    cameraShake: values.cameraShake / 100,
+    viewBob: values.viewBob / 100,
+    weaponSway: values.weaponSway / 100,
+    flashIntensity: values.flashIntensity / 100,
+    screenEffectIntensity: values.screenEffectIntensity / 100,
     crosshairStyle: values.crosshairStyle,
     crosshairColor: values.crosshairColor,
+    crosshairOpacity: values.crosshairOpacity / 100,
+    crosshairSize: values.crosshairSize / 100,
+    crosshairThickness: values.crosshairThickness,
+    crosshairGap: values.crosshairGap,
+    crosshairOutline: values.crosshairOutline,
     showMinimap: values.showMinimap,
     showDamageNumbers: values.showDamageNumbers,
     hudScale: values.hudScale / 100,
+    hudTextSize: values.hudTextSize,
+    minimapRotation: values.minimapRotation,
+    showKillfeed: values.showKillfeed,
+    showObjectiveMarkers: values.showObjectiveMarkers,
+    damageVignette: values.damageVignette,
+    colorVisionPreset: values.colorVisionPreset,
+    reduceMotion: values.reduceMotion,
+    networkDiagnosticsOverlay: values.networkDiagnosticsOverlay,
+    brightness: values.brightness / 100,
     difficulty: values.difficulty,
     botCount: values.botCount,
     killLimit: values.killLimit,
@@ -167,6 +195,7 @@ function configureGameFromSettings(game) {
       ? values.mode : 'tdm',
   };
   for (const [key, value] of Object.entries(mapping)) game.settings.set(key, value);
+  if (game.canvas?.style) game.canvas.style.filter = `brightness(${mapping.brightness})`;
 
   const binds = {};
   for (const [action, slots] of Object.entries(snapshot.bindings)) {
@@ -186,7 +215,7 @@ const settings = createSettingsController({
   },
 });
 
-for (const key of ['reduceMotion', 'colorVisionPreset', 'subtitleSize', 'cameraShake', 'viewBob',
+for (const key of ['reduceMotion', 'colorVisionPreset', 'subtitleSize', 'hudTextSize', 'brightness', 'cameraShake', 'viewBob',
   'weaponSway', 'flashIntensity', 'screenEffectIntensity', 'captionBackground', 'subtitles',
   'closedCaptions', 'captionDirection']) {
   applyDocumentPreference(key, settings.get(key));
@@ -227,8 +256,24 @@ shellApi = createLobbyShellAdapter({
   },
 });
 
+let networkFacadePromise = null;
+function loadNetworkFacade() {
+  if (networkFacadePromise) return networkFacadePromise;
+  networkFacadePromise = import('./net/facade.js').then(({ net }) => {
+    // Reconnect tickets must travel through the authenticated platform client. The facade
+    // deliberately has no cookie-only fetch fallback, and the game bundle remains outside
+    // the shell's initial module graph until an authoritative handoff is entered.
+    net.setTicketProvider((matchId) => shellApi.reconnectMatch({ matchId }));
+    return net;
+  }).catch((error) => {
+    networkFacadePromise = null;
+    throw error;
+  });
+  return networkFacadePromise;
+}
+
 function applyHydratedDocumentPreferences() {
-  for (const key of ['reduceMotion', 'colorVisionPreset', 'subtitleSize', 'cameraShake', 'viewBob',
+  for (const key of ['reduceMotion', 'colorVisionPreset', 'subtitleSize', 'hudTextSize', 'brightness', 'cameraShake', 'viewBob',
     'weaponSway', 'flashIntensity', 'screenEffectIntensity', 'captionBackground', 'subtitles',
     'closedCaptions', 'captionDirection']) {
     applyDocumentPreference(key, settings.get(key));
@@ -326,6 +371,8 @@ runtime = createGameRuntime({
   bootFill,
   bootText,
   configureGame: configureGameFromSettings,
+  loadNetworkFacade,
+  onNetworkDiagnostics: (diagnostics) => settings.setSessionDiagnostics(diagnostics),
   onUnsupported(reason, observed) {
     const identity = identifyRuntimeClient(navigator);
     telemetry.recordUnsupported({
@@ -358,12 +405,7 @@ shell = mountAppShell({
   settings,
   bootReady: sessionRestore,
   deferInitialLoad: true,
-  loadGameRuntime: async ({ handoff }) => {
-    if (handoff?.fixture !== true && handoff?.localPractice !== true) {
-      const error = new Error('The authoritative match network adapter is not available in this client build.');
-      error.code = 'FEATURE_DISABLED';
-      throw error;
-    }
+  loadGameRuntime: async ({ handoff, firstMatch }) => {
     runtimeReturnPath = handoff.localPractice === true
       ? '/welcome'
       : handoff.fixture === true
@@ -374,7 +416,17 @@ shell = mountAppShell({
           ? `/results/${encodeURIComponent(handoff.matchId)}`
           : '/play/rooms';
     const snapshot = settings.getSnapshot();
+    const networked = handoff && handoff.fixture !== true && handoff.localPractice !== true;
+    // Career hydration is best-effort and mode-scoped. Failure cannot block joining a live
+    // match; the runtime still switches to a neutral server-authoritative projection so the
+    // practice localStorage blob never becomes the fallback authority.
+    const serverCareer = networked
+      ? await shellApi.getCareerOverview().catch(() => null)
+      : null;
     const game = await runtime.enter({
+      handoff,
+      firstMatch,
+      serverCareer,
       matchOptions: {
         mode: featureFlags.isEnabled('mode.bomb.enabled') && featureFlags.isEnabled('map.the_square.enabled')
           ? snapshot.values.mode : 'tdm',
