@@ -490,6 +490,11 @@ async function testShellContractMappings() {
         receipt: 'receipt', correlationId,
       };
       if (path === '/v1/rooms') responseData = { items: [room()], nextCursor: null, correlationId };
+      if (path === '/v1/config/regions') responseData = { regions: [
+        { id: 'yyz', label: 'Toronto', probeUrl: null, available: false },
+        { id: 'ord', label: 'Chicago', probeUrl: 'https://ord.example.invalid/health', available: true },
+        { id: 'iad', label: 'Ashburn, Virginia', probeUrl: null, available: false },
+      ], correlationId };
       if (path.startsWith('/v1/presence/online')) responseData = { items: [{
         accountId: 'account-online', displayName: 'Online Player', state: 'online',
         joinable: false, roomId: null,
@@ -806,7 +811,54 @@ await testFrozenUnloadIngress();
 testHighLevelTelemetryHooks();
 await testShellContractMappings();
 await testLegacyProgressionImportStaysUnverified();
+
+/**
+ * http-api.md §11.6 sideload. The room-create form shipped a free-text Region box against a
+ * closed set of datacenter codes, so "Canada" and "US" were both rejected with nothing naming
+ * yyz/ord/iad. These pin the two properties the dropdown depends on: the list arrives with the
+ * rooms, and a failure to fetch it degrades the FORM rather than the page.
+ */
+async function testRoomListSideloadsRegions() {
+  const correlationId = '01J00000000000000000000010';
+  const regions = [
+    { id: 'yyz', label: 'Toronto', probeUrl: null, available: false },
+    { id: 'ord', label: 'Chicago', probeUrl: 'https://ord.example.invalid/health', available: true },
+  ];
+  const make = (regionResponder) => createShellApi({
+    client: { sessionState: { authenticated: true },
+      request: async (path) => {
+        if (path.startsWith('/v1/config/regions')) return regionResponder(correlationId);
+        if (path.startsWith('/v1/presence/online')) {
+          return { status: 200, correlationId, headers: new Headers(),
+            data: { items: [], nextCursor: null, correlationId } };
+        }
+        return { status: 200, correlationId, headers: new Headers(),
+          data: { items: [], nextCursor: null, correlationId } };
+      } },
+    legacyStorage: null });
+
+  const ok = await make(() => ({ status: 200, correlationId, headers: new Headers(),
+    data: { regions, correlationId } })).listRooms();
+  assert.deepEqual(ok.regions.map((r) => r.id), ['yyz', 'ord'],
+    'the region list arrives alongside the rooms, in server order');
+  assert.equal(ok.regionsUnavailable, false, 'and is not flagged unavailable when it loaded');
+
+  // A malformed list must NOT take down the room browser. Presence rethrows CLIENT_PROTOCOL
+  // because it is page content; regions are options for an optional sub-form.
+  const malformed = await make(() => ({ status: 200, correlationId, headers: new Headers(),
+    data: { regions: [{ id: 'yyz' }], correlationId } })).listRooms();
+  assert.equal(malformed.regionsUnavailable, true, 'a malformed region list is flagged');
+  assert.deepEqual(malformed.regions, [], 'and yields no options rather than partial ones');
+  assert.ok(Array.isArray(malformed.items),
+    'the room listing still succeeds — a broken region list is not an outage of the browser');
+
+  const failed = await make(() => { throw new Error('network'); }).listRooms();
+  assert.equal(failed.regionsUnavailable, true, 'a transport failure is flagged the same way');
+  assert.ok(Array.isArray(failed.items), 'and still does not break the listing');
+}
+
 await testClosedShellSuccessSchemas();
+await testRoomListSideloadsRegions();
 await testColdProfileRestoreRequestsOwnProfileOnce();
 await testMalformedAuthCannotMutateSession();
 testRegistryIsClosed();

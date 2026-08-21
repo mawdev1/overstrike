@@ -99,6 +99,14 @@ const validPresencePage = (value) => closed(value, ['items', 'nextCursor', 'corr
   && Array.isArray(value.items) && value.items.every(validPresenceItem)
   && nullableText(value.nextCursor) && text(value.correlationId);
 
+// http-api.md §11.6. `probeUrl` is nullable by contract: a region with no registered server has
+// nothing honest to point at, and naming a host that will not answer would have the client
+// record a timeout as a latency.
+const validRegion = (value) => closed(value, ['id', 'label', 'probeUrl', 'available'])
+  && text(value.id) && text(value.label) && nullableText(value.probeUrl) && bool(value.available);
+const validRegionList = (value) => closed(value, ['regions'], ['correlationId'])
+  && Array.isArray(value.regions) && value.regions.every(validRegion);
+
 const validSession = (value) => closed(value,
   ['sessionId', 'deviceLabel', 'userAgentClass', 'ipClass', 'createdAt', 'lastSeenAt', 'isCurrent'])
   && text(value.sessionId) && text(value.deviceLabel) && text(value.userAgentClass)
@@ -607,6 +615,37 @@ export function createShellApi({ client, telemetry = null, settings = null, ulid
         } catch (error) {
           if (error?.code === 'CLIENT_PROTOCOL') throw error;
           response.presenceUnavailable = true;
+        }
+
+        // §11.6's region list, sideloaded like presence and for the same reason: the create
+        // form needs it and it is not worth a second round trip on every page.
+        //
+        // The form used to ask for a free-text region. `yyz`/`ord`/`iad` are datacenter codes
+        // no player knows, so typing "Canada" and then "US" produced two VALIDATION_FAILEDs
+        // that named nothing acceptable. A closed set the server owns belongs in a dropdown,
+        // and §11.6 exists to deliver it.
+        //
+        // A failure here is NOT fatal to the page — rooms still list and still join. It sets a
+        // flag the form reads, so the fallback is a visible explanation rather than an empty
+        // dropdown that looks like the deployment has no regions at all.
+        response.regions = [];
+        response.regionsUnavailable = false;
+        try {
+          const list = await data('/v1/config/regions', undefined, validRegionList);
+          response.regions = list.regions;
+        } catch {
+          // EVERY failure degrades, including CLIENT_PROTOCOL — deliberately unlike the presence
+          // sideload directly above, which rethrows it.
+          //
+          // Presence is CONTENT of this page; a protocol violation there means what the player
+          // is reading is not what the contract describes, and that must be loud. Regions are
+          // input options for an optional sub-form. Letting a malformed region list take down
+          // the entire room browser — no listing, no joining — would be a far larger outage than
+          // the one it reports, and browsing and joining do not depend on it at all.
+          //
+          // Not silent: `regionsUnavailable` renders as a notice on the form and disables
+          // submission, so the failure is visible exactly where it has consequences.
+          response.regionsUnavailable = true;
         }
       }
       return response;

@@ -658,7 +658,11 @@ function roomCard(room) {
 function selectControl(label, id, options) {
   const select = element('select', { id });
   for (const option of options) {
-    select.append(element('option', { value: option.value }, option.label));
+    const node = element('option', { value: option.value }, option.label);
+    // A region with no capacity is shown and NOT selectable: hiding it would make a region the
+    // player saw yesterday silently vanish, which reads as a bug rather than as "full".
+    if (option.disabled) node.disabled = true;
+    select.append(node);
   }
   return element('div', { className: 'os-field' }, [element('label', { htmlFor: id }, label), select]);
 }
@@ -758,7 +762,38 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
   ]);
   const createName = field({ label: 'Room name', name: 'room-create-name', required: true });
   createName.input.maxLength = 48;
-  const createRegion = field({ label: 'Region', name: 'room-create-region', required: true });
+  /**
+   * Region is a SELECT, not a text box.
+   *
+   * It shipped as free text. The accepted values are `yyz`/`ord`/`iad` — Fly datacenter codes —
+   * so a player typed "Canada", got `VALIDATION_FAILED`, typed "US", got it again, and nothing
+   * in the UI or the error named a value that would have worked. Map and Mode two lines below
+   * were already selects; Region was the one closed set left open, and it was the one nobody
+   * could guess.
+   *
+   * The options come from `GET /v1/config/regions` (§11.6), not a list hardcoded here. A copy
+   * in the client is a copy that drifts from the server's allowlist, and it could not carry
+   * `available` at all — which is the part that stops the form offering a region that room
+   * creation will then refuse for want of capacity.
+   */
+  const regionList = view.data?.regions || [];
+  const regionOptions = regionList.map((region) => ({
+    value: region.id,
+    label: region.available ? region.label : `${region.label} — no capacity`,
+    disabled: !region.available,
+  }));
+  const createRegionWrap = selectControl('Region', 'shell-room-create-region', regionOptions);
+  const createRegionSelect = createRegionWrap.querySelector('select');
+  // Preselect the first region that can actually host, so the default submission succeeds.
+  const firstAvailable = regionList.find((region) => region.available);
+  if (firstAvailable) createRegionSelect.value = firstAvailable.id;
+  // An empty or unreachable list must explain itself. A bare empty dropdown reads as "this
+  // deployment has no regions", which is a different and more alarming claim than the truth.
+  const regionNotice = view.data?.regionsUnavailable
+    ? 'Region list unavailable — try again shortly.'
+    : regionList.length && !firstAvailable
+      ? 'No region currently has match capacity.'
+      : null;
   const modeOptions = [
     isFeatureEnabled?.('mode.tdm.enabled') !== false ? { value: 'tdm', label: 'Team deathmatch' } : null,
     isFeatureEnabled?.('mode.bomb.enabled') !== false ? { value: 'bomb', label: 'Bomb' } : null,
@@ -773,18 +808,19 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
   const createPassword = field({ label: 'Password (optional)', name: 'room-create-password', type: 'password', autocomplete: 'new-password' });
   const createStatus = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite' });
   const createSubmit = submitButton('Create and join');
-  createSubmit.disabled = !modeOptions.length || !mapOptions.length;
+  createSubmit.disabled = !modeOptions.length || !mapOptions.length || !firstAvailable;
   const createForm = element('form', { className: 'os-form' }, [
-    createName.wrapper, createRegion.wrapper, createMapWrap, createModeWrap,
+    createName.wrapper, createRegionWrap, createMapWrap, createModeWrap,
     createCapacity.wrapper, createPassword.wrapper,
     !modeOptions.length || !mapOptions.length
       ? element('p', { className: 'os-notice', role: 'status' }, 'Room creation is unavailable because no approved mode and map combination is enabled.') : null,
+    regionNotice ? element('p', { className: 'os-notice', role: 'status' }, regionNotice) : null,
     createStatus, createSubmit,
   ]);
   createForm.addEventListener('submit', (event) => {
     event.preventDefault();
     actions.submit('createRoom', {
-      name: createName.input.value.trim(), region: createRegion.input.value.trim(),
+      name: createName.input.value.trim(), region: createRegionSelect.value,
       mapId: createMapWrap.querySelector('select').value, mode: createModeWrap.querySelector('select').value,
       capacity: Number(createCapacity.input.value), password: createPassword.input.value || undefined,
     }, {
