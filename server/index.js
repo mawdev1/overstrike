@@ -157,7 +157,7 @@ function activateAllocation(allocation, trace = {}) {
     roster: new Map(allocation.roster.map((seat) => [seat.accountId, {
       displayName: seat.displayName, team: seat.team, primaryIdx: seat.primaryIdx, secondaryIdx: seat.secondaryIdx,
       joined: false, connected: false, released: false, graceEndsAt: null,
-      connectBy: Date.now() + 60_000, joinedAt: null, connectedAt: null,
+      connectBy: seatClock.now() + 60_000, joinedAt: null, connectedAt: null,
       connectedMs: 0, disconnectedAt: null,
     }])),
   };
@@ -220,6 +220,63 @@ game.bus?.on('damage', (e) => {
 // register. A machine kept warm for hours makes this the normal case, not the edge case.
 const INTERMISSION_MS = 10000;
 const RECONNECT_GRACE_MS = 90_000;
+
+/**
+ * The SEAT-LIFECYCLE clock.  Deliberately not the simulation clock.
+ *
+ * Two deadlines decide whether a player still owns a body on this authority: the 60 s
+ * `connectBy` window an allocated seat has to convert its handoff, and the 90 s
+ * `RECONNECT_GRACE_MS` a dropped player has to come back. Both were read straight off
+ * `Date.now()`, which means the only way to observe either one is to wait that long in real
+ * time — and the only way to observe them NOT firing is to finish everything else faster
+ * than the deadline, on whatever hardware you happen to be on.
+ *
+ * That is not a hypothetical. The `browserlivetest` acceptance harness starts two real
+ * Chromium contexts, and on shared CI hardware loading the engine through the Vite dev
+ * server took longer than the 60 s `connectBy` window. Both seats were reaped WHILE the
+ * browsers were still entering, so `/v1/matches/:id/reconnect-ticket` answered 409
+ * RECONNECT_GRACE_EXPIRED and the harness failed against a wall-clock deadline it did not
+ * control. Widening the window would only move the number that CI is slower than.
+ *
+ * So the deadlines get a clock that a test can hold still and advance explicitly:
+ *
+ *   hold()        freeze it — deadlines stop approaching, nothing else changes
+ *   resume()      continue from the frozen instant (no jump forward on release)
+ *   advance(ms)   step it deliberately, to expire a window without waiting for it
+ *
+ * `toWallClock()` projects a seat-clock instant back into real time, because the platform
+ * compares `graceEndsAt` against ITS own real clock. Reporting a held instant unprojected
+ * would tell the platform a seat had expired while this process was still holding the body.
+ *
+ * The control surface for this is opt-in via OVERSTRIKE_SEAT_CLOCK_CONTROL (see
+ * `/control/seat-clock`), so a production authority does not merely refuse to freeze —
+ * it does not expose the ability at all.
+ */
+const seatClock = (() => {
+  let frozenAt = null;
+  let offsetMs = 0;
+  const now = () => (frozenAt === null ? Date.now() + offsetMs : frozenAt);
+  return {
+    now,
+    /**
+     * Real-time instant at which a seat-clock instant will actually be reached.
+     * Computed from the offset directly rather than `now() - Date.now()`, which reads the
+     * real clock twice and can straddle a millisecond boundary.
+     */
+    toWallClock: (seatMs) => seatMs - (frozenAt === null ? offsetMs : frozenAt - Date.now()),
+    hold() { if (frozenAt === null) frozenAt = Date.now() + offsetMs; },
+    resume() { if (frozenAt !== null) { offsetMs = frozenAt - Date.now(); frozenAt = null; } },
+    advance(ms) { if (frozenAt === null) offsetMs += ms; else frozenAt += ms; },
+    state: () => ({ held: frozenAt !== null,
+      offsetMs: frozenAt === null ? offsetMs : frozenAt - Date.now(), seatNow: now() }),
+  };
+})();
+// Opt-in by env var, not by NODE_ENV: the acceptance harnesses deliberately run this process
+// with NODE_ENV=production so that ticket enforcement is the real one. The seam therefore has
+// to be a switch the SPAWNER sets, and a deployed authority never sets it — so the route does
+// not exist there at all, which is a stronger guarantee than a route that exists and refuses.
+const SEAT_CLOCK_CONTROL = process.env.OVERSTRIKE_SEAT_CLOCK_CONTROL === '1';
+
 const heldEntities = new Map();
 let restartAt = 0;
 let matchesPlayed = 1;
@@ -319,9 +376,12 @@ let behind = 0;
 
 function pump() {
   const wallNow = Date.now();
-  expireUnjoinedSeats(boundMatch?.roster, wallNow);
+  // Seat deadlines run on the seat clock, never on `wallNow`: a test must be able to hold
+  // this window open or step past it deliberately rather than race it. See `seatClock`.
+  const seatNow = seatClock.now();
+  expireUnjoinedSeats(boundMatch?.roster, seatNow);
   for (const [accountId, held] of heldEntities) {
-    if (held.expiresAt > wallNow) continue;
+    if (held.expiresAt > seatNow) continue;
     heldEntities.delete(accountId);
     game.removeEntity(held.entity);
     const seat = boundMatch?.roster.get(accountId);
@@ -482,7 +542,8 @@ const http_ = http.createServer((req, res) => {
       traceSpans: correlationId ? observability.timelineSpans(correlationId) : [],
       seats: boundMatch ? [...boundMatch.roster].map(([accountId, seat]) => ({
         accountId, connected: seat.connected, released: seat.released,
-        graceEndsAt: seat.graceEndsAt ? new Date(seat.graceEndsAt).toISOString() : null,
+        // Projected back into real time: the platform compares this against ITS clock.
+        graceEndsAt: seat.graceEndsAt ? new Date(seatClock.toWallClock(seat.graceEndsAt)).toISOString() : null,
       })) : [] }));
     return;
   }
@@ -512,6 +573,37 @@ const http_ = http.createServer((req, res) => {
       matchTicketVerifier?.releaseAllocation?.(boundMatch.matchId);
       boundMatch = null;
       res.writeHead(204); res.end();
+    });
+    return;
+  }
+  /**
+   * The seat clock's control surface — the deterministic seam that replaces "wait 60 seconds".
+   *
+   * `{ "hold": true }`  freeze seat deadlines (they stop approaching)
+   * `{ "hold": false }` resume from the frozen instant, without jumping forward
+   * `{ "advanceMs": N }` step the seat clock, to expire a window on purpose
+   *
+   * Only mounted when OVERSTRIKE_SEAT_CLOCK_CONTROL=1, and still behind the control secret.
+   * An authority that was not started with the switch answers 404: the seam is absent, not
+   * merely disabled.
+   */
+  if (req.url === '/control/seat-clock' && req.method === 'POST') {
+    if (!SEAT_CLOCK_CONTROL) { res.writeHead(404); res.end(); return; }
+    if (!controlAuthorized(req)) { res.writeHead(401); res.end(); return; }
+    let raw = ''; req.setEncoding('utf8'); req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      let input;
+      try { input = JSON.parse(raw); } catch { res.writeHead(400); res.end(); return; }
+      const keys = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input) : null;
+      if (!keys || keys.length !== 1
+        || !((keys[0] === 'hold' && typeof input.hold === 'boolean')
+          || (keys[0] === 'advanceMs' && Number.isFinite(input.advanceMs) && input.advanceMs >= 0))) {
+        res.writeHead(422); res.end(); return;
+      }
+      if (keys[0] === 'hold') (input.hold ? seatClock.hold() : seatClock.resume());
+      else seatClock.advance(input.advanceMs);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, ...seatClock.state() }));
     });
     return;
   }
@@ -633,7 +725,7 @@ wss.on('connection', (sock, req) => {
     const accountId = session.identity?.sub;
     const allocationSeat = boundMatch?.roster.get(accountId);
     const held = heldEntities.get(accountId);
-    if (held && held.expiresAt > Date.now()) {
+    if (held && held.expiresAt > seatClock.now()) {
       heldEntities.delete(accountId);
       session.isReconnect = true;
       if (allocationSeat) {
@@ -693,7 +785,7 @@ wss.on('connection', (sock, req) => {
     // entity, and `removeEntity(undefined)` is a way to find that out at runtime.
     if (session.entity && session.identity?.sub) {
       const seat = boundMatch?.roster.get(session.identity.sub);
-      const expiresAt = Date.now() + RECONNECT_GRACE_MS;
+      const expiresAt = seatClock.now() + RECONNECT_GRACE_MS;
       heldEntities.set(session.identity.sub, {
         entity: session.entity, expiresAt,
       });

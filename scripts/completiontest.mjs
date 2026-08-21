@@ -43,7 +43,11 @@ const gameServer = spawn(process.execPath, [join(root, 'server/index.js'), `--po
     OVERSTRIKE_MATCH_CONTROL_SECRET: controlSecret,
     OVERSTRIKE_PLATFORM_CONTROL_URL: `http://127.0.0.1:${platformPort}`,
     OVERSTRIKE_PUBLIC_WS_URL: `ws://127.0.0.1:${matchPort}`,
-    OVERSTRIKE_SERVER_ID: `completion-${matchPort}` },
+    OVERSTRIKE_SERVER_ID: `completion-${matchPort}`,
+    // The seat-lifecycle clock seam (server/index.js `seatClock`). Without it this harness
+    // races the authority's 60 s `connectBy` window with however long Chromium takes to load
+    // the engine through Vite — which is a wall-clock deadline the harness does not control.
+    OVERSTRIKE_SEAT_CLOCK_CONTROL: '1' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let gameLog = '';
@@ -104,11 +108,26 @@ async function onboard(index) {
   return { token: signup.body.accessToken, accountId: signup.body.profile.accountId, email, password };
 }
 
+/**
+ * A lobby client that answers heartbeats, because a real one does.
+ *
+ * These sockets used to ignore the server's `heartbeat` frames entirely. The lobby closes a
+ * socket that misses two of them (30 s) and releases its seat 90 s after that, so every one
+ * of these fake players was on a 120-second fuse from the moment it connected — and the
+ * harness passed only for as long as it finished first. Under load it does not: four
+ * concurrent runs put the room past the fuse, the room emptied and was destroyed, and the
+ * rematch leg failed with `lobby reconnect 404`.
+ *
+ * That is the same defect as the seat-clock one, wearing a different hat: a test racing a
+ * real deadline instead of controlling it. Here the control is free and needs no seam —
+ * speak the protocol. A client that acks is not "given longer", it is simply not dead.
+ */
 function lobbySocket(ticket) {
   const url = new URL(ticket.lobbySocketUrl); url.searchParams.set('ticket', ticket.lobbyTicket);
   const ws = new WebSocket(url); const frames = []; const waiters = [];
   ws.on('message', (raw) => {
     const frame = JSON.parse(String(raw)); frames.push(frame);
+    if (frame.t === 'heartbeat') ws.send(JSON.stringify({ t: 'heartbeat.ack', correlationId: ulid(), d: {} }));
     for (const waiter of [...waiters]) {
       if (!waiter.predicate(frame)) continue;
       clearTimeout(waiter.timer); waiters.splice(waiters.indexOf(waiter), 1); waiter.resolve(frame);
@@ -143,6 +162,37 @@ function matchHandshake(ticket) {
     });
     ws.once('error', reject);
   });
+}
+
+/**
+ * Hold the authority's SEAT deadlines still for the duration of `body`.
+ *
+ * Entering a match is the one step of this harness whose cost is set by the machine: two
+ * Chromium contexts, a software GL stack, and an unbundled Vite module graph. On CI hardware
+ * that outran the 60 s `connectBy` window, both seats were reaped mid-startup, and
+ * `/v1/matches/:id/reconnect-ticket` correctly answered 409 RECONNECT_GRACE_EXPIRED — the
+ * harness lost a race against a clock it had no say in.
+ *
+ * The answer is not a longer window (that just picks a number CI has to beat) but control:
+ * freeze the seat clock while the clients start, release it afterwards. Nothing else is
+ * suspended — ticket verification, the simulation, and the match timer all run for real —
+ * and the reaper this suspends is asserted directly, on its own, by `bombbottest.mjs`.
+ */
+async function seatClockControl(body) {
+  const response = await fetch(`http://127.0.0.1:${matchPort}/control/seat-clock`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${controlSecret}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`seat-clock control refused: ${response.status}`);
+  return response.json();
+}
+async function withSeatDeadlinesHeld(body) {
+  const held = await seatClockControl({ hold: true });
+  // A hold that silently did nothing would put this harness straight back on the wall clock
+  // while looking green, so the authority has to say it took effect.
+  if (held.held !== true) throw new Error(`seat clock did not hold: ${JSON.stringify(held)}`);
+  try { return await body(); } finally { await seatClockControl({ hold: false }); }
 }
 
 async function startBrowserClients(users) {
@@ -259,6 +309,10 @@ async function browserLobby(row, roomId) {
     const ws = new WebSocket(socketUrl, ['overstrike-lobby-v1', `overstrike-ticket.${ticket.lobbyTicket}`]);
     ws.addEventListener('message', (event) => {
       const frame = JSON.parse(event.data); frames.push(frame);
+      // Same reason as `lobbySocket`: a client that never acks is reaped in 30 s.
+      if (frame.t === 'heartbeat') {
+        ws.send(JSON.stringify({ t: 'heartbeat.ack', correlationId: frame.correlationId, d: {} }));
+      }
       for (const waiter of [...waiters]) if (waiter.predicate(frame)) {
         waiters.splice(waiters.indexOf(waiter), 1); waiter.resolve(frame);
       }
@@ -322,20 +376,27 @@ try {
       && frame.correlationId === correlationId, 12_000)));
   }
 
-  const firstHandoffs = await launch();
+  // Allocation through entry is one span: `connectBy` starts ticking the moment the authority
+  // is allocated, and everything up to the last client entering has to fit inside it.
+  const firstHandoffs = await withSeatDeadlinesHeld(async () => {
+    const handoffs = await launch();
+    if (!browserLive) {
+      for (const handoff of handoffs) {
+        const admitted = await matchHandshake(handoff.d.sessionTicket); matchSockets.push(admitted.ws);
+        check(admitted.welcome?.mode === 'tdm' && !admitted.rejection,
+          'platform-minted ticket admits its signed roster seat');
+      }
+    }
+    if (browserRows) {
+      await Promise.all(browserRows.map((row, index) => browserEnter(row, handoffs[index].d)));
+    }
+    return handoffs;
+  });
   const firstMatchId = firstHandoffs[0].d.matchId;
   check(firstHandoffs.every((frame) => frame.d.matchId === firstMatchId && frame.d.mode === 'tdm'),
     'actual platform allocation hands both seats to one TDM authority');
-  if (!browserLive) {
-    for (const handoff of firstHandoffs) {
-      const admitted = await matchHandshake(handoff.d.sessionTicket); matchSockets.push(admitted.ws);
-      check(admitted.welcome?.mode === 'tdm' && !admitted.rejection,
-        'platform-minted ticket admits its signed roster seat');
-    }
-  }
 
   if (browserRows) {
-    await Promise.all(browserRows.map((row, index) => browserEnter(row, firstHandoffs[index].d)));
     check(browserRows.every((row) => row.page.url().startsWith(row.webBase)
       && row.errors.length === 0),
     'two platform-minted tickets admit isolated production browser runtimes without client errors');
@@ -421,19 +482,23 @@ try {
       const correlationId = ulid();
       await browserIntent(browserRows[index], 'ready.set', { ready: true }, correlationId);
     }
+  }
+  // The rematch is the same race a second time: a fresh allocation, and two runtimes that
+  // have to be back in it before the new `connectBy` window closes.
+  secondHandoffs = await withSeatDeadlinesHeld(async () => {
+    if (!browserRows) return launch();
     const launchCorrelation = ulid();
     await browserIntent(browserRows[0], 'launch.request', {}, launchCorrelation);
-    secondHandoffs = await Promise.all(browserRows.map((row) => row.page.evaluate((correlationId) =>
+    const handoffs = await Promise.all(browserRows.map((row) => row.page.evaluate((correlationId) =>
       window.__BROWSER_LIVE_LOBBY__.wait((frame) => frame.t === 'match.ready'
         && frame.correlationId === correlationId), launchCorrelation)));
-  } else {
-    secondHandoffs = await launch();
-  }
+    await Promise.all(browserRows.map((row, index) => browserEnter(row, handoffs[index].d)));
+    return handoffs;
+  });
   const secondMatchId = secondHandoffs[0].d.matchId;
   check(secondMatchId !== firstMatchId && secondHandoffs.every((frame) => frame.d.matchId === secondMatchId),
     'the reopened room allocates a distinct rematch on the released server');
   if (browserRows) {
-    await Promise.all(browserRows.map((row, index) => browserEnter(row, secondHandoffs[index].d)));
     check(await Promise.all(browserRows.map((row) => row.page.evaluate(() =>
       window.__GAME__?.netFacade?.state === 'live'))).then((values) => values.every(Boolean)),
     'both Chromium contexts enter the distinct rematch through the production facade');

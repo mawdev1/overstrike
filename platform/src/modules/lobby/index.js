@@ -1122,6 +1122,40 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     }
   }
 
+  /**
+   * Start a seat's reconnect grace, at the instant the server decided the peer was gone.
+   *
+   * `at` is a parameter rather than a `now()` read inside here for a reason that is easy to
+   * miss: the socket `close` event does not fire when the connection dies, it fires when the
+   * TCP close HANDSHAKE finishes — one network round trip and at least one event-loop poll
+   * later. Stamping `disconnectedAt` in that handler dates the grace window from an instant
+   * chosen by the peer's responsiveness and by how busy this process happens to be.
+   *
+   * That is wrong twice over. In production it hands a slow or half-dead peer extra grace
+   * proportional to how slow it is, which is exactly backwards. And it made the 90-second
+   * expiry untestable: `presencetest.mjs` drives a fake clock, closes two sockets from
+   * `sweep()`, and advances 90 s — but the advance is microtasks away from the close, while
+   * the server-side `close` handler is an I/O poll away. On an idle laptop the handler won
+   * that race and the seats expired; on loaded CI hardware it lost, the seats were stamped
+   * 89 s LATE, and the expiry assertion failed while its "strictly inside the grace"
+   * neighbour still passed — the boundary was being straddled rather than controlled.
+   *
+   * So the heartbeat-timeout path in `sweep()` stamps the seat synchronously with the sweep's
+   * own `at`, before the socket has finished closing, and the `close` handler that arrives
+   * later is a no-op because the seat is no longer `connected`. The grace window is now a
+   * function of the clock the sweep reads and nothing else.
+   */
+  function markDisconnected(room, member, at) {
+    if (!room.members.has(member.accountId) || member.connection !== 'connected') return;
+    member.connection = 'reconnecting';
+    member.disconnectedAt = at;
+    touchPresence(member.accountId, { state: 'in-lobby', joinable: false, roomId: room.roomId });
+    broadcastRoster(room, { updated: [member] });
+    void persistRoom(room).catch((error) => logger.error('lobby.disconnect.persist_failed', {
+      roomId: room.roomId, accountId: member.accountId, message: error.message,
+    }));
+  }
+
   async function removeMember(room, accountId, correlationId = id(), voluntary = false) {
     const member = room.members.get(accountId);
     if (!member) return;
@@ -1201,14 +1235,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     ws.on('close', () => {
       if (room.connections.get(member.accountId)?.ws !== ws) return;
       room.connections.delete(member.accountId);
-      if (!room.members.has(member.accountId)) return;
-      member.connection = 'reconnecting';
-      member.disconnectedAt = now();
-      touchPresence(member.accountId, { state: 'in-lobby', joinable: false, roomId: room.roomId });
-      broadcastRoster(room, { updated: [member] });
-      void persistRoom(room).catch((error) => logger.error('lobby.disconnect.persist_failed', {
-        roomId: room.roomId, accountId: member.accountId, message: error.message,
-      }));
+      markDisconnected(room, member, now());
     });
     ws.on('error', () => {});
     if (!resume) send(connection, 'lobby.welcome', snapshot(room, member.accountId), id(), 0);
@@ -1725,7 +1752,15 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       for (const member of [...room.members.values()]) {
         if (member.connection === 'connected' && member.lastAckAt + HEARTBEAT_MS * 2 <= at) {
           const connection = room.connections.get(member.accountId);
-          if (connection) connection.ws.close(1011, 'heartbeat timeout');
+          if (connection) {
+            // Drop the connection here, not in the `close` handler, so nothing tries to send
+            // a roster frame down a socket that is already CLOSING.
+            room.connections.delete(member.accountId);
+            connection.ws.close(1011, 'heartbeat timeout');
+          }
+          // The seat's grace starts NOW, when the timeout was declared — not whenever the
+          // close handshake happens to complete. See `markDisconnected`.
+          markDisconnected(room, member, at);
           continue;
         }
         if (member.connection !== 'connected' && member.disconnectedAt + GRACE_MS <= at) await removeMember(room, member.accountId);
