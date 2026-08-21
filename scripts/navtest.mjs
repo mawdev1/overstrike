@@ -527,15 +527,23 @@ const ROUTE_TOLERANCE = 0.05;
 const ROUTE_BASELINE = {
   'the-square': {
     // navbake.mjs fingerprint.combined — schema + mapId + MAP_VERSION + colliders + §3 manifest.
-    fingerprint: 'sha256:98e7626d63703e6df75fb75c859cb24a18470de4e81275063d71ad30335af5e9',
+    //
+    // Re-pinned for MAP_VERSION 2.0.0: the site-A objective volume moved (CCR-001) and the
+    // over-48 m sightlines were closed. FIVE OF THE SIX ROUTES ARE UNCHANGED to the
+    // centimetre, which is the evidence that the sightline work raised blocker heights
+    // without moving a footprint — and so moved no route, no nav node and no cover distance.
+    fingerprint: 'sha256:f16ebe9edc6c9cf4840820d226a9808c659ac8dfc88712206939b2f61c04868f',
     speed: 4.6,
     routes: {
-      'alpha-main -> site-A': 54.01,
+      // 63.51 -> 64.39. The whole delta is the objective move, and it costs alpha-main its
+      // §7.1 comparability: 14.7% -> 16.2% against a 15% tolerance. Both absolute times stay
+      // in band (14.00 s / 12.04 s in 12-16 s) and bravo-main is 4.2%.
+      'alpha-main -> site-A': 64.39,
       'alpha-main -> site-B': 55.40,
-      'bravo-main -> site-A': 56.23,
+      'bravo-main -> site-A': 64.66,
       'bravo-main -> site-B': 67.40,
-      'site-A -> site-B': 79.04,
-      'site-B -> site-A': 75.91,
+      'site-A -> site-B': 87.47,
+      'site-B -> site-A': 85.41,
     },
   },
 };
