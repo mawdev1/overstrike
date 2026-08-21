@@ -12,6 +12,7 @@ import { ulid, isUlid } from '../../core/ids.js';
 import { LIVE_LOADOUT_CATALOG, publicLoadoutCatalog } from '../../shared/liveCatalog.js';
 import { evidenceDigest } from '../../shared/evidenceDigest.js';
 import { parseTraceparent, traceparentForCorrelation } from '../../core/observability.js';
+import { describeError } from '../../core/logger.js';
 
 const RESERVATION_MS = 30_000;
 const GRACE_MS = 90_000;
@@ -956,7 +957,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       broadcast(room, 'room.updated', { status: 'in-progress', joinable: false, joinBlockedReason: 'in-progress' }, correlationId);
       for (const member of room.members.values()) touchPresence(member.accountId, { state: 'in-match', joinable: false, roomId: room.roomId });
     })().catch(async (error) => {
-      logger.error('lobby.launch.failed', { roomId: room.roomId, correlationId, message: error.message });
+      logger.error('lobby.launch.failed', { roomId: room.roomId, correlationId, ...describeError(error) });
       // Allocation is staged in memory as a single-authority lock before the durable commit.
       // If that commit fails, restore an open room and release the slot before telling clients;
       // `abortCountdown` cannot do this after countdown was already nulled.
@@ -1812,7 +1813,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     attachedServer = server;
     server.on('upgrade', onUpgrade);
     heartbeatTimer = setInterval(() => {
-      void sweep().catch((error) => logger.error('lobby.sweep.failed', { message: error.message }));
+      void sweep().catch((error) => logger.error('lobby.sweep.failed', describeError(error)));
       for (const room of rooms.values()) for (const connection of room.connections.values()) send(connection, 'heartbeat', { serverTime: iso(now()) });
     }, HEARTBEAT_MS);
     heartbeatTimer.unref?.();

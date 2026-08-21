@@ -28,7 +28,7 @@ const TRACEPARENT = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
 const SAFE_FIELDS = new Set([
   'correlationId', 'traceId', 'spanId', 'parentSpanId', 'traceparent',
   'method', 'path', 'status', 'statusClass', 'ms', 'durationMs', 'at', 'occurredAt',
-  'code', 'errorCode', 'type', 'name', 'action', 'actorRole', 'subjectKind', 'reasonCode',
+  'code', 'errorCode', 'errorClass', 'type', 'name', 'action', 'actorRole', 'subjectKind', 'reasonCode',
   'consumer', 'attempts', 'retryInMs', 'count', 'removed', 'suppliedLength',
   'module', 'transport', 'hasKey', 'delivered', 'schemaVersion', 'signal', 'port', 'env',
   'storage', 'kind', 'tier', 'component', 'severity', 'reason', 'retryable', 'outcome',
@@ -177,6 +177,33 @@ function sanitizeFields(logEvent, fields) {
     }
     if (safe !== undefined) out[key] = safe;
   }
+  return out;
+}
+
+/**
+ * The loggable part of a thrown error.
+ *
+ * `message`, `stack` and `cause` are in `SECRET_OR_PERSONAL` on purpose — an exception message
+ * routinely carries a connection string, an email address or a provider diagnostic that echoed a
+ * bearer token, and none of that belongs in a log with a retention policy. That rule is right and
+ * is not being weakened here.
+ *
+ * What it cost was diagnosis. Callers wrote `logger.error('x.failed', { message: err.message })`,
+ * the one field they passed was dropped, and production emitted `{"event":"lobby.sweep.failed"}`
+ * every fifteen seconds — an alarm with no cause attached, repeating forever. `lobby.launch.failed`
+ * was the same, which is why a live allocation failure said nothing about why it failed.
+ *
+ * So: log the CLASSIFICATION, never the prose. `errorCode` is an ApiError code — a closed set
+ * defined in this codebase. `errorClass` is the constructor name. Both are bounded by
+ * construction rather than by hoping a message is clean, which is what makes them safe to keep
+ * when the message is not. Anything unrecognised degrades to `Error`, never to caller text.
+ */
+export function describeError(error) {
+  const out = {};
+  const code = error?.code;
+  if (typeof code === 'string' && TOKEN.test(code)) out.errorCode = code;
+  const name = error?.constructor?.name ?? error?.name;
+  out.errorClass = typeof name === 'string' && TOKEN.test(name) ? name : 'Error';
   return out;
 }
 

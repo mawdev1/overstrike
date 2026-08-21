@@ -1,5 +1,5 @@
 /** Central structured-log privacy boundary — auth, lobby, events, and observability callers. */
-import { createLogger } from '../src/core/logger.js';
+import { createLogger, describeError } from '../src/core/logger.js';
 import { createObservability, traceparentForCorrelation } from '../src/core/observability.js';
 
 let failures = 0;
@@ -161,6 +161,64 @@ check(!JSON.stringify(lines).includes('abc123')
   && !JSON.stringify(lines).includes('ordinary-looking-secret')
   && !JSON.stringify(lines).includes('nested-secret'),
 'the closed label vocabulary rejects credential keys and non-denylisted personal dimensions');
+
+// ── a failure that says WHY, without saying what it must not ──────────────────────────────
+//
+// `message`, `stack` and `cause` are denied on purpose, and callers passing `{ message: err.message }`
+// therefore logged nothing at all: production emitted a bare `{"event":"lobby.sweep.failed"}`
+// every fifteen seconds, and a live allocation failure gave an operator no cause whatsoever.
+// `describeError` is the answer that does not weaken the rule — a closed code and a class name,
+// both bounded by construction rather than by hoping a message is clean.
+{
+  const errLines = [];
+  const errLogger = createLogger({ level: 'info', service: 'platform',
+    sink: { log: (line) => errLines.push(JSON.parse(line)) } });
+
+  class AllocationError extends Error {
+    constructor() {
+      super(`could not reach wss://gs.internal/?token=${bearer} for ${email}`);
+      this.code = 'MATCH_ALLOCATION_FAILED';
+    }
+  }
+  errLogger.error('lobby.launch.failed', { correlationId, ...describeError(new AllocationError()) });
+  const failure = errLines.find((line) => line.event === 'lobby.launch.failed');
+  check(failure?.errorCode === 'MATCH_ALLOCATION_FAILED' && failure?.errorClass === 'AllocationError',
+    'a failure log carries the closed error code and class — an operator learns the cause',
+    JSON.stringify(failure));
+  check(!JSON.stringify(errLines).includes(bearer)
+    && !JSON.stringify(errLines).includes(email)
+    && !JSON.stringify(errLines).includes('gs.internal')
+    && !JSON.stringify(errLines).includes('could not reach'),
+  'and none of the message, its embedded credential, address or URL survives');
+
+  // A plain Error still yields something, or the sweep alarm goes back to being silent.
+  errLogger.error('lobby.sweep.failed', describeError(new TypeError('x is not a function')));
+  const sweep = errLines.find((line) => line.event === 'lobby.sweep.failed');
+  check(sweep?.errorClass === 'TypeError' && sweep?.errorCode === undefined,
+    'an error with no code still logs its class rather than an empty object',
+    JSON.stringify(sweep));
+
+  // Hostile shapes must not become a smuggling channel for the prose that was just denied.
+  errLogger.error('probe.hostile', describeError({ code: bearer, name: email }));
+  const hostile = errLines.find((line) => line.event === 'probe.hostile');
+  check(hostile?.errorCode === undefined
+    && !JSON.stringify(hostile).includes(bearer) && !JSON.stringify(hostile).includes(email),
+  'a code that is not token-shaped is dropped rather than carried as text',
+  JSON.stringify(hostile));
+
+  // A class name comes from a constructor, which is code, not caller data — but a thrown object
+  // can still put text there, and that must not become a way to log the prose just denied.
+  const smuggled = { message: 'x' };
+  Object.defineProperty(smuggled, 'name', { value: `${email} ${bearer}` });
+  errLogger.error('probe.smuggled', describeError(Object.assign(Object.create(null), smuggled)));
+  const smug = errLines.find((line) => line.event === 'probe.smuggled');
+  check(smug?.errorClass === 'Error'
+    && !JSON.stringify(smug).includes(email) && !JSON.stringify(smug).includes(bearer),
+  'a non-token class name degrades to Error rather than smuggling text through errorClass',
+  JSON.stringify(smug));
+  check(describeError(null).errorClass === 'Error' && describeError(undefined).errorClass === 'Error',
+    'describing a null or undefined throw does not itself throw');
+}
 
 if (failures) process.exit(1);
 console.log('structured logger privacy checks passed');
