@@ -14,7 +14,7 @@ import { createRNG, mixSeed } from '../core/rng.js';
  * locally and blit `bone.matrixWorld` into the instance buffer.
  *
  * Cost: 12 bones x 2 teams = 24 draw calls for any number of bots.
- * Geometry: 45 boxes = 540 triangles per soldier.
+ * Geometry: 49 boxes = 588 triangles per soldier.
  */
 
 const BONES = [
@@ -100,7 +100,7 @@ class BoxBuilder {
 }
 
 /**
- * 45 boxes = 540 triangles per soldier, laid out for readability at range.
+ * 49 boxes = 588 triangles per soldier, laid out for readability at range.
  *
  * The rules the shapes follow, in priority order:
  *  1. OUTLINE — helmet dome wider than the skull with a rim that overhangs it,
@@ -173,6 +173,8 @@ function buildBoneGeometries(p) {
     .build();
   const foreArm = () => new BoxBuilder()
     .box(0, -0.13, 0, 0.10, 0.26, 0.10, p.fatigueDark)
+    // elbow pad caps the joint so the bend reads as a bend, not a gap
+    .box(0, -0.005, -0.005, 0.105, 0.09, 0.115, p.webbing)
     .box(0, -0.29, 0, 0.095, 0.11, 0.115, p.boot)
     .build();
   out.upperArmL = upperArm();
@@ -187,6 +189,8 @@ function buildBoneGeometries(p) {
     .build();
   const shin = () => new BoxBuilder()
     .box(0, -0.18, 0, 0.125, 0.36, 0.145, p.fatigueDark)
+    // knee pad — sits proud of the shin's front face and caps the hinge
+    .box(0, -0.035, -0.075, 0.13, 0.13, 0.06, p.webbing)
     .box(0, -0.40, -0.03, 0.14, 0.10, 0.26, p.boot)
     .build();
   out.thighL = thigh();
@@ -491,6 +495,12 @@ export class BotModel {
     this.aimBlend = 0;
     this.crouchBlend = 0;
     this.reloadBlend = 0;
+    this.sprintBlend = 0;
+    this.airBlend = 0;
+    this.landDip = 0;
+    this.breath = 0;
+    this._wasGrounded = true;
+    this._peakFall = 0;
     this.flinch = 0;
     this.flinchDir = 0;
     this.deathT = 0;
@@ -521,7 +531,13 @@ export class BotModel {
     const rng = this._rng;
     this.gait = rng() * Math.PI * 2;
     this._limpSeed = rng();
+    this.breath = rng() * Math.PI * 2;   // desynced chests across a squad
     this.legYaw = yaw;
+    this.sprintBlend = 0;
+    this.airBlend = 0;
+    this.landDip = 0;
+    this._wasGrounded = true;
+    this._peakFall = 0;
     this.deathT = 0;
     this.flinch = 0;
     this.reloadBlend = 0;
@@ -602,74 +618,127 @@ export class BotModel {
     this.flinch = Math.max(0, this.flinch - dt * 3.4);
     this.speedSmooth = damp(this.speedSmooth, speed, 10, dt);
 
+    // Grounded / vertical state. Bots carry `grounded` and a real vy; avatars derive
+    // both from the interpolated position stream. Undefined means "assume grounded"
+    // so a caller that predates these fields keeps the old behaviour.
+    const grounded = bot.grounded !== false;
+    const vy = bot.velocity ? (bot.velocity.y || 0) : 0;
+    // The instantaneous vy at the grounded transition is useless for the landing dip:
+    // bots zero velocity.y in the same physics tick they become grounded, and avatars
+    // derive vy from a position stream that has already stopped moving. So the hardest
+    // downward speed is banked while airborne and spent on the transition instead.
+    if (!grounded) this._peakFall = Math.max(this._peakFall, -vy);
+    if (grounded && !this._wasGrounded) {
+      // Landing dip, scaled by how hard the fall was. Fold onto whatever is left of
+      // the previous dip rather than resetting, so a quick double-hop still reads.
+      this.landDip = clamp(Math.max(this.landDip, this._peakFall / 9), 0, 1);
+      this._peakFall = 0;
+    }
+    this._wasGrounded = grounded;
+    this.landDip = Math.max(0, this.landDip - dt * 3.2);
+    this.airBlend = damp(this.airBlend, grounded ? 0 : 1, 12, dt);
+
+    // Sprint reads off the mover's own flag (bots: moveMode, avatars: anim.sprint)
+    // gated on actually moving; shouldering the weapon always wins over the sprint
+    // carry, exactly as the movement code stops sprinting when firing starts.
+    const sprinting = (bot.moveMode === 'sprint' || !!(anim && anim.sprint))
+      && speed > 2.0 && grounded;
+    this.sprintBlend = damp(this.sprintBlend, sprinting ? 1 : 0, 8, dt);
+
     const cr = this.crouchBlend;
     const aim = this.aimBlend;
     const sp = this.speedSmooth;
+    const air = this.airBlend;
+    const spr = this.sprintBlend * (1 - aim);
+    const dip = this.landDip * this.landDip;   // ease the tail of the recovery
 
-    // ---- gait
-    const strideLen = lerp(1.55, 2.55, clamp(sp / 6.5, 0, 1));
-    this.gait += sp * strideLen * dt;
+    // ---- idle breathing: only surfaces once the gait and the fall are out of the way
+    this.breath += dt * 1.9;
+    if (this.breath > Math.PI * 200) this.breath -= Math.PI * 200;
+
+    // ---- gait: sprint lengthens the stride instead of just spinning it faster
+    const strideLen = lerp(1.55, 2.55, clamp(sp / 6.5, 0, 1)) * lerp(1, 0.86, spr);
+    this.gait += sp * strideLen * dt * (1 - air * 0.85);
     if (this.gait > Math.PI * 200) this.gait -= Math.PI * 200;
-    const gaitAmp = clamp(sp / 5.0, 0, 1);
+    const gaitAmp = clamp(sp / 5.0, 0, 1) * (1 - air);
     const s = Math.sin(this.gait);
     const s2 = Math.sin(this.gait * 2);
+    const breathAmp = (1 - gaitAmp) * (1 - air) * (1 - this.flinch);
+    const br = Math.sin(this.breath) * breathAmp;
 
     // ---- hips
-    bones.hips.position.y = lerp(HIP_Y_STAND, HIP_Y_CROUCH, cr) + s2 * 0.032 * gaitAmp;
+    bones.hips.position.y = lerp(HIP_Y_STAND, HIP_Y_CROUCH, cr)
+      + s2 * lerp(0.032, 0.05, spr) * gaitAmp
+      - dip * 0.16 + air * 0.06;
     bones.hips.rotation.set(
-      lerp(0, 0.28, cr) + gaitAmp * 0.05,
+      lerp(0, 0.28, cr) + gaitAmp * lerp(0.05, 0.14, spr) + dip * 0.10,
       0,
-      Math.sin(this.gait) * 0.045 * gaitAmp,
+      s * lerp(0.045, 0.07, spr) * gaitAmp,
     );
 
-    // ---- torso: twist + aim pitch + bob + flinch
+    // ---- torso: twist + aim pitch + sprint lean + bob + breath + flinch
     const pitch = bot.pitch || 0;
     bones.torso.rotation.y = twist;
     bones.torso.rotation.x = -pitch * 0.42 * aim + lerp(0.06, 0.30, cr)
-      + gaitAmp * 0.10 - this.flinch * 0.22;
-    bones.torso.rotation.z = -s * 0.05 * gaitAmp + this.flinch * 0.09 * Math.sin(this.flinchDir);
+      + gaitAmp * 0.10 + spr * 0.22 + air * 0.10 + dip * 0.18
+      + br * 0.022 - this.flinch * 0.22;
+    bones.torso.rotation.z = -s * lerp(0.05, 0.08, spr) * gaitAmp
+      + this.flinch * 0.09 * Math.sin(this.flinchDir);
 
-    // ---- head: remaining pitch, small counter-yaw so it leads the turn
+    // ---- head: remaining pitch (counter the sprint lean so the eyes stay level)
     bones.head.position.y = lerp(HEAD_Y_STAND, HEAD_Y_CROUCH, cr);
-    bones.head.rotation.x = -pitch * lerp(0.88, 0.55, aim) - this.flinch * 0.25;
+    bones.head.rotation.x = -pitch * lerp(0.88, 0.55, aim) - spr * 0.18
+      - br * 0.015 - this.flinch * 0.25;
     bones.head.rotation.y = 0;
     bones.head.rotation.z = 0;
 
     // ---- legs
-    const kneeIdle = lerp(0.12, 0.95, cr);
-    const thighIdle = lerp(-0.04, -0.62, cr);
-    const swing = s * 0.72 * gaitAmp;
-    const swingOff = Math.sin(this.gait + Math.PI) * 0.72 * gaitAmp;
-    bones.thighL.rotation.set(thighIdle + swing, 0, lerp(0, -0.18, cr));
-    bones.thighR.rotation.set(thighIdle + swingOff, 0, lerp(0, 0.18, cr));
-    bones.shinL.rotation.x = -(kneeIdle + Math.max(0, -Math.sin(this.gait - 0.9)) * 1.05 * gaitAmp);
-    bones.shinR.rotation.x = -(kneeIdle + Math.max(0, -Math.sin(this.gait + Math.PI - 0.9)) * 1.05 * gaitAmp);
+    const kneeIdle = lerp(0.12, 0.95, cr) + dip * 0.85;
+    const thighIdle = lerp(-0.04, -0.62, cr) - dip * 0.35;
+    const swingAmp = lerp(0.72, 0.98, spr) * gaitAmp;
+    const swing = s * swingAmp;
+    const swingOff = Math.sin(this.gait + Math.PI) * swingAmp;
+    // In the air the legs split into a trail pose — lead leg reaches, rear leg tucks.
+    const airLead = air * -0.55, airTrail = air * 0.35;
+    const airKnee = air * 0.75;
+    bones.thighL.rotation.set(thighIdle + swing + airLead, 0, lerp(0, -0.18, cr));
+    bones.thighR.rotation.set(thighIdle + swingOff + airTrail, 0, lerp(0, 0.18, cr));
+    bones.shinL.rotation.x = -(kneeIdle + airKnee * 0.5
+      + Math.max(0, -Math.sin(this.gait - 0.9)) * lerp(1.05, 1.35, spr) * gaitAmp);
+    bones.shinR.rotation.x = -(kneeIdle + airKnee
+      + Math.max(0, -Math.sin(this.gait + Math.PI - 0.9)) * lerp(1.05, 1.35, spr) * gaitAmp);
 
-    // ---- arms: blend relaxed carry -> shouldered aim -> reload
+    // ---- arms: blend relaxed carry -> shouldered aim, with the sprint pump and the
+    //      reload layered on top
     const rl = this.reloadBlend;
     const rlWave = Math.sin(rl * Math.PI);
 
-    // right arm keeps the grip in every pose
-    const ruX = lerp(-0.35 - swingOff * 0.55, -0.62, aim);
-    const ruZ = lerp(0.10, 0.34, aim);
+    // right arm keeps the grip in every pose; sprinting pumps it with the stride
+    const ruX = lerp(-0.35 - swingOff * 0.55, -0.62, aim)
+      + spr * (0.10 - swingOff * 0.45) + air * -0.25 + br * 0.02;
+    const ruZ = lerp(0.10, 0.34, aim) + spr * 0.06 + air * 0.20;
     bones.upperArmR.rotation.set(ruX, 0, ruZ);
-    bones.foreArmR.rotation.set(lerp(-0.75, -1.32, aim), 0, 0);
+    bones.foreArmR.rotation.set(lerp(-0.75, -1.32, aim) - spr * 0.35 - air * 0.20, 0, 0);
 
     // left arm supports the handguard, and drops to the magwell on reload
-    const luX = lerp(-0.35 - swing * 0.55, -0.95, aim);
-    const luZ = lerp(-0.10, -0.55, aim);
+    const luX = lerp(-0.35 - swing * 0.55, -0.95, aim)
+      + spr * (0.10 - swing * 0.45) + air * -0.25 + br * 0.02;
+    const luZ = lerp(-0.10, -0.55, aim) - spr * 0.06 - air * 0.20;
     bones.upperArmL.rotation.set(luX + rlWave * 0.55, rlWave * 0.35, luZ + rlWave * 0.30);
-    bones.foreArmL.rotation.set(lerp(-0.75, -1.15, aim) - rlWave * 0.85, 0, 0);
+    bones.foreArmL.rotation.set(lerp(-0.75, -1.15, aim) - spr * 0.30 - rlWave * 0.85, 0, 0);
 
-    // ---- weapon: shouldered vs slung-low, plus the reload tilt
-    const wx = lerp(0.20, 0.055, aim);
-    const wy = lerp(0.24, 0.40, aim) - cr * 0.04;
-    const wz = lerp(-0.10, -0.26, aim);
+    // ---- weapon: shouldered vs slung-low vs the sprint carry (muzzle down and
+    //      across the chest), plus the reload tilt. Outside ADS the muzzle still
+    //      tracks a fraction of the aim pitch so hip fire points where it shoots.
+    const wx = lerp(0.20, 0.055, aim) - spr * 0.04;
+    const wy = lerp(0.24, 0.40, aim) - cr * 0.04 - spr * 0.10;
+    const wz = lerp(-0.10, -0.26, aim) + spr * 0.06;
     bones.weapon.position.set(wx, wy, wz - rlWave * 0.05);
     bones.weapon.rotation.set(
-      lerp(0.55, 0, aim) - pitch * 0.55 * aim + rlWave * 0.30,
-      lerp(-0.32, 0, aim) + rlWave * 0.22,
-      lerp(0.25, 0, aim) - rlWave * 0.45,
+      lerp(0.55, 0, aim) + spr * 0.45 - pitch * lerp(0.22, 0.55, aim) * (1 - spr)
+        + rlWave * 0.30 + s2 * 0.03 * gaitAmp,
+      lerp(-0.32, 0, aim) - spr * 0.35 + rlWave * 0.22,
+      lerp(0.25, 0, aim) + spr * 0.15 - rlWave * 0.45,
     );
   }
 

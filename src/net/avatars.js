@@ -6,9 +6,9 @@
  * the server owns it, and anything this machine simulated on its behalf would be a second
  * opinion fighting the snapshots that are the actual truth.
  *
- * `BotModel` only reads seven fields off whatever it is handed — position, yaw, pitch,
- * velocity, height, alive, anim — so a plain object carrying those drives the existing rig
- * with no changes to it. That is the whole trick here: the renderer already had no idea
+ * `BotModel` only reads a handful of fields off whatever it is handed — position, yaw,
+ * pitch, velocity, height, alive, grounded, anim — so a plain object carrying those
+ * drives the existing rig with no changes to it. That is the whole trick here: the renderer already had no idea
  * what a Bot was.
  *
  * Velocity is DERIVED rather than taken from the wire. The rig uses it to pick a walk
@@ -29,12 +29,14 @@ class Avatar {
     this.state = {
       position: new THREE.Vector3(),
       velocity: new THREE.Vector3(),
-      yaw: 0, pitch: 0, height: 1.8, alive: true,
-      anim: { aim: 0, reload: 0, deathYaw: 0 },
+      yaw: 0, pitch: 0, height: 1.8, alive: true, grounded: true,
+      anim: { aim: 0, reload: 0, sprint: 0, deathYaw: 0 },
     };
     this._lastPos = new THREE.Vector3();
     this._havePos = false;
     this._wasAlive = true;
+    this._lastVy = 0;
+    this._lowVyTime = 0;
   }
 
   dispose() { this.model?.dispose(); this.model = null; }
@@ -77,6 +79,25 @@ export class RemoteAvatars {
       st.yaw = r.yaw;
       st.pitch = r.pitch;
       st.height = r.crouching ? 1.15 : 1.8;
+      // Grounded is not on the wire, but the derived velocity already carries the
+      // answer: an interpolated position stream only moves vertically when the
+      // remote is actually airborne (jumping or falling). A plain |vy| < 1.2 test
+      // is not enough though — vy passes through zero at every jump apex for about
+      // a tenth of a second, which read as a mid-air landing and swung the pose
+      // toward grounded at the top of the arc. So the test is latched: the avatar
+      // goes airborne the moment |vy| clears the threshold, and re-grounds only on
+      // evidence of an actual landing — it was just falling hard (the apex can
+      // never show that; vy approaches it from above), or vy has stayed low for
+      // longer than an apex can (the position has genuinely stopped).
+      const vyNow = st.velocity.y;
+      if (Math.abs(vyNow) < 1.2) {
+        av._lowVyTime += dt;
+        if (!st.grounded) st.grounded = av._lastVy < -2.5 || av._lowVyTime > 0.25;
+      } else {
+        av._lowVyTime = 0;
+        st.grounded = false;
+      }
+      av._lastVy = vyNow;
 
       // The rig reads these three and nothing wrote them. `BotModel` blends `aim` into a
       // shouldered stance, `reload` into the reload, and `deathYaw` decides which way a
@@ -85,6 +106,9 @@ export class RemoteAvatars {
       // now come off flag bits that were already free in the snapshot.
       st.anim.aim = (r.ads || r.firing) ? 1 : 0;
       st.anim.reload = r.reloading ? 1 : 0;
+      // Sprint was already a flag bit on the wire; the rig folds it into the
+      // lowered-weapon sprint carry (aim wins over it inside BotModel).
+      st.anim.sprint = r.sprinting ? 1 : 0;
       // Captured on the transition, from the yaw they were facing when they went down.
       if (av._wasAlive && !r.alive) st.anim.deathYaw = r.yaw;
       av._wasAlive = r.alive;

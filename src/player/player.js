@@ -485,7 +485,7 @@ export class Player {
       wishForward: 0, wishRight: 0,
       crouchHeld: false, toggleAdsMode: false, sprintKeyHeld: false, breathHold: false,
       fireHeld: false, aimButtonHeld: false,
-      leanKeyHeld: false, leanRightKeyHeld: false,
+      leanKeyHeld: false, leanRightKeyHeld: false, interactHeld: false,
     };
     /**
      * Local-only, client-side bookkeeping for the crouch/ADS toggle SETTINGS — see
@@ -2108,6 +2108,9 @@ export const PLAYER_SNAPSHOT = defineSnapshot('Player', {
     _held: [
       'wishForward', 'wishRight', 'crouchHeld', 'toggleAdsMode', 'sprintKeyHeld',
       'breathHold', 'fireHeld', 'aimButtonHeld', 'leanKeyHeld', 'leanRightKeyHeld',
+      // §6.4 "plant key held continuously" — the server accumulates plant/defuse
+      // progress from this, so a rewind that drops it replants a different bomb.
+      'interactHeld',
     ],
     _edge: [
       'jump', 'crouch', 'reload', 'melee', 'grenade', 'interact', 'inspect', 'killstreak',
