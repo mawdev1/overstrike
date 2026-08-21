@@ -16,10 +16,33 @@ const PROD = {
   PLATFORM_IDENTITY_PROVIDER: 'supabase', SUPABASE_URL: 'https://example.supabase.co',
   SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
 };
-let noMailError = null;
-try { loadConfig(PROD); } catch (error) { noMailError = error; }
-check(noMailError?.problems?.includes('PLATFORM_MAIL_TRANSPORT=resend is required in production'),
-  'production refuses to boot without the recovery-capable Resend transport');
+/**
+ * This asserted that production REFUSED to boot without Resend. That rule was relaxed on the
+ * human owner's instruction (config.js records what it costs: no verification mail, no
+ * recovery delivery). The assertion is updated rather than deleted, because the interesting
+ * property is not "mail is mandatory" — it is that the ADJACENT guards did not move with it.
+ *
+ * A relaxation is where neighbouring rules quietly go missing, so each is asserted here.
+ */
+const bootProblems = (env) => {
+  try { loadConfig({ ...PROD, ...env }); return null; } catch (error) { return error.problems || []; }
+};
+
+check(bootProblems({ PLATFORM_MAIL_TRANSPORT: 'none' }) === null,
+  "production boots with mail 'none' — deliberately allowed, and it means no code is ever sent");
+
+check((bootProblems({ PLATFORM_MAIL_TRANSPORT: 'log' }) || [])
+  .some((p) => p.includes("must be 'resend' or 'none'")),
+  "production still refuses 'log' — it prints tokens, and a verification token IS the credential");
+
+check((bootProblems({ PLATFORM_MAIL_TRANSPORT: 'resend' }) || [])
+  .some((p) => p.includes('PLATFORM_MAIL_FROM and PLATFORM_MAIL_API_KEY')),
+  'production still refuses a Resend transport with no key — configured and unable to send is '
+  + 'worse than honestly disabled, because it reports success and delivers nothing');
+
+check((bootProblems({ PLATFORM_MAIL_TRANSPORT: 'none', SUPABASE_SERVICE_ROLE_KEY: '' }) || [])
+  .some((p) => p.includes('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY')),
+  'and the identity guard beside it is untouched by the mail relaxation');
 
 let halfMailError = null;
 try { loadConfig({ ...PROD, PLATFORM_MAIL_TRANSPORT: 'resend' }); }
