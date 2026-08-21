@@ -86,6 +86,11 @@ export class Match {
      * `BOMB.init` and torn down by `BOMB.cleanup`, so the referee never carries dormant
      * objective state through a TDM match.
      *
+     * It OUTLIVES the final whistle on purpose, until `reset()` or `dispose()`. `matchEnd`
+     * is a phase the match sits in (bomb-rules §3), and the ruleset is what answers every
+     * rule attached to it — free camera (§8), late reconnects (§9), and the `matchEnd` byte
+     * itself (`wire-protocol.md` §8.6). See the note in `_end()`.
+     *
      * The flat, replication-facing view of it is the getter block further down
      * (`bomb`, `roundPhase`, `aliveCounts`, `interaction`, …) — that is what
      * `src/net/server.js` reads, and it is deliberately plain data.
@@ -1143,7 +1148,40 @@ export class Match {
       4,
     );
     this.game.present.play('matchEnd', { volume: 0.9 });
-    this.mode.cleanup?.(this);
+
+    // The ruleset is deliberately NOT torn down here.
+    //
+    // `this.mode.cleanup?.(this)` used to run on this line, and for Bomb that nulls
+    // `bombRules` (`modes.js`). Every terminal fact then evaporated on the tick that
+    // produced it, and all of it INSIDE `_fixedUpdate`, i.e. before that tick's
+    // `_broadcastMatchState()` — so the first frame a client got after the match was:
+    //
+    //   {"kind":"OUTCOME","scope":"match","winner":"draw","reason":"timer"}
+    //   {"kind":"STATE","phase":"warmup","ri":0,"sa":6,"sb":6,"aa":0,"ab":0}
+    //
+    // `roundPhase` fell back to `this.phase` — `'ended'`, which is not one of
+    // `wire-protocol.md` §8.6's six phases, so the encoder substituted `warmup` — while
+    // `roundIndex` and `aliveCounts` fell back to their empty defaults. §8.9 requires the
+    // outcome to be sent "immediately before the corresponding `MSG_MATCHSTATE` phase
+    // change"; there was no corresponding phase change at all, so phase `5 = matchEnd` was
+    // never encoded once in a whole series, and the client was told the match had reverted
+    // to warmup, round 0, nobody alive.
+    //
+    // Deferring the teardown, rather than copying the four wire fields into the replication
+    // view before it, is what the contract asks for: `matchEnd` is a phase the match SITS
+    // IN, not an instant. bomb-rules §3 lists it in the state machine ("Series resolved,
+    // result submitted"), §8 grants "full free camera at `roundEnd` and `matchEnd`", and §9
+    // admits a player past their reconnect grace "until `matchEnd`". The ruleset is the only
+    // thing that can answer any of those — `canFreeCam`, `canSpectate`, `canJoin` — and one
+    // of them was already wrong for the same reason as the phase byte: `src/ui/bomb/local.js`
+    // publishes `canFreeCam: rules?.canFreeCam?.() === true`, so with the ruleset gone the
+    // §8 free camera the contract grants at `matchEnd` was reported as denied. Copying the
+    // four wire fields into the replication view would have fixed the byte and left that.
+    //
+    // Nothing keeps running: `fixedUpdate` returns immediately while `phase === 'ended'`, so
+    // the ruleset never ticks again, and `_checkEnd` only runs while `phase === 'live'`, so
+    // `_end` cannot re-enter. The ruleset is released by `reset()` — the next match, which
+    // calls `cleanup` first — and by `dispose()`.
 
     // Game.endMatch() emits the canonical `matchEnd` with this payload.
     this.game.endMatch(result);

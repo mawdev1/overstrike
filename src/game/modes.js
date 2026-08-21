@@ -225,6 +225,14 @@ export const BOMB = {
       if (e.team === 0 || e.team === 1) match.bombRules.noteConnect(e);
     }
   },
+  /**
+   * Release the ruleset. Called by `Match.reset()` (the next match) and `Match.dispose()`,
+   * NOT by `Match._end()`: the series ending puts the ruleset in `matchEnd` (§3), a phase
+   * the match sits in, and everything §8/§9 says about that phase — full free camera, late
+   * reconnects, and the phase byte `wire-protocol.md` §8.6 calls `5 = matchEnd` — is
+   * answered by this object. Freeing it at the whistle published `warmup` for the finished
+   * match. See the note in `Match._end()`.
+   */
   cleanup(match) { if (match) match.bombRules = null; },
   onSpawn() {},
 
