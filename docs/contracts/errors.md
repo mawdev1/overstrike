@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.6.0 |
+| **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform endpoint, the lobby socket, the client HTTP layer |
 
@@ -123,6 +123,14 @@ websocket-binary · memory · vram · cpu-cores · mobile-or-tablet
 `build` is in the set because the build floor is a real failure mode with its own error branch;
 it was previously in the error's list and missing from the event's, so the one failure the
 server rejects most often could not be measured (REQ-CC-032).
+
+### 3.2 `ClientTransportCode` — telemetry-only outcomes
+
+`CLIENT_NETWORK | CLIENT_TIMEOUT` are closed client-side transport outcomes. They are permitted
+only in `telemetry.md`'s `connection.failure.code`; they are **not** `ErrorCode` members, never
+appear in an API error envelope, and cannot be constructed as `ApiError`. The distinction is
+load-bearing: DNS/offline and a browser deadline happen before a platform response exists, so
+mapping either to `SERVICE_UNAVAILABLE` would fabricate a server refusal.
 
 ### Reconnect and session codes — required `details`
 

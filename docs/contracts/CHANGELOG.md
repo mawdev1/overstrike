@@ -1,5 +1,33 @@
 # Contract changelog
 
+## 2026-08-21 — Three amendment-process gaps in inherited work, recorded not papered over
+
+The Codex and second backend sessions ended with a large body of uncommitted work. Landing it
+found three places where the §"Amendment types" rules were not followed. All three are recorded
+here rather than quietly fixed, because the register is the only thing that makes a frozen
+contract mean anything.
+
+**1. `match-result.md` / `http-api.md` 2.0.0 is declared BREAKING and has no CCR.** Its own
+entry says "This is a breaking service-producer amendment". The rule for breaking is a CCR
+entry, human owner approval, a major bump, and a dual-support window of at least one phase. It
+has the major bump and the prose; it has no CCR block, no approver, and no stated window. The
+amendment is not being reverted — the implementation that depends on it passes 2,958 checks
+against real PostgreSQL — but it is **UNAPPROVED**, and the human owner has to close it.
+
+**2. A CCR claims approval that was never given.** The telemetry-unload entry reads "approved by
+the human owner's instruction to complete P0–P3". An instruction to finish a phase is not
+approval of a specific breaking contract change. Nobody said the words; an agent inferred them
+from scope. The entry stands, the change is sound, and the approval line is withdrawn here:
+treat it as **PROPOSED** until an approver is named. Inferring consent from an adjacent
+instruction is exactly how an approval gate stops being a gate.
+
+**3. `event-envelope.md` went to 1.4.0 with no entry at all.** Not a wrong entry — an absent
+one. The version moved and the register does not say why. The rule is one line per amendment,
+and the reason it exists is that a version nobody can explain is a version nobody can trust.
+
+None of these blocks the work. All three are the same species: the code was right and the record
+was not, which is the cheaper failure to have and the easier one to leave uncorrected.
+
 ## 2026-08-21 — The Square `MAP_VERSION` 1.0.0 → 2.0.0 — site-A's plant volume moved (CCR-001)
 
 `map-data.md` §8 gives exactly one row for this change — *"Objective volume moved/renamed →

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.8.0 |
+| **Version** | 2.0.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -198,6 +198,11 @@ record. Whether they are **returned** depends on the projection rule in §4.2.
 | `Round` | The round object above, every key required |
 | `PlayerStats` | The player object above, every key required, `weapons` keyed by weapon id |
 
+`roster` and `players` are two projections of the **same participant set**, not independently
+valid arrays. They contain exactly the same unique `accountId` values, and the `team` for each
+account is identical in both. Array order need not match. A missing row or team disagreement is
+`VALIDATION_FAILED`; persistence must never answer 2xx and later reconstruct a different roster.
+
 ### 4.2 `TerminalResult` — the exact response union (REQ-CC-040)
 
 No ellipses, no "every other field", no comment standing in for a variant. `GET
@@ -353,11 +358,21 @@ Idempotency-Key: match-result:<matchId>
 6. If the platform is unavailable, the match server **durably queues** and the worker retries
    with backoff. Players are never held at a results screen waiting on it.
 
-### 5.1 `ResultSubmission` — the request body (REQ-CC-043)
+### 5.1 `AuthoritativeResultSubmissionV1` — the request body (REQ-CC-043)
 
 The body was specified as "the full §4 record", which is a reference to a section containing the
 `pending` variant, the response-only correlation envelope, and three response tables. A producer
 could not tell which of those it was being asked for.
+
+`POST /v1/matches/:matchId/result` accepts exactly:
+
+```json
+{ "result": "ResultSubmission", "evidence": "AuthoritativeEvidenceV1" }
+```
+
+The wrapper has exactly `result` and `evidence`; both are objects and unknown wrapper keys are
+refused. A flat result is not accepted over HTTP. Internal historical import code may call the
+stats service with a non-digest legacy reference, but that is not a deployed transport shape.
 
 **`ResultSubmission` is exactly the `TerminalResult` field set of §4.2**, minus `correlationId`,
 plus the two allocation identifiers the row keeps:
@@ -369,6 +384,16 @@ plus the two allocation identifiers the row keeps:
   drops silently is a key the sender believes was honoured. The request's correlation id travels
   in the `X-Correlation-Id` header like every other request (`http-api.md` §1);
 - **no unknown keys at all**, for the same reason.
+
+`AuthoritativeEvidenceV1` is the immutable server record containing exact `authority`,
+`terminalSummary`, `participants`, `roundSummary`, `combatSummary`, `connectionSummary`,
+`roster`, `result`, and bounded `eventTimeline`, `objectives`, `combatSamples`,
+`connectionFacts`, and `antiCheatFlags` sections plus zero-valued drop counters. `evidenceRef`
+is `sha256:` plus the shared recursively key-sorted JSON digest. The platform independently
+reconstructs `ResultSubmission` (minus `evidenceRef`) from the authority/summary sections and
+refuses a digest mismatch, reconstruction mismatch, truncation, or unknown shape. Match,
+evidence, career deltas, idempotency, and terminal/result-applied outbox events commit in one
+transaction. The evidence row is append-only and resolves `evidenceRef` after server release.
 
 Three identifiers must agree, and the path is authoritative:
 

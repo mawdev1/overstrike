@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.9.0 |
+| **Version** | 1.11.0 |
 | **Implements** | `src/net/facade.js` (new, P2) over `MultiplayerSession` / `NetClient` |
 | **Owner** | [CC] Claude Code |
 | **Consumer** | [CX] Codex — **this is the only part of `src/net/` Codex may import** |
@@ -40,8 +40,10 @@ loss it lies in the player's favour, which is the exact shape of a cheat.
 ## 3. Connection lifecycle
 
 ```js
-await net.connect(handoff)   // handoff is the MatchHandoff from realtime-lobby.md §6.1,
-                            // passed through UNMODIFIED — see §3.1
+await net.reserve(handoff)   // consumes the short-lived launch ticket before heavy Game init
+net.bindGame(game)
+await net.promoteReservation() // authenticated reconnect ticket replaces the lightweight socket
+await net.connect(handoff)   // direct path for an already-initialized runtime/reconnect
 net.disconnect(reason)
 net.state   // 'idle' | 'connecting' | 'live' | 'reconnecting' | 'closed' | 'version-mismatch' | 'rejected'
 ```
@@ -83,6 +85,13 @@ does not have (REQ-CC-035).
 the fresh ticket. A player who reloads the page has lost the original `match.ready` and would
 otherwise reconnect into a match whose map and rules it cannot name.
 
+**Cold-load ordering.** `reserve()` validates the same complete handoff and opens HELLO
+immediately. It deliberately sends no commands and owns no presentation. Once Game has finished
+initializing, `bindGame()` followed by `promoteReservation()` requests a fresh authenticated
+reconnect ticket and atomically replaces the lightweight socket. Failure during initialization
+must close the reservation. The referee clock stays held until promoted roster clients submit
+their signed loadout, so neither asset loading nor a reservation socket consumes match time.
+
 ### 3.2 Connection states
 
 `connect()` rejects with a typed error from `errors.md`. The states Codex must design screens
@@ -103,6 +112,7 @@ for, and what each means:
 ```js
 net.sendLoadout({ primaryIdx, secondaryIdx })   // fire-and-forget, server may refuse
 net.requestInteraction(kind)                    // 'plant' | 'defuse'  — Alpha scope
+net.requestTacticalPing(kind)                   // 'location' | 'danger' | 'objective'
 ```
 
 Input itself does **not** go through the facade. `src/core/input.js` (Codex) feeds the
@@ -116,6 +126,10 @@ calling them had no defined response. Bomb pickup is contact-range with no cast 
 `requestInteraction` returns nothing. Progress and completion arrive in `matchState` and as
 snapshot events. There is deliberately no promise to await — awaiting an interaction is how
 a UI ends up believing its own optimism.
+
+`requestTacticalPing` returns whether the closed intent was submitted to a live session. It
+never accepts or sends a client position; the authoritative server position arrives later in
+the team-filtered `tacticalPing` event.
 
 ## 5. Inbound — read-only views
 
@@ -188,7 +202,7 @@ frames; entity objects are pooled and their contents change under you.
     role: 'attacker'|'defender'|null,
     alive: boolean, isSpectating: boolean, spectatingId: number|null,
     spectatorPolicy: { canSpectateEnemies: false,
-                       canFreeCam: boolean,        // phase-derived, see below
+                       canFreeCam: boolean,        // phase-derived and server-enforced, see below
                        canUseTeamChat: boolean },  // phase-derived, see below
   },
 }
@@ -227,7 +241,12 @@ Policy version 1 (`canSpectateEnemies` is `false` in every phase for all of Alph
 |---|---|---|
 | `live`, `planted` | `false` | `false` while dead — the relay rule |
 | `roundEnd`, `matchEnd` | `true` | `true` |
-| `warmup`, `freeze` | `true` | `true` |
+| `warmup`, `freeze` | `false` | `true` |
+
+Free camera remains closed during `warmup` and `freeze` because BombRules does not allow it
+there: the roster is live and an unrestricted camera would reveal positions immediately before
+the round begins. This table is the presentation projection of the server's rule, not a second
+permission source.
 
 The server enforces all three regardless; the facade exposes them so the UI does not offer a
 control the server will refuse.
@@ -279,6 +298,7 @@ client cannot have, and REQ-CC-012 correctly caught three of them.
 | `roundEnded` | `{ roundIndex, winner, reason, scoreAlpha, scoreBravo, actorId }` | **`MSG_OUTCOME` scope 1** (§8.9) |
 | `matchEnded` | `{ matchId, winner: 'alpha'\|'bravo'\|'draw'\|null, outcomeReason, terminationReason, scoreAlpha, scoreBravo, roundsPlayed }` — **`outcomeReason`**, the same name and enum as the result record; `reason` is round-level only | **`MSG_OUTCOME` scope 2** (§8.9). `winner: null` only when the match had **no** winner — an aborted forfeit/abandon carries a real winner (`match-result.md` §4.0). `null` and `'draw'` are different facts |
 | `bombStateChanged` | `{ from, to, actorId, siteId }` | `MSG_MATCHSTATE` bomb fields + §8.7 events |
+| `tacticalPing` | `{ senderId, kind: 'location'|'danger'|'objective', position: { x, y, z } }` | `MSG_TACTICAL_PING_EVENT` (§8.9.1); server-positioned and delivered only to authenticated teammates |
 
 **`matchEnded` is PROVISIONAL, and the results screen must fetch (REQ-CC-043).** It carries
 what `MSG_OUTCOME` carries and nothing more. It does **not** carry `invalidationReason`, because

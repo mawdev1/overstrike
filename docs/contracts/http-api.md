@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.11.0 |
+| **Version** | 2.1.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -17,6 +17,9 @@
 - Every request carries `X-Correlation-Id` (client-generated ULID); the server echoes it and
   puts it in every log line and event the request causes. If absent, the server generates one
   and returns it — but a client that omits it cannot correlate its own bug reports.
+- Client HTTP requests also carry W3C `traceparent`. The platform propagates the same trace and
+  correlation through match-control calls. Correlation-only lobby frames deterministically map
+  back to that trace; trace context is never put in player tickets or business payloads.
 - Every request carries `X-Client-Build`. Below the supported floor → `UNSUPPORTED_CLIENT`.
 - Errors follow `errors.md` without exception.
 - Timestamps are ISO-8601 UTC with milliseconds. IDs are ULIDs as strings.
@@ -300,6 +303,7 @@ endpoint keyed by a name would leak account state to whoever guessed the name.
 | GET | `/v1/profile/:accountId/matches` | A | Paginated history, newest first. Includes `aborted` entries |
 | GET | `/v1/profile/me/settings` | A | Roaming settings only |
 | PUT | `/v1/profile/me/settings` | A | Full replace; `If-Match` on the settings version |
+| POST | `/v1/profile/me/progression-import` | A | One-time inert import of the legacy practice blob; never authoritative stats |
 
 `GET /v1/profile/me` response:
 
@@ -335,6 +339,29 @@ the order, and a client that ignores this field is refused exactly as before.
 **Client settings that must roam** are stored here. Machine-specific ones (resolution,
 graphics quality, audio device) stay local — roaming a monitor resolution to a different
 machine is a bug, not a feature.
+
+### 4.1 Legacy practice import
+
+The old `overstrike.progress.v1` localStorage value is hostile client-authored data. An
+authenticated client may send it once without deleting or promoting its local practice copy:
+
+```http
+POST /v1/profile/me/progression-import
+{ "progress": { /* parsed legacy blob */ } }
+
+200 → { "source": "localStorage:overstrike.progress.v1",
+        "verified": false,
+        "importedAt": "…",
+        "data": { "schema": int, "xp": int, "lifetime": {…},
+                  "weapons": {…}, "challenges": [string] },
+        "alreadyImported": bool,
+        "correlationId": "…" }
+```
+
+The first normalized record is returned on every retry (`alreadyImported:true` thereafter).
+It is stored separately from `player_stats`/`player_weapon_stats`, is never merged into career,
+rank, unlock, matchmaking or result authority, and can only be labelled as unverified offline
+history. Unknown blob keys are dropped; client values are bounded by the ordinary request limit.
 
 ## 5. Presence
 
@@ -415,8 +442,13 @@ two simultaneous joiners for one seat resolve deterministically.
 | POST | `/v1/reports` | A | Player report; returns a reference |
 | GET | `/v1/config/flags` | A | Client-visible flags only. `feature-flags.md` §3.1 |
 | GET | `/v1/config/regions` | P | Region list with probe endpoints |
+| POST | `/v1/telemetry/client` | P/A | Ordinary batch; auth optional. Exact privacy/receipt rules in `telemetry.md` §3.3 |
+| POST | `/v1/telemetry/unload/credential` | A | Rotates the endpoint-scoped unload cookie; `204` |
+| POST | `/v1/telemetry/unload` | P | Beacon-only ingress; exact global-header exception in `telemetry.md` §3.3.1 |
 | GET | `/v1/health` | P | Liveness. No dependency detail |
 | GET | `/v1/health/ready` | **S** | Readiness, per dependency |
+| GET | `/v1/ops/metrics` | **S** | Bounded service counters/latency and outbox/alert signals |
+| GET | `/v1/ops/incidents/:correlationId` | **S** | Redacted correlated event/audit/span timeline |
 
 The config and health rows previously sat outside this table, orphaned below the prose that
 followed it (REQ-CC-027).
@@ -467,6 +499,18 @@ should have to store: the server already knows, and asking is one request.
 
 Health responses carry `correlationId` like every other response (§1); they previously omitted
 it.
+
+The operations endpoints are service-only and read-only. Metrics use route templates rather
+than player/account paths. Incident lookup returns durable event/audit metadata plus bounded
+recent spans from client, platform, and match server; it never returns event payloads, actor
+identifiers, email, chat, credentials, provider bodies, or the alert webhook URL. Recent spans
+are diagnostic and process-local; the outbox and audit rows are the durable timeline facts.
+
+The unload ingress is the only exception to §1's header carriage. It validates exact
+`correlationId`, `clientBuild`, and unique `deliveryId` equivalents in its JSON body because
+`navigator.sendBeacon` cannot set the two global headers. That exception does not waive the
+build floor, consent-subject binding, batch limit, closed event registry, or server-side actor
+derivation. The credential endpoint uses the normal authenticated header contract.
 
 ## 8. Idempotency
 
@@ -776,11 +820,16 @@ left to inference.
 
 // GET /v1/profile/:accountId          public projection
 200 → { "accountId", "displayName", "createdAt",
-        "stats": { … } | null,        // null when statsVisibility forbids it
+        "stats": ModeStats (§11.5) | null, // null when statsVisibility forbids it
         "presence": { … } | null,     // null when presenceVisibility forbids it
         "correlationId" }
   A privacy-hidden field is null. It is never omitted, and never a 403 — both would
   disclose that the setting exists and is set.
+
+The public-profile `stats` object is exactly one single-mode §11.5 projection (TDM in Alpha),
+not an open summary object. The dedicated stats endpoint remains the mode-selectable source;
+both surfaces call the same service projection, so their counters cannot diverge. Unknown
+nested fields are a protocol violation.
 
 // GET /v1/presence/online?limit=&cursor=
 200 → { "items": [ { "accountId", "displayName",
@@ -800,24 +849,28 @@ left to inference.
 // POST /v1/rooms/:id/launch   {} → 202 { "correlationId" }
 //   errors: AUTH_FORBIDDEN (not owner) · CONFLICT (not all ready) · ROOM_IN_PROGRESS
 
-// POST /v1/reports  { "subjectAccountId", "category", "matchId"?, "description"? }
+// POST /v1/reports  { "subjectAccountId", "category", "matchId"?, "chatMessageId"?, "description"? }
 201 → { "reportId", "correlationId" }
   category ∈ cheating | harassment | offensive-name | griefing | other
-  errors: REPORT_DUPLICATE · RATE_LIMITED · VALIDATION_FAILED
+  A supplied chatMessageId is accepted only when it belongs to subjectAccountId and the
+  reporter was a member of that message's room when it was sent. Both failures are NOT_FOUND
+  so report evidence cannot be used to enumerate another room's messages.
+  errors: REPORT_DUPLICATE · RATE_LIMITED · VALIDATION_FAILED · NOT_FOUND
 
 // GET /v1/health, /v1/health/ready → defined once in §7.1; not restated here
 
 // POST /v1/matches/:matchId/result   [S]  Idempotency-Key: match-result:<matchId>
-  body: ResultSubmission (match-result.md §5.1) — the §4.2 TerminalResult field set,
-        terminal status only, WITHOUT correlationId/retryAfterMs, plus optional
-        roomId/serverId. Unknown and response-only keys are refused, not ignored.
+  body: AuthoritativeResultSubmissionV1 (match-result.md §5.1), exactly
+        { "result": ResultSubmission, "evidence": AuthoritativeEvidenceV1 }.
+        Flat results, unknown wrapper keys, response-only keys, digest mismatches and
+        non-reconstructable/truncated evidence are refused, not ignored.
         Path :matchId wins over body matchId; Idempotency-Key must be the derived one.
   200 → { "matchId", "status", "applied": bool, "resultAppliedAt",
           "appliedToCount": int, "correlationId" }   // applied:false = idempotent replay
   errors: CONFLICT (finalised with a different payload) · VALIDATION_FAILED · AUTH_FORBIDDEN
 ```
 
-**The result body is `ResultSubmission`, not "the §4 record" (REQ-CC-043).** §4 contains the
+**The result body is `AuthoritativeResultSubmissionV1`, not "the §4 record" (REQ-CC-043).** §4 contains the
 pending variant and the response-only correlation envelope as well, so the old reference asked a
 producer to send a section rather than a type. `appliedToCount` is `0` for the outcomes
 `match-result.md` §6.1 does not aggregate, and `resultAppliedAt` is stamped on every terminal

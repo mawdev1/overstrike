@@ -117,6 +117,7 @@ representing, it is `agent.action.requested` — a request that was made, which 
 | `player.killed` | service | match | public | standard |
 | `objective.planted` / `objective.defused` | service | match | public | standard |
 | `report.submitted` | player | account | sensitive | audit |
+| `chat.removed` | service | chat-message | sensitive | audit |
 | `sanction.applied` / `sanction.lifted` | admin | account | sensitive | audit |
 | `admin.action.executed` | admin | * | sensitive | audit |
 | `config.changed` | admin | * | internal | audit |

@@ -34,26 +34,25 @@ buildable — a single open question does not freeze a whole document.
 
 | # | Contract | Status | Covers |
 |---|---|---|---|
-| 1 | [`http-api.md`](http-api.md) | FROZEN 1.11.0 | Platform REST surface for P1–P4 |
-| 2 | [`errors.md`](errors.md) | FROZEN 1.6.0 | Error envelope and the closed error-code enumeration |
-| 3 | [`auth.md`](auth.md) | FROZEN | Tokens, sessions, revocation, recovery |
-| 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN | Lobby WebSocket: presence, roster, teams, ready, launch |
-| 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN | The binary match protocol, as it exists and as it must change |
-| 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.9.0 | The only surface Codex uses to reach netcode |
-| 7 | [`match-result.md`](match-result.md) | FROZEN 1.8.0 | Canonical stat definitions and the immutable result record |
-| 8 | [`event-envelope.md`](event-envelope.md) | FROZEN | Canonical platform event envelope and catalogue |
-| 9 | [`map-data.md`](map-data.md) | FROZEN | What `level.js` must export for the server to consume |
+| 1 | [`http-api.md`](http-api.md) | FROZEN 2.1.0 | Platform REST surface for P1–P4 |
+| 2 | [`errors.md`](errors.md) | FROZEN 1.7.0 | Error envelope and the closed error-code enumeration |
+| 3 | [`auth.md`](auth.md) | FROZEN 1.7.0 | Tokens, sessions, revocation, recovery |
+| 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN 1.11.0 | Lobby WebSocket: presence, roster, teams, ready, launch |
+| 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN 1.8.0 | The binary match protocol, as it exists and as it must change |
+| 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.11.0 | The only surface Codex uses to reach netcode |
+| 7 | [`match-result.md`](match-result.md) | FROZEN 2.0.0 | Canonical stat definitions and the immutable result record |
+| 8 | [`event-envelope.md`](event-envelope.md) | FROZEN 1.4.0 | Canonical platform event envelope and catalogue |
+| 9 | [`map-data.md`](map-data.md) | FROZEN 1.2.0 | What `level.js` must export for the server to consume |
 | 10 | [`bomb-rules.md`](bomb-rules.md) | FROZEN 1.7.0 | The Bomb ruleset |
-| 11 | [`db-schema.md`](db-schema.md) | FROZEN 1.8.0 | Initial PostgreSQL schema |
-| 12 | [`telemetry.md`](telemetry.md) | FROZEN 1.10.0 | Client and server telemetry, privacy and retention classes |
-| 13 | [`feature-flags.md`](feature-flags.md) | FROZEN | Flag naming, evaluation, defaults, kill switches |
+| 11 | [`db-schema.md`](db-schema.md) | FROZEN 2.1.0 | Initial PostgreSQL schema |
+| 12 | [`telemetry.md`](telemetry.md) | FROZEN 2.1.0 | Client and server telemetry, privacy and retention classes |
+| 13 | [`feature-flags.md`](feature-flags.md) | FROZEN 1.1.0 | Flag naming, evaluation, defaults, kill switches |
 
-**All 13 contracts are FROZEN at 1.7.0** (2026-08-20), on the human owner's instruction to
-proceed without a further review round. Frozen means buildable and stable, not immutable:
-additive amendments bump the minor version, breaking ones need a CCR and a dual-support
-window. `REQ-CC-042`, `043` and `044` are **closed** (2026-08-20); `045`…`053` remain open and
-will land as ordinary amendments — see
-[`CHANGELOG.md`](CHANGELOG.md) for what is known-open and how severe each is.
+**All 13 contracts are FROZEN; their current individual versions are authoritative in the
+index above.** The initial freeze occurred on 2026-08-20 and later additive amendments have
+advanced individual versions. Frozen means buildable and stable, not immutable: additive
+amendments bump the minor version, while breaking changes need a CCR and a dual-support
+window. [`CHANGELOG.md`](CHANGELOG.md) records the exact provenance.
 
 One caveat carried forward: `auth.md` §11 (age and eligibility) is a **working default**, not a
 legal position, and needs professional review before P8 and P11. Nothing outside those phases

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.10.0 |
+| **Version** | 2.1.0 |
 | **Owner** | [CC] Claude Code |
 | **Producers** | [CX] client, [CC] match server and platform |
 
@@ -49,7 +49,7 @@ its own.
 | `funnel.preconsent` | Landing, eligibility, **and the consent screen itself**, as unlinked internal counts. The only lawful measurement of the steps that precede a decision |
 | `session.first_match` | Time to first match and whether it completed |
 | `lobby.abandoned` | Left before launch, with the last state reached |
-| `connection.failure` | Failed connect, by stage and `errors.md` code |
+| `connection.failure` | Failed connect, by stage and platform `ErrorCode` or browser `ClientTransportCode` |
 | `room.join_failure` | Join refused, by reason |
 | `match.handoff_failure` | Allocation or handoff failed after countdown |
 | `match.return_outcome` | How the player left a match and whether they returned to lobby |
@@ -156,7 +156,7 @@ authorization, rate-limit identity, or anything that matters.
 |---|---|
 | Batch size | ≤ 50 events, ≤ 64 KB |
 | Batch cadence | 10 s, or on `visibilitychange: hidden` |
-| Unload delivery | `navigator.sendBeacon`. Never a synchronous XHR — it blocks the tab close |
+| Hidden/unload delivery | `navigator.sendBeacon` to the single same-origin `/v1/telemetry/unload` ingress defined below. Never the ordinary endpoint; never synchronous XHR |
 | Max event age | 30 min. Older events are dropped, not backdated |
 | Queue cap | 500 events, then **drop oldest** |
 | Retry | Once, after 30 s. Then drop. Telemetry never retries into an outage |
@@ -166,11 +166,67 @@ authorization, rate-limit identity, or anything that matters.
 | `consentReceipt` on an internal-only batch | **Not required, and should be absent.** A receipt on a batch carrying no personal events is an identifier with no purpose |
 | Payload | Per-name **allowlist**. Keys outside it are dropped server-side, not stored-and-filtered |
 
+**Queue acknowledgement rule (REQ-CC-059).** Normal delivery removes records only after the
+ordinary endpoint returns its `202`. Unload delivery is necessarily response-independent:
+`sendBeacon(true)` means that the user agent accepted the bytes, so those selected records leave
+this best-effort queue at that point. `false` applies the ordinary one-retry/30 s rule. The
+server makes that limited acknowledgement safe by accepting one exact, fail-closed envelope,
+reserving its `deliveryId` transactionally before ingestion, and returning `202` for a duplicate.
+A crash after reservation may lose telemetry, but a browser retry cannot double KPI rows. This
+is an explicit at-most-once trade rather than a claim that the beacon boolean is a server reply.
+
+#### 3.3.1 Unload ingress (REQ-CC-059)
+
+The global header rule still applies everywhere except this one endpoint. Because Beacon cannot
+set `Authorization`, `X-Correlation-Id`, or `X-Client-Build`, the client copies the latter two
+values into a closed body and the ingress validates them with the same syntax and build floor:
+
+```http
+POST /v1/telemetry/unload/credential   A
+Authorization: Bearer …
+X-Correlation-Id: 01…
+X-Client-Build: 123
+
+204
+Set-Cookie: os_tu=<signed opaque credential>; HttpOnly; SameSite=Strict;
+            Path=/v1/telemetry/unload; Max-Age=900; Secure (production)
+
+POST /v1/telemetry/unload              P
+Content-Type: application/json
+Cookie: os_tu=…                         # automatic and optional
+
+{
+  "correlationId": "01…",
+  "deliveryId": "01…",
+  "clientBuild": "123",
+  "schemaVersion": 1,
+  "clientSessionId": "01…",           # personal only
+  "consentReceipt": "opaque",          # personal only
+  "events": [ … ]
+}
+
+202 → { "accepted": int, "rejected": int, "duplicate": bool,
+        "consentReceiptError": object|null, "correlationId": "…" }
+```
+
+The credential is issued only by an authenticated ordinary request, rotates before its 15-minute
+expiry, is scoped to this endpoint, and signs `(accountId, sessionId, issuedAt, expiresAt, nonce)`.
+It is never readable by JavaScript. Rotation invalidates the prior nonce immediately, and every
+use revalidates that the named platform session still exists, belongs to that account, and is not
+revoked; a valid signature is not a second 15-minute session after signout. A signed-in client
+refuses to beacon personal events until it has a current credential. The ingress derives actor
+identity only from the verified cookie and never reads an `accountId` from the body. Signed-out personal events remain bound to the signed
+consent receipt plus `clientSessionId`; internal events are accepted without identity and any
+ambient identity is discarded by the telemetry service. Same-origin deployment, `SameSite=Strict`,
+the endpoint-only cookie path, closed JSON shape, build-floor validation, 64 KB batch limit, and a
+30-minute transactional `deliveryId` reservation are all mandatory. No query-string credential,
+bearer token, or generic configurable beacon URL exists.
+
 **Never persisted in the queue:** access tokens, refresh cookies, raw error strings, chat
 text, other players' display names, or anything from §3.4's prohibitions. The queue survives a
 reload in `sessionStorage`, so anything in it is anything an XSS can read.
 
-### 3.3.1 Event registry (REQ-CC-014)
+### 3.3.2 Event registry (REQ-CC-014)
 
 The allowlist was referenced but never published, which left "allowlisted" meaning nothing.
 This is it. **Privacy class is derived server-side from `(name, version)` using this table** —
@@ -188,7 +244,7 @@ Every payload below is closed: unlisted keys are dropped server-side, not stored
 | `room.join_failure` | 1 | personal | `{ code, joinBlockedReason }` — both closed enums from `errors.md` / `http-api.md` §11.3; `joinBlockedReason` null when the failure was not a block |
 | `match.handoff_failure` | 1 | personal | `{ stage, code }` — stage `allocating`\|`ticket`\|`connect`\|`welcome` |
 | `match.return_outcome` | 1 | personal | `{ outcome, returnedToLobby: bool }` — outcome `completed`\|`disconnected`\|`kicked`\|`aborted`\|`grace-expired` |
-| `connection.failure` | 1 | personal | `{ stage, code }` — stage `platform`\|`lobby`\|`match`; code from `errors.md` |
+| `connection.failure` | 1 | personal | `{ stage, code }` — stage `platform`\|`lobby`\|`match`; code is a platform `ErrorCode` when a response supplied one, otherwise `CLIENT_NETWORK`\|`CLIENT_TIMEOUT` from `errors.md` §3.2. The receiver and aggregation preserve the distinction; local transport failures are never relabelled as `SERVICE_UNAVAILABLE` |
 | `settings.friction` | 1 | personal | `{ category, duringFirstSession: bool }` — `category` is a canonical category ID from settings vocabulary **version 1** (§3.6). Not a settings key, and not a display label |
 | `client.unsupported` | 1 | internal | `{ reason, browser, browserMajor, os }` — `reason` is `UnsupportedReason` (`errors.md` §3.1), including `build` |
 | `client.fps` | 1 | internal | `{ p50: 0–1000, p01: 0–1000, windowSec: 1–600 }` |
@@ -338,7 +394,13 @@ Every telemetry stream declares both, matching `event-envelope.md` §7.
 | Capacity/network/sim | internal | standard |
 | Anti-cheat signals | sensitive | audit (7 y) |
 | Match evidence | internal | **See §6** |
-| Chat | sensitive | audit-linked, per moderation retention |
+| Chat | sensitive | 30 days; if report-linked, until resolution plus 30 days |
+
+Accepted room chat retains only the normalized policy-approved text, message/room/sender ids,
+and creation/removal metadata. It is never a client telemetry event or lobby-history query.
+Unreported rows purge at 30 days. An open report pins its referenced row; resolution starts a
+final 30-day review window. Account deletion does not erase an active moderation record early;
+normal expiry removes it after the hold. Raw rejected text is never stored.
 
 ## 6. Match evidence retention — **needs a privacy review before P5**
 

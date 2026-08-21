@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.8.0 |
+| **Version** | 2.1.0 |
 | **Engine** | PostgreSQL — **Supabase, primary region `ca-central-1` (Toronto)** (D2) |
 | **Owner** | [CC] Claude Code |
 | **Scope** | P1–P5. Economy, ownership, creator, and agent tables are later contracts |
@@ -62,6 +62,8 @@ accounts(
   -- provider (D1, Supabase Auth); it exists so a self-hosted fallback does not need a schema
   -- change, and so the column is never invented ad hoc at the write site.
   password_hash     text,
+  identity_provider text,                -- `supabase` in production; null for local test only
+  identity_subject  text,                -- opaque provider user id; never a provider token
   roles             text[] not null default '{player}',
   name_changed_at   timestamptz,
   display_name_folded text not null unique,  -- NFKC + case + confusable folding (auth.md §9)
@@ -81,6 +83,11 @@ accounts(
   updated_at        timestamptz not null default now(),
   deleted_at        timestamptz
 )
+
+`identity_provider` and `identity_subject` are an all-or-nothing pair and unique together.
+Production rows use that pair and keep `password_hash` null. The non-production local-test
+provider does the inverse. No API projection, event, or audit summary exposes either credential
+field.
 
 account_name_history(account_id, previous_name, changed_at, changed_by, reason)
 
@@ -185,9 +192,33 @@ rooms(room_id primary key, owner_account_id, region, map_id, mode, capacity,
 room_members(room_id, account_id, team, ready, loadout jsonb,
              joined_at, left_at, primary key (room_id, account_id))
 
+chat_messages(
+  message_id primary key, room_id references rooms, sender_account_id references accounts,
+  text, created_at, expires_at,
+  removed_at, removed_by, removal_reason,
+  check (removal metadata is either all null or all present)
+)
+create index on chat_messages(expires_at) where removed_at is null;
+create index on chat_messages(room_id, created_at);
+
+-- reports adds nullable chat_message_id references chat_messages(message_id). The duplicate
+-- incident key is (reporter,subject,match_id,chat_message_id,category) NULLS NOT DISTINCT.
+-- The runtime verifies sender==subject and historical room membership at message time.
+
 match_servers(server_id primary key, region, address, capacity, in_use,
               status,          -- registering|healthy|draining|unhealthy|gone
               build, last_heartbeat_at)
+
+match_tickets(
+  jti primary key, account_id references accounts, room_id references rooms,
+  match_id references matches, expires_at, consumed_at null, created_at
+)
+-- Admission is a single atomic UPDATE where consumed_at is null and expires_at > now.
+-- The HMAC is only the portable claim envelope; this durable row is the replay authority,
+-- so a game-server restart or two concurrent verifiers cannot reuse the same jti.
+-- Both consumed and never-consumed rows are deleted 24 hours after expires_at. `consumed_at`
+-- is the sole one-way state transition: ticket rows are immutable admission receipts rather
+-- than mutable domain records, so the ordinary updated_at rule does not apply.
 
 matches(
   match_id primary key, room_id, region, server_id,

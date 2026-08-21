@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.5.0 |
+| **Version** | 1.7.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Client HTTP layer, lobby socket, match server, Admin Portal |
 
@@ -35,6 +35,37 @@ provider does not get to relax:
 3. **The match-server handoff uses our own single-use tickets (§6), never provider tokens.**
    A provider outage must not be able to hand out match access, and a provider token has the
    wrong scope, the wrong lifetime, and far too much authority for a game socket.
+
+**Executable provider boundary.** A production process refuses to boot unless
+`PLATFORM_IDENTITY_PROVIDER=supabase`, `SUPABASE_URL`, and a service-role key are configured.
+Signup creates the Supabase user through the admin endpoint with provider email confirmation
+enabled because Overstrike owns the separate incomplete verification/setup gate. Signin verifies
+the password through Supabase's password grant but discards provider tokens; the platform still
+mints and revokes its own sessions. `accounts.identity_provider` and `identity_subject` hold only
+the provider discriminator and opaque user id. `password_hash` is null. The scrypt adapter is an
+explicit development/test provider, is forbidden in production, and performs the same dummy KDF
+verification for a nonexistent account. It is not an alternative production decision.
+
+**Legacy cutover.** Migration 0021 only creates the provider-reference columns; it cannot create
+remote identities. Before the first Supabase production boot, the operator runs
+`npm run identity:cutover` as a dry-run, resolves every blocker, then runs the same command with
+`-- --apply`. For each live legacy account the tool requires its stored transactional-mail
+address, creates (or safely resumes) only a Supabase user whose app metadata names that exact
+Overstrike account, assigns a cryptographically random password that is never disclosed, records
+the provider subject while clearing `password_hash`, and revokes existing sessions in one database
+transaction. The player must then use normal password recovery. Provider creation is compensated
+if the database write fails; a provider user left by a process crash can be safely adopted only
+when its account binding matches. A production process queries identity readiness and refuses to
+boot while any live account still has a local credential or lacks its Supabase subject. There is
+no production local-KDF fallback.
+
+The cutover cannot precede transactional-mail readiness. Production requires
+`PLATFORM_MAIL_TRANSPORT=resend`, `PLATFORM_MAIL_FROM`, and `PLATFORM_MAIL_API_KEY`; mail appears
+as a named service-readiness dependency. Configuration readiness does not prove deliverability,
+so the deployment gate also requires one verification canary and one recovery canary delivered
+through the configured, Resend-verified From domain. Tokens must appear only in the message body,
+never provider errors, structured logs, or deployment output. Without that evidence the random
+cutover password would be an account lockout, so the cutover and deployment remain blocked.
 
 **Reversal trigger:** if Supabase Auth cannot express immediate session revocation (§5) or
 per-session device listing (§5), revisit before P1 ends. Both are G2 gate requirements, not
@@ -141,6 +172,12 @@ Grace window is per-mode and lives in `bomb-rules.md` / mode config, not here.
   compromise, leaving the attacker's session live defeats it.
 - Recovery cannot change the linked wallet, and cannot bypass a moderation hold. (Wallets
   arrive in P8; the boundary is stated now so recovery is not designed into a corner.)
+- Provider replacement and the platform transaction form a resumable saga. Completion
+  exclusively reserves the recovery token, changes the provider credential, commits the account
+  event/audit state, and revokes every platform session before consuming the token. A transient
+  provider, database, outbox, or revocation failure releases the reservation so the same link can
+  retry. This is required because a provider password update cannot be compensated without
+  retaining the old password, which the platform must never do.
 
 ## 9. Display names
 
