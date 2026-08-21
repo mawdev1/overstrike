@@ -166,14 +166,21 @@ reproduce at HEAD.
 
 ### D1 — nothing in the shipping game can plant or defuse
 
-`git grep requestInteract -- src/ server/` finds the definition (`bomb.js:570`), the passthrough
-(`match.js:716`), and **no production caller**. `player.js:1928` routes the interact edge to
+CORRECTED 2026-08-21, and the correction narrows it rather than dismissing it. At the time this
+was written `requestInteract` had no production caller at all. It now has one: `botManager.js`
+calls it, so **bots genuinely plant and defuse** — 30 plants and 13 defuses over 38 rounds,
+measured. The ruleset is reachable and exercised server-side, which is where the contract puts
+the authority.
+
+What is still missing is the **client request path**. `bomb.js`'s own header says "a client
+REQUESTS an interaction (`requestInteract`) and the server decides"; there is no route from a
+human player's key to that call. `player.js:1928` routes the interact edge to
 `_interact()`, which raycasts the world and emits a bus `interact` event nothing subscribes to
 the bomb, and `src/net/server.js` never reads `cmd.interact`.
 
-So bomb-rules §6/§7, the `interact` wire byte, `plantComplete`/`defuseComplete`,
-`MSG_OUTCOME.actorId` and every `REFUSAL_REASONS` value are proved **only against
-harness-invented calls**. `bombtest.mjs` and `wstest.mjs` call `rules.requestInteract` directly.
+So Bomb is playable by bots and **unplayable by a human**. The `interact` wire byte and every
+`REFUSAL_REASONS` value are still proved only against harness-invented calls, because no client
+ever sends the request that would produce them. `bombtest.mjs` and `wstest.mjs` call `rules.requestInteract` directly.
 That is the same failure `server.js`'s own `normaliseObjective` comment already documents: the
 test hand-fed the shape the test invented, so producer and consumer were never connected.
 
@@ -329,13 +336,14 @@ findings remain because they explain why the proofs exist.
 
 ### Evidence run on this tree
 
-- `node scripts/platformtest.mjs`: **2,454 checks, 12 suites, zero failures** on memory.
-- `node scripts/pgtest.mjs`: migration 0001–0021 applied, **2,865 checks, 12 suites, zero
-  failures** on PostgreSQL 16, then migration replay reported `nothing to do (20 already applied)`.
+- `node scripts/platformtest.mjs`: **2,494 checks, 15 suites, zero failures** on memory.
+- PostgreSQL platform aggregate within `node scripts/pgtest.mjs`: 23 migrations through 0024
+  applied, **2,918 checks, 15 suites, zero failures** on PostgreSQL 16. The same run's separate
+  P2 second-room lobby assertion is tracked below and is not counted as P0/P1 evidence.
 - `node scripts/viteproxytest.mjs`: Chromium drove the Vite `/v1` proxy through a stateful
   scenario across navigation, exact correlation echo, scoped Secure/httpOnly cookie carriage and
   reload refresh.
-- `identitytest.mjs`: Supabase admin-create/password-grant/update/delete shapes,
+- `identitytest.mjs`: **13/13** Supabase admin-create/password-grant/update/delete shapes,
   `email_confirm:true`, provider-subject binding, generic 5xx mapping, no service-role material in
   errors, production local-provider refusal, and dummy-KDF unknown-user work.
 
@@ -352,8 +360,8 @@ as a test flake rather than erased or counted as a product failure.
 | P0 decisions | D1–D5 are recorded working decisions. D6 remains a working engineering default and still requires professional legal review before P8/P11; this entry does not declare that review complete. |
 | H1.1 | Backend/browser proof is executable and green through Vite. A current CX acceptance statement is still separate review evidence. |
 | H1.2 | Local and PostgreSQL auth/profile/telemetry switching is executable. A live production Supabase switch is externally blocked because the deployed platform has no provider URL/service-role secret. |
-| H1.3 | Browser→platform correlation, HTTP→outbox/audit correlation, and match/platform component tests are green. The phase-review artifact tracing one actual CX action across client → match server → platform → audit has not been produced here, so H1.3 is not self-certified complete. |
-| P1 observability exit | Structured logs and correlation are implemented. This audit has no evidence of deployed distributed traces, service metrics, alert routing, or an incident timeline view; that checklist row remains open. |
+| H1.3 | Executable local and PostgreSQL lobby acceptance sends an explicit client W3C trace on one six-client launch, retains that trace through platform allocation/control and game-server spans, joins the durable `match.allocated` outbox event by correlation, and reads it through the service-only redacted incident timeline. The code/evidence gate is complete; deployed alert delivery remains the external hold below. |
+| P1 observability exit | Code-complete: bounded service metrics, route-template latency, health/outbox/dead-letter/5xx alert signals, service-auth platform and game-server metrics, and a correlation-indexed incident timeline are executable. The timeline omits payloads and actor/subject IDs; trace attributes are closed/redacted. Production readiness intentionally reports alerts down until the secret webhook is configured and probed. |
 | P1 migration exit | PostgreSQL 16 scratch rehearsal and forward replay are green. Production rollout remains a deployment action. |
 
 ### Required production identity configuration
@@ -364,12 +372,80 @@ The platform must receive all three values; none may be replaced with the local 
 PLATFORM_IDENTITY_PROVIDER=supabase
 SUPABASE_URL=https://<project>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<secret>
+PLATFORM_MAIL_TRANSPORT=resend
+PLATFORM_MAIL_FROM=Overstrike <accounts@<verified-domain>>
+PLATFORM_MAIL_API_KEY=<secret>
+PLATFORM_ALERT_WEBHOOK_URL=https://<incident-relay>/<secret-route>
 ```
 
 Fail-closed boot was rechecked twice: production without the provider selector reports
 `PLATFORM_IDENTITY_PROVIDER=supabase is required in production`; selecting Supabase without its
 two credentials reports `SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for the Supabase
 identity provider`. No fallback is installed or permitted.
+
+Supabase provider compensation now treats only 2xx and 404 deletes as success; transport, 5xx,
+and other refusals are surfaced and logged without masking the original signup failure. The
+production identity readiness probe also audits provider users carrying Overstrike account
+metadata and reports orphan/mismatched subjects by count, never address or provider credential.
+This prevents a failed database commit plus failed delete from being reported as reconciled.
+
+### Identity cutover correction — REQ-CC-070
+
+The initial closure above missed existing rows. The production audit found nine accounts, all with
+legacy `password_hash` values and null provider subjects. Enabling the configured Supabase adapter
+would therefore strand all nine: signin could not bind the returned Supabase user and recovery
+could not name a provider user to update.
+
+The code path is now closed without weakening D1. `npm run identity:cutover` is dry-run by default;
+`-- --apply` provisions/resumes exact account-bound provider users, assigns a random undisclosed
+credential, transactionally records the Supabase subject while clearing the old KDF and revoking
+sessions, and requires the ordinary recovery flow. Database failure compensates a new provider
+user, and an interrupted run adopts only a user whose provider metadata names that same account.
+Production boot queries all live identities and refuses any remaining local hash, non-Supabase
+provider, or missing subject.
+
+This is **code-complete but operationally blocked**. The Supabase project and
+`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` do not exist on the Fly app, so no provider users have
+been created and the nine production rows have not been changed. Required deployment sequence:
+configure Resend, prove verification and recovery canaries from its verified domain, apply
+migration 0021, capture a blocker-free dry-run, run explicit apply in a maintenance window,
+capture the zero-candidate post-run, then deploy the Supabase-only process. The Fly app currently
+has no mail transport/API-key/From secrets, so the cutover would leave every migrated user with an
+unknowable password and no recovery path. Until both provider and mail evidence exist, H1.2's live
+provider switch and the platform deployment remain open.
+
+The updated aggregate counts above include nine focused cutover state-machine/production-boot
+checks, six mail-security/configuration checks, and memory/PostgreSQL identity-readiness
+conformance. A later full `pgtest` invocation passed the then-current platform portion, then failed
+in the concurrently edited P2 lobby
+normal-completion/rematch acceptance. That P2 failure is not counted as P0/P1 green evidence and
+does not alter this lane's external Supabase deployment block.
+
+### 2026-08-21 P1 client/authority/observability closure addendum
+
+- The shell client now applies closed success validators before UI/session mutation across auth,
+  consent, flags, own/public profile, settings, room list/detail/create/join/mutations, career,
+  active/reconnect match and terminal-result surfaces. Unknown, omitted and wrong-typed 2xx
+  projections become `CLIENT_PROTOCOL`; protocol failures are no longer swallowed by optional
+  presence loading.
+- `overstrike.progress.v1` is explicitly practice/unverified authority. Authenticated network
+  entry swaps it out before `Game` construction for a mode-scoped server career projection;
+  local match award/write paths are disabled, server weapon/career totals are displayed, and
+  network exit restores the unchanged practice blob. The authenticated one-shot legacy import
+  preserves that blob, stores only the separate `verified:false` inert projection, and never
+  merges it into career/result authority.
+- The production runtime deduplicates facade `matchEnded`, carries its exact match/status/reason
+  and server-derived completion/mode into `restoreShell`, and passes the shell-owned first-match
+  marker. A forged/local `toMenu` payload cannot claim a completed network match.
+- Browser proof: `uishell` passes **1,283 assertions**, including modified-localStorage isolation
+  and the exact production `onExit` shape. `viteproxytest` passes the real Vite proxy/cookie/
+  correlation/reload path. `lobbytest` proves a supplied trace across client, platform, game
+  server and durable event while asserting the incident response contains no subject ID.
+
+External holds remain exact: no Supabase project/provider secrets, no Resend From/API secret or
+verification/recovery delivery canary, nine legacy accounts not yet cut over, no alert-webhook
+secret/delivery probe, and D6 professional legal review still required before P8/P11. No deploy
+may turn any of those into a local-production fallback or a claimed human sign-off.
 
 ### Open requests
 
