@@ -208,6 +208,12 @@ export class BombRules {
     this._requests = new Map();
     /** entity ids eliminated for this round (§8) */
     this.eliminated = new Set();
+    /**
+     * Deaths reported since the referee last resolved — see `_commitDeaths()`. The engine
+     * produces kills in the WEAPONS phase, which `game.js` runs BEFORE the rules, so every
+     * real kill is already in hand by the time this ruleset steps.
+     */
+    this._freshDeaths = new Set();
     /** entity id → { connected, sinceTick, absentRounds } (§9) */
     this._conn = new Map();
     /** Completion latch. Once set inside a step it cannot be revoked by anything in it. */
@@ -287,6 +293,26 @@ export class BombRules {
     return entity.alive !== false;
   }
 
+  /**
+   * §4 simultaneity, expressed as one predicate.
+   *
+   * A death reported since the referee last resolved happened *on this tick*, and §4 says a
+   * tie between an action a player took and anything else resolves in favour of the action:
+   * "if the last defender dies on the same tick a defuse completes, the defuse wins — it
+   * completed". So for the two places that decide whether an in-progress objective survives
+   * this tick — carrying the bomb, and accumulating plant/defuse progress — a player who
+   * died this tick is still acting. `_commitDeaths()` applies the death immediately
+   * afterwards, before anything reads `aliveCount`, so the death is late by nothing.
+   *
+   * Everything else — pickup, alive counts, clutch, spectating — uses `isAlive`, where the
+   * death is already in effect. A corpse does not pick the bomb up.
+   */
+  _actingThisTick(entity) {
+    if (!entity) return false;
+    if (this._freshDeaths.has(entity.id)) return this.isConnected(entity.id);
+    return this.isAlive(entity);
+  }
+
   aliveCount(team) {
     let n = 0;
     for (const e of this._roster()) if (e.team === team && this.isAlive(e)) n++;
@@ -336,6 +362,7 @@ export class BombRules {
     this._progress.clear();
     this._requests.clear();
     this.eliminated.clear();
+    this._freshDeaths.clear();
     this._clutch = [null, null];
     this._lastAlive = [-1, -1];
 
@@ -430,8 +457,12 @@ export class BombRules {
 
   _tickRound() {
     this.phaseTicks++;
+    // Bomb carrying and objective progress see the tick's deaths as still-acting players
+    // (`_actingThisTick`); `_commitDeaths` then applies those deaths before anything that
+    // counts the living runs. That ordering IS §4's simultaneity rule.
     this._updateBomb();
     this._accumulate();
+    this._commitDeaths();
     if (this.phase === 'live') this.roundTicks++;
     else this.bombTicks++;
     this._noteClutch();
@@ -439,11 +470,56 @@ export class BombRules {
     this._completed = null;
   }
 
+  /**
+   * Apply the consequences of every death reported since the last resolution: lost objective
+   * progress (§6) and a dropped bomb (§5).
+   *
+   * These are deferred out of `onKill` rather than applied there because `onKill` runs in the
+   * WEAPONS phase of the engine's fixed step and the referee runs LAST (`game.js`
+   * `_fixedUpdate`: nav → player → entities → bots → weapons → projectiles → match). Applied
+   * on arrival, a death would wipe the progress of an objective that completes on the very
+   * same tick, and both §4 simultaneity clauses would invert: the defuse that completed would
+   * be reported as a detonation, and the plant that completed as a pre-plant elimination.
+   */
+  _commitDeaths() {
+    if (this._freshDeaths.size === 0) return;
+    // Ordered by id: every iteration that can influence the simulation must be ordered.
+    for (const id of [...this._freshDeaths].sort((a, b) => a - b)) {
+      if (this._completed && this._completed.actorId === id) {
+        // Their objective completed on this tick. It is not cancelled by their death (§4),
+        // and the bomb is about to be planted or defused rather than dropped — so the
+        // request is dropped silently instead of being reported as an interruption.
+        this._requests.delete(id);
+        this._progress.delete(id);
+        continue;
+      }
+      this._applyDeath(id);
+    }
+    this._freshDeaths.clear();
+  }
+
+  /**
+   * §6 progress is lost and §5 the carried bomb drops, at the death position.
+   *
+   * `entity` is passed in where the caller already holds the victim, so the bomb lands on the
+   * body even if the roster can no longer resolve the id.
+   */
+  _applyDeath(id, entity = this._entity(id)) {
+    this._requests.delete(id);
+    this._resetProgress(id, REFUSE.dead);
+    if (this.bomb.state === 'carried' && this.bomb.carrierId === id) {
+      this._dropBomb(entity, 'carrierDeath');
+    }
+  }
+
   /** §5 carrier tracking, drop recovery, pickup, out-of-bounds return. */
   _updateBomb() {
     if (this.bomb.state === 'carried') {
       const carrier = this._entity(this.bomb.carrierId);
-      if (!carrier || !this.isAlive(carrier) || carrier.team !== this.attackingTeam) {
+      // `_actingThisTick`: a carrier killed earlier in this tick still holds it until
+      // `_commitDeaths`, so a plant completing on the tick they die is not refused for
+      // `notCarrying` (§4). Their death drops it moments later, in the same tick.
+      if (!carrier || !this._actingThisTick(carrier) || carrier.team !== this.attackingTeam) {
         this._dropBomb(carrier, 'carrierLost');
       } else {
         this._setBombPosition(carrier.position);
@@ -512,10 +588,18 @@ export class BombRules {
     this._resetProgress(entity.id, REFUSE.released);
   }
 
-  /** Every precondition in §6 / §7, server-side, evaluated fresh every step. */
-  _validate(entity, kind) {
+  /**
+   * Every precondition in §6 / §7, server-side, evaluated fresh every step.
+   *
+   * @param {boolean} [acting] when true, a player killed earlier in THIS tick still counts as
+   *   acting (§4 simultaneity — see `_actingThisTick`). Only `_accumulate` passes it: a NEW
+   *   request from a player the engine has already killed is refused as `dead`.
+   */
+  _validate(entity, kind, acting = false) {
     if (!this.isConnected(entity.id)) return { ok: false, reason: REFUSE.disconnected };
-    if (!this.isAlive(entity)) return { ok: false, reason: REFUSE.dead };
+    if (!(acting ? this._actingThisTick(entity) : this.isAlive(entity))) {
+      return { ok: false, reason: REFUSE.dead };
+    }
     if (kind === 'plant') {
       if (this.phase === 'planted') return { ok: false, reason: REFUSE.alreadyPlanted };
       if (this.phase !== 'live') return { ok: false, reason: REFUSE.wrongPhase };
@@ -589,7 +673,7 @@ export class BombRules {
     for (const id of ids) {
       const req = this._requests.get(id);
       const entity = this._entity(id);
-      const check = entity ? this._validate(entity, req.kind) : { ok: false, reason: REFUSE.disconnected };
+      const check = entity ? this._validate(entity, req.kind, true) : { ok: false, reason: REFUSE.disconnected };
       if (!check.ok) {
         this._requests.delete(id);
         this._resetProgress(id, check.reason);
@@ -608,12 +692,17 @@ export class BombRules {
       // §7: two defenders do NOT stack. Each accumulates its own progress at the same
       // rate, so the pair completes on exactly the tick one of them would have.
       if (prog.ticks >= total && !this._completed) {
-        // Completion is LATCHED here and consumed by `_resolve()` later in this same step,
-        // which is what makes §4's "if the last defender dies on the same tick a defuse
-        // completes, the defuse wins" true: `Match` runs before weapons and bots in
-        // `game.systems`, so a kill produced by this step reaches the referee AFTER the
-        // round has already been resolved. Nothing between the latch and the resolution
-        // can revoke it, and `_tickRound` clears it once the resolution has read it.
+        // Completion is LATCHED here and consumed by `_resolve()` later in this same step.
+        // Nothing between the latch and the resolution can revoke it, and `_tickRound`
+        // clears it once the resolution has read it.
+        //
+        // The latch alone does NOT make §4's "if the last defender dies on the same tick a
+        // defuse completes, the defuse wins" true, and an earlier comment here claimed the
+        // opposite on the strength of an ordering the engine does not have: `game.systems`
+        // is consumed by the RENDER path only, while the simulation step is hand-ordered in
+        // `game.js` `_fixedUpdate` and runs the rules LAST. Every real kill therefore lands
+        // BEFORE this loop, not after it. What makes the rule true is `_actingThisTick`
+        // above plus `_commitDeaths` below.
         this._completed = { kind: prog.kind, actorId: id, site: prog.site };
       }
     }
@@ -781,18 +870,25 @@ export class BombRules {
 
   // ────────────────────────────────────────────────────────────────── §8 elimination
 
-  /** Called from the mode's `onKill`. Death in live/planted is elimination (§8). */
+  /**
+   * Called from the mode's `onKill`. Death in `live` OR `planted` is elimination (§8) —
+   * both, which is why this reads `liveRound` and not `phase === 'live'`.
+   *
+   * The elimination itself is recorded HERE, so `aliveCount` is right for every reader from
+   * this instant. What is deferred to `_commitDeaths` is only what could destroy an
+   * objective that completes on this same tick (§4): the progress reset and the bomb drop.
+   */
   onKill(victim, attacker) {
-    if (!victim) return;
-    if (this.liveRound) this.eliminated.add(victim.id);
-    // Any progress the victim had is lost — no partial credit (§6).
-    this._requests.delete(victim.id);
-    this._resetProgress(victim.id, REFUSE.dead);
-    // §5 carrier death: drops at the death position, on the ground, pickable.
-    if (this.bomb.state === 'carried' && this.bomb.carrierId === victim.id) {
-      this._dropBomb(victim, 'carrierDeath');
-    }
     void attacker;
+    if (!victim) return;
+    if (!this.liveRound) {
+      // No round is running, so there is no objective tick for this death to be
+      // simultaneous with. Apply it now.
+      this._applyDeath(victim.id, victim);
+      return;
+    }
+    this.eliminated.add(victim.id);
+    this._freshDeaths.add(victim.id);
   }
 
   /** §3: respawns are on in warmup only; in live/planted a death is an elimination. */

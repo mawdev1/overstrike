@@ -81,6 +81,60 @@ function kill(game, victim, attacker = null) {
   game.bus.emit('kill', { victim, attacker, weaponId: 'ar_vector', headshot: false, distance: 12 });
 }
 
+/**
+ * ONE FULL ENGINE STEP with the kills produced where the engine really produces them.
+ *
+ * This exists because the §4 simultaneity cases were previously "proved" by calling `kill()`
+ * AFTER `step()` and asserting the result — an order the engine cannot produce. `game.systems`
+ * is consumed by the RENDER path only; the simulation step is hand-ordered in `game.js`
+ * `_fixedUpdate` — nav → player → extra entities → bots → weapons → projectiles → **match** —
+ * so every real kill reaches `bombRules.onKill` BEFORE the referee resolves that tick.
+ * Measured over 40 000 ticks of a live bot match, every kill was emitted from a phase ahead
+ * of the rules (`{ bots: 44, match: 3 }`).
+ *
+ * So the harness injects from the weapons phase and MEASURES the ordering rather than
+ * assuming it: the return value is how many of the victims the referee already knew were
+ * eliminated at the moment it ran. Reorder `game.js` and these cases fail here first.
+ *
+ * The ACTORS are held still for that step — the same reason `step()` exists (see the header):
+ * a boundary case must be a boundary case and not a race with an AI that wandered out of the
+ * volume, and a body teleported into a volume by `place()` is airborne on its first real
+ * physics step, which refuses the plant for `notGrounded` before the rule under test is ever
+ * reached. Nothing about the ORDER changes: the phases still run in `game.js`'s order, and
+ * the kill still originates ahead of the rules, which is the property being held down.
+ *
+ * @returns {number} victims already eliminated when `match.fixedUpdate` began
+ */
+function engineStepKilling(game, victims, attacker = null) {
+  const frozen = [game.player, game.bots].filter((s) => s !== null && s !== undefined);
+  const weapons = game.weapons;
+  const match = game.match;
+  const realWeapons = weapons.fixedUpdate;
+  const realMatch = match.fixedUpdate;
+  const realActors = frozen.map((s) => s.fixedUpdate);
+  let knownToReferee = -1;
+  for (const s of frozen) s.fixedUpdate = () => {};
+  weapons.fixedUpdate = (dt) => {
+    realWeapons.call(weapons, dt);
+    for (const v of victims) kill(game, v, attacker);
+  };
+  match.fixedUpdate = (dt) => {
+    const elim = game.match.bombRules.eliminated;
+    let n = 0;
+    for (const v of victims) if (elim.has(v.id)) n++;
+    knownToReferee = n;
+    realMatch.call(match, dt);
+  };
+  try {
+    game._fixedUpdate(FIXED_DT);
+  } finally {
+    weapons.fixedUpdate = realWeapons;
+    match.fixedUpdate = realMatch;
+    frozen.forEach((s, i) => { s.fixedUpdate = realActors[i]; });
+  }
+  return knownToReferee;
+}
+
 /** Eliminate a whole team except the listed survivors. */
 function wipe(game, team, keep = []) {
   const keepIds = new Set(keep.map((e) => e.id));
@@ -147,14 +201,30 @@ eq(DEFAULT_MODE, 'tdm', 'TDM remains the default ruleset');
 eq(getMode('bomb'), BOMB, 'getMode resolves the bomb id to the Bomb ruleset');
 eq(getMode('capture-the-flag'), TDM, 'an unknown mode id resolves to TDM');
 eq(getMode('constructor'), TDM, 'a prototype key is not a mode');
+// §2 is the HUMAN OWNER's table, so every value is pinned to its literal here. Reading a
+// duration back out of BOMB_PARAMS and asserting the ruleset agrees with itself detects
+// nothing: with the durations below asserted only against themselves, the round-end delay
+// (5→3 s), the freeze (8→6 s), the round length (105→90 s) and the reconnect grace
+// (90→30 s) could all be changed without a single check going red.
 eq(BOMB_PARAMS.roundsToWin, 7, '§2 rounds to win is 7');
 eq(BOMB_PARAMS.maxRounds, 12, '§2.1a regulation is MR12');
 eq(BOMB_PARAMS.sideSwitchAfterRound, 6, '§2 sides switch after round 6');
+eq(BOMB_PARAMS.roundSeconds, 105, '§2 the round is 1:45 pre-plant');
+eq(BOMB_PARAMS.freezeSeconds, 8, '§2 the freeze is 8 s');
+eq(BOMB_PARAMS.plantSeconds, 3, '§2 the plant is 3.0 s');
+eq(BOMB_PARAMS.defuseSeconds, 7, '§2 the defuse is 7.0 s');
+eq(BOMB_PARAMS.bombTimerSeconds, 40, '§2.1 the bomb timer is 40 s after the plant');
+eq(BOMB_PARAMS.roundEndSeconds, 5, '§2 the round-end delay is 5 s');
+eq(BOMB_PARAMS.reconnectGraceSeconds, 90, '§2 the reconnect grace is 90 s');
+eq(BOMB_PARAMS.abandonRounds, 2, '§2 an abandon is 2 consecutive rounds absent');
 eq(BOMB_PARAMS.overtime, false, '§2.2 there is no overtime in Alpha');
 eq(BOMB_PARAMS.defuseKit, false, '§2 there is no defuse kit in Alpha');
+eq(T.round, 12600, '§2 the round is 105 s of fixed steps');
+eq(T.freeze, 960, '§2 the freeze is 8 s of fixed steps');
 eq(T.bomb, 4800, '§2.1 the bomb timer is 40 s of fixed steps');
 eq(T.plant, 360, '§2 the plant takes 3.0 s of fixed steps');
 eq(T.defuse, 840, '§2 the defuse takes 7.0 s of fixed steps');
+eq(T.roundEnd, 600, '§2 the round-end delay is 5 s of fixed steps');
 
 // ═══════════════════════════════════════════════ map-data §3.3 — sites come from the map
 
@@ -169,6 +239,19 @@ head('map-data.md §3.3 objective volumes');
   });
   eq(good.get('A').defuseId, 'p', 'an omitted defuse volume defaults to the plant volume');
   eq(good.get('A').requiresGround, true, 'requiresGround defaults to true');
+
+  // The site table is ordered by site id, not by the order the manifest happened to author
+  // its volumes. Nothing else can see this: within one process a Map iterates in insertion
+  // order every time, so two runs of the same build agree with each other whether the sort
+  // is there or not, and a determinism replay is blind to it.
+  const authoredBackwards = compileObjectives({
+    objectives: [
+      { id: 'pB', kind: 'plant', site: 'B', box: boxA },
+      { id: 'pA', kind: 'plant', site: 'A', box: boxA },
+    ],
+  });
+  eqJson([...authoredBackwards.keys()], ['A', 'B'],
+    'sites iterate in id order even when the manifest authored B before A');
 
   const rejects = [
     [{ objectives: 'nope' }, 'publishes no objectives array'],
@@ -380,6 +463,9 @@ head('§4 post-plant 4: eliminating the attackers after the plant wins NOTHING')
 
 head('§4 simultaneity: plant vs elimination on one tick');
 {
+  // §4 pre-plant precedence, rule 1 before rule 2. Injecting the attacker-wipe check above
+  // the completed-plant check in `_resolve` — the exact refactor §4 exists to prevent —
+  // turns this case into a defender elimination win, and this is the case that says so.
   const game = await newGame();
   const bomb = toLive(game, 'plant vs attacker wipe');
   const carrier = carrierIntoSite(game, 'A');
@@ -387,15 +473,18 @@ head('§4 simultaneity: plant vs elimination on one tick');
   bomb.requestInteract(carrier, 'plant');
   step(game, T.plant - 1);
   eq(bomb.aliveCounts()[bomb.attackingTeam], 1, 'the planter is the last attacker alive');
-  // The completing tick. In the engine a kill from this step reaches the referee AFTER
-  // match.fixedUpdate — so the plant is resolved first, exactly as §4 orders it.
-  step(game, 1);
-  eq(bomb.phase, 'planted', '§4 pre-plant 1: the plant is a PHASE CHANGE and it comes first');
   const scoreBefore = defenders(game).map((e) => game.match.statsFor(e).score);
   const killer = defenders(game)[0];
-  kill(game, carrier, killer);
-  eq(bomb.phase, 'planted', 'the last attacker dying in that same step does not end the round');
+  // The completing tick, driven through the WHOLE engine with the kill produced in the
+  // weapons phase — which runs before the rules, so the referee resolves this tick already
+  // knowing the planter is dead. That is the collision §4 legislates for.
+  eq(engineStepKilling(game, [carrier], killer), 1,
+    'the weapon kill reached the referee BEFORE it resolved the round');
+  eq(bomb.aliveCounts()[bomb.attackingTeam], 0, 'and the planter really is dead');
+  eq(bomb.phase, 'planted', '§4 pre-plant 1: the plant is a PHASE CHANGE and it comes first');
   eq(bomb.rounds.length, 0, 'no round outcome was awarded for the simultaneous elimination');
+  eq(bomb.bomb.state, 'planted', 'the bomb is down, not dropped on the planter\'s corpse');
+  eq(bomb.bomb.siteId, 'A', 'on the site they were standing in');
   // The killer is paid for the KILL and nothing more; nobody is paid a round win.
   eqJson(
     defenders(game).map((e, i) => game.match.statsFor(e).score - scoreBefore[i]),
@@ -408,15 +497,16 @@ head('§4 simultaneity: plant vs elimination on one tick');
   game.dispose();
 }
 {
-  // Control: the same death ONE TICK EARLIER is an ordinary pre-plant elimination.
+  // Control: the same death ONE TICK EARLIER — the tick that would have carried the plant
+  // to its last tick — is an ordinary pre-plant elimination.
   const game = await newGame();
   const bomb = toLive(game, 'plant vs attacker wipe control');
   const carrier = carrierIntoSite(game, 'A');
   wipe(game, bomb.attackingTeam, [carrier]);
   bomb.requestInteract(carrier, 'plant');
-  step(game, T.plant - 1);
-  kill(game, carrier, defenders(game)[0]);
-  step(game, 1);
+  step(game, T.plant - 2);
+  eq(engineStepKilling(game, [carrier], defenders(game)[0]), 1, 'control: the kill reached the referee first here too');
+  eq(bomb.rounds.length, 1, 'control: the round resolved on that tick');
   eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'control: the planter dying one tick earlier wins for the defenders');
   eq(bomb.rounds[0].reason, 'elimination', 'control: by elimination');
   eq(bomb.rounds[0].planted, false, 'control: and the bomb was never planted');
@@ -431,14 +521,30 @@ head('§4 simultaneity: plant vs elimination on one tick');
   const carrier = carrierIntoSite(game, 'A');
   bomb.requestInteract(carrier, 'plant');
   step(game, T.plant - 1);
-  wipe(game, bomb.defendingTeam);
-  step(game, 1);
+  const doomed = defenders(game).filter((e) => bomb.isAlive(e));
+  eq(doomed.length, 4, 'all four defenders are alive going into the completing tick');
+  eq(engineStepKilling(game, doomed, carrier), 4, 'and all four kills reached the referee before it resolved');
   eq(bomb.rounds[0].reason, 'elimination', 'a plant and the last defender on one tick resolves as an elimination');
   eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'and the attackers win it');
   eq(bomb.rounds[0].planted, true, 'the round record shows the bomb DID go down');
   eq(bomb.rounds[0].site, 'A', 'on site A');
   eq(game.match.statsFor(carrier).plants, 1, 'the plant still counts — it completed');
   eq(bomb.roundWins[bomb.rounds[0].winnerTeam], 1, 'exactly one round was awarded, not two');
+  game.dispose();
+}
+{
+  // §4 pre-plant precedence, rule 3 before rule 4: the last defender dying on the very tick
+  // the round timer expires is an ATTACKER elimination win, not a defender timer win.
+  const game = await newGame();
+  const bomb = toLive(game, 'defender wipe on the timer tick');
+  step(game, T.round - 1);
+  eq(bomb.rounds.length, 0, 'nothing is decided one tick before the timer expires');
+  const doomed = defenders(game).filter((e) => bomb.isAlive(e));
+  eq(doomed.length, 4, 'the whole defending side is alive going into the expiry tick');
+  eq(engineStepKilling(game, doomed, attackers(game)[0]), 4, 'their deaths reached the referee before it resolved');
+  eq(bomb.roundTicks, T.round, 'the round timer expired on that very tick');
+  eq(bomb.rounds[0].reason, 'elimination', '§4 pre-plant 3 beats pre-plant 4: it is an elimination');
+  eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'and the attackers win it, not the defenders on the clock');
   game.dispose();
 }
 
@@ -487,14 +593,16 @@ head('§4 simultaneity: defuse vs the last defender dying');
   step(game, T.defuse - 1);
   eq(bomb.aliveCounts()[bomb.defendingTeam], 1, 'the defuser is the last defender alive');
   eq(bomb.rounds.length, 0, 'the round has not resolved yet');
-  step(game, 1);
-  // The kill lands in the same step, after the referee — which is the ordering the engine
-  // produces, since Match runs before weapons and bots in `game.systems`.
-  kill(game, defender, attackers(game)[0]);
+  // The completing tick, with the kill produced in the weapons phase — before the rules run,
+  // which is the only ordering the engine has.
+  eq(engineStepKilling(game, [defender], attackers(game)[0]), 1,
+    'the weapon kill reached the referee BEFORE it resolved the round');
   eq(bomb.rounds.length, 1, 'exactly one round outcome exists');
   eq(bomb.rounds[0].reason, 'defuse', '§4: the defuse completed, so the defuse wins');
   eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'the defenders win it despite having nobody left');
   eq(bomb.aliveCounts()[bomb.defendingTeam], 0, 'and they really do have nobody left');
+  eq(bomb.bomb.state, 'defused', 'the bomb is defused, not detonated');
+  eq(bomb.objectiveStats.get(defender.id)?.defuses, 1, '§10 the dead defuser is still credited the completion');
   game.dispose();
 }
 {
@@ -506,12 +614,13 @@ head('§4 simultaneity: defuse vs the last defender dying');
   const defender = defenders(game)[0];
   beginDefuse(game, defender);
   wipe(game, bomb.defendingTeam, [defender]);
-  step(game, T.defuse - 1);
-  kill(game, defender, attackers(game)[0]);
-  step(game, 1);
+  step(game, T.defuse - 2);
+  eq(engineStepKilling(game, [defender], attackers(game)[0]), 1, 'control: the kill reached the referee first here too');
+  eq(bomb.rounds.length, 1, 'control: the round resolved on that tick');
   eq(bomb.rounds[0].reason, 'elimination', 'control: dying one tick before completion loses the defuse');
   eq(bomb.rounds[0].winnerTeam, bomb.attackingTeam, 'control: the attackers win by elimination');
   eq(bomb.bomb.state, 'detonated', 'control: the bomb was never defused');
+  eq(bomb.objectiveStats.has(defender.id), false, 'control: and the defuser is credited nothing');
   game.dispose();
 }
 
@@ -549,14 +658,18 @@ head('§6 plant preconditions, all server-side');
   eq(bomb.requestInteract(carrier, 'plant'), true, 'the carrier, alive, grounded, inside the volume, may plant');
   step(game, 5);
   eq(bomb._progress.get(carrier.id).ticks, 5, 'progress accumulates on the SERVER, one tick at a time');
+  // A kill arrives in the weapons phase; the referee applies its consequences when it steps.
   kill(game, carrier, defender);
+  step(game, 1);
   eq(bomb._progress.has(carrier.id), false, 'death resets the progress to zero');
   eq(bomb.progressOf(carrier.id), 0, 'and the wire progress reads zero');
+  eq(lastEvent(bomb, 'plantCancel').reason, REFUSE.dead, 'and the cancel names the death');
+  eq(bomb._requests.has(carrier.id), false, 'the held request dies with them, so it cannot resume');
   game.dispose();
 }
 
 head('§6/§7 interruption at every boundary — no partial credit, no resume');
-for (const at of ['first tick', 'one tick before completion', 'the completing tick']) {
+for (const at of ['first tick', 'one tick before completion', 'the last tick']) {
   const game = await newGame();
   const bomb = toLive(game, `plant interrupted at ${at}`);
   const carrier = carrierIntoSite(game, 'A');
@@ -564,22 +677,38 @@ for (const at of ['first tick', 'one tick before completion', 'the completing ti
   bomb.requestInteract(carrier, 'plant');
   step(game, before);
   eq(bomb._progress.get(carrier.id).ticks, before, `${at}: the server holds exactly ${before} tick(s) of progress`);
-  if (at === 'the completing tick') {
-    // Interrupt in the step that would have completed it, before the referee runs.
-    kill(game, carrier, defenders(game)[0]);
+  bomb.releaseInteract(carrier);
+  eq(bomb._progress.has(carrier.id), false, `${at}: releasing the key resets progress to zero`);
+  eq(lastEvent(bomb, 'plantCancel').reason, REFUSE.released, `${at}: the cancel is reported, with the reason`);
+  if (at === 'the last tick') {
+    // Releasing on the tick that would have completed it: the plant does not land at all.
     step(game, 1);
-    eq(bomb.phase, 'live', `${at}: the plant did not complete`);
-  } else {
-    bomb.releaseInteract(carrier);
-    eq(bomb._progress.has(carrier.id), false, `${at}: releasing the key resets progress to zero`);
-    eq(lastEvent(bomb, 'plantCancel').reason, REFUSE.released, `${at}: the cancel is reported, with the reason`);
-    // No resume: the interrupted progress buys nothing.
-    bomb.requestInteract(carrier, 'plant');
-    step(game, T.plant - 1);
-    eq(bomb.phase, 'live', `${at}: after re-starting, ${T.plant - 1} ticks is still not a plant`);
-    step(game, 1);
-    eq(bomb.phase, 'planted', `${at}: it takes the FULL plant time again`);
+    eq(bomb.phase, 'live', `${at}: the plant does not complete after the key went up`);
+    eq(game.match.statsFor(carrier).plants, 0, `${at}: and nothing is credited`);
   }
+  // No resume: the interrupted progress buys nothing.
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 1);
+  eq(bomb.phase, 'live', `${at}: after re-starting, ${T.plant - 1} ticks is still not a plant`);
+  step(game, 1);
+  eq(bomb.phase, 'planted', `${at}: it takes the FULL plant time again`);
+  game.dispose();
+}
+{
+  // Death is the other interruption (§6), and it lands in the weapons phase. A death on the
+  // tick BEFORE the plant would complete stops it dead. A death ON the completing tick does
+  // NOT — that is §4 simultaneity, asserted above — and the two cases are one tick apart.
+  const game = await newGame();
+  const bomb = toLive(game, 'plant interrupted by a death one tick out');
+  const carrier = carrierIntoSite(game, 'A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant - 2);
+  eq(bomb._progress.get(carrier.id).ticks, T.plant - 2, 'the server holds two ticks less than a plant');
+  eq(engineStepKilling(game, [carrier], defenders(game)[0]), 1, 'the kill reached the referee before it resolved');
+  eq(bomb.phase, 'live', 'the plant did not complete');
+  eq(bomb.progressOf(carrier.id), 0, 'and no progress survived the death');
+  eq(game.match.statsFor(carrier).plants, 0, 'no partial credit for a plant that was one tick short');
+  eq(bomb.bomb.state, 'dropped', '§5 the bomb drops at the dead carrier rather than staying with them');
   game.dispose();
 }
 {
@@ -671,20 +800,57 @@ head('§7 two defenders do not defuse faster than one');
   const bombTwo = toLive(two, 'two defusers');
   plant(two, 'A', 'two defusers');
   const [e1, e2] = defenders(two);
-  beginDefuse(two, e1);
+  expect(e1.id < e2.id, 'the two defusers have distinct ids, lower first', `${e1.id} vs ${e2.id}`);
+  // The HIGHER id asks first, so the request map's INSERTION order is the reverse of the id
+  // order. `_accumulate` sorts by id, and this is the only thing that can tell: with both
+  // defusers completing on the same tick, whichever the loop reaches first takes the credit.
+  // A determinism replay cannot see it — insertion order is stable within a process, so both
+  // runs of a comparison agree with each other while disagreeing with the rule.
   beginDefuse(two, e2);
-  let ticksTwo = 0;
+  beginDefuse(two, e1);
+  step(two, 1);
+  let ticksTwo = 1;
+  eq(bombTwo.progressActor, e1.id, '§11 the progress actor is the LOWEST id defusing, not the first to ask');
+  eq(bombTwo.interaction.actorId, e1.id, 'and that is the actor the wire publishes');
+  eq(bombTwo.interaction.kind, 'defuse', 'as a defuse');
   while (bombTwo.rounds.length === 0 && ticksTwo < T.defuse * 2) { step(two); ticksTwo++; }
 
   eq(ticksOne, T.defuse, 'one defender takes exactly the configured defuse time');
   eq(ticksTwo, T.defuse, 'two defenders take exactly the same time — progress does not stack');
   eq(bombTwo.rounds[0].reason, 'defuse', 'the two-defender round still ends in a defuse');
-  eq(bombTwo.objectiveStats.get(e1.id).defuses, 1, 'the lower entity id is credited with the completion');
+  eq(bombTwo.objectiveStats.get(e1.id)?.defuses, 1, 'the LOWER entity id is credited with the completion, whoever asked first');
   eq(bombTwo.objectiveStats.has(e2.id), false, 'the second defender is credited nothing — completions only');
   one.dispose(); two.dispose();
 }
 
 // ════════════════════════════════════════════════════════════════════ §5 the bomb object
+
+head('§5 the carrier is ONE RANDOM eligible attacker');
+{
+  // The decoupling from `game.rng` is proved further down; this proves the other half of the
+  // rule, which nothing else does: that a draw happens at all. `const carrier = eligible[0]`
+  // — or any other fixed index — satisfies "one eligible attacker" and fails here.
+  const game = await newGame({ seed: 20260819 });
+  const bomb = game.match.bombRules;
+  const picks = [];
+  for (let round = 1; round <= 6; round++) {
+    let guard = 0;
+    while (bomb.phase !== 'freeze' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
+    eq(bomb.roundNumber, round, `round ${round}: the freeze belongs to the round being counted`);
+    const eligible = teamOf(game, bomb.attackingTeam);
+    eq(eligible.length, 4, `round ${round}: four attackers are eligible to carry`);
+    picks.push(eligible.findIndex((e) => e.id === bomb.bomb.carrierId));
+    guard = 0;
+    while (bomb.phase !== 'live' && guard < T.freeze + 4) { step(game); guard++; }
+    wipe(game, bomb.defendingTeam);       // the attackers take the round; on to the next
+    step(game, 1 + T.roundEnd);
+  }
+  eq(picks.filter((i) => i < 0).length, 0, 'every round\'s carrier was one of that round\'s eligible attackers');
+  eqJson(picks, [2, 2, 3, 2, 0, 3], '§5 six rounds draw this exact sequence of carriers from one seed');
+  const distinct = [...new Set(picks)].sort((a, b) => a - b);
+  eq(distinct.length, 3, '§5 and the draw really is a draw — it lands on three different attackers, not a fixed index');
+  game.dispose();
+}
 
 head('§5 the bomb object');
 {
@@ -715,7 +881,14 @@ head('§5 the bomb object');
   place(defender, { x: site.plant.min.x - 40, y: spot.y, z: spot.z });
 
   const nextAttacker = attackers(game).find((e) => bomb.isAlive(e));
-  place(nextAttacker, { x: spot.x + 0.4, y: spot.y, z: spot.z });
+  // §5 pickup is CONTACT range. Nothing else pins the distance down: every other pickup in
+  // this file happens with the attacker standing almost on top of the bomb, so a range of
+  // 25 m would pass all of them.
+  place(nextAttacker, { x: spot.x + 3, y: spot.y, z: spot.z });
+  step(game, 1);
+  eq(bomb.bomb.state, 'dropped', '§5 an attacker three metres away is not in contact with it');
+  eq(bomb.bomb.carrierId, -1, 'and does not become the carrier at range');
+  place(nextAttacker, { x: spot.x + 1.5, y: spot.y, z: spot.z });
   step(game, 1);
   eq(bomb.bomb.state, 'carried', '§5 any attacker in contact range picks it up, with no cast time');
   eq(bomb.bomb.carrierId, nextAttacker.id, 'and becomes the carrier');
@@ -782,6 +955,7 @@ head('§8 no respawns, and spectator information limits');
   eq(bomb.canSpectate(mate, enemy), false, 'a LIVING player spectates nobody');
   eq(bomb.canFreeCam(victim), false, '§8 there is no free camera during a live round');
   eq(bomb.canPing(victim), false, '§8 the eliminated cannot ping');
+  eq(bomb.canPing(mate), true, 'and a living player can');
 
   const chat = [];
   game.bus.on('chat', (p) => chat.push(p));
@@ -798,6 +972,9 @@ head('§8 no respawns, and spectator information limits');
   eq(bomb.phase, 'roundEnd', 'the round is decided');
   eq(bomb.canFreeCam(victim), true, '§8 free camera opens at roundEnd, when there is nothing to leak');
   eq(bomb.canSpectate(victim, enemy), true, 'and any camera is permitted then');
+  // The ping rule is about the LIVE round, not about being dead: once the round is decided
+  // there is no call-out left to relay, so the eliminated get their pings back.
+  eq(bomb.canPing(victim), true, '§8 the eliminated may ping again once the round is decided');
   step(game, T.roundEnd);
   eq(bomb.phase, 'freeze', 'the next round opens with a freeze');
   eq(chat.length, 2, 'the held message is delivered at the freeze');
@@ -907,7 +1084,7 @@ head('§2.1a round transitions, side switch and the series');
       let guard = 0;
       while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
     }
-    seen.push({ round: bomb.roundNumber, attacking: bomb.attackingTeam });
+    seen.push({ round: bomb.roundNumber, attacking: bomb.attackingTeam, switched: bomb.sideSwitched });
     wipe(game, 1);
     step(game, 1);
     if (round === 7) {
@@ -919,6 +1096,10 @@ head('§2.1a round transitions, side switch and the series');
   eqJson(seen.map((s) => s.round), [1, 2, 3, 4, 5, 6, 7], 'the rounds run 1 through 7 in order');
   eqJson(seen.map((s) => s.attacking), [0, 0, 0, 0, 0, 0, 1],
     '§2 sides switch after round 6 and not before');
+  // The published flag is the same rule read a second way, and it is read by the HUD. It
+  // must flip ON round 7, the first round of the second half — not one round later.
+  eqJson(seen.map((s) => s.switched), [false, false, false, false, false, false, true],
+    '§2 `sideSwitched` is false for all six rounds of the first half and true from round 7');
   eqJson(bomb.roundWins, [7, 0], 'team 0 has 7 round wins');
   eq(bomb.phase, 'matchEnd', '§2.1a reaching 7 ends the match immediately');
   eq(bomb.rounds.length, 7, 'the remaining rounds are not played');
@@ -991,6 +1172,28 @@ head('§10 objective scoring');
   eq(bomb.rounds[0].clutchBy, hero.id, '§10 the last player standing is recorded as the clutch');
   eq(game.match.statsFor(hero).score - before, SCORE.roundWin + SCORE.clutch, 'and is paid the clutch on top of the round win');
   eq(game.match.statsFor(hero).clutches, 1, 'the clutch is booked once');
+  game.dispose();
+}
+{
+  // The control for the rule above: a 1v1 is not a clutch. Nothing else pinned the
+  // "two or more enemies" half of §10 down, so a clutch awarded against a single opponent
+  // — every last-man-standing round in the match — went unnoticed.
+  const game = await newGame({ seed: 4242 });
+  const bomb = toLive(game, 'clutch control');
+  const hero = defenders(game)[0];
+  const lastEnemy = attackers(game)[0];
+  wipe(game, bomb.defendingTeam, [hero]);
+  wipe(game, bomb.attackingTeam, [lastEnemy]);
+  step(game, 1);
+  eqJson([bomb.aliveCounts()[bomb.defendingTeam], bomb.aliveCounts()[bomb.attackingTeam]], [1, 1],
+    'the round is down to one against one');
+  const before = game.match.statsFor(hero).score;
+  kill(game, lastEnemy, null);            // no killer, so no kill award muddies the total
+  step(game, 1);
+  eq(bomb.rounds[0].winnerTeam, bomb.defendingTeam, 'the last defender wins the round');
+  eq(bomb.rounds[0].clutchBy, -1, '§10 but beating ONE opponent is not a clutch');
+  eq(game.match.statsFor(hero).score - before, SCORE.roundWin, 'so they are paid the round win and nothing else');
+  eq(game.match.statsFor(hero).clutches, 0, 'and no clutch is booked');
   game.dispose();
 }
 
@@ -1157,6 +1360,73 @@ head('individually load-bearing guards');
     'a disconnecting carrier drops the bomb at their position, not at the last one replicated');
   eq(bomb.requestInteract(carrier, 'plant'), false, 'a disconnected player cannot interact');
   eq(lastEvent(bomb, 'interactRefused').reason, REFUSE.disconnected, 'and the refusal says so, rather than calling them dead');
+  game.dispose();
+}
+{
+  // §8 says death in `live` OR `planted` is an elimination until the next freeze. Every
+  // elimination case elsewhere in this file happens PRE-plant, so the `planted` half was
+  // carried by nothing — and BotManager's own fallback respawn timer, which can put a bot
+  // back in the world mid-round, is the live consequence of getting it wrong.
+  const game = await newGame();
+  const bomb = toLive(game, 'elimination during the planted phase');
+  const carrier = plant(game, 'A', 'post-plant elimination');
+  const victim = defenders(game)[0];
+  const aliveBefore = bomb.aliveCounts()[bomb.defendingTeam];
+  eq(aliveBefore, 4, 'the defending side is whole before the kill');
+  kill(game, victim, carrier);
+  step(game, 1);
+  eq(bomb.phase, 'planted', 'the round is still in the planted phase');
+  eq(bomb.eliminated.has(victim.id), true, '§8 a death in the PLANTED phase is an elimination too');
+  eq(bomb.aliveCounts()[bomb.defendingTeam], 3, 'and the defending side is one lighter for it');
+  victim.alive = true;                    // BotManager's fallback respawn, mid-round
+  eq(bomb.isAlive(victim), false, 'a post-plant elimination survives a revival from outside the ruleset');
+  eq(bomb.aliveCounts()[bomb.defendingTeam], 3, 'so the alive count on the wire does not jump back up');
+  eq(game.match.canFire(victim), false, 'and they still cannot fire');
+  place(victim, centre(bomb.sites.get('A').defuse));
+  eq(bomb.requestInteract(victim, 'defuse'), false, 'nor defuse the bomb they were eliminated in front of');
+  eq(lastEvent(bomb, 'interactRefused').reason, REFUSE.dead, 'their request is refused as dead');
+  step(game, 1);
+  eq(bomb.progressOf(victim.id), 0, 'and no defuse progress accrues for a corpse standing in the volume');
+  game.dispose();
+}
+{
+  // §3: in `planted` the round timer is REPLACED by the bomb timer, not run alongside it.
+  // Nothing could see this, because the bomb timer (40 s) always expires long before the
+  // round timer (1:45) could, so a round clock left running is invisible in play — until a
+  // shorter round or a longer bomb timer makes it decide a round.
+  const game = await newGame();
+  const bomb = toLive(game, 'the bomb timer replaces the round timer');
+  plant(game, 'A', 'timer replacement');
+  const atPlant = bomb.roundTicks;
+  eq(atPlant, T.plant, 'the round timer ran up to the plant and no further');
+  step(game, 600);
+  eq(bomb.roundTicks, atPlant, '§3 the round timer stops dead at the plant');
+  eq(bomb.bombTicks, 600, 'and the bomb timer is the clock that advances');
+  eq(bomb.roundTimeRemaining, (T.round - atPlant) * FIXED_DT, 'the round clock is frozen where it stopped');
+  eq(bomb.displayTime, bomb.bombTimeRemaining, 'and the HUD shows the bomb timer, not the round timer');
+  game.dispose();
+}
+{
+  // `_roster()` sorts by entity id. Within one process the world's entity array is already
+  // in a stable order, so two runs of a determinism replay agree with each other whether the
+  // sort is there or not — the invariant has to be asserted directly, with a combatant whose
+  // id is out of insertion order.
+  const game = await newGame();
+  const bomb = toLive(game, 'roster ordering');
+  const before = bomb._roster().map((e) => e.id);
+  const straggler = {
+    id: Math.min(...before) - 1, team: 0, alive: true, grounded: true,
+    position: { x: 0, y: 0, z: 0 },
+  };
+  game.addEntity(straggler);
+  step(game, 1);
+  const all = game.entities;
+  eq(all[all.length - 1].id, straggler.id, 'the world appends the newcomer LAST, as join order demands');
+  eq(bomb._roster()[0].id, straggler.id, 'but the roster the rules iterate puts the lowest id FIRST');
+  const ids = bomb._roster().map((e) => e.id);
+  eqJson(ids, [...ids].sort((a, b) => a - b), 'and the whole roster is in id order, not world order');
+  eq(ids.length, before.length + 1, 'with the newcomer counted exactly once');
+  game.removeEntity(straggler);
   game.dispose();
 }
 {
