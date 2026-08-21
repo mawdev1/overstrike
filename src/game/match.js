@@ -1,4 +1,8 @@
-import { MODES, MODE_LIST, getMode, DEFAULT_MODE, TEAM_NAMES, getWeaponDefs } from './modes.js';
+import {
+  MODES, MODE_LIST, getMode, DEFAULT_MODE, TEAM_NAMES, getWeaponDefs,
+  DEFAULT_KILL_LIMIT, normalizeKillLimit,
+} from './modes.js';
+import { resolveMapManifest } from './bomb.js';
 import { Spawner, SPAWN_PROTECTION } from './spawner.js';
 import { Killstreaks } from './killstreaks.js';
 import { progression } from './progression.js';
@@ -55,7 +59,18 @@ export const SCORE = {
   multiKill: 300,
   teamKillPenalty: -100,
   suicidePenalty: -50,
+  // bomb-rules §10 — objective awards. Values are balance and belong to the human owner
+  // alongside §2; the rules hold for any values here.
+  plant: 250,
+  defuse: 250,
+  roundWin: 200,
+  clutch: 300,
 };
+
+/** bomb-rules §10 award ids, so a typo at a call site is a crash and not a silent zero. */
+const OBJECTIVE_AWARDS = Object.freeze({
+  plant: SCORE.plant, defuse: SCORE.defuse, roundWin: SCORE.roundWin, clutch: SCORE.clutch,
+});
 
 export class Match {
   constructor(game) {
@@ -66,12 +81,31 @@ export class Match {
     this.modeId = DEFAULT_MODE;
     this.mode = getMode(DEFAULT_MODE);
     this.modeState = {};
+    /**
+     * Bomb's round state machine (`bomb.js`), or null in every other mode. Created by
+     * `BOMB.init` and torn down by `BOMB.cleanup`, so the referee never carries dormant
+     * objective state through a TDM match.
+     *
+     * The flat, replication-facing view of it is the getter block further down
+     * (`bomb`, `roundPhase`, `aliveCounts`, `interaction`, …) — that is what
+     * `src/net/server.js` reads, and it is deliberately plain data.
+     */
+    this.bombRules = null;
+    /** Staged replication values for harnesses; ignored whenever `bombRules` exists. */
+    this._bombView = {};
+    /**
+     * The map manifest the objective volumes come from (`map-data.md` §3.3). Resolved
+     * from the map at `begin()`, or supplied explicitly by a harness building against a
+     * map whose objectives are not authored yet. Never coordinates in the ruleset.
+     */
+    this.mapManifest = null;
 
     /** Team scores. Index === team for team modes. */
     this.scores = [0, 0];
     this.phase = 'idle';        // 'idle' | 'countdown' | 'live' | 'ended'
     this._elapsedTicks = 0;
     this.timeLimit = 600;
+    this.killLimit = DEFAULT_KILL_LIMIT;
     this.countdown = 0;
     this.playerTeam = 0;
     this.botCount = 7;
@@ -116,12 +150,8 @@ export class Match {
     await this.killstreaks.init();
     progression.registerWeapons(getWeaponDefs(this.game));
 
-    // Park every mode's objective rig in the scene now, hidden. This runs during boot,
-    // one phase ahead of `Game._prewarmShaders()`, which force-shows the whole scene and
-    // links everything in it — so an objective mesh that exists here never links a shader
-    // program inside a gameplay frame later. Measured before this: the first DOMINATION
-    // match of a session linked 2 programs and the first KILL CONFIRMED linked 1, all
-    // after match start.
+    // Keep the one-entry mode hook in the boot lifecycle so the rules contract remains
+    // explicit if TDM ever gains prewarmed presentation resources.
     for (const m of this.modeList) {
       try { m.prewarm?.(this); } catch (err) { console.warn('[match] mode prewarm', m.id, err); }
     }
@@ -143,10 +173,12 @@ export class Match {
    */
   reset(opts = {}) {
     this.mode?.cleanup?.(this);
-    const requested = opts.mode ?? this.modeId ?? DEFAULT_MODE;
-    this.modeId = MODES[requested] ? requested : DEFAULT_MODE;
+    this.modeId = this._resolveModeId(opts);
     this.mode = getMode(this.modeId);
     this.timeLimit = this.mode.timeLimit;
+    this.killLimit = normalizeKillLimit(
+      opts.killLimit ?? this.game.settings?.get?.('killLimit') ?? this.killLimit,
+    );
     this.modeState = {};
     this.scores[0] = 0;
     this.scores[1] = 0;
@@ -171,17 +203,31 @@ export class Match {
 
   /**
    * Start a match.
-   * @param {{mode?:string, botCount?:number, difficulty?:string}} opts
+   * @param {{killLimit?:number, botCount?:number, difficulty?:string}} opts
    */
   begin(opts = {}) {
     const settings = this.game.settings;
-    const requested = opts.mode ?? this.modeId ?? DEFAULT_MODE;
-    this.modeId = MODES[requested] ? requested : DEFAULT_MODE;
+    this.modeId = this._resolveModeId(opts);
     this.mode = getMode(this.modeId);
+    // Game.startMatch() writes `mode` into settings before systems reset, and it writes the
+    // DEFAULT there because it does not resolve modes itself. The referee is what decides
+    // which ruleset is being played, so it has the last word on what settings, the menu and
+    // the next match's default read back.
+    //
+    // For 'bomb' this write is currently DISCARDED: `Settings.ENUMS.mode` is `['tdm']` and
+    // `settings.js` is Codex-owned, so the enum entry is filed as REQ-CX-008 rather than
+    // edited here. Nothing depends on it sticking — every caller that wants Bomb passes
+    // `opts.mode`, which wins over the setting in `_resolveModeId` — but a Bomb match
+    // followed by a `startMatch()` with no options does fall back to TDM until it lands.
+    settings?.set?.('mode', this.modeId);
+    this.mapManifest = opts.mapManifest ?? resolveMapManifest(this.game);
     this.modeState = {};
     this.botCount = Math.max(0, opts.botCount ?? settings?.get?.('botCount') ?? this.botCount);
     this.difficulty = opts.difficulty ?? settings?.get?.('difficulty') ?? this.difficulty;
     this.timeLimit = this.mode.timeLimit;
+    this.killLimit = normalizeKillLimit(
+      opts.killLimit ?? settings?.get?.('killLimit') ?? this.killLimit,
+    );
 
     this.scores[0] = 0;
     this.scores[1] = 0;
@@ -223,10 +269,21 @@ export class Match {
     this._pushHud(true);
   }
 
-  /** Teams for team modes; unique per-entity ids for free-for-all. */
+  /**
+   * Which ruleset this match is played under.
+   *
+   * `opts.mode` first (the caller asked for it), then the stored setting, then the
+   * default. Unknown or stale ids resolve to the default rather than failing — see
+   * `getMode`.
+   */
+  _resolveModeId(opts = {}) {
+    return getMode(opts.mode ?? this.game.settings?.get?.('mode') ?? DEFAULT_MODE).id;
+  }
+
+  /** Assign the two Team Deathmatch squads. */
   _assignTeams() {
     const ents = this.game.entities;
-    if (this.mode.teamBased) {
+    {
       this.playerTeam = 0;
       // BotManager has already dealt the roster into two sides and baked a model
       // colourway per bot. Only intervene if that split is actually wrong — a team
@@ -262,20 +319,10 @@ export class Match {
         (e.team === 1 ? b++ : a++);
       }
       if (dirty || Math.abs(a - b) > 1) this._rebalance();
-    } else {
-      // Everyone hostile. The player keeps team 0 so HUD colouring stays sane; bots
-      // take unique ids from 2 upward. `areEnemies()` is the real authority here.
-      this.playerTeam = 0;
-      let t = 2;
-      for (let i = 0; i < ents.length; i++) {
-        const e = ents[i];
-        e.team = e === this.game.player ? 0 : t++;
-      }
     }
   }
 
   _rebalance() {
-    if (!this.mode.teamBased) return;
     const ents = this.game.entities;
     const local = this.game.player;
     let a = 0;
@@ -317,6 +364,8 @@ export class Match {
       streak: 0, bestStreak: 0, headshots: 0, longshots: 0,
       longestShot: 0, shotsFired: 0, shotsHit: 0, damageDealt: 0,
       captures: 0, defends: 0, confirms: 0, denies: 0,
+      // bomb-rules §10 — completions only.
+      plants: 0, defuses: 0, roundWins: 0, clutches: 0,
       streaksEarned: 0, tier: 0,
       lastKillTime: -99, multiCount: 0, lastKilledBy: -1,
       _hitThisShot: false,
@@ -356,7 +405,6 @@ export class Match {
 
   areEnemies(a, b) {
     if (!a || !b || a === b) return false;
-    if (!this.mode.teamBased) return true;
     return a.team !== b.team;
   }
 
@@ -640,6 +688,97 @@ export class Match {
     this._addScore(st, points, reason);
   }
 
+  /**
+   * bomb-rules §10 objective awards. The ruleset names an award; the referee owns what it
+   * pays and books the completion counters. An unknown award id throws rather than paying
+   * nothing quietly — a typo that silently zeroes a payout is indistinguishable from a
+   * balance decision.
+   */
+  awardObjective(entity, award) {
+    const points = OBJECTIVE_AWARDS[award];
+    if (points === undefined) throw new Error(`match: unknown objective award "${award}"`);
+    if (!entity) return null;
+    const st = this.statsFor(entity);
+    if (!st) return null;
+    if (award === 'plant') st.plants++;
+    else if (award === 'defuse') st.defuses++;
+    else if (award === 'roundWin') st.roundWins++;
+    else if (award === 'clutch') st.clutches++;
+    this._addScore(st, points, null);
+    return st;
+  }
+
+  /**
+   * Client → server objective request (§6, §7). The client only ASKS; every precondition,
+   * the accumulation and the interruption all happen inside the ruleset on the fixed step.
+   * Returns false in any mode that has no objectives.
+   */
+  requestInteract(entity, kind) { return this.bombRules ? this.bombRules.requestInteract(entity, kind) : false; }
+
+  /** Key released. §6: progress resets to zero — no partial credit, no resume. */
+  releaseInteract(entity) { this.bombRules?.releaseInteract(entity); }
+
+  // ─────────────────────────────────────────── the replication view of the Bomb ruleset
+  //
+  // `src/net/server.js` (`readBombMatchState`) and the HUD read THESE, never the rules
+  // object: everything below is plain data with a documented shape, so the wire cannot
+  // acquire a dependency on the ruleset's internals. Each returns a TDM-safe default so a
+  // non-Bomb match produces an honest empty frame rather than throwing in the tick loop.
+  //
+  // Each one is WRITABLE, and the write is only honoured while no ruleset is loaded. That
+  // is for harnesses (`nettest.mjs`) that stage one frame of Bomb state on a real Match to
+  // test replication without running a match: with a ruleset present the derived value
+  // always wins, so a staged value can never mask the live one in a real match.
+
+  /** bomb-rules §5, the bomb object: `{ state, carrierId, siteId, position }`. */
+  get bomb() { return this.bombRules ? this.bombRules.bomb : (this._bombView.bomb ?? null); }
+  set bomb(v) { this._bombView.bomb = v; }
+
+  /**
+   * bomb-rules §3 round phase — `warmup | freeze | live | planted | roundEnd | matchEnd`.
+   *
+   * NOT the same thing as `match.phase`, which is the MATCH's own lifecycle
+   * (`idle | countdown | live | ended`) and is what TDM, the HUD timer and `canFire` read.
+   * A Bomb round can be in `freeze` while the match is `live`.
+   */
+  get roundPhase() { return this.bombRules ? this.bombRules.phase : (this._bombView.roundPhase ?? this.phase); }
+  set roundPhase(v) { this._bombView.roundPhase = v; }
+
+  /** 0-based index of the round being played; `roundNumber` is the 1-based one. */
+  get roundIndex() { return this.bombRules ? this.bombRules.roundIndex : (this._bombView.roundIndex ?? 0); }
+  set roundIndex(v) { this._bombView.roundIndex = v; }
+
+  get roundNumber() { return this.roundIndex + 1; }
+
+  get attackingTeam() { return this.bombRules ? this.bombRules.attackingTeam : (this._bombView.attackingTeam ?? 0); }
+  set attackingTeam(v) { this._bombView.attackingTeam = v; }
+
+  /** True once the §2 side switch has happened, i.e. from round 7 on. */
+  get sideSwitched() { return this.bombRules ? this.bombRules.sideSwitched : !!this._bombView.sideSwitched; }
+  set sideSwitched(v) { this._bombView.sideSwitched = v; }
+
+  /** Living, connected, non-eliminated players per side. Public to both teams (§8). */
+  get aliveCounts() {
+    if (!this.bombRules) return this._bombView.aliveCounts ?? { alpha: 0, bravo: 0 };
+    const [alpha, bravo] = this.bombRules.aliveCounts();
+    return { alpha, bravo };
+  }
+  set aliveCounts(v) { this._bombView.aliveCounts = v; }
+
+  /** Milliseconds left on whichever clock this phase runs (§3). */
+  get phaseRemainingMs() {
+    if (!this.bombRules) return this._bombView.phaseRemainingMs ?? 0;
+    return Math.round(this.bombRules.displayTime * 1000);
+  }
+  set phaseRemainingMs(v) { this._bombView.phaseRemainingMs = v; }
+
+  /** The objective interaction being shown: `{ kind, actorId, progress }`, progress 0..1. */
+  get interaction() {
+    if (!this.bombRules) return this._bombView.interaction ?? { kind: 'none', actorId: 0, progress: 0 };
+    return this.bombRules.interaction;
+  }
+  set interaction(v) { this._bombView.interaction = v; }
+
   /** Public: modes award team score through here. */
   addTeamScore(team, points) {
     const t = team === 1 ? 1 : 0;
@@ -650,6 +789,21 @@ export class Match {
 
   _queueRespawn(entity, killer) {
     const isPlayer = !!entity.isPlayer;
+    // bomb-rules §8: in a live Bomb round a death is an ELIMINATION, and the player stays
+    // out until the next freeze. The mode decides; TDM has no opinion and respawns.
+    if (this.mode.allowRespawn?.(this, entity) === false) {
+      if (isPlayer) {
+        this.game.present.deathScreen({
+          victim: entity,
+          killer: killer && killer !== entity ? killer : null,
+          killerName: killer ? (this._book.get(killer.id)?.name || killer.name || '') : '',
+          killerHealth: killer?.health ?? 0,
+          respawnIn: 0,
+          eliminated: true,
+        });
+      }
+      return;
+    }
     // The player's countdown is shown on the death screen and must stay exact; only bots
     // get the de-clustering jitter.
     const delay = isPlayer
@@ -723,7 +877,6 @@ export class Match {
 
   /** Keep the sides even as bots cycle through; only ever moves a dead bot. */
   _rebalanceOnRespawn(bot) {
-    if (!this.mode.teamBased) return;
     const ents = this.game.entities;
     let a = 0;
     let b = 0;
@@ -788,6 +941,9 @@ export class Match {
   canFire(entity) {
     if (this.phase !== 'live') return false;
     if (entity && entity.alive === false) return false;
+    // A mode with its own round phases (Bomb: freeze and roundEnd both lock weapons, and
+    // the eliminated never fire — bomb-rules §3, §8) gets the final say.
+    if (this.mode.canFire && this.mode.canFire(this, entity) === false) return false;
     return true;
   }
 
@@ -905,7 +1061,11 @@ export class Match {
       this._lastHudB = out[1];
       hud.setScore?.(out[0], out[1]);
     }
-    const t = this.phase === 'countdown' ? this.timeLimit : this.timeRemaining;
+    // A mode with its own clocks publishes them (Bomb: the bomb timer REPLACES the round
+    // timer at plant — bomb-rules §3).
+    const t = this.mode.hudTime
+      ? this.mode.hudTime(this)
+      : (this.phase === 'countdown' ? this.timeLimit : this.timeRemaining);
     const whole = Math.ceil(t);
     if (force || whole !== this._lastHudTime) {
       this._lastHudTime = whole;
@@ -933,9 +1093,9 @@ export class Match {
       mode: this.modeId,
       modeName: this.mode.name,
       scores: [this.scores[0], this.scores[1]],
+      killLimit: this.killLimit,
       reason: res.reason,
       // Always a team id: the after-action screen compares it against `player.team`.
-      // In free-for-all every entity carries a unique team, so this still resolves.
       winner: res.winnerTeam >= 0 ? res.winnerTeam : (res.winnerEntity?.team ?? -1),
       winnerTeam: res.winnerTeam ?? -1,
       winnerEntity: res.winnerEntity ?? null,
@@ -949,10 +1109,21 @@ export class Match {
       teamNames: TEAM_NAMES,
     };
 
+    // The ruleset adds what only it knows (Bomb: the round log, the series record and the
+    // objective evidence — bomb-rules §10). Before progression, so the payload the
+    // `roundEnd`/`matchEnd` consumers see is the complete one.
+    this.mode.decorateResult?.(this, result);
+
     const prog = this._awardProgression(outcome);
     result.progression = prog;
     this.lastProgression = prog;
     this.result = result;
+
+    // The end sequence is intentionally ordered: freeze and snapshot first, announce the
+    // final result second, then Game.endMatch emits `matchEnd` and opens After Action.
+    // Consumers that want a final-kill camera/announcer hook use `roundEnd`; persistence
+    // and results consumers use the immutable `matchEnd` payload that follows it.
+    this.game.bus.emit('roundEnd', result);
 
     this.notice(
       outcome === 'win' ? 'VICTORY' : outcome === 'draw' ? 'DRAW' : 'DEFEAT',
@@ -969,15 +1140,12 @@ export class Match {
   _didPlayerWin(res) {
     const player = this.game.player;
     if (!player) return false;
-    if (res.winnerEntity) return res.winnerEntity === player;
-    if (this.mode.teamBased) return res.winnerTeam === player.team;
-    return res.winner === player;
+    return res.winnerTeam === player.team;
   }
 
   _winnerName(res) {
     if (res.winner === -1 || res.reason === 'draw') return '';
-    if (res.winnerEntity) return this._book.get(res.winnerEntity.id)?.name || res.winnerEntity.name || '';
-    if (this.mode.teamBased && res.winnerTeam >= 0) return TEAM_NAMES[res.winnerTeam] || `TEAM ${res.winnerTeam}`;
+    if (res.winnerTeam >= 0) return TEAM_NAMES[res.winnerTeam] || `TEAM ${res.winnerTeam}`;
     return '';
   }
 
@@ -1041,6 +1209,8 @@ export class Match {
       r.headshots = st.headshots;
       r.tier = st.tier;
       r.captures = st.captures;
+      r.plants = st.plants;
+      r.defuses = st.defuses;
       r.confirms = st.confirms;
       r.denies = st.denies;
       r.alive = !!e?.alive;
@@ -1084,9 +1254,7 @@ export class Match {
     for (const u of this._unsub) u?.();
     this._unsub.length = 0;
     this.mode?.cleanup?.(this);
-    // Modes are singletons and each keeps its own lazily-built GPU rig, so every mode
-    // that ever ran this session holds one — not just the one that happens to be
-    // selected now.
+    // The rules list owns any prewarmed presentation resources it created.
     for (const m of this.modeList) m.dispose?.();
     this.killstreaks.dispose();
     this.spawner.dispose();

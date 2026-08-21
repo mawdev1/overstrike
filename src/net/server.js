@@ -1044,7 +1044,17 @@ export function readBombMatchState(game) {
   const alive = m.aliveCounts ?? {};
   const state = BOMB_STATES.includes(bomb.state) ? bomb.state : 'none';
   return {
-    phase: PHASES.includes(m.phase) ? m.phase : 'warmup',
+    // `roundPhase`, NOT `phase`.
+    //
+    // `Match.phase` is the MATCH lifecycle (warmup/live/ended); `Match.roundPhase` is the Bomb
+    // round state machine (freeze/live/planted/roundEnd). Reading the former published `live`
+    // for every round phase, so the client could never be told a round had frozen, that the
+    // bomb was planted, or that the round had ended — the entire §3 state machine collapsed to
+    // one value on the wire, while every field around it was correct.
+    //
+    // The names differ by one word and both are valid identifiers on the same object, so the
+    // wrong one costs nothing at read time and everything at the far end.
+    phase: PHASES.includes(m.roundPhase) ? m.roundPhase : 'warmup',
     roundIndex: m.roundIndex ?? 0,
     scoreAlpha: m.scores?.[0] ?? 0,
     scoreBravo: m.scores?.[1] ?? 0,

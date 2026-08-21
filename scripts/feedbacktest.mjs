@@ -19,6 +19,22 @@ import { RecordingPresenter, NullPresenter } from '../src/core/presenter.js';
 import { GameServer, SNAPSHOT_INTERVAL } from '../src/net/server.js';
 import { NetClient } from '../src/net/client.js';
 import { createLoopbackPair } from '../src/net/transport.js';
+
+/**
+ * MAP: pinned to the MERIDIAN fixture, deliberately.
+ *
+ * This harness asserts that damage, hitmarkers and kill events survive the round trip from
+ * server to client. None of that is about geometry — but it places two players and fires
+ * between them, so it needs a map where they can see each other. Left on the rotation it
+ * silently followed the rotation onto The Square and reported three failures
+ * ("victim health unchanged at 100") that were entirely about that map's in-flight geometry
+ * and nothing about feedback routing.
+ *
+ * map-data.md §9 keeps MERIDIAN registered as the fixture for exactly this: a harness whose
+ * subject is not the map should not change its answer when the map does.
+ */
+const FIXTURE_MAP = 'meridian';
+
 import { encodeSnapshot, decodeSnapshot, EV_KINDS, HELD_BITS, EDGE_BITS } from '../src/net/protocol.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
 
@@ -92,6 +108,15 @@ console.log('\ncombat feedback reaches the client');
   const bare = decodeSnapshot(encodeSnapshot({ ...snap, events: [] }, null), null);
   if (bare.entities.length === 1 && bare.events.length === 0) ok('a snapshot with no events still decodes');
   else bad('a snapshot with no events still decodes', JSON.stringify(bare).slice(0, 120));
+
+  const roundEnd = decodeSnapshot(encodeSnapshot({
+    ...snap,
+    events: [{ kind: 'roundEnd', killerId: 25, victimId: 19, amount: 25, weaponIdx: 0 }],
+  }, null), null).events[0];
+  if (roundEnd.kind === 'roundEnd' && roundEnd.killerId === 25
+    && roundEnd.victimId === 19 && roundEnd.amount === 25) {
+    ok('the authoritative TDM result survives the wire');
+  } else bad('the TDM result survives the wire', JSON.stringify(roundEnd));
 }
 
 // ── the recorder attributes feedback to the right entity ─────────────────────────────
@@ -137,7 +162,7 @@ console.log('\ncombat feedback reaches the client');
 // ── end to end: a real shot at a real target over a real socket ──────────────────────
 {
   const game = new Game({ headless: true });
-  await game.initHeadless({ presenter: new RecordingPresenter() });
+  await game.initHeadless({ presenter: new RecordingPresenter(), mapId: FIXTURE_MAP });
   game.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 99 });
   game.match.phase = 'live';
   game.match.countdown = 0;
@@ -231,7 +256,7 @@ console.log('\ncombat feedback reaches the client');
 // blood and no sound. Exactly like the bullet missing.
 {
   const game = new Game({ headless: true });
-  await game.initHeadless({ presenter: new NullPresenter() });
+  await game.initHeadless({ presenter: new NullPresenter(), mapId: FIXTURE_MAP });
   game.startMatch({ mode: 'tdm', botCount: 4, difficulty: 'regular', seed: 7 });
   game.match.phase = 'live';
   game.match.countdown = 0;
@@ -283,7 +308,7 @@ console.log('\ncombat feedback reaches the client');
 // added tomorrow is covered automatically.
 {
   const game = new Game({ headless: true });
-  await game.initHeadless({ presenter: new NullPresenter() });
+  await game.initHeadless({ presenter: new NullPresenter(), mapId: FIXTURE_MAP });
   game.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 21 });
   game.match.phase = 'live';
   game.match.countdown = 0;
@@ -340,12 +365,12 @@ console.log('\ncombat feedback reaches the client');
 {
   const { MultiplayerSession } = await import('../src/net/session.js');
   const sg = new Game({ headless: true });
-  await sg.initHeadless({ presenter: new RecordingPresenter() });
-  sg.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 0xABCDEF });
+  await sg.initHeadless({ presenter: new RecordingPresenter(), mapId: FIXTURE_MAP });
+  sg.startMatch({ mode: 'tdm', killLimit: 9, botCount: 2, difficulty: 'regular', seed: 0xABCDEF });
   sg.match.phase = 'live'; sg.match.countdown = 0;
 
   const cg = new Game({ headless: true });
-  await cg.initHeadless({ presenter: new NullPresenter() });
+  await cg.initHeadless({ presenter: new NullPresenter(), mapId: FIXTURE_MAP });
   cg.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular' });   // no seed, exactly as the menu does
   cg.match.phase = 'live'; cg.match.countdown = 0;
   const rolledItsOwn = cg.matchSeed;
@@ -366,6 +391,30 @@ console.log('\ncombat feedback reaches the client');
       `client ${cg.matchSeed} vs server ${sg.matchSeed} — every predicted shot's spread is ` +
       'drawn from a different stream than the one the server fires');
   }
+
+  if (cg.match.killLimit === 9 && cg.settings.get('killLimit') === 9) {
+    ok('the client adopts the server TDM kill limit');
+  } else {
+    bad('the client adopts the server TDM kill limit',
+      `match=${cg.match.killLimit}, setting=${cg.settings.get('killLimit')}`);
+  }
+
+  // A late joiner may not possess every earlier kill event. The authoritative roundEnd
+  // event must still put it into the same results state as the host.
+  sg.match.killLimit = 1;
+  server.broadcastWelcome();
+  for (let i = 0; i < 5; i++) { sT.pump(ms); server.tick(); cT.pump(ms); ms += FIXED_DT * 1000; }
+  let clientEnds = 0;
+  cg.bus.on('matchEnd', () => clientEnds++);
+  const finalVictim = sg.bots.bots.find((b) => b.team !== sg.player.team);
+  finalVictim?.die({ attacker: sg.player, weaponId: 'ar_vector' });
+  for (let i = 0; i < 8; i++) { server.tick(); cT.pump(ms); ms += FIXED_DT * 1000; }
+  if (cg.state === 'gameover' && cg.match.result?.reason === 'killLimit' && clientEnds === 1) {
+    ok('the authoritative final kill runs the client end-of-round sequence once');
+  } else {
+    bad('the authoritative final kill ends the client round',
+      `state=${cg.state}, reason=${cg.match.result?.reason}, events=${clientEnds}`);
+  }
   session.dispose?.();
 }
 
@@ -380,12 +429,12 @@ console.log('\ncombat feedback reaches the client');
 {
   const { MultiplayerSession } = await import('../src/net/session.js');
   const sg = new Game({ headless: true });
-  await sg.initHeadless({ presenter: new RecordingPresenter() });
+  await sg.initHeadless({ presenter: new RecordingPresenter(), mapId: FIXTURE_MAP });
   sg.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 5 });
   sg.match.phase = 'live'; sg.match.countdown = 0;
 
   const cg = new Game({ headless: true });
-  await cg.initHeadless({ presenter: new NullPresenter() });
+  await cg.initHeadless({ presenter: new NullPresenter(), mapId: FIXTURE_MAP });
   cg.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 5 });
   cg.match.phase = 'live'; cg.match.countdown = 0;
   cg.weapons.giveLoadout(cg.player, ['dmr_meridian', 'pistol_viper']);
@@ -420,7 +469,7 @@ console.log('\ncombat feedback reaches the client');
 // cluster on spawns and a freshly spawned enemy is the obvious target.
 {
   const game = new Game({ headless: true });
-  await game.initHeadless({ presenter: new NullPresenter() });
+  await game.initHeadless({ presenter: new NullPresenter(), mapId: FIXTURE_MAP });
   game.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 11 });
   game.match.phase = 'live';
   game.match.countdown = 0;
@@ -550,7 +599,7 @@ console.log('\ncombat feedback reaches the client');
 {
   const { MultiplayerSession } = await import('../src/net/session.js');
   const game = new Game({ headless: true });
-  await game.initHeadless({ presenter: new NullPresenter() });
+  await game.initHeadless({ presenter: new NullPresenter(), mapId: FIXTURE_MAP });
   game.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 3 });
   game.match.phase = 'live';
   game.match.countdown = 0;

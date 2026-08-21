@@ -65,7 +65,7 @@ const step = (game, n = 1) => { for (let i = 0; i < n; i++) game.match.fixedUpda
 
 /** Advance to the live round, asserting the freeze lasted exactly the configured time. */
 function toLive(game, label) {
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   let n = 0;
   while (bomb.phase !== 'live' && n < T.freeze * 4) { step(game); n++; }
   eq(n, T.freeze + 1, `${label}: freeze lasts ${BOMB_PARAMS.freezeSeconds}s then the round goes live`);
@@ -74,8 +74,8 @@ function toLive(game, label) {
 
 const roster = (game) => game.entities.filter((e) => e.team === 0 || e.team === 1);
 const teamOf = (game, team) => roster(game).filter((e) => e.team === team).sort((a, b) => a.id - b.id);
-const attackers = (game) => teamOf(game, game.match.bomb.attackingTeam);
-const defenders = (game) => teamOf(game, game.match.bomb.defendingTeam);
+const attackers = (game) => teamOf(game, game.match.bombRules.attackingTeam);
+const defenders = (game) => teamOf(game, game.match.bombRules.defendingTeam);
 
 function kill(game, victim, attacker = null) {
   game.bus.emit('kill', { victim, attacker, weaponId: 'ar_vector', headshot: false, distance: 12 });
@@ -86,7 +86,7 @@ function wipe(game, team, keep = []) {
   const keepIds = new Set(keep.map((e) => e.id));
   for (const e of teamOf(game, team)) {
     if (keepIds.has(e.id)) continue;
-    if (game.match.bomb.isAlive(e)) kill(game, e, null);
+    if (game.match.bombRules.isAlive(e)) kill(game, e, null);
   }
 }
 
@@ -105,7 +105,7 @@ function place(entity, p) {
 
 /** Put the round's bomb carrier inside a site's plant volume, ready to plant. */
 function carrierIntoSite(game, siteId = 'A') {
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   const carrier = game.entityById(bomb.bomb.carrierId);
   place(carrier, centre(bomb.sites.get(siteId).plant));
   return carrier;
@@ -113,7 +113,7 @@ function carrierIntoSite(game, siteId = 'A') {
 
 /** Plant the bomb outright, and assert it took exactly the configured plant time. */
 function plant(game, siteId = 'A', label = 'plant') {
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   const carrier = carrierIntoSite(game, siteId);
   bomb.requestInteract(carrier, 'plant');
   step(game, T.plant - 1);
@@ -131,7 +131,7 @@ function lastEvent(bomb, kind) {
 
 /** Put a defender in the defuse volume and hold the key. */
 function beginDefuse(game, defender) {
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   place(defender, centre(bomb.sites.get(bomb.bomb.siteId).defuse));
   return bomb.requestInteract(defender, 'defuse');
 }
@@ -211,7 +211,7 @@ head('map-data.md §3.3 objective volumes');
 
 {
   const game = await newGame();
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   eqJson([...bomb.sites.keys()], ['A', 'B'], 'the ruleset reads its site ids from the manifest');
   eq(bomb.sites.get('A').plantId, 'site-A', 'site A plants inside the map\'s own site-A volume');
   eq(bomb.sites.get('B').defuseId, 'site-B', 'site B, declaring no defuse volume, defuses inside its plant volume');
@@ -227,7 +227,7 @@ head('map-data.md §3.3 objective volumes');
 head('§3 round state machine');
 {
   const game = await newGame();
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   eq(bomb.phase, 'warmup', 'a Bomb match starts in warmup');
   eq(bomb.allowRespawn(), true, '§3 respawns are on during warmup');
   step(game, 1);
@@ -812,7 +812,7 @@ head('§8 no respawns, and spectator information limits');
 head('§9 backfill and disconnects');
 {
   const game = await newGame();
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   eqJson(bomb.canJoin(), { allowed: true, reason: null }, 'joining during warmup is allowed');
   toLive(game, 'backfill');
   eqJson(bomb.canJoin(), { allowed: false, reason: 'ROOM_IN_PROGRESS' },
@@ -875,11 +875,16 @@ head('§9 backfill and disconnects');
   const bomb = toLive(game, 'abandon');
   const gone = attackers(game)[1];
   bomb.noteDisconnect(gone);
+  gone.position.set(1.5, 0.25, 2.5);
+  const parked = [gone.position.x, gone.position.y, gone.position.z];
   eq(bomb.abandoned(gone.id), false, 'one round absent is not an abandon');
   wipe(game, bomb.defendingTeam);
   step(game, 1 + T.roundEnd);
   eq(bomb.abandoned(gone.id), false, 'still not, after one full round');
-  eq(gone.alive, false, 'a disconnected player is not put back in the world at the freeze');
+  eq(bomb.phase, 'freeze', 'the next round has begun');
+  eqJson([gone.position.x, gone.position.y, gone.position.z], parked,
+    'a disconnected player is not respawned at the freeze — they are not in the round');
+  eq(bomb.isAlive(gone), false, 'and they do not count as alive');
   wipe(game, bomb.defendingTeam);
   step(game, 1 + T.freeze + T.roundEnd);
   eq(bomb.abandoned(gone.id), true, `§2 ${BOMB_PARAMS.abandonRounds} consecutive rounds absent is an abandon`);
@@ -995,7 +1000,7 @@ head('TDM still plays by its own rules');
 {
   const game = await newGame({ mode: 'tdm', botCount: 7 });
   eq(game.match.modeId, 'tdm', 'a TDM match resolves to the TDM ruleset');
-  eq(game.match.bomb, null, 'and carries no bomb state');
+  eq(game.match.bombRules, null, 'and carries no bomb state');
   const attacker = game.player;
   const victim = game.bots.bots.find((b) => b.team !== attacker.team);
   kill(game, victim, attacker);
@@ -1004,14 +1009,256 @@ head('TDM still plays by its own rules');
   game.dispose();
 }
 
+// ═══════════════════════════════════════ §11 the state this ruleset puts on the wire
+
+head('§11 replication view');
+{
+  const game = await newGame({ seed: 4711 });
+  const bomb = game.match.bombRules;
+  const match = game.match;
+  eq(match.roundPhase, 'warmup', 'the round phase is published separately from the match phase');
+  eq(match.phase, 'live', 'and the match phase is the match\'s own lifecycle, untouched');
+  eqJson(match.aliveCounts, { alpha: 4, bravo: 4 }, 'alive counts are published per side');
+  eqJson(match.interaction, { kind: 'none', actorId: 0, progress: 0 }, 'with no interaction in progress');
+  toLive(game, 'replication');
+  eq(match.roundPhase, 'live', 'the round phase follows the ruleset');
+  eq(match.phaseRemainingMs, BOMB_PARAMS.roundSeconds * 1000, 'the phase clock is published in milliseconds');
+  eq(match.roundIndex, 0, 'the round index is 0-based');
+  eq(match.attackingTeam, 0, 'the attacking side is published');
+  eq(match.sideSwitched, false, 'and whether the sides have switched');
+  eq(match.bomb.state, 'carried', 'match.bomb is the bomb OBJECT — plain data, not the rules');
+  eq(match.bomb.carrierId, bomb.bomb.carrierId, 'carrying the carrier id');
+  eq(match.bomb.siteId, null, 'and no site until it is planted');
+
+  const carrier = carrierIntoSite(game, 'A');
+  bomb.requestInteract(carrier, 'plant');
+  step(game, T.plant / 2);
+  eqJson(match.interaction, { kind: 'plant', actorId: carrier.id, progress: 0.5 },
+    'a half-finished plant publishes kind, actor and a 0..1 progress');
+  eq(bomb.progressOf(carrier.id), 31, 'and the same progress quantised to the 0..63 wire byte');
+  step(game, T.plant / 2);
+  eq(match.roundPhase, 'planted', 'the phase changes on the plant');
+  eq(match.bomb.state, 'planted', 'so does the bomb state');
+  eq(match.bomb.siteId, 'A', 'and the site is published');
+  eqJson(match.interaction, { kind: 'none', actorId: 0, progress: 0 }, 'the plant bar clears');
+  eq(match.phaseRemainingMs, BOMB_PARAMS.bombTimerSeconds * 1000, 'the published clock is now the bomb timer');
+
+  wipe(game, bomb.defendingTeam);
+  step(game, 1);
+  eqJson([match.scores[0], match.scores[1]], [1, 0],
+    'the referee\'s team score IS the round score, so the scoreline replicates');
+  eqJson(match.aliveCounts, { alpha: 4, bravo: 0 }, 'and the alive counts reflect the wipe');
+
+  // The server's reader (src/net/server.js, [CC] net lane) consumes exactly this shape.
+  // If that file and this one drift apart, this check is where it shows up.
+  let frame = null;
+  let importError = '';
+  try {
+    const { readBombMatchState } = await import('../src/net/server.js');
+    frame = readBombMatchState(game);
+  } catch (err) { importError = err.message; }
+  expect(frame !== null, 'the server\'s MSG_MATCHSTATE reader accepts this match', importError || 'reader returned null');
+  if (frame) {
+    // This pair was a deliberate tripwire while the two lanes disagreed: the server reader
+    // took `match.phase` (the MATCH lifecycle) rather than `match.roundPhase`, so the wire
+    // said "live" for every phase of every round and could never send freeze, planted or
+    // roundEnd. The §3 state machine collapsed to one value on the wire while every field
+    // around it stayed correct — which is exactly the kind of gap a green suite hides.
+    //
+    // Fixed in src/net/server.js. The assertion is now the CORRECT one: the wire must carry
+    // the round phase the ruleset is actually in, and a regression to `match.phase` fails
+    // here rather than being reported as a known gap.
+    eq(match.roundPhase, 'roundEnd', 'the ruleset publishes the round phase as roundEnd');
+    eq(frame.phase, 'roundEnd',
+      'and the WIRE carries the round phase, not the match lifecycle');
+    eq(frame.bomb.state, 'detonated', 'and the bomb state');
+    eq(frame.bomb.siteId, 'A', 'and the site');
+    eq(frame.scoreAlpha, 1, 'and the round score');
+    eq(frame.aliveAlpha, 4, 'and the alive counts');
+    eq(frame.attackingTeam, 0, 'and which side is attacking');
+    eqJson(frame.interaction, { kind: 'none', actorId: 0, progress: 0 }, 'and the objective progress');
+  }
+  game.dispose();
+}
+{
+  const game = await newGame({ mode: 'tdm' });
+  eq(game.match.bomb, null, 'a TDM match publishes no bomb object');
+  eq(game.match.bombRules, null, 'and holds no ruleset');
+  eq(game.match.roundPhase, 'live', 'its round phase is its match phase');
+  eqJson(game.match.aliveCounts, { alpha: 0, bravo: 0 }, 'and the Bomb-only fields are empty rather than absent');
+  eqJson(game.match.interaction, { kind: 'none', actorId: 0, progress: 0 }, 'with no interaction');
+  eq(game.match.phaseRemainingMs, 0, 'and no phase clock');
+  game.dispose();
+}
+
+// ══════════════════════════════════════════════════ guards that no scenario above reaches
+//
+// Every check below exists because deleting one specific line left the suite green. They
+// are grouped rather than scattered so the reason they exist stays visible.
+
+head('individually load-bearing guards');
+{
+  const game = await newGame();
+  const bomb = game.match.bombRules;
+  step(game, 1);
+  eq(bomb.displayTime, BOMB_PARAMS.freezeSeconds, 'during the freeze the HUD clock counts the freeze down');
+  step(game, T.freeze);
+  eq(bomb.displayTime, BOMB_PARAMS.roundSeconds, 'once live it counts the ROUND down');
+  step(game, 120);
+  eq(bomb.displayTime, BOMB_PARAMS.roundSeconds - 1, 'and keeps counting');
+
+  // A non-combatant (streak hardware carries no team) must not enter the roster.
+  const sentry = { id: 99001, team: -1, alive: true, position: { x: 0, y: 0, z: 0 } };
+  const before = bomb._roster().length;
+  game.addEntity(sentry);
+  step(game, 1);
+  eq(game.entities.length, before + 1, 'the sentry really is in the world');
+  eq(bomb._roster().length, before, 'a teamless entity is not a combatant and never joins the roster');
+  eqJson(bomb.aliveCounts(), [4, 4], 'and does not appear in either team\'s alive count');
+  game.removeEntity(sentry);
+
+  // BotManager keeps its own fallback respawn timer and can put a bot back in the world.
+  // Elimination is the RULESET's state and must survive that.
+  const victim = attackers(game)[1];
+  kill(game, victim, defenders(game)[0]);
+  victim.alive = true;
+  eq(bomb.isAlive(victim), false, 'an entity revived from outside the ruleset is still eliminated');
+  eq(game.match.canFire(victim), false, 'and still cannot fire');
+  eq(bomb.requestInteract(victim, 'plant'), false, 'and still cannot interact');
+  eq(lastEvent(bomb, 'interactRefused').reason, REFUSE.dead, 'their request is refused as dead');
+
+  eq(bomb.requestInteract(null, 'plant'), false, 'a request from no entity is refused, not a crash');
+  const eventsBefore = bomb.events.length;
+  eq(bomb.requestInteract(attackers(game)[0], 'dance'), false, 'an unknown interaction kind is refused');
+  eq(bomb.events.length, eventsBefore, 'an interaction the protocol does not define is dropped, not answered with a refusal');
+  eq(bomb.releaseInteract(null), undefined, 'releasing for no entity is a no-op');
+  eq(bomb.noteDisconnect(null), undefined, 'a disconnect for no entity is a no-op');
+  eq(bomb.onKill(null, null), undefined, 'a death report with no victim is a no-op');
+  eq(bomb.isAlive(null), false, 'nobody is not alive');
+  eq(bomb._roster() === bomb._roster(), true, 'the roster is built once per step, not per question');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = game.match.bombRules;
+  step(game, 1);
+  const carrier = carrierIntoSite(game, 'A');
+  eq(bomb.phase, 'freeze', 'the round is frozen');
+  eq(bomb.requestInteract(carrier, 'plant'), false, '§6.3 a plant during the freeze is refused');
+  eq(lastEvent(bomb, 'interactRefused').reason, REFUSE.wrongPhase, 'the refusal names the phase');
+  eq(bomb.canSpectate(defenders(game)[0], attackers(game)[0]), false, 'nobody spectates during a freeze');
+  eq(bomb.canSpectate(null, null), false, 'a spectate request with no viewer or target is refused');
+  while (bomb.phase !== 'live') step(game);
+  // Drop position with no intervening step: the bomb lands where the carrier IS.
+  const spot = centre(bomb.sites.get('B').plant);
+  place(carrier, spot);
+  bomb.noteDisconnect(carrier);
+  eqJson([bomb.bomb.position.x, bomb.bomb.position.z], [spot.x, spot.z],
+    'a disconnecting carrier drops the bomb at their position, not at the last one replicated');
+  eq(bomb.requestInteract(carrier, 'plant'), false, 'a disconnected player cannot interact');
+  eq(lastEvent(bomb, 'interactRefused').reason, REFUSE.disconnected, 'and the refusal says so, rather than calling them dead');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'spectator guards');
+  const [a1, a2] = attackers(game);
+  const d1 = defenders(game)[0];
+  eq(bomb.canSpectate(a1, a2), false, 'a LIVING player may not spectate, even a team-mate');
+  kill(game, a1, d1);
+  kill(game, a2, d1);
+  eq(bomb.canSpectate(a1, a2), false, 'a dead player may not spectate another DEAD team-mate');
+  eq(bomb.canSpectate(a1, attackers(game).find((e) => bomb.isAlive(e))), true,
+    'but may spectate a living one');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'reconnect guards');
+  const gone = attackers(game)[1];
+  bomb.noteDisconnect(gone);
+  step(game, Math.round(BOMB_PARAMS.reconnectGraceSeconds / FIXED_DT) + 1);
+  eq(bomb.noteReconnect(gone).allowed, false, 'a reconnect after grace is refused');
+  eq(bomb.isConnected(gone.id), false, 'and the refused player is NOT rebound to the match');
+  // A player who never left is never refused, however long the match has been running —
+  // the grace clock applies to the DISCONNECTED, not to everyone.
+  eqJson(bomb.canReconnect(attackers(game)[0].id), { allowed: true, asSpectator: false, reason: null },
+    'a still-connected player is not caught by the expired grace window');
+  // Once the match is over there is nothing left to protect.
+  for (const e of teamOf(game, bomb.defendingTeam)) bomb.noteDisconnect(e);
+  eq(bomb.phase, 'matchEnd', 'the match ends');
+  eqJson(bomb.canReconnect(gone.id), { allowed: true, asSpectator: false, reason: null },
+    '§9 after matchEnd a lapsed player may return');
+  game.dispose();
+}
+{
+  const game = await newGame();
+  const bomb = toLive(game, 'forfeit mirror');
+  for (const e of teamOf(game, 0)) bomb.noteDisconnect(e);
+  eq(bomb.series.winnerTeam, 1, '§9 team 0 emptying forfeits to team 1');
+  eq(bomb.series.outcomeReason, 'forfeit', 'as a forfeit');
+  eq(game.match.awardObjective(null, 'plant'), null, 'awarding an objective to nobody is a no-op, not a crash');
+  game.dispose();
+}
+{
+  // Team 1 reaching 7 must end the match too — the same rule, the other index.
+  const game = await newGame({ seed: 909 });
+  const bomb = toLive(game, 'team 1 series');
+  for (let round = 1; round <= 7; round++) {
+    let guard = 0;
+    while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
+    wipe(game, 0);
+    step(game, 1 + T.roundEnd);
+  }
+  eqJson(bomb.roundWins, [0, 7], 'team 1 has 7 round wins');
+  eq(bomb.phase, 'matchEnd', 'and the match ends on team 1 reaching 7');
+  eq(bomb.series.winnerTeam, 1, 'with team 1 as the winner');
+  game.dispose();
+}
+{
+  // An attacking side with nobody on it (possible after the side switch on a lopsided
+  // roster) must not leave the bomb attached to an entity that does not exist.
+  const game = await newGame({ seed: 61, botCount: 0 });
+  const bomb = toLive(game, 'empty attacking side');
+  eq(bomb.aliveCounts()[1], 0, 'team 1 has no players in this match');
+  for (let round = 1; round <= 6; round++) {
+    let guard = 0;
+    while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
+    wipe(game, 0);
+    step(game, 1 + T.roundEnd);
+  }
+  eq(bomb.attackingTeam, 1, 'the sides have switched, so the empty team now attacks');
+  eq(bomb.bomb.carrierId, -1, '§5 with no eligible attacker the bomb has no carrier');
+  eq(bomb.bomb.state, 'dropped', 'and it lies on the ground rather than following a ghost');
+  game.dispose();
+}
+
 // ═══════════════════════════════════════════════════════════════════ §12.12 determinism
 
 head('§12.12 determinism');
 
+{
+  // §5's carrier draw comes from a stream derived from (matchSeed, roundIndex), NOT from
+  // `game.rng` — which respawn jitter and bot behaviour also draw on. Taking it from the
+  // shared stream would make the carrier depend on how many unrelated draws happened
+  // first, which is a replay divergence waiting for the first bot to die at a new time.
+  const clean = await newGame({ seed: 12321 });
+  step(clean, 1);
+  const cleanCarrier = clean.match.bombRules.bomb.carrierId;
+  clean.dispose();
+
+  const disturbed = await newGame({ seed: 12321 });
+  for (let i = 0; i < 7; i++) disturbed.rng();
+  step(disturbed, 1);
+  eq(disturbed.match.bombRules.bomb.carrierId, cleanCarrier,
+    '§5 the carrier draw is unaffected by unrelated draws on the shared RNG stream');
+  disturbed.dispose();
+}
+
 /** A scripted round, identical every time it is run, exercising every subsystem. */
 async function scriptedRun(seed) {
   const game = await newGame({ seed, botCount: 7 });
-  const bomb = game.match.bomb;
+  const bomb = game.match.bombRules;
   while (bomb.phase !== 'live') step(game);
   const carrier = carrierIntoSite(game, 'A');
   bomb.requestInteract(carrier, 'plant');
@@ -1064,7 +1311,7 @@ async function liveRun(seed, ticks) {
   game.startMatch({ mode: 'bomb', botCount: 7, seed });
   for (let i = 0; i < ticks; i++) game._fixedUpdate(FIXED_DT);
   const out = {
-    bomb: game.match.bomb ? game.match.bomb.state() : null,
+    bomb: game.match.bombRules ? game.match.bombRules.state() : null,
     rows: game.match.getScoreboardRows().map((r) => ({ ...r, entity: undefined })),
   };
   game.dispose();

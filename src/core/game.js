@@ -20,6 +20,7 @@ import { AudioEngine } from '../audio/audio.js';
 import { HUD } from '../ui/hud.js';
 import { Menu } from '../ui/menu.js';
 import { Match } from '../game/match.js';
+import { normalizeKillLimit } from '../game/modes.js';
 import { WEAPON_LIST } from '../weapons/weaponDefs.js';
 import { BotModel } from '../ai/botModel.js';
 
@@ -249,7 +250,7 @@ export class Game {
    * There is no render loop: the caller drives `_fixedUpdate(FIXED_DT)` at whatever rate
    * it likes. `start()` is deliberately not called — it wants requestAnimationFrame.
    */
-  async initHeadless({ presenter, colliders = true } = {}) {
+  async initHeadless({ presenter, colliders = true, mapId } = {}) {
     const tBoot = performance.now();
     this.present = presenter || new NullPresenter();
 
@@ -264,7 +265,15 @@ export class Game {
 
     setCollidersOnly(colliders);
     this.world = new World(this);
-    await this.world.init();
+    // `mapId` is threaded so a harness can PIN the fixture.
+    //
+    // Without it, every Game-based harness silently ran whatever map the rotation currently
+    // points at. The moment The Square landed, `feedbacktest` started failing — shots not
+    // registering, no hitmarker, no kill event — and `--map=meridian` did nothing to it,
+    // because the flag reached `World.init` from map harnesses and never from here. A harness
+    // that cannot choose its map is a harness whose result is about the rotation, not the code
+    // it claims to test.
+    await this.world.init({ mapId });
 
     this.nav = new NavGrid(this);
     await this.nav.init();
@@ -394,7 +403,10 @@ export class Game {
     // number — the referee and the roster disagreed for the whole match.
     if (opts.botCount !== undefined) this.settings.set('botCount', opts.botCount);
     if (opts.difficulty !== undefined) this.settings.set('difficulty', opts.difficulty);
-    if (opts.mode !== undefined) this.settings.set('mode', String(opts.mode));
+    if (opts.killLimit !== undefined) this.settings.set('killLimit', normalizeKillLimit(opts.killLimit));
+    // Team Deathmatch is the sole ruleset. Old callers may still pass a stale mode id;
+    // normalize it here so settings, events, and every subsystem agree on the same mode.
+    this.settings.set('mode', 'tdm');
 
     // Deliberately NOT resetting `_entityIdSeq` here. The Player is constructed once at
     // boot and keeps its id for the process; restarting the sequence per match would hand
@@ -414,7 +426,11 @@ export class Game {
     this.engine?.setFade(0);
     this.input?.requestLock();
     this.audio?.resume();
-    this.bus.emit('matchStart', { mode: opts.mode ?? this.match.mode, scores: this.match.scores });
+    this.bus.emit('matchStart', {
+      mode: 'tdm',
+      killLimit: this.match.killLimit,
+      scores: this.match.scores,
+    });
   }
 
   endMatch(result) {

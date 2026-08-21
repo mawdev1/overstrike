@@ -33,6 +33,7 @@
     "maptest": "node scripts/maptest.mjs",
     "navtest": "node scripts/navtest.mjs",
     "mapbalance": "node scripts/mapbalance.mjs",
+    "spawnbalance": "node scripts/mapbalance.mjs --spawn-only",
     "vertprobe": "node scripts/vertprobe.mjs",
     "feedbacktest": "node scripts/feedbacktest.mjs",
     "servertest": "node scripts/servertest.mjs",

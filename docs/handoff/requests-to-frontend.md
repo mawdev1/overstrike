@@ -185,7 +185,7 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
 - Status: DONE
 - Response: Re-read and mapped the current versions into the typed platform/shell clients before implementation. The client uses the closed `CONSENT_RECEIPT_INVALID` verdict and exact result/error projections; real online handoff remains fail-closed until the contracted browser net-facade surface is available rather than inventing a local substitute.
 
-### REQ-CX-008 — `settings.js` must accept `mode: 'bomb'`, and the menu must offer it
+### REQ-CX-009 — `settings.js` must accept `mode: 'bomb'`, and the menu must offer it
 - Phase: P3
 - Blocking: no for the simulation — Bomb plays today via `startMatch({ mode: 'bomb' })` and
   `bombtest.mjs` is green — but yes for a human being able to pick the mode
