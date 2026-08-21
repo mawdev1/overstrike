@@ -5,7 +5,7 @@
  * now; the match restarts itself when it ends, so a machine that nobody is on stays warm
  * and empty rather than dying.
  *
- * Run:  node server/index.js [--port=8080] [--bots=8] [--tickrate=120]
+ * Run:  node server/index.js [--port=8080] [--bots=8] [--killlimit=75] [--mode=tdm|bomb]
  */
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
@@ -14,6 +14,7 @@ import { RecordingPresenter } from '../src/core/presenter.js';
 import { GameServer } from '../src/net/server.js';
 import { Player } from '../src/player/player.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
+import { normalizeKillLimit } from '../src/game/modes.js';
 
 const arg = (k, d) => {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`--${k}=`));
@@ -22,9 +23,24 @@ const arg = (k, d) => {
   return env !== undefined ? Number(env) : d;
 };
 
+/** Same, for a string-valued flag. `arg` coerces to Number, which turns `bomb` into NaN. */
+const argStr = (k, d) => {
+  const hit = process.argv.slice(2).find((a) => a.startsWith(`--${k}=`));
+  if (hit) return hit.slice(k.length + 3);
+  return process.env[`OVERSTRIKE_${k.toUpperCase()}`] ?? d;
+};
+
 const PORT = arg('port', Number(process.env.PORT) || 8080);
+/**
+ * Which ruleset this process runs. Bomb puts `MSG_MATCHSTATE` and `MSG_OUTCOME` on the wire
+ * and TDM does not, so a dedicated server that can only ever be TDM leaves half the v2
+ * protocol with no end-to-end coverage over a real socket at all (`wire-protocol.md` §9.6).
+ */
+const MODE = argStr('mode', 'tdm');
 const BOTS = arg('bots', 8);
 const MAX_CLIENTS = arg('maxclients', 12);
+/** First team to this many kills wins the round. */
+const KILL_LIMIT = normalizeKillLimit(arg('killlimit', 75));
 /** Round length in seconds. 0 keeps the mode's own limit. Short rounds are for testing. */
 const TIME_LIMIT = arg('timelimit', 0);
 
@@ -32,7 +48,7 @@ const game = new Game({ headless: true });
 // Not a NullPresenter: the server has no screen, but its clients do, and the feedback
 // it generates is theirs. See `RecordingPresenter`.
 await game.initHeadless({ presenter: new RecordingPresenter() });
-game.startMatch({ mode: 'tdm', botCount: BOTS, difficulty: 'regular' });
+game.startMatch({ mode: MODE, killLimit: KILL_LIMIT, botCount: BOTS, difficulty: 'regular' });
 game.match.phase = 'live';
 game.match.countdown = 0;
 if (TIME_LIMIT > 0) game.match.timeLimit = TIME_LIMIT;
@@ -103,7 +119,7 @@ function restartMatch() {
   // stamps its commands and its interpolation against the server tick, so rewinding it
   // strands them in a future the server no longer has snapshots for.
   const keepTick = game.tick;
-  game.startMatch({ mode: 'tdm', botCount: BOTS, difficulty: 'regular' });
+  game.startMatch({ mode: MODE, killLimit: KILL_LIMIT, botCount: BOTS, difficulty: 'regular' });
   game.tick = keepTick;
   game.match.phase = 'live';
   game.match.countdown = 0;
@@ -266,6 +282,7 @@ const http_ = http.createServer((req, res) => {
       ticksBehind: behind,
       phase: game.match?.phase ?? 'unknown',
       timeRemaining: Math.round(game.match?.timeRemaining ?? 0),
+      killLimit: game.match?.killLimit ?? KILL_LIMIT,
       matches: matchesPlayed,
     }));
     return;
@@ -291,11 +308,19 @@ wss.on('connection', (sock, req) => {
     return;
   }
   const transport = new WsServerTransport(sock);
+  const who = req.socket.remoteAddress;
 
-  // Every connection gets its OWN entity. There is no "first client takes game.player"
-  // asymmetry any more — see the note where `game.player` is nulled.
-  const entity = new Player(game);
-  {
+  /**
+   * Every connection gets its OWN entity — but **not until it has said hello** (§8.2 step 4:
+   * "No entity exists before step 4. An unauthenticated socket can never cause allocation.").
+   *
+   * This ran unconditionally on `connection` before, so anyone who could open a socket could
+   * make this process build a `Player`, register it in `game.entities`, arm it and spawn it
+   * into the match without sending a single byte. A factory hands the decision to
+   * `GameServer._onHello`, which runs it only after the version check passes.
+   */
+  const makeEntity = () => {
+    const entity = new Player(game);
     entity.init();
     game.addEntity(entity);
     game.weapons.giveLoadout(entity, ['ar_vector', 'pistol_sidewinder']);
@@ -306,15 +331,17 @@ wss.on('connection', (sock, req) => {
     // teammate and the hit is then discarded entirely.
     entity.team = smallerTeam();
     entity.respawn?.();
-  }
+    console.log(`[server] client ${session.id} joined from ${who} as entity ${entity.id} (${server.clients.size} online)`);
+    return entity;
+  };
 
-  const session = server.addClient(transport, entity);
-  const who = req.socket.remoteAddress;
-  console.log(`[server] client ${session.id} joined from ${who} as entity ${entity.id} (${server.clients.size} online)`);
+  const session = server.addClient(transport, makeEntity);
 
   sock.on('close', () => {
     server.removeClient(session);
-    game.removeEntity(entity);
+    // Only what the handshake actually allocated. A socket that never said hello has no
+    // entity, and `removeEntity(undefined)` is a way to find that out at runtime.
+    if (session.entity) game.removeEntity(session.entity);
     console.log(`[server] client ${session.id} left (${server.clients.size} online)`);
   });
 });

@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 import {
   encodeCommands, quantiseCommand, MSG_WELCOME, MSG_SNAPSHOT, MSG_REJECT,
+  MSG_HELLO as MSG_HELLO_T,
   decodeSnapshot, encodeHello, decodeReject, PROTOCOL_VERSION,
 } from '../src/net/protocol.js';
 
@@ -372,6 +373,10 @@ async function joinClient(port) {
     state.snap = snap;
   });
   await new Promise((r, j) => { sock.on('open', r); sock.on('error', j); });
+  // §8.2: the first frame on the socket, and the only thing that makes the server allocate an
+  // entity. Without it this client gets no welcome, no snapshots and no entity at all — which
+  // is the point of the gate.
+  sock.send(Buffer.from(encodeHello(PROTOCOL_VERSION, 'st_wstest_join')), { binary: true });
   state.sock = sock;
   return state;
 }
@@ -495,6 +500,370 @@ await sleep(300);
 child2.kill('SIGTERM');
 await sleep(500);
 child2.kill('SIGKILL');
+
+
+// ── every v2 message type, over a real socket (§9.6) ─────────────────────────────────
+//
+// §9.6: "`scripts/nettest.mjs` and `scripts/wstest.mjs` must cover any new message type in
+// the same change, including its malformed and hostile cases." This file covered `MSG_HELLO`
+// and `MSG_REJECT` and nothing else — no `MSG_MATCHSTATE` content, no `MSG_OUTCOME`, no
+// `interact` byte, no Bomb event kinds — so four of the six v2 additions had never crossed a
+// socket at all, only the in-process loopback.
+//
+// A real `WebSocketServer`, a real `GameServer` over a real Bomb match, and the real
+// `NetClient`. Bomb rather than TDM because `MSG_MATCHSTATE` and `MSG_OUTCOME` do not exist on
+// a TDM stream, and the dedicated entrypoint is exercised in bomb mode below as well.
+console.log('\nprotocol v2 message types over a real socket');
+
+{
+  const { WebSocketServer } = await import('ws');
+  const { Game } = await import('../src/core/game.js');
+  const { NullPresenter } = await import('../src/core/presenter.js');
+  const { GameServer } = await import('../src/net/server.js');
+  const {
+    MSG_MATCHSTATE, MSG_OUTCOME, MSG_COMMANDS, MATCHSTATE_BYTES, decodeMatchState,
+    unpackInteract, COMMAND_BYTES, MAX_COMMANDS_PER_BATCH,
+  } = await import('../src/net/protocol.js');
+
+  const WS_PORT = PORT + 2;
+  if (!await waitForFreePort(WS_PORT)) bad(`port ${WS_PORT} is free`, 'still held');
+
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'bomb', botCount: 7, seed: 20260820 });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  const gs = new GameServer(game);
+  gs.evidence.identify({ matchId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' });
+  const rules = game.match.bombRules;
+  for (let i = 0; i < 4000 && rules.phase !== 'live'; i++) gs.tick();
+  if (rules.phase === 'live') ok('a real Bomb match reached its live round');
+  else bad('the Bomb ruleset reaches a live round', `phase ${rules.phase}`);
+
+  /** The same Buffer/ArrayBuffer discipline `server/index.js` uses. */
+  const serverTransport = (sock) => {
+    const t = { closed: false, _h: null };
+    sock.on('message', (data) => {
+      const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      // A malformed message must not take the process down — the same contract
+      // `WsServerTransport` keeps.
+      try { t._h?.(ab); } catch (e) { t.threw = e.message; }
+    });
+    sock.on('close', () => { t.closed = true; });
+    t.onMessage = (fn) => { t._h = fn; };
+    t.send = (buf) => { if (!t.closed && sock.readyState === 1) sock.send(Buffer.from(buf), { binary: true }); };
+    t.pump = () => {};
+    t.close = () => { t.closed = true; try { sock.close(); } catch { /* gone */ } };
+    return t;
+  };
+
+  // Entities handed out in the order clients arrive: an attacker first, then defenders.
+  const teamMembers = (team) => game.entities.filter((e) => e.team === team);
+  const pool = [
+    teamMembers(rules.attackingTeam).find((e) => e.id !== rules.bomb.carrierId),
+    ...teamMembers(rules.defendingTeam),
+  ];
+  let handed = 0;
+  const wss2 = new WebSocketServer({ port: WS_PORT, perMessageDeflate: false, maxPayload: 4096 });
+  const sessions = [];
+  wss2.on('connection', (sock) => {
+    const s = gs.addClient(serverTransport(sock), () => pool[handed++]);
+    sessions.push(s);
+  });
+  await new Promise((r) => wss2.once('listening', r));
+
+  /** A real NetClient on a real socket, tapping every frame it is sent. */
+  async function joinReal(ticket) {
+    const sock = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+    await new Promise((r, j) => { sock.on('open', r); sock.on('error', j); });
+    const frames = [];
+    const c = new NetClient(wsTransport(sock));
+    sock.on('message', (d) => frames.push(toArrayBuffer(d)));
+    c.sendHello(ticket);
+    for (let i = 0; i < 100 && !c.entityId; i++) { gs.tick(); await sleep(5); }
+    return { sock, client: c, frames };
+  }
+
+  const A = await joinReal('st_attacker');
+  const B = await joinReal('st_defender');
+  if (A.client.entityId && B.client.entityId && A.client.entityId !== B.client.entityId) {
+    ok(`two real sockets were welcomed with distinct entities (${A.client.entityId}, ${B.client.entityId})`);
+  } else {
+    bad('the handshake allocates over a real socket', `${A.client.entityId} / ${B.client.entityId}`);
+  }
+
+  const step = async (n) => { for (let i = 0; i < n; i++) gs.tick(); await sleep(60); };
+  await step(8);
+
+  // ── MSG_MATCHSTATE, decoded from the socket's own bytes ───────────────────────────
+  const stateFrames = A.frames.filter((f) => new DataView(f).getUint8(0) === MSG_MATCHSTATE);
+  if (stateFrames.length === 0) {
+    bad('MSG_MATCHSTATE crosses a real socket', `frame types [${[...new Set(A.frames.map((f) => new DataView(f).getUint8(0)))].join(',')}]`);
+  } else {
+    const ms = decodeMatchState(stateFrames[stateFrames.length - 1]);
+    if (stateFrames[0].byteLength === MATCHSTATE_BYTES) ok(`MSG_MATCHSTATE arrives over a real socket at exactly ${MATCHSTATE_BYTES} bytes`);
+    else bad('MSG_MATCHSTATE is 41 bytes on the wire', `${stateFrames[0].byteLength}`);
+    if (ms.phase === 'live') ok('and its phase decodes as the round the ruleset is really in');
+    else bad('the match state names the real phase', `${ms.phase} vs ruleset ${rules.phase}`);
+    if (ms.localRole === 'attacker') ok('and tells this recipient which side it is on');
+    else bad('the match state names the local role', `${ms.localRole}`);
+    if (ms.bombState === 'carried') ok('and what the bomb is doing');
+    else bad('the match state names the bomb state', `${ms.bombState} vs ${rules.bomb.state}`);
+  }
+
+  // ── the appended interact byte, over a real socket ────────────────────────────────
+  {
+    const carrier = game.entityById(rules.bomb.carrierId);
+    const site = rules.sites.get('A');
+    carrier.position.set((site.plant.min.x + site.plant.max.x) / 2, site.plant.min.y + 0.5,
+      (site.plant.min.z + site.plant.max.z) / 2);
+    let seen = null;
+    for (let i = 0; i < 120 && !seen; i++) {
+      rules.requestInteract(carrier, 'plant');
+      carrier.grounded = true;
+      gs.tick();
+      if (i % 8 === 0) await sleep(4);
+      for (const sn of A.client.snapshots) {
+        const e = sn.entities.find((x) => x.id === carrier.id);
+        if (!e) continue;
+        const u = unpackInteract(e.interact ?? 0);
+        if (u.kindName === 'plant' && u.progress > 0) seen = u;
+      }
+    }
+    if (seen) ok(`the appended interact field crosses a real socket carrying a plant at ${seen.progress}/63`);
+    else bad('the interact byte carries a plant over a real socket', 'every entity read as interact 0');
+  }
+
+  // ── the Bomb event kinds, over a real socket, with §8.8 applied ───────────────────
+  {
+    const carrier = game.entityById(rules.bomb.carrierId);
+    const sp = game.world.spawnPoints.map((p) => p.position ?? p);
+    const DROP = {
+      x: Math.fround(sp[0].x + 0.101563), y: Math.fround(sp[0].y + 0.302734), z: Math.fround(sp[0].z + 0.507813),
+    };
+    const eyeH = carrier.eyeHeight ?? 1.6;
+    let blindAt = null;
+    for (let i = 1; i < sp.length && !blindAt; i++) {
+      if (!game.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, DROP)) blindAt = sp[i];
+    }
+    const defender = game.entityById(B.client.entityId);
+    const attacker = game.entityById(A.client.entityId);
+    defender.position.set(blindAt.x, blindAt.y, blindAt.z);
+    attacker.position.set(DROP.x, DROP.y + 1, DROP.z);      // authorised by role anyway
+    carrier.position.set(DROP.x, DROP.y, DROP.z);
+    A.frames.length = 0;
+    B.frames.length = 0;
+    rules.noteDisconnect(carrier);                          // §9's own path into `_dropBomb`
+    carrier.position.set(sp[3].x, sp[3].y, sp[3].z);
+    await step(8);
+
+    const scan = (frames) => {
+      const want = [DROP.x, DROP.y, DROP.z];
+      const hits = [];
+      for (const f of frames) {
+        const dv = new DataView(f);
+        for (let o = 0; o + 4 <= f.byteLength; o++) {
+          if (want.some((w) => Object.is(dv.getFloat32(o, true), w))) hits.push(`type=${dv.getUint8(0)} off=${o}`);
+        }
+      }
+      return hits;
+    };
+    const hitsA = scan(A.frames);
+    const hitsB = scan(B.frames);
+    if (hitsA.length >= 3) ok(`bombDropped crosses a real socket to an authorised recipient (${hitsA.length} float32 hits)`);
+    else bad('the drop reaches an authorised recipient over a real socket', `${hitsA.length} hits — the control failed`);
+    if (hitsB.length === 0) ok('and the coordinates appear on NO frame a blind defender received, at any offset');
+    else bad('an unauthorised recipient never receives the coordinates over a real socket', hitsB.join('; '));
+    const evA = A.client.snapshots.flatMap((s) => s.events).find((e) => e.kind === 'bombDropped');
+    if (evA) ok(`and the real NetClient decoded it as ${evA.kind} at (${evA.x.toFixed(2)}, ${evA.y.toFixed(2)}, ${evA.z.toFixed(2)})`);
+    else bad('an authorised client decodes bombDropped from the socket', 'no event arrived');
+  }
+
+  // ── MSG_OUTCOME, over a real socket ───────────────────────────────────────────────
+  {
+    const attackingTeam = rules.attackingTeam;
+    for (const e of teamMembers(rules.defendingTeam)) {
+      game.bus.emit('kill', { victim: e, attacker: null, weaponId: 'ar_vector', headshot: false, distance: 12 });
+    }
+    await step(12);
+    const outFrames = A.frames.filter((f) => new DataView(f).getUint8(0) === MSG_OUTCOME);
+    const o = A.client.outcome;
+    if (outFrames.length === 0 || !o) {
+      bad('MSG_OUTCOME crosses a real socket', `${outFrames.length} frames, outcome ${JSON.stringify(o)}`);
+    } else {
+      if (outFrames[0].byteLength === 32) ok('MSG_OUTCOME arrives over a real socket at exactly 32 bytes');
+      else bad('MSG_OUTCOME is 32 bytes on the wire', `${outFrames[0].byteLength}`);
+      if (o.scope === 'round') ok('and decodes as a round outcome');
+      else bad('the outcome names its scope', `${o.scope}`);
+      if (o.winnerTeam === (attackingTeam === 0 ? 'alpha' : 'bravo')) ok(`and names the winner (${o.winnerTeam})`);
+      else bad('the outcome names the winner', `${o.winnerTeam}`);
+      if (o.reason === 'elimination') ok('and why they won');
+      else bad('the outcome names the reason', `${o.reason}`);
+      if (o.matchId === '01ARZ3NDEKTSV4RRFFQ69G5FAV') ok('and carries the match id as 16 raw ULID bytes');
+      else bad('the outcome carries the match id', `${o.matchId}`);
+    }
+  }
+
+  // ── hostile and malformed, client → server, over a real socket ────────────────────
+  {
+    const before = game.entities.length;
+
+    // 1. Commands before any hello.
+    const rude = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+    const rudeFrames = [];
+    let rudeClosed = false;
+    rude.on('message', (d) => rudeFrames.push(toArrayBuffer(d)));
+    rude.on('close', () => { rudeClosed = true; });
+    await new Promise((r, j) => { rude.on('open', r); rude.on('error', j); });
+    const cmd = { seq: 1, tick: 0, wishForward: 1, wishRight: 0, deltaYaw: 0, deltaPitch: 0, baseYaw: 0, basePitch: 0, slot: -1, wheel: 0 };
+    quantiseCommand(cmd);
+    rude.send(Buffer.from(encodeCommands([cmd])), { binary: true });
+    for (let i = 0; i < 60 && !rudeClosed; i++) { gs.tick(); await sleep(10); }
+    const rej = rudeFrames.find((f) => new DataView(f).getUint8(0) === MSG_REJECT);
+    if (rej && decodeReject(rej).reason === 'SESSION_TOKEN_INVALID') ok('commands before the hello are refused over a real socket');
+    else bad('a socket that skips the hello is refused', `frames [${rudeFrames.map((f) => new DataView(f).getUint8(0)).join(',')}]`);
+    if (rudeClosed) ok('and the socket is closed rather than left half-alive');
+    else { bad('an unauthenticated socket is closed', 'still open'); try { rude.close(); } catch { /* gone */ } }
+    if (game.entities.length === before) ok('and it caused no entity to be allocated');
+    else bad('an unauthenticated socket allocates nothing', `${game.entities.length} entities, was ${before}`);
+
+    // 2. A hello at the wrong length, and a hostile command batch, on their own sockets.
+    for (const [name, bytes] of [
+      ['a hello claiming a 255-byte ticket it did not send', (() => {
+        const b = new ArrayBuffer(6); const v = new DataView(b);
+        v.setUint8(0, MSG_HELLO_T); v.setUint16(1, PROTOCOL_VERSION, true); v.setUint8(3, 255); return b;
+      })()],
+    ]) {
+      const sock = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+      const fr = [];
+      let closed = false;
+      sock.on('message', (d) => fr.push(toArrayBuffer(d)));
+      sock.on('close', () => { closed = true; });
+      await new Promise((r, j) => { sock.on('open', r); sock.on('error', j); });
+      sock.send(Buffer.from(bytes), { binary: true });
+      for (let i = 0; i < 60 && !closed; i++) { gs.tick(); await sleep(10); }
+      if (closed && fr.some((f) => new DataView(f).getUint8(0) === MSG_REJECT)) ok(`${name} is rejected and closed (§8.11)`);
+      else bad(`${name} closes the connection`, `closed=${closed} frames=[${fr.map((f) => new DataView(f).getUint8(0)).join(',')}]`);
+    }
+
+    // 3. A command batch declaring far more commands than the cap, from an AUTHENTICATED
+    //    socket. `decodeCommands` throws, and the throw must not reach the tick loop.
+    const hostile = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+    await new Promise((r, j) => { hostile.on('open', r); hostile.on('error', j); });
+    hostile.send(Buffer.from(encodeHello(PROTOCOL_VERSION, 'st_hostile')), { binary: true });
+    for (let i = 0; i < 40; i++) { gs.tick(); await sleep(5); }
+    const huge = new ArrayBuffer(6 + COMMAND_BYTES);
+    const hv = new DataView(huge);
+    hv.setUint8(0, MSG_COMMANDS);
+    hv.setUint32(2, MAX_COMMANDS_PER_BATCH * 1000, true);
+    hostile.send(Buffer.from(huge), { binary: true });
+    // 4. And a type this build has never heard of, which §8.11 says to IGNORE.
+    const unknown = new ArrayBuffer(8);
+    new DataView(unknown).setUint8(0, 99);
+    hostile.send(Buffer.from(unknown), { binary: true });
+    const tickBefore = game.tick;
+    let alive = true;
+    try { for (let i = 0; i < 60; i++) gs.tick(); } catch (e) { alive = false; bad('a hostile command batch does not kill the tick loop', e.message); }
+    await sleep(50);
+    if (alive && game.tick > tickBefore) ok('an over-declared command batch and an unknown type leave the server ticking');
+    hostile.close();
+  }
+
+  for (const c of [A, B]) c.sock.close();
+  await sleep(100);
+  wss2.close();
+}
+
+// ── the same protocol, out of the real entrypoint, in Bomb mode ──────────────────────
+{
+  // The blocks above run `GameServer` in-process. This one proves `server/index.js` itself
+  // can host the Bomb wire, because that is the process a player actually connects to.
+  const BOMB_PORT = PORT + 3;
+  if (!await waitForFreePort(BOMB_PORT)) bad(`port ${BOMB_PORT} is free`, 'still held');
+  const bombChild = spawn(process.execPath,
+    [path.join(ROOT, 'server/index.js'), `--port=${BOMB_PORT}`, '--bots=6', '--mode=bomb'],
+    { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+  let bombLog = '';
+  bombChild.stdout.on('data', (d) => { bombLog += d; });
+  bombChild.stderr.on('data', (d) => { bombLog += d; });
+  let bombUp = false;
+  for (let i = 0; i < 100 && !bombUp; i++) {
+    await sleep(200);
+    try { bombUp = (await fetch(`http://127.0.0.1:${BOMB_PORT}/health`)).ok; } catch { /* not yet */ }
+  }
+  if (!bombUp) {
+    bad('the dedicated server starts in Bomb mode', bombLog.slice(-800));
+  } else {
+    ok('the dedicated server starts in Bomb mode');
+    const sock = new WebSocket(`ws://127.0.0.1:${BOMB_PORT}`);
+    const c = new NetClient(wsTransport(sock));
+    const seen = new Set();
+    sock.on('message', (d) => seen.add(new DataView(toArrayBuffer(d)).getUint8(0)));
+    await new Promise((r, j) => { sock.on('open', r); sock.on('error', j); });
+    c.sendHello('st_bomb_real');
+    for (let i = 0; i < 200 && c.stats.matchStates === 0; i++) await sleep(25);
+    if (c.stats.matchStates > 0) ok(`MSG_MATCHSTATE arrives from the real entrypoint (${c.stats.matchStates} frames)`);
+    else bad('the dedicated server sends match state in Bomb mode', `types seen [${[...seen].join(',')}]`);
+    const ms = c.matchState;
+    if (ms && ['warmup', 'freeze', 'live', 'planted', 'roundEnd', 'matchEnd'].includes(ms.phase)) {
+      ok(`and its phase is a real one ("${ms.phase}", round ${ms.roundIndex})`);
+    } else {
+      bad('the match state from the real server decodes', JSON.stringify(ms));
+    }
+    if (c.rejected === null) ok('and the client was never rejected');
+    else bad('a matching client is accepted by a Bomb server', JSON.stringify(c.rejected));
+    sock.close();
+  }
+  await sleep(200);
+  bombChild.kill('SIGTERM');
+  await sleep(400);
+  bombChild.kill('SIGKILL');
+  if (/threw|Error:/.test(bombLog)) bad('the Bomb server logged no errors', bombLog.slice(-600));
+  else ok('the Bomb server logged no errors');
+}
+
+// ── a hostile SERVER, over a real socket ─────────────────────────────────────────────
+{
+  // The client half of §8.11, which no test had ever exercised over a socket: a known message
+  // type at a length this build cannot read. A 6-byte welcome used to throw a RangeError out
+  // of `NetClient._onMessage`, which the transport swallowed — no close, no reject, and the
+  // connection carried on being fed bytes neither side agreed about.
+  const { WebSocketServer } = await import('ws');
+  const { MSG_MATCHSTATE, MSG_OUTCOME } = await import('../src/net/protocol.js');
+  const EVIL_PORT = PORT + 4;
+  if (!await waitForFreePort(EVIL_PORT)) bad(`port ${EVIL_PORT} is free`, 'still held');
+
+  for (const [name, type, len] of [
+    ['a 6-byte welcome', MSG_WELCOME, 6],
+    ['a welcome between the two legal lengths', MSG_WELCOME, 18],
+    ['a truncated match state', MSG_MATCHSTATE, 40],
+    ['an over-long outcome', MSG_OUTCOME, 33],
+  ]) {
+    const evil = new WebSocketServer({ port: EVIL_PORT, perMessageDeflate: false });
+    await new Promise((r) => evil.once('listening', r));
+    evil.on('connection', (s) => {
+      const b = Buffer.alloc(len);
+      b[0] = type;
+      s.send(b, { binary: true });
+    });
+    const sock = new WebSocket(`ws://127.0.0.1:${EVIL_PORT}`);
+    let closed = false;
+    sock.on('close', () => { closed = true; });
+    // The receiver is attached BEFORE the socket opens: this server sends its hostile frame
+    // the instant the connection lands, and a handler added after `open` misses it.
+    const c = new NetClient(wsTransport(sock));
+    await new Promise((r, j) => { sock.on('open', r); sock.on('error', j); });
+    c.sendHello('st_evil');
+    for (let i = 0; i < 100 && !c.rejected; i++) await sleep(20);
+    if (c.rejected && c.stats.malformed === 1) ok(`${name} from a real server closes the client's connection`);
+    else bad(`${name} closes the connection (§8.11)`, `rejected=${JSON.stringify(c.rejected)} malformed=${c.stats.malformed}`);
+    if (c.lastMalformed?.byteLength === len) ok(`...and the client names the frame that did it (type ${c.lastMalformed.type}, ${len} bytes)`);
+    else bad('the client records which frame was malformed', JSON.stringify(c.lastMalformed));
+    try { sock.close(); } catch { /* gone */ }
+    await new Promise((r) => evil.close(r));
+    void closed;
+  }
+}
 
 console.log(failures ? `\n${failures} FAILED` : '\nthe dedicated server runs clean');
 process.exit(failures ? 1 : 0);

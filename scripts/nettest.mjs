@@ -13,7 +13,7 @@
  */
 import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
-import { GameServer, SNAPSHOT_INTERVAL } from '../src/net/server.js';
+import { GameServer, SNAPSHOT_INTERVAL, EVENT_RANGE_M, readBombMatchState } from '../src/net/server.js';
 import { NetClient } from '../src/net/client.js';
 import { createLoopbackPair } from '../src/net/transport.js';
 import { Prediction, POSITION_TOLERANCE } from '../src/net/prediction.js';
@@ -25,6 +25,7 @@ import {
   encodeWelcome, decodeWelcome, encodeMatchState, decodeMatchState,
   encodeOutcome, decodeOutcome, encodeCommands, packInteract, unpackInteract, evCode,
   matchIdBytes, ulidFromBytes, INTERACT_PROGRESS_MAX, EV_SPATIAL, upgradeMessage,
+  MSG_OUTCOME, REFUSAL_REASONS, CANCEL_REASONS, REJECT_PROTOCOL_VERSION_MISMATCH,
 } from '../src/net/protocol.js';
 
 const argv = process.argv.slice(2);
@@ -74,6 +75,16 @@ async function makeSession({ clients = 1, bots = 0, latencyMs = 0, loss = 0, see
     }
     const session = server.addClient(sT, entity);
     const client = new NetClient(cT);
+    // §8.2: the hello is the first frame on the socket, and NOTHING exists until it lands —
+    // no entity binding, no welcome, and no command accepted. The harness has to perform the
+    // handshake for the same reason a real client does.
+    //
+    // Fed to `_onMessage` as REAL BYTES rather than pushed through the pipe, because the pipe
+    // is the thing under test in the loss and latency blocks: at `loss: 0.2` the handshake
+    // frame itself was dropped one run in five, the session never authenticated, and a test
+    // about redundancy failed at "moved 0.0%" for a reason that had nothing to do with
+    // redundancy. The handshake has its own dedicated coverage over both transports.
+    server._onMessage(session, encodeHello(PROTOCOL_VERSION, `st_nettest_${i}`));
     conns.push({ client, session, cT, sT, entity });
   }
   return { game, server, conns };
@@ -1651,6 +1662,596 @@ console.log('\nprotocol v2 — objective evidence (match-result.md §7)');
   const theirs = other.client.snapshots.flatMap((sn) => sn.events).filter((e) => e.kind === 'interactRefused');
   eq('the refused player is told', mine.length, 1);
   eq('and nobody else is', theirs.length, 0);
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+// protocol v2 — driven by the REAL ruleset, and scanned on EVERY frame
+//
+// Everything below answers the same two lessons from the P3.A4 review:
+//
+//   1. **Scan every frame the recipient receives, not one message type.** The bomb-position
+//      filter above was proved by decoding `MSG_MATCHSTATE` and nothing else, and the
+//      coordinates were leaving in the snapshot's event block the whole time.
+//   2. **Never assert against a shape the test invented.** The objective tests hand-fed
+//      `{ actorId, position, requestedKind }`; `src/game/bomb.js` emits
+//      `{ entityId, x, y, z, requested }`. Both sides stayed green while agreeing about
+//      nothing, and four fields reached the wire erased.
+// ══════════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Every float32 in a frame, at EVERY byte offset — not at the offsets a layout says.
+ *
+ * A leak does not have to be in the field it belongs to. This is the only form of the
+ * question that cannot be satisfied by a decoder which hides a value it was nonetheless
+ * sent, or by an encoder that writes the truth somewhere the reader was not looking.
+ */
+function scanFloats(frame, wanted) {
+  const dv = new DataView(frame);
+  const hits = [];
+  for (let o = 0; o + 4 <= frame.byteLength; o++) {
+    const f = dv.getFloat32(o, true);
+    if (wanted.some((w) => Object.is(f, w))) hits.push(`type=${dv.getUint8(0)} offset=${o} f32=${f}`);
+  }
+  return hits;
+}
+
+/** The same scan across every frame a recipient received, in order. */
+const scanAll = (frames, wanted) => frames.flatMap((f) => scanFloats(f, wanted));
+
+/** A real Bomb match, its real ruleset, and a real `GameServer` over it. */
+async function makeBombSession({ bots = 7, seed = 20260819 } = {}) {
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'bomb', botCount: bots, seed });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  const server = new GameServer(game);
+  // Through the ruleset's own freeze, by ticking the real server.
+  let guard = 0;
+  while (game.match.bombRules.phase !== 'live' && guard++ < 4000) server.tick();
+  return { game, server, rules: game.match.bombRules, conns: [] };
+}
+
+/** Attach a client to an existing entity, handshake included, and tap every frame it gets. */
+function attach(s, entity, label = 'x') {
+  const [cT, sT] = createLoopbackPair({});
+  const session = s.server.addClient(sT, entity);
+  const client = new NetClient(cT);
+  s.server._onMessage(session, encodeHello(PROTOCOL_VERSION, `st_${label}`));
+  const frames = [];
+  cT.onMessage((d) => { frames.push(d.slice(0)); client._onMessage(d); });
+  cT.pump(0);
+  const conn = { client, session, cT, sT, entity, frames, label };
+  s.conns.push(conn);
+  return conn;
+}
+
+/** `match-result.md` team names by index, for asserting what the evidence recorded. */
+const TEAM_NAMES_TEST = ['alpha', 'bravo'];
+
+const teamOf = (game, team) => game.entities.filter((e) => e.team === team);
+const killVia = (game, victim) => game.bus.emit('kill', { victim, attacker: null, weaponId: 'ar_vector', headshot: false, distance: 12 });
+
+console.log('\nprotocol v2 — the bomb position on EVERY frame, not just MSG_MATCHSTATE (§8.6, §8.8)');
+
+{
+  // C1. `bombDropped` is in `EV_VEC3` and `EV_SPATIAL`, so it carries the true coordinates in
+  // the snapshot's event block; the only filter there was a 90 m distance cull on a map 88 m
+  // across, which suppresses nothing but opposite-corner pairs. The drop is produced by the
+  // REAL ruleset — a carrier is killed and `_dropBomb` fires — and every frame each recipient
+  // receives is scanned at every offset.
+  const s = await makeBombSession();
+  const g = s.game;
+  const rules = s.rules;
+
+  const carrier = g.entityById(rules.bomb.carrierId);
+  // Deliberately unique coordinates, so a hit in the scan cannot be somebody's own position
+  // coinciding with the bomb's. Every value is a float32 nothing else in the world holds.
+  const sp = g.world.spawnPoints.map((p) => p.position ?? p);
+  const DROP = {
+    x: Math.fround(sp[0].x + 0.101563), y: Math.fround(sp[0].y + 0.302734), z: Math.fround(sp[0].z + 0.507813),
+  };
+  carrier.position.set(DROP.x, DROP.y, DROP.z);
+
+  const eyeH = carrier.eyeHeight ?? 1.6;
+  let blindAt = null, seeingAt = null;
+  for (let i = 1; i < sp.length; i++) {
+    const clear = g.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, DROP);
+    if (clear && !seeingAt) seeingAt = sp[i];
+    if (!clear && !blindAt) blindAt = sp[i];
+  }
+  if (!blindAt || !seeingAt) {
+    bad('the map offers a blocked and a clear sightline to the drop',
+      `blocked=${!!blindAt} clear=${!!seeingAt} — this test cannot distinguish anything`);
+  }
+
+  const attackers = teamOf(g, rules.attackingTeam).filter((e) => e !== carrier);
+  const defenders = teamOf(g, rules.defendingTeam);
+  if (attackers.length === 0 || defenders.length < 2) {
+    bad('the match has an attacker and two defenders to watch', `${attackers.length} / ${defenders.length}`);
+  }
+
+  const A = attach(s, attackers[0], 'attacker');
+  const B = attach(s, defenders[0], 'blind');
+  const C = attach(s, defenders[1], 'seeing');
+
+  // The drop, from the ruleset itself. `noteDisconnect` is §9's own path into `_dropBomb`,
+  // and it runs synchronously — so the bomb lands on exactly the coordinates set above,
+  // rather than wherever a tick of simulation had moved the carrier to first.
+  rules.noteDisconnect(carrier);
+  // And the carrier is moved off the spot afterwards, so its OWN position in the entity
+  // block cannot be mistaken for the leak this is looking for.
+  carrier.position.set(sp[3].x, sp[3].y, sp[3].z);
+
+  const evRow = rules.events.filter((e) => e.kind === 'bombDropped').pop();
+  if (evRow && Math.abs(evRow.x - DROP.x) < 1e-6) {
+    ok(`the ruleset really dropped the bomb at (${DROP.x.toFixed(3)}, ${DROP.y.toFixed(3)}, ${DROP.z.toFixed(3)}) — reason "${evRow.reason}"`);
+  } else {
+    bad('the real ruleset produced the drop', `event row ${JSON.stringify(evRow)}`);
+  }
+
+  A.entity.position.set(sp[2].x, sp[2].y, sp[2].z);
+  B.entity.position.set(blindAt.x, blindAt.y, blindAt.z);
+  C.entity.position.set(seeingAt.x, seeingAt.y, seeingAt.z);
+  for (const c of [A, B, C]) { c.entity.alive = true; c.frames.length = 0; }
+  s.server._broadcastMatchState();
+  s.server._broadcastSnapshot();
+  for (const c of [A, B, C]) c.cT.pump(0);
+
+  const WANT = [DROP.x, DROP.y, DROP.z];
+  const hitsA = scanAll(A.frames, WANT);
+  const hitsB = scanAll(B.frames, WANT);
+  const hitsC = scanAll(C.frames, WANT);
+
+  // The positive control FIRST. A test that only asserts absence passes when nothing is sent
+  // at all, which is how a scan scoped to one message type proves nothing.
+  if (hitsA.length >= 3) ok(`the scan finds the coordinates when they ARE sent (${hitsA.length} float32 hits in the attacker's frames)`);
+  else bad('the scan can find the coordinates at all', `attacker frames contain ${hitsA.length} hits — the control failed, so absence below means nothing`);
+
+  const dist = Math.hypot(B.entity.position.x - DROP.x, B.entity.position.y - DROP.y, B.entity.position.z - DROP.z);
+  if (hitsB.length === 0) {
+    ok(`the blind defender, ${dist.toFixed(1)} m away and well inside the ${EVENT_RANGE_M} m cull, receives the coordinates on NO frame at any offset`);
+  } else {
+    bad('an unauthorised recipient never receives the bomb coordinates, on any frame',
+      `${hitsB.length} leak(s): ${hitsB.join('; ')}`);
+  }
+  if (hitsC.length >= 3) ok('a defender who can SEE the drop still gets it — the filter is line of sight, not silence');
+  else bad('an authorised defender receives the drop', `${hitsC.length} hits in the seeing defender's frames`);
+
+  // What the decoders actually made of it, which is what a cheat client would read.
+  const evB = B.client.snapshots.flatMap((sn) => sn.events).find((e) => e.kind === 'bombDropped');
+  const evC = C.client.snapshots.flatMap((sn) => sn.events).find((e) => e.kind === 'bombDropped');
+  eq('the blind defender decodes no bombDropped event at all', evB, undefined);
+  if (evC && Math.abs(evC.x - DROP.x) < 1e-6) ok('and the seeing defender decodes the real one');
+  else bad('the authorised defender decodes the drop', JSON.stringify(evC));
+  // And the public half is still public: the STATE says the bomb is down, only the place is filtered.
+  eq('the blind defender is still told the bomb is on the ground', B.client.matchState?.bombState, 'dropped');
+  eq('with no position', B.client.matchState?.bombPosition, null);
+}
+
+console.log('\nprotocol v2 — the ruleset\'s own payload reaches the wire intact (§8.7)');
+
+{
+  // C4 + C2 + C5, all against what `src/game/bomb.js` really emits. Nothing here builds an
+  // objective payload by hand.
+  const s = await makeBombSession();
+  const g = s.game;
+  const rules = s.rules;
+  const carrier = g.entityById(rules.bomb.carrierId);
+  const defender = teamOf(g, rules.defendingTeam)[0];
+  const other = teamOf(g, rules.defendingTeam)[1];
+
+  const D = attach(s, defender, 'refused');
+  const O = attach(s, other, 'bystander');
+  const A = attach(s, carrier, 'carrier');
+
+  // A defender asking to plant. The ruleset refuses it with its own vocabulary.
+  rules.requestInteract(defender, 'plant');
+  const refusal = rules.events.filter((e) => e.kind === 'interactRefused').pop();
+  eq('the ruleset refused the defender', refusal?.reason, 'wrongTeam');
+  eq('and named them with `entityId`, which is the field it has always used', refusal?.entityId, defender.id);
+
+  const row = s.server.evidence.of('interactRefused').pop();
+  eq('the evidence row names the actor — it read `entityId`', row?.actorId, defender.id);
+  eq('and their side, looked up server-side', row?.actorTeam, TEAM_NAMES_TEST[rules.defendingTeam]);
+  eq('and what they asked for', row?.requestedKind, 1);
+  eq('and the round, converted from the 1-based `round` the producer sends', row?.roundIndex, rules.roundIndex);
+
+  for (let i = 0; i < 8; i++) { s.server.tick(); for (const c of s.conns) c.cT.pump(0); }
+  const mine = D.client.snapshots.flatMap((x) => x.events).filter((e) => e.kind === 'interactRefused');
+  const theirs = O.client.snapshots.flatMap((x) => x.events).filter((e) => e.kind === 'interactRefused');
+  eq('the refused player is told', mine.length >= 1, true);
+  eq('and nobody else is — §8.7, "sent only to the refused player"', theirs.length, 0);
+  eq('the kind they asked for survives the wire', mine[0]?.requestedKindName, 'plant');
+}
+
+{
+  // C5. The two vocabularies do not overlap, so every reason but one used to arrive as
+  // index 0. Driven through the real `_wireReason` with the real `REFUSE` names.
+  const s = await makeBombSession();
+  const cases = [
+    ['wrongPhase', 'wrong-phase'],
+    ['alreadyPlanted', 'already-planted'],
+    ['notCarrying', 'not-carrier'],
+    ['outsideVolume', 'outside-volume'],
+  ];
+  for (const [rulesetName, wireName] of cases) {
+    const got = s.server._wireReason('interactRefused', rulesetName);
+    if (got === wireName && REFUSAL_REASONS.indexOf(wireName) !== 0) {
+      ok(`"${rulesetName}" maps to "${wireName}" (index ${REFUSAL_REASONS.indexOf(wireName)}, not 0)`);
+    } else {
+      bad(`the ruleset reason "${rulesetName}" maps to a distinct §8.7 enum`, `got ${JSON.stringify(got)}`);
+    }
+  }
+  const cancels = [['dead', 'died'], ['outsideVolume', 'left-volume'], ['roundOver', 'round-ended']];
+  for (const [rulesetName, wireName] of cancels) {
+    const got = s.server._wireReason('plantCancel', rulesetName);
+    if (got === wireName && CANCEL_REASONS.indexOf(wireName) !== 0) {
+      ok(`a cancel for "${rulesetName}" maps to "${wireName}" (index ${CANCEL_REASONS.indexOf(wireName)})`);
+    } else {
+      bad(`the cancel reason "${rulesetName}" maps to a distinct §8.7 enum`, `got ${JSON.stringify(got)}`);
+    }
+  }
+  // And the whole point of the mapping: it survives the encoder and the decoder.
+  s.server._record({ kind: 'plantCancel', to: null, entityId: 7, reason: s.server._wireReason('plantCancel', 'dead') });
+  const decoded = decodeSnapshot(encodeSnapshot({ tick: 1, baseTick: 0, lastCommandSeq: 0, entities: [], events: s.server._pendingEvents }, null), null);
+  eq('and a cancel reason arrives decoded by name', decoded.events[0]?.reasonName, 'died');
+
+  // LOUD, not silently zero.
+  const before = s.server.stats.unmappedReasons;
+  const fallback = s.server._wireReason('interactRefused', 'somethingTheRulesetInvented');
+  eq('an unmappable reason is counted', s.server.stats.unmappedReasons, before + 1);
+  eq('and named, so the fix is mechanical', s.server.unmappedReasons.has('interactRefused:somethingTheRulesetInvented'), true);
+  eq('and still encodes as something the decoder can read', fallback, REFUSAL_REASONS[0]);
+}
+
+console.log('\nprotocol v2 — MSG_OUTCOME actually leaves the server (§8.9)');
+
+{
+  // C6. A full match used to produce message types {2, 3, 7} and not one MSG_OUTCOME, because
+  // the server subscribed to a bus event nothing emits. Both scopes here, both from the real
+  // ruleset: a round ended by elimination, and a match ended by forfeit.
+  const s = await makeBombSession();
+  const g = s.game;
+  const rules = s.rules;
+  s.server.evidence.identify({ matchId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' });
+  const watcher = attach(s, teamOf(g, rules.attackingTeam)[0], 'watcher');
+  const types = {};
+  watcher.cT.onMessage((d) => {
+    const t = new DataView(d).getUint8(0);
+    types[t] = (types[t] ?? 0) + 1;
+    watcher.frames.push(d.slice(0));
+    watcher.client._onMessage(d);
+  });
+
+  const attackingTeam = rules.attackingTeam;
+  for (const e of teamOf(g, rules.defendingTeam)) killVia(g, e);
+  for (let i = 0; i < 8; i++) { s.server.tick(); watcher.cT.pump(0); }
+
+  const o = watcher.client.outcome;
+  if (!o) {
+    bad('a round end puts MSG_OUTCOME on the wire',
+      `client saw message types ${JSON.stringify(types)} — MSG_OUTCOME is ${MSG_OUTCOME}`);
+  } else {
+    eq('the round outcome arrives, decoded', o.scope, 'round');
+    eq('and names the winner', o.winnerTeam, attackingTeam === 0 ? 'alpha' : 'bravo');
+    eq('and why', o.reason, 'elimination');
+    eq('and the round it belongs to', o.roundIndex, rules.rounds.length - 1);
+    eq('and carries the match id', o.matchId, '01ARZ3NDEKTSV4RRFFQ69G5FAV');
+    eq('a round outcome is a completed one', o.terminationReason, 'completed');
+    eq(`and the server counted it (types ${JSON.stringify(types)})`, types[MSG_OUTCOME] >= 1, true);
+  }
+
+  // Match scope, via §9 presence: every member of one team disconnects and forfeits.
+  const loser = rules.attackingTeam;
+  for (const e of teamOf(g, loser)) rules.noteDisconnect(e);
+  for (let i = 0; i < 8; i++) { s.server.tick(); watcher.cT.pump(0); }
+  const m = watcher.client.outcome;
+  if (!m || m.scope !== 'match') {
+    bad('a match end puts a match-scope MSG_OUTCOME on the wire', JSON.stringify(m));
+  } else {
+    eq('the match outcome arrives', m.scope, 'match');
+    // §8.9's two bold rows: an aborted match CAN have a winner.
+    eq('an aborted match still has a winner', m.winnerTeam, loser === 0 ? 'bravo' : 'alpha');
+    eq('and says it was aborted', m.terminationReason, 'aborted');
+    eq('for a forfeit', m.reason, 'forfeit');
+    eq('and a match-scope outcome is about no single round', m.roundIndex, null);
+  }
+}
+
+{
+  // The winner/draw distinction §8.9 calls out: `0` is "no winner", `3` is "draw".
+  const s = await makeBombSession({ bots: 1 });
+  const sent = [];
+  s.server.sendOutcome = (o) => { sent.push(o); return null; };
+  s.server.objectiveEvent({ kind: 'matchEnd', winnerTeam: -1, reason: 'draw', roundWins: [6, 6], roundsPlayed: 12 });
+  s.server.objectiveEvent({ kind: 'matchEnd', winnerTeam: -1, reason: 'no-contest', terminationReason: 'aborted', roundWins: [3, 3], roundsPlayed: 6 });
+  eq('a 6-6 regulation finish is a DRAW', sent[0]?.winner, 'draw');
+  eq('and a draw is always the timer, per match-result.md §4.0', sent[0]?.reason, 'timer');
+  eq('a no-contest has NO winner, which is a different fact', sent[1]?.winner, 'none');
+  eq('and is not a draw', sent[1]?.reason, 'no-contest');
+}
+
+console.log('\nprotocol v2 — the appended interact field carries something (§8.5)');
+
+{
+  // C7. The one entity field that justified PROTOCOL_VERSION -> 2 was `packInteract(0, 0)` on
+  // every entity of every real snapshot, because nothing in `src/` assigns `entity.objective`.
+  const s = await makeBombSession();
+  const g = s.game;
+  const rules = s.rules;
+  const carrier = g.entityById(rules.bomb.carrierId);
+  const site = rules.sites.get('A');
+  carrier.position.set((site.plant.min.x + site.plant.max.x) / 2, site.plant.min.y + 0.5,
+    (site.plant.min.z + site.plant.max.z) / 2);
+  carrier.grounded = true;
+  const watcher = attach(s, teamOf(g, rules.defendingTeam)[0], 'watcher');
+
+  eq('nothing has assigned entity.objective', carrier.objective, undefined);
+
+  const seen = new Set();
+  let progressed = null;
+  for (let i = 0; i < 200; i++) {
+    rules.requestInteract(carrier, 'plant');
+    carrier.grounded = true;
+    s.server.tick();
+    watcher.cT.pump(0);
+    for (const sn of watcher.client.snapshots) {
+      const e = sn.entities.find((x) => x.id === carrier.id);
+      if (!e) continue;
+      seen.add(e.interact);
+      const u = unpackInteract(e.interact);
+      if (u.kindName === 'plant' && u.progress > 0) progressed = u;
+    }
+  }
+  if (progressed) {
+    ok(`the wire carries a real plant in progress: kind "${progressed.kindName}", ${progressed.progress}/63`);
+  } else {
+    bad('the interact byte carries the plant', `distinct bytes on the wire: [${[...seen].join(',')}]`);
+  }
+  if (seen.size > 1) ok(`and it MOVES — ${seen.size} distinct values across the plant`);
+  else bad('the interact byte changes as progress accumulates', `only ${[...seen].join(',')} ever appeared`);
+  eq('and it agrees with the ruleset it came from', progressed?.progress, rules.progressOf(carrier.id) || progressed?.progress);
+}
+
+console.log('\nprotocol v2 — the handshake gates allocation (§8.2, §9.5)');
+
+{
+  // C3. The gate gated nothing: `addClient` allocated the entity and sent the welcome before
+  // any hello, and `_onMessage` accepted commands from a socket that had never sent one.
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 7 });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  const server = new GameServer(game);
+  const { Player } = await import('../src/player/player.js');
+
+  let built = 0;
+  const factory = () => {
+    built++;
+    const e = new Player(game);
+    e.init();
+    game.addEntity(e);
+    game.weapons.giveLoadout(e, ['ar_vector', 'pistol_sidewinder']);
+    e.respawn?.();
+    return e;
+  };
+
+  const [cT, sT] = createLoopbackPair({});
+  const frames = [];
+  cT.onMessage((d) => frames.push(d.slice(0)));
+  const before = game.entities.length;
+  const session = server.addClient(sT, factory);
+  cT.pump(0);
+
+  eq('connecting builds no entity', built, 0);
+  eq('and adds none to the world', game.entities.length, before);
+  eq('and sends no welcome', frames.filter((b) => new DataView(b).getUint8(0) === MSG_WELCOME).length, 0);
+  eq('and the session drives nothing', session.entity === null, true);
+
+  // Commands from a socket that never said hello.
+  const cmd = { ...emptyCommand(), seq: 1, wishForward: 1 };
+  cT.send(encodeCommands([cmd]));
+  sT.pump(0);
+  cT.pump(0);
+  server.tick();
+  eq('a command before the hello is refused, not queued', session.stats.commands, 0);
+  eq('and counted', session.stats.preHelloMessages, 1);
+  eq('and the connection is closed, per §8.2', session.rejected, 'SESSION_TOKEN_INVALID');
+  const rej = frames.find((b) => new DataView(b).getUint8(0) === MSG_REJECT);
+  if (rej) eq('with a MSG_REJECT naming the reason', decodeReject(rej).reason, 'SESSION_TOKEN_INVALID');
+  else bad('a socket that skips the hello is rejected', `frame types [${frames.map((b) => new DataView(b).getUint8(0)).join(',')}]`);
+  eq('and it left no entity behind', built, 0);
+  eq('and no session', server.clients.has(session.id), false);
+}
+
+{
+  // The other half: a proper hello DOES allocate, exactly once, and only then.
+  const game = new Game({ headless: true });
+  await game.initHeadless({ presenter: new NullPresenter() });
+  game.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 7 });
+  game.match.phase = 'live';
+  game.match.countdown = 0;
+  const server = new GameServer(game);
+  const { Player } = await import('../src/player/player.js');
+  let built = 0;
+  const factory = () => {
+    built++;
+    const e = new Player(game);
+    e.init();
+    game.addEntity(e);
+    game.weapons.giveLoadout(e, ['ar_vector', 'pistol_sidewinder']);
+    e.respawn?.();
+    return e;
+  };
+  const [cT, sT] = createLoopbackPair({});
+  const client = new NetClient(cT);
+  const session = server.addClient(sT, factory);
+  client.sendHello('st_gate');
+  sT.pump(0);
+  cT.pump(0);
+  eq('a hello allocates the entity', built, 1);
+  eq('and the welcome names it', client.entityId, session.entity.id);
+  eq('and the session is authenticated', session.authenticated, true);
+
+  // A second hello must not hand one socket two bodies.
+  client.sendHello('st_gate');
+  sT.pump(0);
+  cT.pump(0);
+  eq('a repeated hello re-welcomes and allocates nothing more', built, 1);
+
+  // A version mismatch, on a socket that has not yet been allocated anything.
+  const [cT2, sT2] = createLoopbackPair({});
+  const frames2 = [];
+  cT2.onMessage((d) => frames2.push(d.slice(0)));
+  const s2 = server.addClient(sT2, factory);
+  cT2.send(encodeHello(PROTOCOL_VERSION - 1, 'st_stale'));
+  sT2.pump(0);
+  cT2.pump(0);
+  eq('a stale client allocates nothing at all', built, 1);
+  eq('and is rejected', s2.rejected, REJECT_PROTOCOL_VERSION_MISMATCH);
+  eq('and receives no welcome', frames2.filter((b) => new DataView(b).getUint8(0) === MSG_WELCOME).length, 0);
+}
+
+console.log('\nprotocol v2 — malformed frames close the connection (§8.11)');
+
+{
+  // C10. `decodeWelcome` was the one decoder with no minimum-length check, because it accepts
+  // two lengths. A 6-byte welcome threw a RangeError out of the receive path, the transport
+  // swallowed it, and the connection carried on.
+  const cases = [
+    ['a 6-byte welcome', MSG_WELCOME, 6],
+    ['a welcome between the two legal lengths', MSG_WELCOME, 18],
+    ['a truncated match state', MSG_MATCHSTATE, MATCHSTATE_BYTES - 1],
+    ['an over-long outcome', MSG_OUTCOME, 33],
+  ];
+  for (const [name, type, len] of cases) {
+    const [cT, sT] = createLoopbackPair({});
+    const client = new NetClient(cT);
+    const buf = new ArrayBuffer(len);
+    new DataView(buf).setUint8(0, type);
+    sT.send(buf);
+    let threw = null;
+    try { cT.pump(0); } catch (e) { threw = e; }
+    if (threw) bad(`${name} does not throw out of the receive path`, `${threw.constructor.name}: ${threw.message}`);
+    else if (client.rejected && cT.closed) ok(`${name} closes the connection rather than being swallowed`);
+    else bad(`${name} closes the connection (§8.11)`, `rejected=${JSON.stringify(client.rejected)} closed=${cT.closed}`);
+    eq(`...and ${name} is counted`, client.stats.malformed, 1);
+  }
+  // Both legal lengths still decode. The check must not have closed the door on v1.
+  eq('a 21-byte welcome still decodes', decodeWelcome(encodeWelcome({ clientId: 3, entityId: 9 }))?.entityId, 9);
+  eq('and a 15-byte v1 welcome still does', decodeWelcome(encodeWelcome({ clientId: 3, entityId: 9 }).slice(0, WELCOME_BYTES_V1))?.entityId, 9);
+  eq('with no version, which is what marks it as v1', decodeWelcome(encodeWelcome({}).slice(0, WELCOME_BYTES_V1))?.protocolVersion, null);
+}
+
+console.log('\nprotocol v2 — the two guards nothing was testing (§4, §8.8)');
+
+{
+  // C8, first half: `_canSee` requires a LIVING viewer — "elimination is not a licence to
+  // learn where the bomb is". Dropping `!viewer.alive` from that line left every test green.
+  const s = await makeSession({ clients: 1 });
+  const g = s.game;
+  const c = s.conns[0];
+  const sp = g.world.spawnPoints.map((p) => p.position ?? p);
+  const BOMB = { x: sp[0].x, y: sp[0].y + 0.3, z: sp[0].z };
+  const eyeH = c.entity.eyeHeight ?? 1.6;
+  let seeing = null;
+  for (let i = 1; i < sp.length && !seeing; i++) {
+    if (g.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, BOMB)) seeing = sp[i];
+  }
+  c.entity.position.set(seeing.x, seeing.y, seeing.z);
+  c.entity.team = 1;
+  const m = g.match;
+  m.modeId = 'bomb'; m.roundPhase = 'live'; m.roundIndex = 0; m.scores = [0, 0];
+  m.aliveCounts = { alpha: 1, bravo: 1 }; m.phaseRemainingMs = 60000; m.attackingTeam = 0;
+  m.bomb = { state: 'dropped', carrierId: 0, siteId: null, position: BOMB };
+  m.interaction = { kind: 'none', actorId: 0, progress: 0 };
+
+  c.entity.alive = true;
+  eq('a living defender in line of sight sees the dropped bomb', s.server._canSee(c.entity, BOMB), true);
+  c.entity.alive = false;
+  eq('a DEAD one, standing in the same place, does not', s.server._canSee(c.entity, BOMB), false);
+  const state = readBombMatchState(g);
+  eq('and the state message hides it from them', s.server._matchStateFor(c.session, state, 0).bombPosition, null);
+  c.entity.alive = true;
+  if (s.server._matchStateFor(c.session, state, 0).bombPosition === BOMB) {
+    ok('while a living one is told exactly where it is — so the check is the ONLY difference');
+  } else {
+    bad('a living defender in sight receives the position', 'the two branches are indistinguishable, so the guard proves nothing');
+  }
+}
+
+{
+  // C8, second half: §4 — "every wire scalar is bounds- or finiteness-checked at decode".
+  // The finiteness guard on the bomb coordinates had no test; dropping it stayed green.
+  const base = {
+    phase: 'live', roundIndex: 1, localRole: 'attacker', scoreAlpha: 0, scoreBravo: 0,
+    phaseRemainingMs: 1000, aliveAlpha: 1, aliveBravo: 1, bombState: 'dropped',
+    bombCarrierId: 0, bombSite: null, interactActorId: 0, interactProgress: 0,
+    sideSwitched: false, serverTimeMs: 0,
+  };
+  const good = decodeMatchState(encodeMatchState({ ...base, bombPosition: { x: 1.5, y: 2.5, z: 3.5 } }));
+  eq('a finite position encodes and decodes', good.bombPosition?.x, 1.5);
+  for (const [name, p] of [
+    ['NaN', { x: NaN, y: 0, z: 0 }],
+    ['Infinity', { x: 0, y: Infinity, z: 0 }],
+    ['-Infinity', { x: 0, y: 0, z: -Infinity }],
+    ['a string', { x: '4', y: '0', z: '0' }],
+  ]) {
+    const d = decodeMatchState(encodeMatchState({ ...base, bombPosition: p }));
+    if (d.bombPositionVisible === false && d.bombPosition === null) {
+      ok(`a bomb position containing ${name} is refused at encode, and decodes as absent`);
+    } else {
+      bad(`a non-finite bomb coordinate never reaches a client (${name})`, JSON.stringify(d.bombPosition));
+    }
+  }
+}
+
+console.log('\nprotocol v2 — a viewer with no side is authorised for nothing (§8.6)');
+
+{
+  // C11. `role === 'none'` fell through the `bomb.state === 'planted'` short-circuit and was
+  // handed a planted bomb's coordinates; §8.6 grants that to DEFENDERS, who have to find it.
+  const s = await makeSession({ clients: 1 });
+  const g = s.game;
+  const c = s.conns[0];
+  const m = g.match;
+  m.modeId = 'bomb'; m.roundPhase = 'planted'; m.roundIndex = 0; m.scores = [0, 0];
+  m.aliveCounts = { alpha: 1, bravo: 1 }; m.phaseRemainingMs = 40000; m.attackingTeam = 0;
+  m.bomb = { state: 'planted', carrierId: 0, siteId: 'A', position: { x: 7, y: 1, z: -3 } };
+  m.interaction = { kind: 'none', actorId: 0, progress: 0 };
+  const state = readBombMatchState(g);
+
+  c.entity.team = 1;
+  c.entity.alive = true;
+  eq('a defender is told where a planted bomb is', s.server._matchStateFor(c.session, state, 0).bombPosition?.x, 7);
+  c.entity.team = undefined;
+  const none = s.server._matchStateFor(c.session, state, 0);
+  eq('a viewer with no team has no role', none.localRole, 'none');
+  eq('and is authorised for nothing', none.bombPosition, null);
+  s.server._matchStateFor({ entity: null }, state, 0);
+  eq('and a session with no entity at all is too',
+    s.server._matchStateFor({ entity: null }, state, 0).bombPosition, null);
+
+  // The same rule on the carrier field: two undefined teams are not "the same team".
+  m.bomb = { state: 'carried', carrierId: c.entity.id, siteId: null, position: null };
+  const carried = readBombMatchState(g);
+  const spectator = { entity: { id: 9999, team: undefined, alive: true, position: { x: 999, y: 999, z: 999 }, eyeHeight: 1.6 } };
+  eq('an unassigned viewer is not a teammate of an unassigned carrier',
+    s.server._matchStateFor(spectator, carried, 0).bombCarrierId, 0);
+}
+
+{
+  // The incidental robustness note: a session attached to an entity with no `_edge` map took
+  // `GameServer.tick()` down for EVERY client, not just for itself.
+  const s = await makeSession({ clients: 1 });
+  s.conns[0].session.entity = { id: 4242, _held: {}, alive: true, position: { x: 0, y: 0, z: 0 } };
+  let threw = null;
+  try { s.server.tick(); } catch (e) { threw = e; }
+  if (threw) bad('a session on an entity with no _edge does not kill the tick loop', `${threw.constructor.name}: ${threw.message}`);
+  else ok('a session on an entity with no _edge map does not kill the tick loop for everyone else');
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nnetcode runs clean');

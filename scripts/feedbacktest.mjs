@@ -172,6 +172,11 @@ console.log('\ncombat feedback reaches the client');
   const shooter = game.player;
   const session = server.addClient(sT, shooter);
   const client = new NetClient(cT);
+  // §8.2: the hello is the first frame on the socket, and the server binds no entity and
+  // accepts no command until it lands.
+  client.sendHello('st_harness');
+  sT.pump(0);
+  cT.pump(0);
 
   const received = [];
   client.onSnapshot((s) => { for (const e of s.events || []) received.push(e); });
@@ -379,6 +384,10 @@ console.log('\ncombat feedback reaches the client');
   const [cT, sT] = createLoopbackPair({ latencyMs: 0, loss: 0 });
   server.addClient(sT, sg.player);
   const session = new MultiplayerSession(cg, cT);
+  // §8.2 — nothing is bound or sent until the client says hello.
+  session.net.sendHello('st_harness');
+  sT.pump(0);
+  cT.pump(0);
   let ms = 0;
   for (let i = 0; i < 30; i++) { sT.pump(ms); server.tick(); cT.pump(ms); ms += FIXED_DT * 1000; }
 
@@ -443,6 +452,9 @@ console.log('\ncombat feedback reaches the client');
   const [cT, sT] = createLoopbackPair({ latencyMs: 0, loss: 0 });
   server.addClient(sT, sg.player);
   const s2 = new MultiplayerSession(cg, cT);
+  s2.net.sendHello('st_harness');
+  sT.pump(0);
+  cT.pump(0);
   s2.connected = true; cg.net = s2;
   s2.sendLoadout();
   let ms2 = 0;
@@ -614,6 +626,9 @@ console.log('\ncombat feedback reaches the client');
   const [cT, sT] = createLoopbackPair({ latencyMs: 0, loss: 0 });
   server.addClient(sT, game.player);
   const session = new MultiplayerSession(cgame, cT);
+  session.net.sendHello('st_harness');
+  sT.pump(0);
+  cT.pump(0);
 
   let ms = 0;
   const step = (n) => {

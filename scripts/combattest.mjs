@@ -112,6 +112,11 @@ async function headlessCase() {
   const shooter = game.player;
   const session = server.addClient(sT, shooter);
   const client = new NetClient(cT);
+  // §8.2: the hello is the first frame on the socket, and the server binds no entity and
+  // accepts no command until it lands.
+  client.sendHello('st_harness');
+  sT.pump(0);
+  cT.pump(0);
 
   // The victim: a second Player, on the OTHER team so friendly fire cannot mask a hit.
   const target = new Player(game);

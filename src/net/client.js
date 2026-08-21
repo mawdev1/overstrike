@@ -15,7 +15,7 @@ import {
   MSG_SNAPSHOT, MSG_WELCOME, MSG_REJECT, MSG_MATCHSTATE, MSG_OUTCOME,
   encodeCommands, decodeSnapshot, quantiseCommand, encodeHello, decodeWelcome, decodeReject,
   decodeMatchState, decodeOutcome, PROTOCOL_VERSION, upgradeMessage,
-  REJECT_PROTOCOL_VERSION_MISMATCH,
+  REJECT_PROTOCOL_VERSION_MISMATCH, WELCOME_BYTES_V1, WELCOME_BYTES_V2,
 } from './protocol.js';
 
 /**
@@ -51,7 +51,13 @@ export class NetClient {
     /** Wall clock when `latestTick` arrived, so render time can advance between snapshots. */
     this.latestAtMs = 0;
 
-    this.stats = { sent: 0, snapshots: 0, acked: 0, discarded: 0, matchStates: 0, outcomes: 0 };
+    this.stats = {
+      sent: 0, snapshots: 0, acked: 0, discarded: 0, matchStates: 0, outcomes: 0,
+      /** Known-type frames refused for their length (§8.11). Each one closes the socket. */
+      malformed: 0,
+    };
+    /** `{ type, byteLength }` of the frame that closed this connection, or null. */
+    this.lastMalformed = null;
     this._onSnapshot = null;
     this._onWelcome = null;
     this._onMatchState = null;
@@ -126,6 +132,20 @@ export class NetClient {
     return this.rejected;
   }
 
+  /**
+   * A known message type arrived at a length this build cannot read (§8.11).
+   *
+   * Terminal, and deliberately the same terminal path a `MSG_REJECT` takes: a peer that has
+   * put a frame of the wrong size on the wire is a peer we no longer agree with about what a
+   * byte means, and there is no recovery from that mid-stream. Counted as well as closed, so
+   * a harness can prove which frame did it rather than inferring it from a dead socket.
+   */
+  _malformed(type, byteLength) {
+    this.stats.malformed++;
+    this.lastMalformed = { type, byteLength };
+    return this._reject(REJECT_PROTOCOL_VERSION_MISMATCH, this.serverVersion);
+  }
+
   _onMessage(data) {
     if (this.rejected) return;
     if (data.byteLength < 1) return;
@@ -139,8 +159,27 @@ export class NetClient {
     }
 
     if (type === MSG_WELCOME) {
+      // **The length is checked HERE, before the decoder is handed the buffer.**
+      //
+      // `decodeWelcome` is the one decoder in `protocol.js` with no length check, because it
+      // legitimately accepts two lengths (15 for v1, 21 for v2) and a single `!==` would have
+      // been wrong — so nothing went in at all. It reads `getUint32(5)` unconditionally, so a
+      // 6-byte welcome threw a `RangeError` straight out of this method; `WebSocketTransport`
+      // catches and logs whatever the handler throws, so the frame produced no close, no
+      // reject, and a connection that carried on being fed bytes neither side agreed about.
+      // §8.11 is explicit: known type, wrong length → connection closed.
+      //
+      // The check lives in the caller rather than in the decoder because moving it into
+      // `protocol.js` would edit the file `lanecheck` watches and force `PROTOCOL_VERSION` to
+      // 3 — and not one byte of the format has changed, so a bump would refuse every peer
+      // this build agrees with perfectly. `NetClient` is the only caller that is ever handed
+      // an attacker-controlled buffer.
+      if (data.byteLength !== WELCOME_BYTES_V1 && data.byteLength !== WELCOME_BYTES_V2) {
+        this._malformed(MSG_WELCOME, data.byteLength);
+        return;
+      }
       const w = decodeWelcome(data);
-      if (!w) return;
+      if (!w) { this._malformed(MSG_WELCOME, data.byteLength); return; }
       // The version gate, on the client's side of the handshake. A server that predates §8.4
       // sends 15 bytes and no version at all — which is not "unknown, carry on", it is a v1
       // server, and v1 cannot describe the fields this build now reads.
@@ -162,7 +201,8 @@ export class NetClient {
 
     if (type === MSG_MATCHSTATE) {
       const s = decodeMatchState(data);
-      if (!s) return;                        // wrong length: a desynced frame, not state
+      // Wrong length: a desynced frame, not state. §8.11 closes the connection.
+      if (!s) { this._malformed(MSG_MATCHSTATE, data.byteLength); return; }
       this.matchState = s;
       this.stats.matchStates++;
       this._onMatchState?.(s);
@@ -171,7 +211,7 @@ export class NetClient {
 
     if (type === MSG_OUTCOME) {
       const o = decodeOutcome(data);
-      if (!o) return;
+      if (!o) { this._malformed(MSG_OUTCOME, data.byteLength); return; }
       this.outcome = o;
       this.stats.outcomes++;
       this._onOutcome?.(o);

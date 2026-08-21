@@ -22,8 +22,9 @@ import { FIXED_DT, PITCH_LIMIT } from '../core/mathUtils.js';
 import {
   MSG_COMMANDS, MSG_LOADOUT, MSG_HELLO, decodeCommands, decodeLoadout, encodeSnapshot,
   entityToWire, EV_SPATIAL, PROTOCOL_VERSION, decodeHello, encodeReject, encodeWelcome,
-  encodeMatchState, encodeOutcome, MATCHSTATE_BYTES, INTERACT_PROGRESS_MAX,
-  REJECT_PROTOCOL_VERSION_MISMATCH, BOMB_STATES, PHASES,
+  encodeMatchState, encodeOutcome, MATCHSTATE_BYTES, INTERACT_PROGRESS_MAX, packInteract,
+  REJECT_PROTOCOL_VERSION_MISMATCH, REJECT_SESSION_TOKEN_INVALID, BOMB_STATES, PHASES,
+  INTERACT_KINDS, CANCEL_REASONS, REFUSAL_REASONS, OUTCOME_REASONS,
 } from './protocol.js';
 import { LagCompensation } from './lagcomp.js';
 import { INTERP_DELAY_MS } from './client.js';
@@ -47,7 +48,7 @@ const MAX_PENDING_EVENTS = 256;
  * Set above the client's own VFX range so audio, which culls itself and matters most for
  * shots you CANNOT see, still arrives.
  */
-const EVENT_RANGE_M = 90;
+export const EVENT_RANGE_M = 90;
 const EVENT_RANGE_SQ = EVENT_RANGE_M * EVENT_RANGE_M;
 
 /**
@@ -121,10 +122,26 @@ const MATCHSTATE_HEARTBEAT_TICKS = 120;
 const TEAM_NAMES = ['alpha', 'bravo'];
 
 class ClientSession {
-  constructor(id, transport, entity) {
+  constructor(id, transport, entity = null) {
     this.id = id;
     this.transport = transport;
+    /**
+     * The entity this connection drives — **null until `MSG_HELLO` has been accepted**.
+     *
+     * §8.2 step 4: "No entity exists before step 4. An unauthenticated socket can never cause
+     * allocation." It could: `addClient` allocated and welcomed before any hello, and
+     * `_onMessage` then accepted commands from a socket that had never said one, so the whole
+     * gate was optional. Everything the server SENDS is gated on `authenticated` for the same
+     * reason — a socket that has not identified itself must not be fed the world.
+     */
     this.entity = entity;
+    /**
+     * What `_allocateEntity` will bind on a successful hello: an entity, or a factory that
+     * makes one. Held rather than used, so it costs nothing until the handshake earns it.
+     */
+    this.pendingEntity = null;
+    /** True once a well-formed, version-matched hello has been answered with a welcome. */
+    this.authenticated = false;
     this.queue = [];
     /**
      * Smoothed round trip, in ms. Drives how far lag compensation rewinds.
@@ -178,6 +195,8 @@ class ClientSession {
     this.stats = {
       commands: 0, duplicates: 0, dropped: 0, snapshots: 0, resyncs: 0, backlogTrimmed: 0,
       matchStates: 0, outcomes: 0, rejectedMessages: 0,
+      /** Frames that arrived before a hello. Each one closes the connection (§8.2). */
+      preHelloMessages: 0,
     };
   }
 }
@@ -291,11 +310,26 @@ export class GameServer {
     this.lag = new LagCompensation(game);
     /** The authoritative objective record. See `ObjectiveEvidence`. */
     this.evidence = new ObjectiveEvidence();
+    /**
+     * Server-side counters for the things that must never be silent.
+     *
+     * `unmappedReasons` and `refusalsWithoutTarget` are both "the producer said something this
+     * layer cannot faithfully put on the wire". Encoding index 0 and moving on is what let a
+     * `wrongTeam` refusal arrive as `not-eligible` in a fully green suite.
+     */
+    this.stats = { outcomes: 0, unmappedReasons: 0, refusalsWithoutTarget: 0 };
+    /** The distinct `kind:reason` pairs that had no §8.7 enum. Named, so a fix is mechanical. */
+    this.unmappedReasons = new Set();
+    /** The planter or defuser who decided the current round — `MSG_OUTCOME.actorId` (§8.9). */
+    this._lastObjectiveActor = 0;
 
     // The Bomb ruleset (`src/game/match.js`) announces every objective fact on the bus, and
     // this is the ONE place it becomes both a wire event and an evidence row — see
     // `objectiveEvent`. One ingestion point, so the two can never describe different rounds.
     game.bus?.on('objective', (p) => this.objectiveEvent(p));
+    // Kept as a direct entry point for anything that already knows the §8.9 shape. It is NOT
+    // where outcomes come from today — nothing in `src/` emits `outcome`, which is why relying
+    // on it alone meant a whole match produced zero `MSG_OUTCOME`. See `_outcomeFromObjective`.
     game.bus?.on('outcome', (p) => this.sendOutcome(p));
 
     // `Player.respawn` re-gives the DEFAULT loadout, so a client's chosen guns would
@@ -354,22 +388,44 @@ export class GameServer {
   }
 
   /**
-   * Attach a client.
+   * Attach a socket. **This does not create an entity and does not send a welcome.**
    *
-   * `entity` is the Player this connection drives. The first client takes `game.player`
-   * because a Game always builds one and several systems expect it to exist; later
-   * clients get their own, registered through `game.addEntity`. That asymmetry is a wart
-   * — on a server nobody should be "the" player — and it is contained entirely here.
+   * §8.2 is an ordered list and step 4 — "create or rebind the entity, send `MSG_WELCOME`" —
+   * comes after the version check. It did not: `addClient` allocated the entity, welcomed it,
+   * and `_onMessage` accepted `MSG_COMMANDS` from a socket that had never said hello. Measured
+   * against the code as it stood: entity allocated, welcome sent, 120 commands consumed, the
+   * entity walked 4.11 m, and `session.rejected` was still null. The version check was correct
+   * whenever a hello arrived; sending one was optional, which is the same as having no gate.
+   *
+   * @param {object} transport the socket
+   * @param {object|Function} entity the Player this connection will drive, or a factory
+   *   called with the session when the handshake succeeds. A factory is what an internet-facing
+   *   listener should pass: then not one object exists for a socket that never identifies
+   *   itself, which is what §8.2's "an unauthenticated socket can never cause allocation" asks
+   *   for. An already-built entity is accepted for in-process harnesses, and is still not
+   *   BOUND — nothing is sent to it and no command from it is applied — until the hello lands.
    */
-  addClient(transport, entity) {
+  addClient(transport, entity = null) {
     const id = this._nextClientId++;
-    const session = new ClientSession(id, transport, entity);
+    const session = new ClientSession(id, transport, null);
+    session.pendingEntity = entity;
     this.clients.set(id, session);
-
     transport.onMessage((data) => this._onMessage(session, data));
-
-    this._sendWelcome(session);
     return session;
+  }
+
+  /**
+   * §8.2 step 4, and the only place an entity is bound to a connection.
+   *
+   * Returns null if there is nothing to bind, which is a refusal rather than a silent
+   * session with no body: a session whose entity is null would receive snapshots of a world
+   * it is not in.
+   */
+  _allocateEntity(session) {
+    const pending = session.pendingEntity;
+    session.pendingEntity = null;
+    if (!pending) return null;
+    return typeof pending === 'function' ? (pending(session) ?? null) : pending;
   }
 
   /**
@@ -429,9 +485,9 @@ export class GameServer {
    * disagrees about the layout cannot be trusted to have encoded the ticket where we read it.
    *
    * Step 2 of §8.2 — validating the ticket — is G2 and is not implemented here; the ticket is
-   * stored unread. Steps 3 and 4 (session replacement, entity creation) are G2/G4 and still
-   * happen in `addClient` today. What lands with v2 is step 1, which is the step that has to
-   * exist before any of the others can be trusted.
+   * stored unread. Step 3 (session replacement) is G2. Step 4 — creating the entity and
+   * welcoming — happens HERE now, after the version check, which is the ordering the section
+   * states; it used to happen in `addClient` before a single byte had been read.
    */
   _onHello(session, data) {
     const hello = decodeHello(data);
@@ -443,14 +499,29 @@ export class GameServer {
       return;
     }
     session.ticket = hello.ticket;
-    // Re-welcome, so a client that connected before saying hello still learns the negotiated
-    // version from a frame it can trust rather than from one it decoded on faith.
+    // A second hello on an established session re-welcomes and nothing more. Allocating again
+    // would give one socket two entities, which is a way to be in two places at once.
+    if (!session.authenticated) {
+      const entity = this._allocateEntity(session);
+      if (!entity) { this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID); return; }
+      session.entity = entity;
+      session.authenticated = true;
+    }
     this._sendWelcome(session);
   }
 
-  /** Re-welcome everyone, so they adopt the new match's seed. */
+  /**
+   * Re-welcome everyone, so they adopt the new match's seed.
+   *
+   * Authenticated sessions only: an unauthenticated one has no entity to name, and telling a
+   * socket that has not identified itself which entity it drives would be answering a question
+   * it has not asked.
+   */
   broadcastWelcome() {
-    for (const session of this.clients.values()) this._sendWelcome(session);
+    for (const session of this.clients.values()) {
+      if (session.rejected || !session.authenticated) continue;
+      this._sendWelcome(session);
+    }
   }
 
   removeClient(session) {
@@ -468,6 +539,15 @@ export class GameServer {
     const v = new DataView(data);
     const type = v.getUint8(0);
     if (type === MSG_HELLO) { this._onHello(session, data); return; }
+    // §8.2: `MSG_HELLO` is **the first frame on the socket. Anything else before it closes the
+    // connection.** Not "is ignored" — an unauthenticated peer that is allowed to keep talking
+    // is an unauthenticated peer, and §8.11's "unknown type is ignored" is about a KNOWN
+    // handshake carrying a type this build does not have, which is a different situation.
+    if (!session.authenticated) {
+      session.stats.preHelloMessages++;
+      this.rejectClient(session, REJECT_SESSION_TOKEN_INVALID);
+      return;
+    }
     if (type === MSG_LOADOUT) { this._applyLoadout(session, data); return; }
     // §8.11: an unknown type is ignored, not fatal. Additive message types must not break an
     // older peer mid-match — that is what version negotiation is for, at the handshake.
@@ -560,9 +640,23 @@ export class GameServer {
    *
    * `kind` is one of the eleven §8.7 names. `progress` is 0..1. `reason` may be an index or one
    * of the `CANCEL_REASONS` / `REFUSAL_REASONS` names.
+   *
+   * **`normaliseObjective` exists because the producer does not speak that shape.** `bomb.js`
+   * `_emit` puts `{ kind, tick, round, entityId, reason, site, x, y, z, requested }` on the bus
+   * and this method read `{ actorId, actorTeam, position, roundIndex, requestedKind, to }` —
+   * six fields, none of which the producer sets. There was no adapter, `game.bus.on('objective')`
+   * subscribed this straight through, and the two shapes had never met: measured on the real
+   * emission, the evidence row's `actorId` came back `null` and a `bombDropped` at (-4, 0, 35)
+   * reached the authorised attacker as `x:0 y:0 z:0` — the REQ-CC-030 "(0,0,0) is a valid world
+   * position" failure, re-introduced on the event path. The tests hand-fed the shape the TEST
+   * invented, so both sides stayed green while agreeing about nothing.
    */
-  objectiveEvent(p) {
+  objectiveEvent(raw) {
+    const p = normaliseObjective(raw, this);
     const kind = p?.kind;
+    // Round and match ends arrive on this same bus and are not §8.7 event kinds — they are
+    // `MSG_OUTCOME` (§8.9). See `_outcomeFromObjective`.
+    if (kind === 'roundEnd' || kind === 'matchEnd') return this._outcomeFromObjective(p, raw);
     if (!kind || !EV_BOMB_KINDS.has(kind)) return null;
     const g = this.game;
     const m = g.match;
@@ -579,16 +673,38 @@ export class GameServer {
       actorId: p.actorId,
       actorTeam: p.actorTeam,
       site: p.site ?? null,
+      // Unfiltered, and in the producer's own words: `reason` is recorded before the wire
+      // mapping below, because evidence is the truth and the wire is a projection of it.
       position: p.position ?? null,
       reason: p.reason ?? null,
       requestedKind: p.requestedKind ?? null,
       progress: progress63,
     });
 
+    // Latched for `MSG_OUTCOME.actorId` (§8.9: "planter, defuser, or 0"). The ruleset's round
+    // record names a clutch player, not the actor who decided the round, so the completion
+    // event is the only place that fact exists.
+    if (kind === 'plantComplete' || kind === 'defuseComplete') {
+      this._lastObjectiveActor = (p.actorId ?? 0) >>> 0;
+    }
+
     // A refusal is a private fact about one player's input — §8.7: sent only to the refused
     // player. Broadcasting it would tell the whole server who is standing on a site trying to
     // plant, which is the information the objective volumes exist to make people fight over.
-    const to = kind === 'interactRefused' ? (p.to ?? p.actorId ?? null) : null;
+    //
+    // `p.actorId` is `undefined` on the producer's shape unless `normaliseObjective` has read
+    // `entityId`, which is exactly why this used to broadcast: `p.to ?? p.actorId ?? null`
+    // collapsed to null and null means everyone. A refusal with no known recipient is DROPPED
+    // rather than broadcast — there is no such thing as a public refusal.
+    let to = null;
+    if (kind === 'interactRefused') {
+      to = p.to ?? p.actorId ?? null;
+      if (!to) {
+        this.stats.refusalsWithoutTarget++;
+        warnOnce(`objective: interactRefused with no actor — dropped rather than broadcast`);
+        return row;
+      }
+    }
     const pos = p.position;
     this._record({
       kind,
@@ -596,11 +712,87 @@ export class GameServer {
       entityId: (p.actorId ?? 0) >>> 0,
       victimId: (p.victimId ?? 0) >>> 0,
       amount: p.amount ?? 0,
-      reason: p.reason ?? null,
+      reason: this._wireReason(kind, p.reason),
       requestedKind: p.requestedKind ?? null,
       x: pos?.x ?? 0, y: pos?.y ?? 0, z: pos?.z ?? 0,
     });
     return row;
+  }
+
+  /**
+   * A ruleset reason, translated into the enum the wire actually carries (§8.7).
+   *
+   * The two vocabularies do not overlap. `bomb.js` `REFUSE` declares eleven camelCase names
+   * "on the wire"; `CANCEL_REASONS` and `REFUSAL_REASONS` are the §8.7 kebab-case tables, and
+   * only `released` appears in both. `reasonIndex` falls back to 0 for anything it does not
+   * recognise, so — measured — a `wrongTeam` refusal arrived at the client as `not-eligible`,
+   * a `carrierDeath` drop as `released`, and every distinction the enum exists to draw was
+   * flattened into whichever name happens to sit at index 0.
+   *
+   * An unmappable reason is LOUD: counted and warned. Silently encoding 0 is what produced a
+   * green suite over a wire that said the wrong thing about every refusal in the game.
+   */
+  _wireReason(kind, reason) {
+    if (reason == null) return null;
+    const table = kind === 'interactRefused' ? REFUSAL_REASONS
+      : (kind === 'plantCancel' || kind === 'defuseCancel') ? CANCEL_REASONS
+        : null;
+    if (!table) return reason;
+    if (typeof reason === 'number') return reason;
+    // Already a §8.7 name: pass it through untouched.
+    if (table.indexOf(reason) >= 0) return reason;
+    const mapped = kind === 'interactRefused'
+      ? RULESET_REFUSAL_REASON[reason]
+      : RULESET_CANCEL_REASON[reason];
+    if (mapped !== undefined) return mapped;
+    this.stats.unmappedReasons++;
+    this.unmappedReasons.add(`${kind}:${reason}`);
+    warnOnce(`objective: ruleset reason "${reason}" on ${kind} maps to no §8.7 enum — sent as `
+      + `"${table[0]}". Add it to RULESET_${kind === 'interactRefused' ? 'REFUSAL' : 'CANCEL'}_REASON.`);
+    return table[0];
+  }
+
+  /**
+   * `MSG_OUTCOME` (§8.9), built from the round and match ends the ruleset already announces.
+   *
+   * `GameServer` subscribed `game.bus.on('outcome')` and **nothing in `src/` has ever emitted
+   * `outcome`** — verified by grep, and measured: a full Bomb match produced 7200 snapshots,
+   * 2247 match states and not one `MSG_OUTCOME`, so `net-facade.md`'s `roundEnded`/`matchEnded`
+   * could not be delivered at all. That is the exact gap REQ-CC-012 added the message to close,
+   * and the codec was correct the whole time — the message simply never left the server.
+   *
+   * Sourced from the `objective` bus rather than from a new emitter in another lane's file, and
+   * rather than from polling the ruleset's phase: `bomb.js` `_endRound` and `_endMatch` already
+   * publish a complete record (`{ winnerTeam, reason, roundWins, roundsPlayed, ... }`) as the
+   * LAST step of their own ordered sequence, which is precisely the moment §8.9 says to send —
+   * "immediately before the corresponding `MSG_MATCHSTATE` phase change". A phase poll would
+   * fire on the next tick's broadcast instead, i.e. after it. Nothing new is asked of `match.js`
+   * or `bomb.js`; this reads what they already say.
+   */
+  _outcomeFromObjective(p, raw) {
+    const match = raw?.scope === 'match' || p.kind === 'matchEnd';
+    const rules = this.game.match?.bombRules ?? null;
+    const winnerTeam = raw?.winnerTeam;
+    const reasonSrc = raw?.outcomeReason ?? raw?.reason ?? null;
+    const scores = raw?.roundWins ?? rules?.roundWins ?? [0, 0];
+    const outcome = {
+      scope: match ? 'match' : 'round',
+      // Match scope is not about one round, and §8.9 spells that as 255, not as round 0.
+      roundIndex: match ? null : ((raw?.round ?? rules?.roundNumber ?? 1) - 1),
+      winner: outcomeWinner(winnerTeam, reasonSrc),
+      reason: outcomeReason(reasonSrc),
+      terminationReason: raw?.terminationReason ?? 'completed',
+      scoreAlpha: scores[0] ?? 0,
+      scoreBravo: scores[1] ?? 0,
+      roundsPlayed: raw?.roundsPlayed ?? rules?.rounds?.length ?? 0,
+      // The planter or defuser, per §8.9. Latched from the completion event that decided the
+      // round, because the ruleset's round record names a clutch player and not an actor.
+      actorId: match ? 0 : (this._lastObjectiveActor ?? 0),
+      matchId: this.evidence.matchId,
+    };
+    this.sendOutcome(outcome);
+    if (!match) this._lastObjectiveActor = 0;
+    return outcome;
   }
 
   /**
@@ -614,10 +806,11 @@ export class GameServer {
     if (!o) return null;
     const buf = encodeOutcome(o);
     for (const session of this.clients.values()) {
-      if (session.rejected) continue;
+      if (session.rejected || !session.authenticated) continue;
       session.transport.send(buf);
       session.stats.outcomes++;
     }
+    this.stats.outcomes++;
     this.evidence.record({
       kind: o.scope === 'match' ? 'matchOutcome' : 'roundOutcome',
       tick: this.game.tick,
@@ -651,7 +844,7 @@ export class GameServer {
     const serverTimeMs = this.serverTimeMs();
 
     for (const session of this.clients.values()) {
-      if (session.rejected) continue;
+      if (session.rejected || !session.authenticated) continue;
       const buf = encodeMatchState(this._matchStateFor(session, state, serverTimeMs));
       session.matchStateAge++;
       if (session.lastMatchState
@@ -677,10 +870,15 @@ export class GameServer {
     const role = roleOf(viewer, state.attackingTeam);
 
     // §8.8 — the carrier. Teammates always; enemies only under line of sight.
+    //
+    // `carrier.team === viewer.team` is TRUE when both are `undefined`, so a viewer with no
+    // team — a spectator, or an entity that has not been assigned one — read as a teammate of
+    // an unassigned carrier and was handed the id. Both sides must name a real side.
     let carrierId = 0;
     if (bomb.carrierId) {
       const carrier = this._entityById(bomb.carrierId);
-      const sameTeam = carrier && viewer && carrier.team === viewer.team;
+      const sameTeam = !!carrier && !!viewer
+        && carrier.team != null && viewer.team != null && carrier.team === viewer.team;
       if (sameTeam || (carrier && this._canSee(viewer, carrier.position))) carrierId = bomb.carrierId;
     }
 
@@ -688,15 +886,7 @@ export class GameServer {
     //   1. is the position a thing that exists?   no -> hidden (a carried bomb has none)
     //   2. is this recipient authorised for it?   no -> hidden
     //   3. otherwise                                  -> the real coordinates
-    let position = null;
-    if (bomb.position && (bomb.state === 'dropped' || bomb.state === 'planted')) {
-      const authorised = role === 'attacker'
-        // A planted bomb's position is public: the defenders have to find it to defuse it.
-        || bomb.state === 'planted'
-        // A dropped one is intel, so a defender earns it by seeing it.
-        || this._canSee(viewer, bomb.position);
-      if (authorised) position = bomb.position;
-    }
+    const position = this._bombPositionAuthorised(viewer, bomb, role) ? bomb.position : null;
 
     return {
       phase: state.phase,
@@ -716,6 +906,28 @@ export class GameServer {
       serverTimeMs,
       bombPosition: position,
     };
+  }
+
+  /**
+   * §8.6 step 2 / §8.8 — may this viewer learn where the bomb is?
+   *
+   * ONE predicate, used by both `MSG_MATCHSTATE` and the `bombDropped` event, because two
+   * copies of an authorisation rule is how one of them ends up wrong. It was: the state
+   * message filtered correctly and the event path had no filter at all.
+   *
+   * A viewer whose role is `none` — no entity, no team, a spectator — is authorised for
+   * nothing. The old test short-circuited on `bomb.state === 'planted'` BEFORE looking at the
+   * role, so `role: 'none'` was handed a planted bomb's coordinates; the contract grants that
+   * to defenders, who have to find it to defuse it, not to everybody who is not an attacker.
+   */
+  _bombPositionAuthorised(viewer, bomb, role) {
+    if (!bomb?.position) return false;
+    if (bomb.state !== 'dropped' && bomb.state !== 'planted') return false;
+    if (role === 'attacker') return true;
+    if (role !== 'defender') return false;
+    // A planted bomb's position is public to the side that must defuse it. A dropped one is
+    // intel, so a defender earns it by seeing it.
+    return bomb.state === 'planted' || this._canSee(viewer, bomb.position);
   }
 
   _entityById(id) {
@@ -738,6 +950,42 @@ export class GameServer {
     return world.losClear(_eye, point);
   }
 
+  /**
+   * What this entity is planting or defusing, and how far through — the appended `interact`
+   * entity field (§8.5), which is the one field that justified `PROTOCOL_VERSION` → 2.
+   *
+   * **Nothing in `src/` has ever assigned `entity.objective`.** `entityToWire` read it, a
+   * comment described it, and the codec was proved against hand-built entities that set it —
+   * so on every real snapshot ever sent the byte was `packInteract(0, 0)`. Measured over 400
+   * ticks of a live Bomb match: exactly one distinct value on the wire, `0`.
+   *
+   * Read from the ruleset here because that is where the truth is (progress accumulates on the
+   * server at the fixed step, §8.5), and `e.objective` is still preferred when it exists so the
+   * producer can take this over — at which point `entityToWire` packs it and this returns null.
+   *
+   * **What `src/game/bomb.js` must assign for this to come from the producer:** on every entity
+   * with progress, `entity.objective = { kind: 'plant' | 'defuse', progress }` with `progress`
+   * a 0..1 fraction, cleared to `null` the moment the progress is cancelled or completed —
+   * exactly the wording already in `wire-protocol.md` §8.5 and in `entityToWire`'s comment.
+   * Until it does, this reads `bombRules.progressFraction(id)` and derives the kind, which is
+   * public ruleset API but cannot tell a plant from a defuse for a second simultaneous actor;
+   * `interaction` only ever names one.
+   */
+  _objectiveFor(e) {
+    if (e?.objective) return e.objective;
+    const rules = this.game.match?.bombRules;
+    if (!rules?.progressFraction || !e) return null;
+    const progress = rules.progressFraction(e.id);
+    if (!(progress > 0)) return null;
+    const inter = rules.interaction;
+    // The named actor's kind is authoritative. For anyone else — two defenders on one bomb —
+    // the side decides it: only attackers plant and only defenders defuse (§6, §7).
+    const kind = inter && inter.actorId === e.id && inter.kind !== 'none'
+      ? inter.kind
+      : (e.team === rules.attackingTeam ? 'plant' : 'defuse');
+    return { kind, progress };
+  }
+
   /** Buffer one feedback event for the next snapshot, respecting the cap. */
   _record(ev) {
     if (this._pendingEvents.length < MAX_PENDING_EVENTS) {
@@ -753,6 +1001,8 @@ export class GameServer {
   /** Advance the simulation one fixed step, consuming at most one command per client. */
   tick() {
     for (const session of this.clients.values()) {
+      // An unauthenticated socket drives nothing. It has no entity to drive.
+      if (!session.authenticated) continue;
       const cmd = session.queue.shift();
       if (!cmd) {
         // Nothing arrived for this tick. Apply the last command's HELD state again rather
@@ -901,6 +1151,12 @@ export class GameServer {
       ? this.lag.viewTickFor(this.game.tick, session.rttMs, INTERP_DELAY_MS)
       : null;
     // `_held` is left exactly as the last command set it, which is the point.
+    //
+    // Guarded: `Object.keys(undefined)` throws, and this runs inside `tick()` for EVERY
+    // client, so one session attached to an entity without an `_edge` map — a bot, a stand-in,
+    // anything that is not a `Player` — took the tick loop down for the whole server, not just
+    // for itself.
+    if (!e._edge) return;
     for (const k of Object.keys(e._edge)) e._edge[k] = false;
     e._edge.slot = -1;
     e._edge.wheel = 0;
@@ -913,17 +1169,58 @@ export class GameServer {
     for (let i = 0; i < ents.length; i++) {
       const e = ents[i];
       const lo = g.weapons?.getLoadout?.(e);
-      wire.push(entityToWire(e, lo ? Math.max(0, lo.index) : 0));
+      const w = entityToWire(e, lo ? Math.max(0, lo.index) : 0);
+      // §8.5's `interact` byte, packed HERE rather than inside `entityToWire`.
+      //
+      // `entityToWire` reads `e.objective`, which nothing in `src/` has ever assigned — so the
+      // one entity field that justified `PROTOCOL_VERSION` → 2 was `packInteract(0, 0)` on
+      // every entity of every real snapshot ever sent. Overwritten rather than fixed at the
+      // source because the fix belongs in `protocol.js`, and editing that file forces a
+      // version bump for a format that has not changed by one byte. `_objectiveFor` returns
+      // null unless there is real progress, so `entityToWire`'s value stands untouched
+      // whenever the producer does start setting `e.objective`.
+      const obj = this._objectiveFor(e);
+      if (obj) {
+        w.interact = packInteract(obj.kind, Math.round((obj.progress ?? 0) * INTERACT_PROGRESS_MAX));
+      }
+      wire.push(w);
     }
 
+    // The unfiltered bomb, read once per snapshot rather than once per recipient.
+    const bomb = readBombMatchState(g);
+
     for (const session of this.clients.values()) {
+      if (session.rejected || !session.authenticated) continue;
       // Route: an event with no `to` is everyone's (a gunshot, a kill); an event with one
       // belongs to exactly one client. Showing somebody else's hitmarker is worse than
       // showing none, so this filter is the whole point of recording `to` at all.
       const mine = session.entity?.id;
       const at = session.entity?.position;
+      const role = bomb ? roleOf(session.entity, bomb.attackingTeam) : 'none';
       const events = this._pendingEvents.filter((ev) => {
         if (ev.to != null) return ev.to === mine;        // private: routing decides it
+        // §8.8, on the EVENT path. `bombDropped` is in `EV_VEC3` and `EV_SPATIAL`, so it
+        // carries the true coordinates in the snapshot's event block — and the only filter
+        // there was the 90 m distance cull, on a map 88 m across. Measured: a blind defender
+        // 23.1 m away was correctly told `visible:false, null` in `MSG_MATCHSTATE` and then
+        // handed the exact coordinates twelve bytes at a time in the very next frame, which
+        // its own `NetClient` decoded into `bombDropped x=-8 y=0.3 z=34`. §8.8: "Sending the
+        // true carrier to everyone and hiding it in the UI would be a wallhack shipped in the
+        // protocol." The same authorisation the state message applies, applied here.
+        //
+        // The event is DROPPED for an unauthorised recipient rather than zeroed: (0,0,0) is a
+        // valid world position (REQ-CC-030), and §8.6 says the position is state — a client
+        // that never sees this event still learns `bombState: 'dropped'` from `MSG_MATCHSTATE`
+        // and the coordinates the moment it is authorised for them.
+        //
+        // Authorised against the EVENT's own point and the state it describes, not against
+        // where the bomb is now: by the time this snapshot goes out, up to four ticks later,
+        // it may already have been picked back up, and the fact being disclosed is still the
+        // place it was lying in.
+        if (EV_BOMB_POSITION_KINDS.has(ev.kind)) {
+          const at3 = { x: ev.x, y: ev.y, z: ev.z };
+          if (!this._bombPositionAuthorised(session.entity, { state: 'dropped', position: at3 }, role)) return false;
+        }
         if (!at || !EV_SPATIAL.has(ev.kind)) return true;
         const dx = ev.x - at.x;
         const dy = ev.y - at.y;
@@ -972,6 +1269,128 @@ export class GameServer {
 
 /** Scratch eye position. `losClear` reads x/y/z, so a plain object is enough and allocates none. */
 const _eye = { x: 0, y: 0, z: 0, set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; } };
+
+/**
+ * The producer's payload, in the shape this layer reads.
+ *
+ * One place, so the two vocabularies meet exactly once. Every field accepts BOTH spellings:
+ * the `bomb.js` one (`entityId`, `requested`, loose `x/y/z`, `round`) and the §8.7 one
+ * (`actorId`, `requestedKind`, `position`, `roundIndex`). A ruleset that changes shape breaks
+ * here, loudly and in one function, instead of silently zeroing four fields at the far end.
+ */
+function normaliseObjective(p, server) {
+  if (!p || typeof p !== 'object') return null;
+  const actorId = p.actorId ?? p.entityId ?? null;
+  const position = p.position
+    ?? (Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z)
+      ? { x: p.x, y: p.y, z: p.z } : null);
+  // `round` is 1-based (`bomb.js` `roundNumber`); `roundIndex` is 0-based. Mixing them puts
+  // every objective fact in the round after the one it happened in.
+  const roundIndex = p.roundIndex ?? (typeof p.round === 'number' ? p.round - 1 : null);
+  const requested = p.requestedKind ?? p.requested ?? null;
+  const requestedKind = requested == null ? null
+    : (typeof requested === 'number' ? requested : Math.max(0, INTERACT_KINDS.indexOf(requested)));
+  // The side is a server-side fact about the actor, so it is looked up rather than trusted:
+  // the producer does not send it, and `null` in the evidence is a row a review cannot use.
+  const actorTeam = p.actorTeam ?? (actorId ? (server?._entityById(actorId)?.team ?? null) : null);
+  return {
+    ...p,
+    kind: p.kind,
+    actorId: actorId == null || actorId < 0 ? null : actorId,
+    actorTeam,
+    position,
+    roundIndex,
+    requestedKind,
+    to: p.to ?? null,
+  };
+}
+
+/**
+ * `bomb.js` `REFUSE` names → `REFUSAL_REASONS` (§8.7). Only `released` overlaps by accident,
+ * and it is a CANCEL reason, not a refusal — so without this table every refusal but one
+ * arrived as index 0.
+ */
+const RULESET_REFUSAL_REASON = Object.freeze({
+  wrongPhase: 'wrong-phase',
+  roundOver: 'wrong-phase',
+  // A defuse asked for while nothing is planted is a phase fact, not an eligibility one.
+  notPlanted: 'wrong-phase',
+  alreadyPlanted: 'already-planted',
+  notCarrying: 'not-carrier',
+  outsideVolume: 'outside-volume',
+  // Inside the volume but airborne: the player is not eligible, they are not outside it.
+  notGrounded: 'not-eligible',
+  wrongTeam: 'not-eligible',
+  dead: 'not-eligible',
+  disconnected: 'not-eligible',
+  released: 'not-eligible',
+});
+
+/** `bomb.js` `REFUSE` names → `CANCEL_REASONS` (§8.7), for `plantCancel` / `defuseCancel`. */
+const RULESET_CANCEL_REASON = Object.freeze({
+  released: 'released',
+  outsideVolume: 'left-volume',
+  notGrounded: 'left-volume',
+  dead: 'died',
+  disconnected: 'died',
+  roundOver: 'round-ended',
+  wrongPhase: 'round-ended',
+  alreadyPlanted: 'round-ended',
+  notPlanted: 'round-ended',
+  notCarrying: 'round-ended',
+  wrongTeam: 'round-ended',
+});
+
+/** `bomb.js` round/match reasons → `OUTCOME_REASONS` (§8.9). */
+const RULESET_OUTCOME_REASON = Object.freeze({
+  elimination: 'elimination',
+  defuse: 'defuse',
+  detonation: 'detonation',
+  timer: 'timer',
+  time: 'timer',
+  // §2.1a: a 6-6 regulation finish. `match-result.md` §4.0 — a draw REQUIRES `timer`, and
+  // only `timer`, so this mapping is not a convenience.
+  draw: 'timer',
+  // Reaching `roundsToWin` ends the series early: the loser can no longer reach it. A
+  // completed match with a winner must be one of elimination/defuse/detonation/timer.
+  roundsToWin: 'elimination',
+  forfeit: 'forfeit',
+  abandon: 'abandon',
+  'no-contest': 'no-contest',
+});
+
+const outcomeReason = (r) => RULESET_OUTCOME_REASON[r] ?? (OUTCOME_REASONS.includes(r) ? r : 'no-contest');
+
+/**
+ * §8.9: **`winner: 0` is "no winner", not "draw"** — a no-contest has neither, and a 6-6
+ * finish is a genuine draw. `bomb.js` spells both as `winnerTeam: -1`, so the reason is what
+ * separates them.
+ */
+function outcomeWinner(winnerTeam, reason) {
+  if (winnerTeam === 0) return 'alpha';
+  if (winnerTeam === 1) return 'bravo';
+  if (reason === 'draw') return 'draw';
+  return 'none';
+}
+
+/** Said once per distinct message. A per-tick warning would be its own denial of service. */
+const _warned = new Set();
+function warnOnce(message) {
+  if (_warned.has(message)) return;
+  _warned.add(message);
+  console.warn(`[net] ${message}`);
+}
+
+/**
+ * Event kinds whose vec3 IS the bomb's position, and which are therefore subject to the §8.8
+ * authorisation filter rather than to the distance cull alone.
+ *
+ * Keyed on the KIND rather than on a flag set at record time: a flag can be forgotten by a
+ * future caller of `_record`, and forgetting it is a wallhack. `bombDetonated` is deliberately
+ * absent — a bomb that has just gone off is not intel, and its site is public the moment it is
+ * planted (§8.6).
+ */
+const EV_BOMB_POSITION_KINDS = new Set(['bombDropped']);
 
 /** The eleven §8.7 kinds this server will accept from the ruleset. Anything else is dropped. */
 const EV_BOMB_KINDS = new Set([
