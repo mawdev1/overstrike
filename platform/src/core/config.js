@@ -106,8 +106,25 @@ export function loadConfig(source = process.env) {
   if (out.identityProvider === 'supabase' && (!out.supabaseAuthUrl || !out.supabaseServiceRoleKey)) {
     problems.push('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for the Supabase identity provider');
   }
-  if (out.env === 'production' && out.mailTransport !== 'resend') {
-    problems.push('PLATFORM_MAIL_TRANSPORT=resend is required in production');
+  // RELAXED DELIBERATELY, on the human owner's instruction, 2026-08-21.
+  //
+  // This required `resend` in production, so the platform refused to boot without a Resend API
+  // key. That is a defensible rule — a production account system that cannot email its users
+  // cannot verify an address or recover an account — and it is being relaxed with that cost
+  // stated rather than forgotten:
+  //
+  //   with `none`, onboarding step 5 asks for a code nothing will ever send, and account
+  //   recovery has no delivery path. Signup still completes: verification does not gate it.
+  //
+  // What is NOT relaxed is the pairing below. `resend` without a key or a from-address still
+  // fails at boot, because a transport that is configured and cannot send is worse than one
+  // that is honestly disabled — it reports success to every caller and delivers nothing.
+  // `modules/mail` refuses `log` in production for its own reason: it prints tokens, and a
+  // verification token IS the credential.
+  //
+  // Restore this line the moment a key exists. The guard was right; the credential was missing.
+  if (out.env === 'production' && !['resend', 'none'].includes(out.mailTransport)) {
+    problems.push("PLATFORM_MAIL_TRANSPORT must be 'resend' or 'none' in production");
   }
   if (out.mailTransport === 'resend' && (!out.mailFrom || !out.mailApiKey)) {
     problems.push('PLATFORM_MAIL_FROM and PLATFORM_MAIL_API_KEY are required for the Resend mail transport');

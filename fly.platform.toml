@@ -30,7 +30,11 @@ primary_region = "yyz"        # ca-central-1 per docs/decisions/P0-decisions.md 
   PLATFORM_PORT = "8080"
   PLATFORM_LOG_LEVEL = "info"
   PLATFORM_IDENTITY_PROVIDER = "supabase"
-  PLATFORM_MAIL_TRANSPORT = "resend"
+  # "none" until a Resend key exists — config.js records exactly what that costs (no
+  # verification mail, no recovery delivery; signup still completes). Turning it back on is a
+  # one-secret change: set PLATFORM_MAIL_API_KEY and PLATFORM_MAIL_FROM, then flip this to
+  # "resend". The pairing guard still refuses "resend" without those two.
+  PLATFORM_MAIL_TRANSPORT = "none"
   PLATFORM_MAIL_API_URL = "https://api.resend.com/emails"
   PLATFORM_PUBLIC_BASE_URL = "https://overstrike.fly.dev"
   PLATFORM_LOBBY_PUBLIC_URL = "wss://overstrike.fly.dev"
