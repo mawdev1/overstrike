@@ -54,6 +54,14 @@ try {
   page.on('pageerror', (e) => bad('page error', e.message));
 
   await page.goto(url, { waitUntil: 'load', timeout: 90000 });
+  // The production shell no longer constructs the game at boot — a signed-out visitor
+  // lands on the welcome screen and `__GAME__` only exists after entering the runtime.
+  // Enter local practice the same way `mapperf.mjs` does; the harness then stop()s the
+  // loop and drives `_fixedUpdate` itself, so which match it entered is irrelevant.
+  await page.waitForFunction(() => window.__OVERSTRIKE_SHELL__?.enterGame, null, { timeout: 90000 });
+  await page.evaluate(() => window.__OVERSTRIKE_SHELL__.enterGame({
+    localPractice: true, matchId: 'determinism-local', mode: 'tdm', seed: 1,
+  }));
   await page.waitForFunction(() => window.__GAME__ && window.__BOOTPROF__?.menu > 0, null, { timeout: 180000 });
 
   /**
@@ -181,7 +189,10 @@ try {
     const inp = g.input;
     inp.enabled = true;
     inp.actions.add('forward');
-    inp.buttons[0] = true;               // hold fire
+    // Since the mouse-rebind work, `input.fire` resolves through the ACTION set (the
+    // real mousedown handler does `actions.add(actionFor(mouseCode(b)))`); writing the
+    // raw `buttons[]` array no longer reaches the sim.
+    inp.actions.add('fire');             // hold fire
     const DT = 1 / 120;
     const startPos = g.player.position.clone();
     let ammoAfter100 = null;
@@ -227,8 +238,8 @@ try {
 
     const inp = g.input;
     inp.enabled = true;
-    // `firePressed` is the EDGE (`buttonsPressed[0]`, set by the real mousedown handler
-    // and cleared by `Input.endFrame()`), not the held state (`buttons[0]`) — the
+    // `firePressed` is the EDGE (`pressed.add('fire')`, set by the real mousedown handler
+    // and cleared by `Input.endFrame()`), not the held state (`actions`) — the
     // feature is "press fire after this to cut the wait short", not "hold it". Fire
     // one press at tick 200 (past the 1.5s/180-tick eligible window) and leave it —
     // this harness never calls `endFrame()`, so it stays "pressed" from then on, which
@@ -237,7 +248,7 @@ try {
     let sawFirePressedTrue = false;
     for (let i = 0; i < 600; i++) {   // 5s ceiling — well past the 4s no-skip timer
       g.frame++;   // this test is about tick ORDERING, not frame-freezing — see above
-      if (i === 200) inp.buttonsPressed[0] = true;
+      if (i === 200) inp.pressed.add('fire');
       g._fixedUpdate(DT);
       if (g.player._firePressedThisFrame) sawFirePressedTrue = true;
       if (g.player.alive) { ticksToRespawn = i; break; }
@@ -300,7 +311,10 @@ try {
     g.stop();
     g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 13 });
     g.match.phase = 'live'; g.match.countdown = 0;
-    g._accum = g._accum + (1 / 120) * 0.5;             // force a real fractional mid-tick position
+    // Force a real fractional mid-tick position. Set, don't add: entering the shell's
+    // practice runtime leaves a residual `_accum` from the live loop `stop()` cut short,
+    // and adding to it can land past one full tick, where the clamp reads 1.
+    g._accum = (1 / 120) * 0.5;
     const playingAlpha = g.accumAlpha;                 // should reflect that fraction, not be pinned
     g.paused = true;
     const pausedAlpha = g.accumAlpha;
@@ -340,7 +354,7 @@ try {
     // Hold the aim button and confirm the player's view of ADS tracks the weapon's.
     // Long enough to cover the initial weapon-switch, which gates ADS until it finishes;
     // this is asserting that aim-in completes, not how fast.
-    inp.buttons[2] = true;
+    inp.actions.add('aim');    // `input.aim` reads the action set, not raw `buttons[]`
     let agreeing = true;
     for (let i = 0; i < 240; i++) {
       g.frame++;
@@ -354,7 +368,7 @@ try {
     p.die({ attacker: null });
     for (let i = 0; i < 120; i++) { g.frame++; g._fixedUpdate(DT); }
     const afterDeath = p.adsAmount;
-    inp.buttons[2] = false;
+    inp.actions.delete('aim');
 
     return { hasOwn, hasHandshake, agreeing, aimedIn, afterDeath };
   });
@@ -389,11 +403,11 @@ try {
     const inp = g.input;
     inp.enabled = true;
     inp.actions.add('forward');
-    inp.buttons[0] = true;
+    inp.actions.add('fire');
     // Exercise the entity first: fields are only present once something has assigned
     // them, so auditing a freshly constructed player would miss anything lazily added.
     for (let i = 0; i < 300; i++) { g.frame++; g._fixedUpdate(DT); }
-    inp.buttons[0] = false;
+    inp.actions.delete('fire');
 
     const playerAudit = PLAYER_SNAPSHOT.audit(p);
     const weaponAudit = WEAPON_SNAPSHOT.audit(p.weapon);
@@ -703,13 +717,13 @@ try {
       if (t >= 60 && t < 90) a.add('back');
       if (t > 140 && t < 190) { a.add('forward'); a.add('sprint'); }
       if (t > 200 && t < 240) a.add('right');
-      inp.buttons[0] = (t > 15 && t < 45) || (t > 250 && t < 270);
+      if ((t > 15 && t < 45) || (t > 250 && t < 270)) a.add('fire');
       // Edges live in `input.pressed`, which `wasPressed()` reads; there is no
       // `actionsPressed`, so an earlier version of this script silently never jumped.
       inp.pressed.clear();
       if (t === 30 || t === 120 || t === 210) inp.pressed.add('jump');
       if (t === 95 || t === 195 || t === 175) inp.pressed.add('crouch');
-      if (t === 80) inp.buttonsPressed[1] = true;               // melee
+      if (t === 80) inp.pressed.add('melee');
       if (t === 110) g.weapons.throwGrenade?.(p);
       if (t === 150) g.weapons.switchTo(p, 1);                  // holster -> raise
       if (t === 230) g.weapons.switchTo(p, 0);
@@ -733,7 +747,6 @@ try {
         g._fixedUpdate(DT);
         out.push({ p: PLAYER_SNAPSHOT.save(p, {}), lo: saveLoadout(lo, {}) });
       }
-      inp.buttons[0] = false;
       inp.actions.clear();
       return out;
     };
