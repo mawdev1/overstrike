@@ -96,14 +96,29 @@ begin
   -- ── The assertion, which is the point of the file ──────────────────────────────────────
   -- Names the offending tables rather than reporting a count, so the failure tells whoever
   -- reads it what to add.
-  select string_agg(tablename, ', ' order by tablename) into missing
-    from pg_tables
-   where schemaname = 'public'
-     and tablename <> 'audit_log'
-     and not (has_table_privilege(app_role, quote_ident(tablename), 'SELECT')
-          and has_table_privilege(app_role, quote_ident(tablename), 'INSERT')
-          and has_table_privilege(app_role, quote_ident(tablename), 'UPDATE')
-          and has_table_privilege(app_role, quote_ident(tablename), 'DELETE'));
+  -- SCHEMA-QUALIFIED, and filtered in a subquery that is materialised before the privilege
+  -- calls run.
+  --
+  -- Written as one flat query with `where schemaname = 'public' and not has_table_privilege(...)`
+  -- this fails on a fresh database with `relation "sql_features" does not exist`. Nothing is
+  -- wrong with the filter; SQL simply does not promise that a WHERE conjunct is evaluated before
+  -- its neighbours, so the planner is free to call has_table_privilege on an information_schema
+  -- row first. An unqualified name is then resolved against search_path, where it is not
+  -- visible, and the function raises rather than returning false.
+  --
+  -- Production happened to plan it the other way and passed, which is the worst version of this
+  -- bug: green where it ran, broken on every new environment. `offset 0` is an optimisation
+  -- fence that stops the outer predicate being pulled into the subquery, and the qualified name
+  -- means resolution never depends on search_path at all.
+  select string_agg(name, ', ' order by name) into missing
+    from (select tablename as name, 'public.' || quote_ident(tablename) as ref
+            from pg_tables
+           where schemaname = 'public' and tablename <> 'audit_log'
+           offset 0) t
+   where not (has_table_privilege(app_role, ref, 'SELECT')
+          and has_table_privilege(app_role, ref, 'INSERT')
+          and has_table_privilege(app_role, ref, 'UPDATE')
+          and has_table_privilege(app_role, ref, 'DELETE'));
   if missing is not null then
     raise exception
       'migrate 0026: % cannot fully use these tables: %. A migration added them without a '
@@ -114,14 +129,14 @@ begin
   -- that quietly widens it.
   select string_agg(priv, ', ') into missing
     from unnest(array['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) as priv
-   where has_table_privilege(app_role, 'audit_log', priv);
+   where has_table_privilege(app_role, 'public.audit_log', priv);
   if missing is not null then
     raise exception 'migrate 0026: % now holds % on audit_log; it must stay append-only',
       app_role, missing;
   end if;
 
-  if not has_table_privilege(app_role, 'audit_log', 'INSERT')
-     or not has_table_privilege(app_role, 'audit_log', 'SELECT') then
+  if not has_table_privilege(app_role, 'public.audit_log', 'INSERT')
+     or not has_table_privilege(app_role, 'public.audit_log', 'SELECT') then
     raise exception 'migrate 0026: % cannot insert into or read audit_log', app_role;
   end if;
 end;

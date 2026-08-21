@@ -192,6 +192,76 @@ try {
     'allocator quarantines an unreachable fresh registry row and retries the healthy regional authority');
   faultOwner.ws.close(); faultPeer.ws.close();
 
+  console.log('\n--- an allocation nobody ever claimed is reclaimed ---');
+  {
+    /**
+     * Found in production: one test launch whose clients never connected held the region's only
+     * game server at 12/12 forever, and every later room creation was refused with "No healthy
+     * match capacity is available in iad". The server answers `allocated` with the right matchId
+     * on every poll, so `healthMisses` resets and the existing reaper — which only handles
+     * ENDED, MOVED ON and UNREACHABLE — never fires.
+     *
+     * The deadline is shortened for THIS SECTION ONLY and restored in `finally`. It cannot be a
+     * constructor argument: the sweep is a single loop over every match in the process, so a
+     * globally shortened value reaps the matches the other sections depend on — which is exactly
+     * what happened when it was first written that way.
+     */
+    const restore = app.deps.lobby.tunables.unclaimedMatchMs;
+    app.deps.lobby.tunables.unclaimedMatchMs = 1_000;
+    try {
+      const users = await Promise.all([onboard(70), onboard(71)]);
+      const created = await call('POST', '/v1/rooms', { name: 'Unclaimed', region: 'iad',
+        mapId: 'the-square', mode: 'tdm', capacity: 2, settings: { requiredReady: 2, minPlayers: 2 } },
+      users[0].token, { 'idempotency-key': `unclaimed:${ulid()}` });
+      const ownerPeer = lobbySocket(created.body); await ownerPeer.opened;
+      await ownerPeer.wait((frame) => frame.t === 'lobby.welcome');
+      const joined = await call('POST', `/v1/rooms/${created.body.room.roomId}/join`, {}, users[1].token,
+        { 'idempotency-key': `unclaimed-join:${ulid()}` });
+      const otherPeer = lobbySocket(joined.body); await otherPeer.opened;
+      await otherPeer.wait((frame) => frame.t === 'lobby.welcome');
+      for (const peer of [ownerPeer, otherPeer]) {
+        const c = peer.send('ready.set', { ready: true });
+        await peer.wait((frame) => frame.t === 'ready.changed' && frame.correlationId === c);
+      }
+      const launch = ownerPeer.send('launch.request', {});
+      await ownerPeer.wait((frame) => frame.t === 'match.ready' && frame.correlationId === launch, 12_000);
+
+      const roomId = created.body.room.roomId;
+      const heldRow = await app.deps.store.matchServers.byId(serverId);
+      check(heldRow.inUse > 0 && [...app.deps.lobby.matches.values()].some((m) => m.roomId === roomId),
+        'control: the allocation holds the server seat once match.ready is delivered',
+        JSON.stringify({ inUse: heldRow.inUse }));
+
+      // NOBODY connects a game client. Drive the sweep past the shortened deadline.
+      await sleep(1_200);
+      await app.deps.lobby.sweep();
+
+      const freedRow = await app.deps.store.matchServers.byId(serverId);
+      check(freedRow.inUse === 0,
+        'the seat is released rather than held for a match that can no longer start',
+        JSON.stringify({ inUse: freedRow.inUse }));
+      check(![...app.deps.lobby.matches.values()].some((m) => m.roomId === roomId),
+        'and the match is dropped from the active set');
+      const reopened = await call('GET', `/v1/rooms/${roomId}`, undefined, users[0].token);
+      // `detail()` spreads the room at the top level; only the CREATE response nests it.
+      check(reopened.body.status === 'open',
+        'the room reopens so the players can try again rather than being stranded in-progress',
+        JSON.stringify(reopened.body?.status));
+
+      // The capacity refusal that the leak caused must no longer happen.
+      const after = await call('POST', '/v1/rooms', { name: 'After Reap', region: 'iad',
+        mapId: 'the-square', mode: 'tdm', capacity: 2 },
+      users[1].token, { 'idempotency-key': `after-reap:${ulid()}` });
+      check(after.status === 201,
+        'a new room can be created again — the region is not permanently out of capacity',
+        `${after.status} ${JSON.stringify(after.body?.error?.details)}`);
+
+      ownerPeer.ws.close(); otherPeer.ws.close();
+    } finally {
+      app.deps.lobby.tunables.unclaimedMatchMs = restore;
+    }
+  }
+
   console.log('\n--- launch refusals name the condition that actually failed ---');
   {
     /**

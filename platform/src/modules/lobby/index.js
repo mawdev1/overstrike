@@ -17,6 +17,14 @@ import { describeError } from '../../core/logger.js';
 const RESERVATION_MS = 30_000;
 const GRACE_MS = 90_000;
 const HEARTBEAT_MS = 15_000;
+/**
+ * How long an allocation may sit with no player having connected before the seat is reclaimed.
+ *
+ * Tied to the handoff ticket lifetime in `buildHandoff` (60s) plus one sweep, not chosen for
+ * feel: once every ticket has expired the match is unjoinable by any route, so the seat is
+ * being held for a game that can no longer happen. See the reap branch in `sweep`.
+ */
+const UNCLAIMED_MATCH_MS = 60_000 + HEARTBEAT_MS;
 const CHAT_WINDOW_MS = 30_000;
 const CHAT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const REPORT_CATEGORIES = new Set(['cheating', 'harassment', 'offensive-name', 'griefing', 'other']);
@@ -145,6 +153,14 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
   const reportKeys = new Set();
   const matchTickets = new Map();
   const matches = new Map();
+  /**
+   * Runtime-adjustable deadlines. Only the unclaimed-allocation reap is here, and only because
+   * the acceptance suite has to reach it without sleeping through the real 75 seconds while
+   * every other match in the same process keeps the production deadline. A constructor argument
+   * could not do that — the sweep is one loop over every match, so a shortened value would reap
+   * the matches the other sections depend on.
+   */
+  const tunables = { unclaimedMatchMs: UNCLAIMED_MATCH_MS };
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 4096,
     // The second offered subprotocol carries the one-use credential. It authenticates the
     // upgrade but is never reflected as the negotiated protocol where browser code, tooling,
@@ -1796,7 +1812,29 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
         const status = await controlStatus(match.serverUrl, match.correlationId, match.traceparent);
         if (status.status === 'ended' && status.matchId === match.matchId) await completeActiveMatch(match, status.result);
         else if (status.matchId !== match.matchId) await abortActiveMatch(match, 'allocation-lost', true);
-        else match.healthMisses = 0;
+        else if (status.status === 'allocated' && match.startedAt + tunables.unclaimedMatchMs <= at) {
+          /**
+           * An allocation nobody ever claimed.
+           *
+           * Every other branch here handles a server that ENDED, MOVED ON, or went unreachable.
+           * A server sitting on an allocation no player ever connected to is none of those: it
+           * answers `allocated` with the right matchId forever, so `healthMisses` resets on every
+           * poll and the reaper never runs. The seat is held for the rest of the process's life.
+           *
+           * That is not a slow leak. Capacity is per-region, and a region with one registered
+           * server is fully consumed by ONE abandoned lobby — every subsequent room creation is
+           * refused with "No healthy match capacity is available", which is exactly what the
+           * deployed browser reported after a single test launch whose clients never connected.
+           *
+           * The deadline is not arbitrary. `buildHandoff` gives every session ticket 60s; once
+           * they have all expired, no player can join this match by any route, so it cannot
+           * become live and holding the seat buys nothing. The margin over that is one full
+           * sweep interval, so a player claiming a ticket in its final second is never reaped by
+           * a poll that happens to land immediately after.
+           */
+          logger.warn('lobby.match_unclaimed', { matchId: match.matchId, correlationId: match.correlationId });
+          await abortActiveMatch(match, 'never-started', false);
+        } else match.healthMisses = 0;
       } catch {
         match.healthMisses = (match.healthMisses || 0) + 1;
         if (match.healthMisses >= 3) {
@@ -1833,5 +1871,5 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     heartbeatTimer = null;
   }
 
-  return { routes, attach, stop, pauseSweeper, handlers, sweep, rooms, tickets, reports, matchTickets, matches, wss };
+  return { routes, attach, stop, pauseSweeper, handlers, sweep, rooms, tickets, reports, matchTickets, matches, wss, tunables };
 }
