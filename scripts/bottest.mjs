@@ -1,4 +1,25 @@
 /**
+
+ * ── A cross-process determinism worry, investigated and closed ───────────────────────────
+ * While this harness was being written, two runs of byte-identical files reported different
+ * round/plant/defuse counts (40/33/15 against 38/30/13), and the author could not reproduce it
+ * on demand across nine further runs, including under CPU load. It was left recorded rather
+ * than dismissed, because every stochastic threshold in this file depends on the answer.
+ *
+ * It is not a scheduler or a CPU-count effect. Measured afterwards on a settled tree: three
+ * consecutive runs and three CONCURRENT runs all produce 41 rounds, 27 plants, 8 defuses with
+ * an identical per-series split.
+ *
+ * The cause was the tree moving underneath the runs. Bot paths come from the nav graph, the nav
+ * graph is baked from `src/world/level.js`, and another session was editing that file
+ * continuously — the same edits that kept the nav-bake staleness guard firing. Different
+ * geometry, different routes, different plants. The simulation was deterministic the whole
+ * time; the INPUT was not.
+ *
+ * The lesson generalises past this file: a measurement taken while another lane is editing a
+ * shared input is a measurement of two things at once. Quote the geometry fingerprint beside
+ * any number from this harness — `scripts/navtest.mjs`'s ROUTE_BASELINE pins exactly that, for
+ * exactly this reason.
  * P3 exit criterion 3 — "Bots navigate The Square and play both modes."
  *
  * `bombbottest.mjs` (H3.3) already proves that ONE autonomous Bomb series on The Square
