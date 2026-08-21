@@ -49,7 +49,7 @@ const VERBOSE = process.argv.includes('--verbose');
  *   --degrade=sever     cut every nav edge across z = 0          (route connectivity)
  *   --degrade=shortcut  bill every edge at 40% of its length     (route geodesic sanity)
  *   --degrade=speed     read the movement speed as 0 m/s         (speed provenance)
- *   --degrade=slowsite  bill edges near site A at 3x             (§7.1 spawn-to-site band)
+ *   --degrade=slowsite  bill edges near site A at 3x             (§7.1 pinned route length)
  */
 const DEGRADE = (process.argv.slice(2).find((a) => a.startsWith('--degrade=')) ?? '').slice('--degrade='.length);
 const DEGRADE_MODES = ['', 'stale', 'sever', 'shortcut', 'speed', 'slowsite'];
@@ -378,12 +378,26 @@ const spawnNodes = [];
 // analytic ran against a map that does not exist.
 
 console.log(`\nmap-data.md §4 — committed nav artifact (${artifactPath(manifest.mapId)})`);
+/**
+ * The fingerprint of the AUTHORED inputs to this map — `navbake.mjs`'s
+ * `fingerprint.combined`, which hashes the schema, the map id, MAP_VERSION, every collider
+ * (`geometry`) and the whole §3 manifest (`manifest`), and hashes NOTHING that this lane
+ * owns: not the bake algorithm, not the edge weights, not the movement speed.
+ *
+ * §7.1 below uses it to tell "[CX] moved the map" apart from "[CC] broke the graph".
+ * Recorded here because the pristine bake is already in hand at this point; re-baking a
+ * second time just to hash it would double the slowest step in this harness.
+ */
+let AUTHORED_FINGERPRINT = null;
 {
   // Determinism first. A staleness check on a non-deterministic bake is a random failure
   // generator, and the first person it wakes up at 2am will delete it — so the property it
   // rests on is asserted here rather than assumed, on every run, for the map under test.
   const first = await bakeMap(manifest.mapId);
   const second = await bakeMap(manifest.mapId);
+  // `first`, never `fresh` — `--degrade=stale` perturbs the geometry inside a throwaway
+  // bake, and §7.1 must still see the fingerprint of the map that is actually on disk.
+  AUTHORED_FINGERPRINT = first.artifact.fingerprint.combined;
   if (first.text === second.text) {
     ok('two bakes of the same geometry are byte-identical', `${first.text.length} bytes, ${first.artifact.fingerprint.combined.slice(7, 19)}`);
   } else {
@@ -468,6 +482,64 @@ console.log(`\nmap-data.md §4 — committed nav artifact (${artifactPath(manife
 const WALK_SPEED = PLAYER_TUNE.WALK_SPEED;
 const SPRINT_SPEED = PLAYER_TUNE.SPRINT_SPEED;
 
+/**
+ * ── the pinned route baseline: what makes the §7.1 numbers failable ──────────────────
+ *
+ * The bands below (12–16 s, 16–22 s, 15% spread) are PENDING and not FAIL on purpose, and
+ * that reasoning is only half of the story. It is right that a breach in [CX]'s authored
+ * geometry must not block this lane's build — REQ-CX-008 item 5 is their open work. It is
+ * wrong to conclude that a §7.1 number is therefore unguarded, because a route time is not
+ * a fact about the geometry alone. It is
+ *
+ *     (a walk over OUR nav graph, billed by OUR edge weights) / OUR speed constant
+ *
+ * and a regression in any of those three moves the seconds just as far as a moved wall
+ * would. Left as PENDING-only, a nav bake that stopped linking a staircase, an edge cost
+ * that started counting cells instead of metres, or a halved WALK_SPEED would all print a
+ * calm PENDING line and exit 0.
+ *
+ * So the two causes are separated by fingerprint rather than by flag:
+ *
+ *   authored inputs UNCHANGED (fingerprint matches)  →  the geometry is byte-for-byte the
+ *       map these numbers were measured on, so anything that moved them came from this
+ *       lane. Every route is a HARD FAIL against its pinned metres, and the speed constant
+ *       is pinned with it. The envelope bands stay PENDING — the known breach is still
+ *       [CX]'s, and it is pinned at exactly the value it currently has.
+ *
+ *   authored inputs CHANGED (fingerprint differs, or the map has no entry here)  →  the
+ *       route lengths are expected to move and this harness cannot say by how much. The
+ *       measurements print, the pin is reported STALE, and nothing fails. The re-pin is
+ *       one paste, printed ready to go, and belongs in the same change as the geometry —
+ *       the same rule map-data.md §4 already applies to the nav artifact itself.
+ *
+ * This is deliberately NOT a `--strict` flag. A gate that only fires under a flag no CI
+ * target passes is the gate this pin exists to replace: `npm run navtest` runs bare, so a
+ * guard that needs an argument guards nothing.
+ *
+ * `--degrade=slowsite` bills the approach to site A at 3x — our edge weights lying, with
+ * the geometry untouched — and is the proof that this pin is live.
+ *
+ * TOLERANCE is 0.05 m, about a fifteenth of the 0.75 m nav cell: the Dijkstra is
+ * deterministic over a deterministic bake, so the honest tolerance is float noise and no
+ * more. Anything wider would start hiding a re-routed staircase.
+ */
+const ROUTE_TOLERANCE = 0.05;
+const ROUTE_BASELINE = {
+  'the-square': {
+    // navbake.mjs fingerprint.combined — schema + mapId + MAP_VERSION + colliders + §3 manifest.
+    fingerprint: 'sha256:98e7626d63703e6df75fb75c859cb24a18470de4e81275063d71ad30335af5e9',
+    speed: 4.6,
+    routes: {
+      'alpha-main -> site-A': 54.01,
+      'alpha-main -> site-B': 55.40,
+      'bravo-main -> site-A': 56.23,
+      'bravo-main -> site-B': 67.40,
+      'site-A -> site-B': 79.04,
+      'site-B -> site-A': 75.91,
+    },
+  },
+};
+
 console.log('\nmap-data.md §7.1 — route timing');
 {
   // The one hard gate on the speed itself: these seconds are only as good as the constant
@@ -501,6 +573,11 @@ console.log('\nmap-data.md §7.1 — route timing');
    * number and the target — and every assertion about OUR OWN code (the graph is connected,
    * the route is a real walk, the speed is real) stays a hard failure directly above and
    * below it.
+   *
+   * That last clause is what ROUTE_BASELINE above completes. A PENDING line says "this
+   * number is outside the band and that is [CX]'s to move"; the pin says "and it is THIS
+   * number, not some other one" — so an envelope breach that this lane widened cannot hide
+   * inside an envelope breach that [CX] authored.
    */
   const envelope = (name, got, lo, hi, unit = ' s') => {
     if (got >= lo && got <= hi) { ok(name, `${fmt(got)}${unit} in ${lo}–${hi}${unit}`); return true; }
@@ -514,6 +591,14 @@ console.log('\nmap-data.md §7.1 — route timing');
       + `allowed ${SPREAD_MAX * 100}% — REQ-CX-008 item 5 (geometry, [CX]).`);
     return false;
   };
+
+  /**
+   * Every §7.1 route this run measured, in metres over the nav graph, keyed by the label it
+   * was printed under. Filled as the rows below are computed and compared against the pin
+   * at the end of the section — one place, after every number exists, so a missing route is
+   * as visible as a wrong one.
+   */
+  const measured = new Map();
 
   const sites = [];
   for (const o of manifest.objectives) {
@@ -570,6 +655,9 @@ console.log('\nmap-data.md §7.1 — route timing');
     for (const g of bombGroups) {
       const dist = routeField(spawnSources(g.spawns));
       const per = sites.map((s) => ({ site: s.site, id: s.id, m: minOver(dist, s.nodes) }));
+      for (const p of per) {
+        if (Number.isFinite(p.m)) measured.set(`${g.id} -> ${p.id}`, p.m);
+      }
       rows.push({ group: g, per });
     }
     console.log(`  spawn-to-site, from each team's protected Bomb group, along the nav graph at ${speed} m/s:`);
@@ -621,7 +709,9 @@ console.log('\nmap-data.md §7.1 — route timing');
     for (let i = 0; i < 2; i++) {
       const from = sites[i], to = sites[1 - i];
       const dist = routeField(from.nodes);
-      rot.push({ label: `${from.id} -> ${to.id}`, m: minOver(dist, to.nodes) });
+      const m = minOver(dist, to.nodes);
+      if (Number.isFinite(m)) measured.set(`${from.id} -> ${to.id}`, m);
+      rot.push({ label: `${from.id} -> ${to.id}`, m });
     }
     console.log('  A↔B rotation, both directions:');
     for (const r of rot) {
@@ -647,6 +737,74 @@ console.log('\nmap-data.md §7.1 — route timing');
       console.log(`     worst rotation ${Math.max(...t).toFixed(1)} s + 7 s defuse = ${(Math.max(...t) + 7).toFixed(1)} s `
         + `against the 40 s Bomb timer (bomb-rules.md §2.1)`);
     }
+  }
+
+  // ── the pin ────────────────────────────────────────────────────────────────────────
+  //
+  // See ROUTE_BASELINE. Nothing here re-derives a route: it compares the metres already
+  // printed above against the metres recorded when the geometry last changed, and the only
+  // question it answers is "did anything on OUR side of the ruler move".
+  const pin = ROUTE_BASELINE[manifest.mapId];
+  const repin = () => {
+    const rows = [...measured.entries()].map(([k, m]) => `        '${k}': ${m.toFixed(2)},`).join('\n');
+    console.log('  to re-pin, replace this map\'s ROUTE_BASELINE entry in scripts/navtest.mjs with:\n'
+      + `    '${manifest.mapId}': {\n`
+      + `      fingerprint: '${AUTHORED_FINGERPRINT}',\n`
+      + `      speed: ${WALK_SPEED},\n`
+      + `      routes: {\n${rows}\n      },\n    },`);
+  };
+
+  if (!speedOk) {
+    // The speed failure above already said why there is nothing to compare.
+  } else if (AUTHORED_FINGERPRINT === null) {
+    // Only reachable if the §4 section did not run, which it always does. Said rather than
+    // assumed: comparing against a pin whose provenance was never established is worse than
+    // not comparing, because it looks like a check.
+    bad('the §7.1 route pin knows which geometry it is pinned to',
+      'the §4 bake did not report an authored fingerprint, so the pin cannot be attributed');
+  } else if (measured.size === 0) {
+    console.log(`  ABSENT   '${manifest.mapId}' measured no §7.1 route, so there is nothing to pin.`);
+  } else if (pin === undefined) {
+    console.log(`  PENDING  '${manifest.mapId}' has no pinned §7.1 route baseline, so a change in this`
+      + ' lane\'s nav graph, edge weights or speed constant would not be caught here.');
+    repin();
+  } else if (pin.fingerprint !== AUTHORED_FINGERPRINT) {
+    console.log(`  STALE    the §7.1 route pin for '${manifest.mapId}' was taken on different authored`
+      + ` geometry (pinned ${pin.fingerprint.slice(7, 19)}, now ${AUTHORED_FINGERPRINT.slice(7, 19)}) —`
+      + ' [CX] moved the map, so these route lengths are expected to have moved with it and'
+      + ' nothing is asserted against them on this run.');
+    repin();
+  } else {
+    // The authored inputs are byte-identical to the ones the pin was taken on. Everything
+    // below is therefore this lane's.
+    exactly(`the §7.1 seconds divide by the pinned speed (${manifest.mapId})`, WALK_SPEED, pin.speed);
+    const pinned = Object.keys(pin.routes).sort();
+    const got = [...measured.keys()].sort();
+    if (pinned.join('|') === got.join('|')) {
+      ok(`the pinned §7.1 route set is the one measured (${manifest.mapId})`, `${got.length} routes`);
+    } else {
+      bad(`the pinned §7.1 route set is the one measured (${manifest.mapId})`,
+        `pinned [${pinned.join(', ')}] but measured [${got.join(', ')}] — on unchanged authored geometry `
+        + `(${AUTHORED_FINGERPRINT.slice(7, 19)}) the set of §7.1 routes cannot change unless this lane changed it`);
+    }
+    let moved = 0;
+    for (const key of pinned) {
+      const m = measured.get(key);
+      if (m === undefined) continue; // already reported by the set comparison above.
+      const delta = m - pin.routes[key];
+      if (Math.abs(delta) <= ROUTE_TOLERANCE) continue;
+      moved++;
+      bad(`${key} is the pinned length`,
+        `${m.toFixed(2)} m = ${secs(m).toFixed(2)} s, pinned ${pin.routes[key].toFixed(2)} m = `
+        + `${(pin.routes[key] / pin.speed).toFixed(2)} s (${delta > 0 ? '+' : ''}${delta.toFixed(2)} m, `
+        + `tolerance ±${ROUTE_TOLERANCE} m). The authored geometry and §3 manifest are UNCHANGED `
+        + `(${AUTHORED_FINGERPRINT.slice(7, 19)}), so this route moved because the nav bake, the edge `
+        + 'weights or the route walk in this lane changed. If that change was intended, re-pin it.');
+    }
+    if (moved === 0 && pinned.join('|') === got.join('|')) {
+      ok(`every §7.1 route is the length pinned to this geometry (${manifest.mapId})`,
+        `${got.length} routes within ±${ROUTE_TOLERANCE} m of the pin`);
+    } else if (moved > 0) repin();
   }
 }
 

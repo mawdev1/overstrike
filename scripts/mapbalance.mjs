@@ -32,9 +32,10 @@
  *   node scripts/mapbalance.mjs --degrade=los|death|hostile|stick
  *                                               deliberately break one part of the real
  *                                               scorer, to prove a threshold can fail
- *   node scripts/mapbalance.mjs --degrade=cover|open|arena|sites-adjacent [--strict]
- *                                               deliberately break the GEOMETRY, to prove
- *                                               a sightline threshold can fail
+ *   node scripts/mapbalance.mjs --degrade=cover|open|arena|sites-adjacent|no-sites [--strict]
+ *                                               deliberately break the GEOMETRY or the §3
+ *                                               manifest, to prove a sightline threshold
+ *                                               can fail
  *
  * ── P3 exit criterion 4: sightlines (map-data.md §7.0/§7.1) ──────────────────────────
  *
@@ -45,20 +46,33 @@
  *
  * A §7 envelope breach on The Square is [CX]'s geometry work and prints as PENDING, the
  * same treatment `navtest.mjs` §7.1 gives route timings. `--strict` makes it fatal, which
- * is how each threshold below was proven failable:
+ * is how each threshold below was proven failable. Every number here was RE-MEASURED after
+ * the length distribution moved onto the glass-transparent ray (see "which ray is a
+ * sightline" in `sightlines`); the old table was taken on the ballistics ray and its long
+ * band read 0.3 points lower:
  *
  *   threshold                        restored      degraded
  *   ──────────────────────────────── ───────────── ────────────────────────────────────
- *   bands all ≥ 5% of rays           long 4.6% ✗   arena: 30.7/23.9/45.4, all pass ✓
- *                                    meridian ✓    (the long band separates 4.6 / 9.2 /
- *                                                   45.4 — see the section comment for
+ *   bands all ≥ 5% of rays           long 4.9% ✗   arena: 30.7/23.9/45.4, all pass ✓
+ *                                    meridian ✓    (the long band separates 4.9 / 11.0 /
+ *                                    (long 11.0%)   45.4 — see the section comment for
  *                                                   what close and medium cannot do)
  *   longest ≤ 48 m (§7.0 hard)       72.6 m ✗      arena: 117.9 m ✗
- *   no uncontested dual-site angle   0 positions ✓ sites-adjacent: 105 positions ✗
+ *   no uncontested dual-site angle   0 of 13 ✓     sites-adjacent: 57 of 376 ✗
+ *   a rotation map declares 2 sites  2 ✓           no-sites: 0 — FAIL, not ABSENT
  *
- * The dual-site row is the one that matters and it moves cleanly: zero on the map as
- * authored, 105 when site B is moved onto walkable ground 8 m from site A, back to zero
- * when the degradation is removed.
+ * The dual-site row is the one that matters and it moves cleanly: on the map as authored 13
+ * standing positions see both sites, the least exposed of them sees 23.0% of the playspace
+ * and none clears the 5% exposure bar; move site B onto walkable ground 8 m from site A and
+ * 376 positions see both, 57 of them from cover. So the threshold is exercised 13 times on
+ * the shipped map rather than passing for want of a candidate — and when a map DOES have no
+ * candidates, the run says so on its own line instead of printing a bare `ok`.
+ *
+ * `no-sites` is the last row's degradation and it exists because that row used to report
+ * ABSENT for The Square — the rotation map — citing the map-data.md §9 FIXTURE clause, and
+ * exit 0. A fixture with no sites is a schedule; a rotation map with no sites is a Bomb map
+ * that cannot be played. `navtest.mjs` §7.1 already made that distinction; this file now
+ * does too, and it is a hard FAIL in the default (ci) mode rather than a `--strict` one.
  */
 import * as THREE from 'three';
 import { Game } from '../src/core/game.js';
@@ -67,6 +81,7 @@ import { SPAWN_WEIGHTS, SPAWN_POLICY } from '../src/game/spawner.js';
 import { MODES } from '../src/game/modes.js';
 import { WEAPONS } from '../src/weapons/weaponDefs.js';
 import { DEFAULTS } from '../src/core/settings.js';
+import { mapRotation } from '../src/world/world.js';
 
 const ARGV = process.argv.slice(2);
 const flag = (k) => ARGV.includes(`--${k}`);
@@ -154,10 +169,12 @@ function stripLowGeometry(g) {
  *
  * The map as an empty box. This is the degradation the band-representation floor is proven
  * against, because `cover` and `open` cannot trip it: The Square's occlusion comes almost
- * entirely from buildings, so deleting its 25 cover volumes or all 42 of its sub-head-height
- * colliders moves the close band by three points and nothing crosses a threshold. That is a
- * finding about the map, not a reason to keep quiet — a floor that only ever fires on
- * geometry nobody would author is a weak floor, and it is recorded as such in the header.
+ * entirely from buildings, so deleting its 21 cover volumes moves the close band by 0.0
+ * points (78.2% either way) and deleting all 42 of its sub-head-height colliders moves it by
+ * 3.2, to 75.0% — and the floor is on the LONG band, which those two push the wrong way
+ * (4.9% -> 4.9% and 5.2%). That is a finding about the map, not a reason to keep quiet — a
+ * floor that only ever fires on geometry nobody would author is a weak floor, and it is
+ * recorded as such in the header. Re-measured on the glass-transparent ray.
  *
  * "Boundary" is identified by position, not by a tag the compiled boxes do not carry: a box
  * that reaches the edge of the declared bounds on any axis. That is the §5 removable layer
@@ -224,6 +241,24 @@ function sitesAdjacent(g) {
     + `${Math.hypot(bestX - cx, bestZ - cz).toFixed(1)} m from site A`;
 }
 
+/**
+ * `--degrade=no-sites` — empty `world.manifest.objectives`.
+ *
+ * A Bomb map whose plant volumes stopped resolving: the §3.3 export gone from the same
+ * normalised manifest the ruleset, the bots and the HUD read. It exists to prove the row
+ * directly above `sitesAdjacent` can fail — the in-rotation guard on the dual-site row —
+ * because "the map declares no sites" is otherwise the one input that makes that row
+ * report success by not running. Meant with `--geom-only`; the P3.A2 spawn matches below
+ * play Bomb and have nothing to plant.
+ */
+function stripSites(g) {
+  const objectives = g.world.manifest?.objectives;
+  if (!Array.isArray(objectives)) return 'this map declares no objectives array to empty';
+  const n = objectives.length;
+  objectives.length = 0;
+  return `${n} objective volume(s) deleted from the §3 manifest`;
+}
+
 const game = new Game({ headless: true });
 await game.initHeadless({ presenter: new NullPresenter() });
 const w = game.world;
@@ -234,7 +269,7 @@ const EYE = 1.62;
  * Geometry degradations, applied to the real world before a single ray is cast. Each one
  * exists to prove one sightline threshold can fail; the header records what each measured.
  */
-const GEOM_DEGRADES = new Set(['cover', 'open', 'arena', 'sites-adjacent']);
+const GEOM_DEGRADES = new Set(['cover', 'open', 'arena', 'sites-adjacent', 'no-sites']);
 function degradeGeometry(g, label) {
   if (DEGRADE === 'cover') {
     const removed = stripCover(g);
@@ -250,6 +285,8 @@ function degradeGeometry(g, label) {
     else note(`DEGRADED ${label}: ${removed} interior colliders deleted, floor and boundary kept (nav graph held fixed)`);
   } else if (DEGRADE === 'sites-adjacent') {
     note(`DEGRADED ${label}: ${sitesAdjacent(g)}`);
+  } else if (DEGRADE === 'no-sites') {
+    note(`DEGRADED ${label}: ${stripSites(g)}`);
   }
 }
 if (GEOM_DEGRADES.has(DEGRADE)) degradeGeometry(game, 'the-square');
@@ -460,26 +497,29 @@ if (!SPAWN_ONLY) {
 //
 // "All represented" is ≥ REPRESENTED_MIN of rays in each band. The floor is 5%, calibrated
 // against the retained comparison fixture rather than picked: MERIDIAN's thinnest band is
-// 9.2%, and half of the only shipped map this repository has is a defensible "this band is
-// a curiosity rather than a way the map is played".
+// 11.0%, so the floor sits under half of it, and half of the only shipped map this
+// repository has is a defensible "this band is a curiosity rather than a way the map is
+// played".
 //
 // WHAT THIS FLOOR CAN AND CANNOT SEPARATE — stated, because two thirds of it is weak.
 //
-// Measured across every configuration tried:
+// Measured across every configuration tried. RE-MEASURED in full on the glass-transparent
+// ray — every row below moved, because 7.8% of The Square's rays and 7.0% of MERIDIAN's
+// pass through at least one pane, and the old table stopped every one of them at the glass:
 //
 //                                 close    medium    long
-//   the-square as shipped         79.9%     15.5%    4.6%   ← long breaches the floor
-//   the-square --degrade=cover    80.2%     15.3%    4.5%
-//   the-square --degrade=open     76.8%     18.4%    4.8%
+//   the-square as shipped         78.2%     16.9%    4.9%   ← long breaches the floor
+//   the-square --degrade=cover    78.2%     16.9%    4.9%
+//   the-square --degrade=open     75.0%     19.8%    5.2%
 //   the-square --degrade=arena    30.7%     23.9%   45.4%
-//   meridian as shipped           74.7%     16.1%    9.2%
+//   meridian as shipped           71.3%     17.6%   11.0%
 //   meridian --degrade=arena      26.3%     22.4%   51.3%
 //
-// The LONG band discriminates: it separates The Square (4.6%) from MERIDIAN (9.2%) from an
+// The LONG band discriminates: it separates The Square (4.9%) from MERIDIAN (11.0%) from an
 // empty arena (45.4%), and it fires on The Square as authored.
 //
-// The CLOSE and MEDIUM bands do NOT. Close never fell below 26% and medium never below
-// 14.9% — not with every cover volume deleted, not with every collider below head height
+// The CLOSE and MEDIUM bands do NOT. Close never fell below 26.3% and medium never below
+// 16.9% — not with every cover volume deleted, not with every collider below head height
 // deleted, and not with the entire interior of the map deleted. Rays are cast from
 // standing positions that are mostly near something, so short rays are unavoidable. Those
 // two assertions are therefore tripwires against a pathological map, not guards that have
@@ -488,15 +528,18 @@ if (!SPAWN_ONLY) {
 //
 // One consequence of the bands worth naming: §7.0 caps sightlines at 48 m and the long
 // band starts at 34 m, so a fully compliant map has only a 14 m window in which to be
-// "long". The Square's 4.6% is 0.4 points under the floor — a real signal, but a marginal
-// one, and the two numbers should be read together rather than the verdict alone.
+// "long". The Square's 4.9% is 0.1 points under the floor — a real signal, but a marginal
+// one, and the two numbers should be read together rather than the verdict alone. It was
+// 0.4 points under on the ballistics ray, which is the whole reason the choice of ray had
+// to be settled: the instrument's error was larger than the margin it was reporting on.
 //
 // ── "no single uncontested angle covering both sites" ───────────────────────────────
 //
 // Made operational, because as prose it cannot pass or fail. A standpoint p (a walkable,
 // reachable nav node, at eye height) is an UNCONTESTED DUAL-SITE ANGLE when all four hold:
 //
-//   1. p has clear line of sight (`world.losClear`, the same query a bullet uses) to a
+//   1. p has clear line of sight (`world.losClear` — the LOS query, which per map-data.md
+//      §3.1 sees through glass; a bullet uses `world.raycast`, which does not) to a
 //      standable point inside site A's plant volume, at most SIGHT_CEILING metres away;
 //   2. the same for site B;
 //   3. p is EXPOSED to at most EXPOSURE_MAX of the playspace — the share of sampled
@@ -519,9 +562,11 @@ if (!SPAWN_ONLY) {
 // can flick between two sites from is exactly the problem the row names. The angular
 // separation is now REPORTED as data and constrains nothing.
 //
-// A map that declares no objective volumes (MERIDIAN, retained as a fixture by §9) is
-// reported ABSENT for this row. It is NOT reported as a pass: `[].every()` is `true`, and
-// a vacuous pass on the fixture is exactly how this row would stop guarding anything.
+// A map OUT OF ROTATION that declares no objective volumes (MERIDIAN, retained as a fixture
+// by §9) is reported ABSENT for this row. It is NOT reported as a pass: `[].every()` is
+// `true`, and a vacuous pass on the fixture is exactly how this row would stop guarding
+// anything. A map IN ROTATION that declares no sites is the opposite case and is a hard
+// FAIL — see the guard in `sightlines`. Prove it with `--degrade=no-sites`.
 const SIGHT_CEILING = 48;                       // §7.0, hard
 const REPRESENTED_MIN = 0.05;
 const EXPOSURE_MAX = 0.05;
@@ -565,19 +610,68 @@ function sightlines(label, world, nav, manifest) {
   const span = manifest.bounds.max.clone().sub(manifest.bounds.min);
   const REACH = Math.ceil(Math.hypot(span.x, span.z)) + 1;
 
-  const o = new THREE.Vector3(), d = new THREE.Vector3();
-  const lens = [];
-  let escaped = 0;
+  // ── which ray is a sightline ────────────────────────────────────────────────────────
+  //
+  // `world.raycast` is the BALLISTICS ray. It calls `_march(..., skipGlass = false)`
+  // (world.js), so it stops at the first pane — correct for a bullet, which resolves
+  // against glass, and wrong for a sightline. map-data.md §3.1: "Glass is tagged
+  // transparent: it blocks movement but not line of sight." The Square has 41 glass boxes.
+  //
+  // This section measures SIGHTLINES: it is named for them, it is checked against the §7.0
+  // sightline ceiling, and the dual-site row four screens below already uses
+  // `world.losClear`, which DOES skip glass. Measuring the length distribution with the
+  // opaque-and-glass ray while measuring site coverage with the glass-transparent one made
+  // one section disagree with itself, and the disagreement was the same size as the signal:
+  // the long band sits 0.4 points under its 5% floor and the two rays differ by 0.3 points.
+  // So the distribution moves onto the transparent ray, and both rows now mean the same
+  // thing by "can be seen".
+  //
+  // `losClear` answers a yes/no over a segment and cannot report a LENGTH, and `_march` is
+  // private. So the length is walked with the public raycast: stop at the first opaque hit,
+  // and step just past any pane and keep going. The ballistics length is kept from the same
+  // rays and reported alongside, because the difference between the two is the map's glass
+  // and is worth seeing rather than asserting once in a comment.
+  const GLASS_STEP = 0.05;    // > 0, so a pane can never be re-entered at the same distance
+  const GLASS_MAX = 128;      // 41 panes = 82 faces on The Square; an exhausted ray is a bug
+  const o = new THREE.Vector3(), d = new THREE.Vector3(), march = new THREE.Vector3();
+  const lens = [];            // to the first OPAQUE hit — the sightline
+  const ballistic = [];       // to the first hit of ANY kind — what a bullet meets
+  let escaped = 0, throughGlass = 0, glassMetres = 0, exhausted = 0;
   for (const e of eyes) {
     for (let i = 0; i < AZIMUTHS; i++) {
       const a = (i / AZIMUTHS) * Math.PI * 2;
-      o.copy(e);
       d.set(Math.cos(a), 0, Math.sin(a));
-      const hit = world.raycast(o, d, REACH);
-      if (!hit) { escaped++; lens.push(REACH); continue; }
-      lens.push(hit.distance);
+      march.copy(e);
+      let travelled = 0, panes = 0, first = -1;
+      for (;;) {
+        const hit = world.raycast(march, d, REACH - travelled);
+        // The result is POOLED (a ring of 8), so both fields are read before the next cast.
+        if (hit === null) { travelled = -1; break; }
+        const dist = hit.distance;
+        const glass = hit.surface === 'glass';
+        if (first < 0) first = travelled + dist;
+        if (!glass) { travelled += dist; break; }
+        panes++;
+        if (panes > GLASS_MAX) { exhausted++; travelled += dist; break; }
+        travelled += dist + GLASS_STEP;
+        if (travelled >= REACH) { travelled = -1; break; }
+        march.copy(e).addScaledVector(d, travelled);
+      }
+      ballistic.push(first < 0 ? REACH : Math.min(first, REACH));
+      if (travelled < 0) { escaped++; lens.push(REACH); }
+      else lens.push(travelled);
+      if (panes > 0) {
+        throughGlass++;
+        glassMetres += (travelled < 0 ? REACH : travelled) - (first < 0 ? REACH : first);
+      }
     }
   }
+  if (exhausted > 0) {
+    bad(`${label}: the sightline walk terminates`,
+      `${exhausted} ray(s) hit ${GLASS_MAX} panes without reaching opaque geometry or leaving the map — `
+      + 'the glass-skipping walk is not making progress, so every length below is suspect');
+  }
+  ballistic.sort((p, q) => p - q);
   lens.sort((p, q) => p - q);
   const pct = (f) => lens[Math.min(lens.length - 1, Math.floor(lens.length * f))];
   const close = lens.filter((v) => v <= CLOSE_MAX).length;
@@ -590,6 +684,24 @@ function sightlines(label, world, nav, manifest) {
   console.log(`     bands:  close ≤${CLOSE_MAX} m ${(share(close) * 100).toFixed(1)}%`
     + ` · medium ≤${MED_MAX} m ${(share(med) * 100).toFixed(1)}%`
     + ` · long >${MED_MAX} m ${(share(long) * 100).toFixed(1)}%`);
+  // What the choice of ray is worth, on this map, on this run — so "glass is transparent to
+  // LOS" is a measured difference here rather than a claim in a comment. Zero on a map with
+  // no glass, and then the two rows are the same measurement and say so.
+  {
+    const bpct = (f) => ballistic[Math.min(ballistic.length - 1, Math.floor(ballistic.length * f))];
+    const bClose = ballistic.filter((v) => v <= CLOSE_MAX).length;
+    const bMed = ballistic.filter((v) => v > CLOSE_MAX && v <= MED_MAX).length;
+    const bLong = ballistic.length - bClose - bMed;
+    const bShare = (n) => n / ballistic.length;
+    console.log(`     the same rays as BALLISTICS (world.raycast, stops at glass): median ${bpct(0.5).toFixed(1)} m`
+      + ` · p90 ${bpct(0.9).toFixed(1)} · max ${ballistic[ballistic.length - 1].toFixed(1)}`
+      + ` · close ${(bShare(bClose) * 100).toFixed(1)}% / medium ${(bShare(bMed) * 100).toFixed(1)}%`
+      + ` / long ${(bShare(bLong) * 100).toFixed(1)}%`);
+    console.log(`     ${throughGlass} of ${lens.length} rays (${(throughGlass / lens.length * 100).toFixed(2)}%) pass through`
+      + ` at least one pane, adding ${glassMetres.toFixed(0)} m in total`
+      + ` — the long band moves ${((share(long) - bShare(bLong)) * 100 >= 0 ? '+' : '')}`
+      + `${((share(long) - bShare(bLong)) * 100).toFixed(2)} points on the transparent ray`);
+  }
   if (escaped > 0) {
     note(`${label}: ${escaped} rays left the map without hitting anything — they are counted at the ${REACH} m reach`);
   }
@@ -621,10 +733,33 @@ function sightlines(label, world, nav, manifest) {
   }
   const plants = manifest.objectives.filter((ob) => ob.kind === 'plant' && typeof ob.site === 'string' && ob.site !== '');
   const sites = [...new Set(plants.map((ob) => ob.site))].sort();
+  /**
+   * ABSENT is a schedule; a rotation map with no sites is a DEFECT.
+   *
+   * These two look identical from inside this function and are opposites. MERIDIAN is a
+   * retained §9 fixture that declares no §3.3 objective volumes at all, so there is
+   * genuinely nothing to measure and saying so is the honest answer. The Square is the
+   * Bomb map this repository ships: if its plant volumes stop resolving, Bomb cannot be
+   * played, and printing "nothing to measure" about it is the harness helping the defect
+   * hide. `navtest.mjs` §7.1 already draws exactly this line with `IN_ROTATION`; this row
+   * did not, so an in-rotation map that lost its sites exited 0 with the row unmeasured
+   * even under `--strict`.
+   *
+   * Note this is a hard `bad`, not `pendingEnvelope`: a missing site is not a §7 envelope
+   * number that [CX] is scheduled to tune, it is a manifest that no longer describes a
+   * playable Bomb map.
+   */
   if (sites.length < 2) {
+    if (mapRotation().includes(manifest.mapId)) {
+      bad(`${label}: a rotation map declares the two bomb sites the dual-site row measures`,
+        `${sites.length} site${sites.length === 1 ? '' : 's'} resolved from ${manifest.objectives.length} objective volume(s)`
+        + ' — §3.3 requires two plant volumes on a Bomb map, and without them this row measures nothing'
+        + ' while still reporting success');
+      return;
+    }
     console.log(`  ABSENT   ${label}: declares ${sites.length} bomb site${sites.length === 1 ? '' : 's'},`
       + ' so "no single uncontested angle covering both sites" has nothing to measure.'
-      + (sites.length === 0 ? ' (map-data.md §9 fixture)' : ''));
+      + ` (not in rotation${sites.length === 0 ? '; map-data.md §9 fixture' : ''})`);
     return;
   }
 
@@ -685,8 +820,10 @@ function sightlines(label, world, nav, manifest) {
   };
 
   const uncontested = [];
+  let leastExposed = Infinity;
   for (const cand of dual) {
     const x = exposure(cand.e);
+    if (x < leastExposed) leastExposed = x;
     if (x <= EXPOSURE_MAX) uncontested.push({ ...cand, exposure: x });
   }
   uncontested.sort((p, q) => p.exposure - q.exposure);
@@ -694,8 +831,20 @@ function sightlines(label, world, nav, manifest) {
   const seps = dual.map((c) => c.sep).sort((p, q) => p - q);
   console.log(`     dual-site angles: ${dual.length} of ${eyes.length} standing positions see both ${sites[0]} and ${sites[1]}`
     + ` inside ${SIGHT_CEILING} m`
-    + (seps.length ? ` (they are ${seps[0].toFixed(0)}–${seps[seps.length - 1].toFixed(0)}° apart; one screen at ${HFOV.toFixed(0)}°)` : '')
+    + (dual.length === 0 ? '' : ` (they are ${seps[0].toFixed(0)}–${seps[seps.length - 1].toFixed(0)}° apart; one screen at ${HFOV.toFixed(0)}°)`)
     + ` · ${uncontested.length} of those are exposed to ≤ ${(EXPOSURE_MAX * 100).toFixed(0)}% of the playspace (${ref.length} reference points)`);
+  // How hard the row worked, printed rather than assumed. A pass with no dual-site
+  // candidates at all is a pass in which EXPOSURE_MAX was never evaluated once — true and
+  // fine, but it has to be legible as such, because it is the shape that would also be
+  // produced by a coverage test that had quietly stopped finding anything.
+  if (dual.length === 0) {
+    note(`${label}: no position sees both sites, so the ${(EXPOSURE_MAX * 100).toFixed(0)}% exposure threshold was not evaluated`
+      + ' — this row passed without testing its threshold');
+  } else {
+    console.log(`     the exposure threshold was evaluated ${dual.length} time${dual.length === 1 ? '' : 's'};`
+      + ` the least exposed dual-site position sees ${(leastExposed * 100).toFixed(1)}% of the playspace`
+      + ` (threshold ${(EXPOSURE_MAX * 100).toFixed(0)}%)`);
+  }
   if (uncontested.length === 0) {
     ok(`${label}: no single uncontested angle covers both sites`);
   } else {
