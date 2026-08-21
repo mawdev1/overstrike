@@ -11,6 +11,7 @@ import {
 import { mountAppShell } from './ui/shell/index.js';
 import { createGameRuntime, identifyRuntimeClient } from './ui/shell/gameRuntime.js';
 import { createSettingsController } from './ui/shell/settings/index.js';
+import { createLobbyShellAdapter } from './ui/lobby/index.js';
 
 const PROF = (globalThis.__BOOTPROF__ = {
   moduleEval: +performance.now().toFixed(1),
@@ -131,6 +132,7 @@ function configureGameFromSettings(game) {
   if (!game?.settings) return;
   const snapshot = settings.getSnapshot();
   const values = snapshot.values;
+  game.clientFeatureFlags = featureFlags.snapshot().flags;
   const mapping = {
     sensitivity: values.sensitivity,
     adsSensitivity: values.adsSensitivity,
@@ -161,7 +163,8 @@ function configureGameFromSettings(game) {
     difficulty: values.difficulty,
     botCount: values.botCount,
     killLimit: values.killLimit,
-    mode: values.mode,
+    mode: featureFlags.isEnabled('mode.bomb.enabled') && featureFlags.isEnabled('map.the_square.enabled')
+      ? values.mode : 'tdm',
   };
   for (const [key, value] of Object.entries(mapping)) game.settings.set(key, value);
 
@@ -190,7 +193,7 @@ for (const key of ['reduceMotion', 'colorVisionPreset', 'subtitleSize', 'cameraS
 }
 
 const baseShellApi = createShellApi({ client: platformClient, telemetry, settings });
-shellApi = Object.freeze({
+const accountShellApi = Object.freeze({
   ...baseShellApi,
   async signIn(payload) {
     const result = await baseShellApi.signIn(payload);
@@ -201,6 +204,26 @@ shellApi = Object.freeze({
     const result = await baseShellApi.signUp(payload);
     await hydrateRemoteSettings().catch(() => null);
     return result;
+  },
+});
+shellApi = createLobbyShellAdapter({
+  client: accountShellApi,
+  reportAdapter: async (payload) => (await platformClient.request('/v1/reports', {
+    method: 'POST', body: payload, maxAttempts: 1,
+  })).data,
+  onSnapshot(snapshot) {
+    const current = shell?.getRoute?.();
+    if (current?.id?.startsWith('room.') && current.params.roomId === snapshot.roomId) {
+      shell.setView({ variant: 'ready', data: snapshot });
+    }
+  },
+  onMatchReady(_handoff, snapshot) {
+    const current = shell?.getRoute?.();
+    if (current?.id?.startsWith('room.') && current.params.roomId === snapshot.roomId) {
+      // `/match/loading` already owns the capability check and exact handoff-to-runtime action.
+      // The adapter's getActiveMatch returns this same in-memory validated handoff to its loader.
+      shell.navigate('/match/loading');
+    }
   },
 });
 
@@ -289,6 +312,8 @@ session.subscribe((state) => {
   if (state.authenticated) {
     void hydrateRemoteSettings().catch(() => {});
     void refreshFeatureFlags().catch(() => {});
+  } else {
+    shellApi?.disconnectLobby?.('session ended');
   }
 });
 
@@ -351,7 +376,8 @@ shell = mountAppShell({
     const snapshot = settings.getSnapshot();
     const game = await runtime.enter({
       matchOptions: {
-        mode: snapshot.values.mode,
+        mode: featureFlags.isEnabled('mode.bomb.enabled') && featureFlags.isEnabled('map.the_square.enabled')
+          ? snapshot.values.mode : 'tdm',
         difficulty: snapshot.values.difficulty,
         botCount: snapshot.values.botCount,
         killLimit: snapshot.values.killLimit,

@@ -2,9 +2,9 @@
 
 **Owner:** Codex (`[CX]`)  
 **Phase:** P0  
-**Version:** 0.2
-**Status:** Ready for Bomb-rules and net-facade contract review  
-**Last updated:** 2026-08-19
+**Version:** 0.3
+**Status:** Reviewed against frozen Bomb/net contracts; fixture implementation complete, live facade integration pending
+**Last updated:** 2026-08-20
 
 ## Objective
 
@@ -55,7 +55,7 @@ stale data, and never emits completion because its animation reached 100%.
 Persistent during live play:
 
 - Alpha round score and upward-chevron team icon.
-- Round number / overtime label.
+- Round number / regulation label. Bomb v1 has no overtime; 6–6 is a draw.
 - Bravo round score and split-bar team icon.
 - Authoritative round clock.
 - Alive counts directly under each team score, using person icon plus number.
@@ -117,8 +117,10 @@ It does not show fake ping. A value is displayed only when the net facade suppli
 | Defusing | Actor | Alive/score remain visible | Planted site remains primary | Authoritative defuse progress; no client-side completion |
 | Round resolving | Any | Final alive counts and server outcome | Markers de-emphasized | One outcome card with reason |
 | Side switch | Any | Old/new roles shown explicitly | Sites keep A/B identities | Input remains unavailable until next round state |
-| Overtime | Any | `OVERTIME` and current rule variant | Normal policy | Rules-summary entry available from scoreboard |
 | Match ended | Any | Final series outcome | Objective markers removed | Transition to authoritative results |
+
+Bomb v1 has no overtime state. A 6–6 regulation series is displayed as the authoritative
+draw outcome; the client must not invent an extra round or an overtime label.
 
 ## Round-transition presentation
 
@@ -198,7 +200,7 @@ The final mapping waits for `errors.md` and `bomb-rules.md`; the UI never parses
 - Planted idle; defuse 0%, 50%, 99%, interrupted, and complete.
 - One-versus-one, eliminated local player, eligible spectator, no eligible target.
 - Round won/lost/draw for every canonical reason and a side switch.
-- Regulation and every approved overtime state.
+- Regulation and the authoritative 6–6 draw state; no overtime fixture exists in Bomb v1.
 - Degraded, stale, reconnecting, grace expired, aborted, protocol mismatch.
 - 1280 x 720, 1920 x 1080, 21:9, HUD 70/100/160%, 200% zoom.
 - Reduced motion, grayscale, and approved color-vision simulations.
@@ -211,7 +213,7 @@ The HUD cannot be frozen until the following are answered in backend-owned contr
 
 - Complete round/series state machine, precedence, and timing.
 - Stable site IDs and callouts.
-- Side/role and overtime representation.
+- Side/role representation and the no-overtime 6–6 draw rule.
 - Bomb visibility rules for alive, dead, and spectator clients.
 - Interaction eligibility/refusal and authoritative progress fields.
 - Clock semantics before and after plant.

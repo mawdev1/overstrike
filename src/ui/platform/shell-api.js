@@ -200,7 +200,17 @@ export function createShellApi({ client, telemetry = null, settings = null, ulid
       });
     },
 
-    async getProfile() { return getOwnProfile(); },
+    async getProfile() {
+      const profile = await getOwnProfile();
+      try {
+        const publicProjection = await data(`/v1/profile/${encode(profile.accountId)}`);
+        return { ...profile, presence: publicProjection.presence ?? null };
+      } catch {
+        // Presence is a privacy-filtered routing hint, never identity authority. An unavailable
+        // public projection must not turn a valid cookie refresh into an auth failure.
+        return profile;
+      }
+    },
     updateProfile(payload = {}) {
       return data('/v1/profile/me', {
         method: 'PATCH', body: bodyWith(payload, ['displayName', 'privacy']),
@@ -214,7 +224,36 @@ export function createShellApi({ client, telemetry = null, settings = null, ulid
       const result = await data(query('/v1/rooms', payload,
         ['region', 'mode', 'hasSpace', 'limit', 'cursor']), { headers });
       if (!Array.isArray(result.items)) protocol(result.correlationId);
-      return { ...result, items: result.items.map(shellRoom), rooms: result.items.map(shellRoom) };
+      const fetchedAt = new Date().toISOString();
+      const response = { ...result, fetchedAt, items: result.items.map(shellRoom), rooms: result.items.map(shellRoom) };
+      // Presence and room cursors are independent opaque namespaces. Load the initial
+      // privacy-filtered presence projection once; room pagination must never replay its cursor
+      // into the presence endpoint or overwrite a previously valid presence list.
+      if (!payload.cursor) {
+        response.online = [];
+        response.presenceUnavailable = false;
+        try {
+          const presence = await data(query('/v1/presence/online', payload, ['limit']));
+          if (!Array.isArray(presence.items)) protocol(presence.correlationId);
+          response.online = presence.items;
+        } catch {
+          response.presenceUnavailable = true;
+        }
+      }
+      return response;
+    },
+
+    getOnlinePresence(payload = {}) {
+      return data(query('/v1/presence/online', payload, ['limit', 'cursor']));
+    },
+
+    createRoom(payload = {}) {
+      return data('/v1/rooms', {
+        method: 'POST',
+        body: bodyWith(payload, ['name', 'region', 'mapId', 'mode', 'capacity', 'password', 'settings']),
+        idempotencyKey: payload.idempotencyKey || key('create-room'),
+        maxAttempts: 1,
+      });
     },
 
     async getRoom(payload = {}) {
@@ -236,6 +275,7 @@ export function createShellApi({ client, telemetry = null, settings = null, ulid
         method: 'POST',
         body: { password: payload.password ?? null, preferredTeam: teamValue(payload.preferredTeam) || 'auto' },
         idempotencyKey: payload.idempotencyKey || key('join-room'),
+        signal: payload.signal,
       });
       // The frozen response is a reservation and does not repeat the path id. The shell needs
       // it for navigation, so retain the already-known request value without claiming a new

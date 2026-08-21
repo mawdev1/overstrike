@@ -448,6 +448,16 @@ async function testShellContractMappings() {
       if (path === '/v1/rooms') responseData = { items: [{ roomId: 'room-a', mapId: 'map-a',
         playerCount: 2, capacity: 8 }], nextCursor: null,
       correlationId: '00000000000000000000000000' };
+      if (path.startsWith('/v1/presence/online')) responseData = { items: [{
+        accountId: 'account-online', displayName: 'Online Player', state: 'online',
+        joinable: false, roomId: null,
+      }], nextCursor: null, correlationId: '00000000000000000000000000' };
+      if (path === '/v1/rooms' && options.method === 'POST') responseData = {
+        room: { roomId: 'room-created' }, roster: [], countdown: null,
+        reservationId: 'reservation-created', expiresAt: new Date().toISOString(),
+        lobbySocketUrl: 'wss://lobby.example/ws', lobbyTicket: 'ticket-created',
+        correlationId: '00000000000000000000000000',
+      };
       if (path === '/v1/auth/sessions') responseData = { sessions: [{ sessionId: 'session-a',
         deviceLabel: 'Browser', isCurrent: false }], correlationId: '00000000000000000000000000' };
       if (path === '/v1/profile/me/settings') responseData = { schemaVersion: 1, version: 2,
@@ -494,6 +504,12 @@ async function testShellContractMappings() {
   const rooms = await api.listRooms({ routeId: 'play.rooms' });
   assert.equal(rooms.items[0].id, 'room-a');
   assert.equal(rooms.items[0].occupancy, '2 / 8');
+  assert.equal(rooms.online[0].displayName, 'Online Player');
+  await api.createRoom({ name: 'New room', region: 'yyz', mapId: 'the-square', mode: 'bomb', capacity: 12 });
+  assert.deepEqual(calls.at(-1).options.body, {
+    name: 'New room', region: 'yyz', mapId: 'the-square', mode: 'bomb', capacity: 12,
+  });
+  assert.equal(typeof calls.at(-1).options.idempotencyKey, 'string');
   await api.setTeam({ roomId: 'room-a', team: 'A' });
   assert.deepEqual(calls.at(-1).options.body, { team: 'alpha' });
   await api.leaveRoom({ roomId: 'room-a' });

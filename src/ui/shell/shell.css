@@ -442,6 +442,132 @@
   overflow-wrap: anywhere;
 }
 
+.os-room-card .os-facts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.os-results-status {
+  min-height: 1.5em;
+  color: var(--os-muted);
+}
+
+.os-stale-content > :not(:first-child) {
+  opacity: .62;
+}
+
+.os-team-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin-block: 1.5rem;
+}
+
+.os-team {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--os-border-soft);
+  border-top: 2px solid var(--os-border);
+  background: var(--os-panel);
+}
+
+.os-team--unassigned {
+  border-top-style: dashed;
+}
+
+.os-team h2 {
+  margin-top: 0;
+}
+
+.os-team .os-roster {
+  margin: 0;
+}
+
+.os-roster-member {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start !important;
+}
+
+.os-roster-member__identity {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+}
+
+.os-roster-member__identity strong,
+.os-ready-reason {
+  overflow-wrap: anywhere;
+}
+
+.os-ready {
+  font-family: var(--f-mono, ui-monospace), monospace;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+
+.os-ready--yes {
+  color: var(--os-accent);
+}
+
+.os-ready--no,
+.os-ready-reason,
+.os-roster-empty {
+  color: var(--os-muted);
+}
+
+.os-ready-reason {
+  grid-column: 1 / -1;
+  font-size: .85rem;
+}
+
+.os-lobby-notices:empty {
+  display: none;
+}
+
+.os-notice,
+.os-countdown {
+  padding: .75rem 1rem;
+  border-left: 2px solid var(--os-accent-deep);
+  background: var(--os-accent-faint);
+}
+
+.os-countdown__value {
+  margin-block: .25rem;
+  color: var(--os-accent);
+  font-family: var(--f-mono, ui-monospace), monospace;
+  font-size: clamp(1.75rem, 4vw, 3rem);
+  font-weight: 800;
+}
+
+.os-chat-report {
+  margin-top: .75rem;
+  padding: .75rem;
+  border: 1px solid var(--os-border-soft);
+}
+
+.os-chat-report summary {
+  color: var(--os-muted);
+  cursor: pointer;
+}
+
+.os-chat-report select,
+.os-chat-report textarea,
+.os-ping-controls select {
+  width: 100%;
+  min-height: 2.75rem;
+  margin-block: .5rem;
+  padding: .65rem .75rem;
+  border: 1px solid var(--os-border-soft);
+  background: var(--os-bg-soft);
+  color: var(--os-text);
+  font: inherit;
+}
+
+.os-muted-players {
+  max-width: 52rem;
+}
+
 .os-status-chip {
   display: inline-block;
   padding: .15rem .5rem;
@@ -590,7 +716,7 @@
 }
 
 .os-filter-bar .os-field {
-  flex: 1 1 18rem;
+  flex: 1 1 12rem;
 }
 
 .os-checkbox {
@@ -695,6 +821,10 @@
   }
 
   .os-form--inline {
+    grid-template-columns: 1fr;
+  }
+
+  .os-team-grid {
     grid-template-columns: 1fr;
   }
 }

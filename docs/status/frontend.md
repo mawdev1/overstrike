@@ -576,3 +576,96 @@ transport codes needed for honest `connection.failure` telemetry. `REQ-CC-045/04
 findings still prevent H1.1/H1.2/G0 acceptance. The P1 shell/client/controller slice is complete;
 CX P1 overall remains **partial** for the explicitly listed runtime-setting and unmeasurable D5
 rows, and the platform gate is **not** claimed complete until the CC dependencies pass.
+
+## P2/P3 Codex frontend and map implementation snapshot
+
+The Codex-owned P2 and P3 implementation is now present as contract-driven islands with strict
+authority boundaries. This section supersedes earlier dated statements that the lobby reducer,
+Square producer, and Bomb presentation package were absent. It does **not** relabel missing
+CC-owned services, protocol/facade code, autonomous Bomb bots, human approvals, or release
+hardware evidence as frontend completion.
+
+P2 delivered in the CX lane:
+
+- A validated realtime lobby controller/reducer with ticket-authenticated WebSocket injection,
+  exact welcome/snapshot replacement, monotonic sequencing, correlation-matched resync, heartbeat
+  acknowledgement even across gaps, a two-heartbeat watchdog, five bounded fresh-ticket reconnect
+  attempts, cancellation, room isolation, authoritative roster state beside optimistic intent,
+  and semantic rejection of impossible roster/team/ready deltas.
+- Shell integration for join reservations, room-scoped controller lifetime, cold reconnect-ticket
+  discovery, live roster/chat/loadout routes, and unique match-ready handoff. Team, ready, loadout,
+  launch, chat, and ping actions now remain pending until a correlation-matched authoritative event
+  resolves or rejects them; merely writing to the socket is not presented as success.
+- Lobby frames are closed-schema checked before mutation: ULID identities/correlations, UTC
+  millisecond timestamps, frozen error/retryability rules, `wss:` handoffs, and local/owner/roster
+  consistency all fail closed. Countdown totals must equal the authoritative ready roster, and
+  match handoffs must preserve RoomCore's immutable map/mode/ruleset tuple. Join presents Requesting slot → Joining room channel → Synchronizing
+  roster → Ready, can be cancelled before reservation commit, and retries only
+  `SLOT_RESERVATION_EXPIRED` exactly once.
+- The server browser now includes exact room facts, measured latency, explicit sort, mode/region/
+  joinable/space filters, reset/refresh/cursor paging, last-confirmed receipt time, stale-response
+  suppression, and reason-specific states. Password-protected room detail uses an actual secret
+  input. Lobby views include Alpha/Bravo/unassigned columns, host/self/connection/readiness tokens,
+  cleared reasons, countdown/allocation/reconnect states, authoritative loadout options, isolated
+  chat, mute/report/ping entry points, rate-limit/error treatment, and focus-safe suppression of
+  heartbeat-only subtree replacement.
+- Local mute remains explicitly local display suppression; canned ping/target vocabulary, loadout
+  catalogue, terminal close mapping, and server enforcement are blocked by `REQ-CC-065`. Cold-page
+  reconnect semantics and mounted report/presence/room/browser-WebSocket surfaces are recorded in
+  `REQ-CC-062/066`. Real handoff remains fail-closed until the CC-owned match facade exists.
+
+P3 delivered in the CX lane:
+
+- `the-square` v1.0.0 is an original 88 m × 88 m producer with a stable manifest, sixteen named
+  spawns across four groups per team, protected Bomb groups, two exact plant volumes, fourteen
+  callouts with total standable coverage, four vertical links, cover/block hints, declared budgets,
+  removable competitive boundary plus its exact boundary-free nav projection, stable empty
+  commercial anchors, and retained MERIDIAN fixture.
+- The current Square passes the executable map, navigation, stair/ramp, vertical occupancy, full
+  collision/containment, geometry-report, and deterministic balance harnesses. Independent producer
+  acceptance additionally hard-gates dense eye-height sightlines at 48 m, 9–14 s protected-spawn
+  contact, 12–16 s nearest-site travel, 16–22 s site rotation, side symmetry, site standing space,
+  three reachable levels, callout coverage, budget declarations, and deliberate failing mutations.
+- The Bomb presentation package freezes clocks when freshness is unknown/stale, never extrapolates
+  plant/defuse progress, purges hidden/carried positions, distinguishes visible enemy and teammate
+  carriers, accepts only an authorized world-marker projection, renders truthful distance/
+  occlusion/offscreen direction, uses closed refusal/outcome/cue copy, measured-only network data,
+  binding-aware prompts, reconnect overlays, semantic progress, reduced motion, forced colors, HUD
+  scale, and color-vision presets. Its browser harness renders the full viewport × HUD-scale ×
+  100/200%-zoom × color-preset × motion matrix and checks every snapshot for overflow, semantics,
+  stable team text, and browser errors.
+- Mode selection/settings expose only the frozen `tdm|bomb` vocabulary and keep Bomb plus The
+  Square behind both disabled-by-default risk flags. Local practice now mounts an authoritative Bomb
+  HUD from `Match`/`BombRules`; defender carrier/drop visibility is filtered by current LOS, site
+  world markers use manifest identity with distance/direction/occlusion/safe-edge projection, and
+  the Square minimap renders distinct A/B shapes plus the player's exact callout. The semantic Bomb
+  subtree is exposed while legacy decorative HUD content remains hidden from assistive technology.
+- The shared scoreboard now reads Bomb round wins, phase time, roles, alive counts, objective state,
+  plants/defuses, and compact history, retains TDM behavior, follows the current scoreboard binding,
+  and renders latency only with complete measured-freshness metadata. Multiplayer mounting remains
+  fail-closed until the CC-owned `src/net/facade.js` exists; `REQ-CC-064/067` records the live
+  freshness/privacy/reconnect projection, spectator-policy, and autonomous objective-bot work.
+  `REQ-CC-063/069` records the absent nav-bake artifact/freshness tooling and mandatory Square-aware
+  CI/performance registration.
+
+Verification at this snapshot:
+
+- `node scripts/uilobby.mjs`: **PASS — 209 assertions**; five malformed CC timelines are rejected
+  as one exact allowlisted set under `REQ-CC-068`, and a sixth invalid timeline would fail the suite.
+- `npm run uishell`: **PASS — 1,279 assertions** (including the password-room and production-entry probes).
+- `node scripts/uibomb.mjs`: **PASS — 1,772 assertions / 36 deterministic fixtures / 180 browser visual combinations**.
+- `node scripts/uimap.mjs`: **PASS — 43 producer assertions**, including deliberate failing mutations and a boundary-free build/nav projection.
+- `npm run maptest`, `navtest`, `stairtest`, `vertprobe`, `collisiontest`, `mapbalance`, and
+  `geomtest`: **PASS** on The Square; nav is 71.71% reachable with all 16 spawn-group/site paths,
+  dense maximum sightline is below 48 m, and the latest deterministic balance arm is within every
+  implemented spawn-quality threshold.
+- `node --test src/ui/scoreboard.test.mjs`: **PASS — 5/5**.
+- `npm run check`: **PASS — 85 modules / 226 imports**. `npm run build`: **PASS — 101 modules**,
+  with the game runtime retained as a separate lazy chunk.
+- `npm run platformtest`, `bombtest`, and `tdmtest`: **PASS** at the tested shared-tree snapshot.
+
+Codex's owned P2/P3 source slice is implemented and locally green. Overall P2/P3 roadmap gates
+remain **partial / externally blocked**, not complete: H2.1–H2.3 require mounted live/stub services;
+H3.1/H3.2 require lane-legal nav bake/tooling and enforced scene budgets; H3.3 requires autonomous
+objective-playing bots and the live facade; H3.4 plus art/accessibility/commercial approval and real
+supported-hardware/browser evidence remain human/joint release work.

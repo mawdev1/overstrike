@@ -595,97 +595,383 @@ function renderSettingsHook({ route, view, actions, settings, session, isFeature
   return host;
 }
 
+function roomId(room) {
+  return room?.id || room?.roomId || null;
+}
+
+function roomPing(room) {
+  if (Number.isFinite(room?.estimatedRttMs)) return room.estimatedRttMs;
+  if (Number.isFinite(room?.measuredPingMs)) return room.measuredPingMs;
+  return null;
+}
+
+function roomCounts(room) {
+  if (Number.isFinite(room?.playerCount) && Number.isFinite(room?.capacity)) {
+    return { players: room.playerCount, capacity: room.capacity, label: `${room.playerCount} / ${room.capacity}` };
+  }
+  const parsed = /^(\d+)\s*\/\s*(\d+)$/.exec(String(room?.occupancy || ''));
+  return parsed
+    ? { players: Number(parsed[1]), capacity: Number(parsed[2]), label: room.occupancy }
+    : { players: null, capacity: null, label: room?.occupancy || null };
+}
+
+function roomMap(room) {
+  return room?.mapId || room?.map || null;
+}
+
+function mapLabel(value) {
+  return value === 'the-square' ? 'The Square' : value;
+}
+
+function modeLabel(value) {
+  if (value === 'tdm') return 'Team deathmatch';
+  if (value === 'bomb') return 'Bomb';
+  return value;
+}
+
+function roomEligibility(room) {
+  if (room?.joinable === true) return 'Eligible to join';
+  if (room?.joinBlockedReason) return `Cannot join: ${String(room.joinBlockedReason).replaceAll('-', ' ')}`;
+  return room?.joinable === false ? 'Not joinable' : 'Eligibility unavailable';
+}
+
 function roomCard(room) {
-  const id = room?.id;
-  const card = element('article', { className: 'os-card' }, [
-    element('h2', {}, room?.name || 'Unnamed room'),
+  const id = roomId(room);
+  const ping = roomPing(room);
+  const counts = roomCounts(room);
+  const card = element('article', { className: 'os-card os-room-card', dataset: { joinable: String(room?.joinable === true) } }, [
+    element('h2', {}, room?.name || id || 'Unnamed room'),
     definitionList([
-      ['Mode', room?.mode],
-      ['Players', room?.occupancy],
+      ['Map', mapLabel(roomMap(room))],
+      ['Mode', modeLabel(room?.mode)],
+      ['Players', counts.label],
       ['Region', room?.region],
-      ['Measured latency', Number.isFinite(room?.measuredPingMs) ? `${room.measuredPingMs} ms` : null],
+      ['Measured latency', ping === null ? 'Unknown' : `${ping} ms`],
+      ['Status', room?.status],
+      ['Join eligibility', roomEligibility(room)],
     ]),
   ]);
   if (id) card.append(shellLink('View room', `/play/rooms/${encodeURIComponent(id)}`, { className: 'os-button os-button--quiet' }));
   return card;
 }
 
-function renderRooms({ view }) {
+function selectControl(label, id, options) {
+  const select = element('select', { id });
+  for (const option of options) {
+    select.append(element('option', { value: option.value }, option.label));
+  }
+  return element('div', { className: 'os-field' }, [element('label', { htmlFor: id }, label), select]);
+}
+
+function defaultRoomOrder(left, right) {
+  if (Boolean(left.joinable) !== Boolean(right.joinable)) return left.joinable ? -1 : 1;
+  const pingDelta = (roomPing(left) ?? Number.POSITIVE_INFINITY) - (roomPing(right) ?? Number.POSITIVE_INFINITY);
+  if (pingDelta) return pingDelta;
+  const playerDelta = (roomCounts(right).players ?? -1) - (roomCounts(left).players ?? -1);
+  if (playerDelta) return playerDelta;
+  return String(left.name || roomId(left) || '').localeCompare(String(right.name || roomId(right) || ''));
+}
+
+function renderRooms({ view, actions, isFeatureEnabled }) {
   const rooms = view.data?.rooms || view.data?.items || [];
-  if (!rooms.length) return element('p', {}, 'No rooms are available.');
-  const ordered = [...rooms].sort((left, right) => {
-    if (Boolean(left.joinable) !== Boolean(right.joinable)) return left.joinable ? -1 : 1;
-    const leftPing = Number.isFinite(left.measuredPingMs) ? left.measuredPingMs : Number.POSITIVE_INFINITY;
-    const rightPing = Number.isFinite(right.measuredPingMs) ? right.measuredPingMs : Number.POSITIVE_INFINITY;
-    return leftPing - rightPing;
-  });
-  const search = field({ label: 'Filter rooms', name: 'room-search', type: 'search', autocomplete: 'off' });
+  const online = Array.isArray(view.data?.online) ? view.data.online : [];
+  const lastUpdatedAt = view.data?.lastUpdatedAt || view.data?.fetchedAt || null;
+  const emptyRoomNotice = !rooms.length ? element('section', { className: 'os-state', role: 'status' }, [
+    element('h2', {}, 'No active rooms'),
+    element('p', {}, 'The platform is reachable, but no rooms are active right now. You can create the first available room.'),
+  ]) : null;
+
+  const modes = [...new Set(rooms.map((room) => room.mode).filter(Boolean))].sort();
+  const regions = [...new Set(rooms.map((room) => room.region).filter(Boolean))].sort();
+  const search = field({ label: 'Search rooms', name: 'room-search', type: 'search', autocomplete: 'off' });
+  const modeControl = selectControl('Mode', 'shell-room-mode', [
+    { value: '', label: 'All modes' }, ...modes.map((mode) => ({ value: mode, label: mode === 'tdm' ? 'Team deathmatch' : mode === 'bomb' ? 'Bomb' : mode })),
+  ]);
+  const regionControl = selectControl('Region', 'shell-room-region', [
+    { value: '', label: 'All regions' }, ...regions.map((region) => ({ value: region, label: region })),
+  ]);
+  const sortControl = selectControl('Sort', 'shell-room-sort', [
+    { value: 'recommended', label: 'Joinable, latency, occupancy' },
+    { value: 'latency', label: 'Measured latency' },
+    { value: 'occupancy', label: 'Most players' },
+    { value: 'name', label: 'Room name' },
+  ]);
+  const mode = modeControl.querySelector('select');
+  const region = regionControl.querySelector('select');
+  const sort = sortControl.querySelector('select');
   const joinable = element('input', { id: 'shell-room-joinable', type: 'checkbox' });
+  const hasSpace = element('input', { id: 'shell-room-space', type: 'checkbox' });
   const joinableLabel = element('label', { className: 'os-checkbox', htmlFor: joinable.id }, [joinable, element('span', {}, 'Joinable only')]);
+  const hasSpaceLabel = element('label', { className: 'os-checkbox', htmlFor: hasSpace.id }, [hasSpace, element('span', {}, 'Has space')]);
   const grid = element('section', { className: 'os-card-grid', 'aria-label': 'Available rooms' });
-  const cards = ordered.map((room) => ({ room, card: roomCard(room) }));
-  cards.forEach(({ card }) => grid.append(card));
-  const resultStatus = element('p', { role: 'status', 'aria-live': 'polite' });
+  const cards = rooms.map((room) => ({ room, card: roomCard(room) }));
+  const resultStatus = element('p', { className: 'os-results-status', role: 'status', 'aria-live': 'polite' });
+
   const apply = () => {
     const query = search.input.value.trim().toLocaleLowerCase();
-    let visible = 0;
-    for (const { room, card } of cards) {
-      const haystack = [room.name, room.id, room.mode, room.region].filter(Boolean).join(' ').toLocaleLowerCase();
-      const matches = (!query || haystack.includes(query)) && (!joinable.checked || room.joinable === true);
-      card.hidden = !matches;
-      if (matches) visible += 1;
-    }
-    resultStatus.textContent = `${visible} room${visible === 1 ? '' : 's'} shown.`;
+    const visible = cards.filter(({ room }) => {
+      const counts = roomCounts(room);
+      const haystack = [room.name, roomId(room), roomMap(room), room.mode, room.region, room.status]
+        .filter(Boolean).join(' ').toLocaleLowerCase();
+      return (!query || haystack.includes(query))
+        && (!mode.value || room.mode === mode.value)
+        && (!region.value || room.region === region.value)
+        && (!joinable.checked || room.joinable === true)
+        && (!hasSpace.checked || (counts.players !== null && counts.capacity !== null && counts.players < counts.capacity));
+    });
+    visible.sort(({ room: left }, { room: right }) => {
+      if (sort.value === 'latency') {
+        const delta = (roomPing(left) ?? Number.POSITIVE_INFINITY) - (roomPing(right) ?? Number.POSITIVE_INFINITY);
+        return delta || defaultRoomOrder(left, right);
+      }
+      if (sort.value === 'occupancy') {
+        const delta = (roomCounts(right).players ?? -1) - (roomCounts(left).players ?? -1);
+        return delta || defaultRoomOrder(left, right);
+      }
+      if (sort.value === 'name') {
+        return String(left.name || roomId(left) || '').localeCompare(String(right.name || roomId(right) || ''));
+      }
+      return defaultRoomOrder(left, right);
+    });
+    grid.replaceChildren(...visible.map(({ card }) => card));
+    resultStatus.textContent = visible.length
+      ? `${visible.length} room${visible.length === 1 ? '' : 's'} shown.`
+      : 'No rooms match these filters. Reset filters to see all active rooms.';
   };
-  search.input.addEventListener('input', apply);
-  joinable.addEventListener('change', apply);
+  for (const control of [search.input, mode, region, sort, joinable, hasSpace]) {
+    control.addEventListener(control === search.input ? 'input' : 'change', apply);
+  }
   const reset = actionButton('Reset filters', () => {
     search.input.value = '';
+    mode.value = '';
+    region.value = '';
+    sort.value = 'recommended';
     joinable.checked = false;
+    hasSpace.checked = false;
     apply();
     search.input.focus();
   }, { className: 'os-button os-button--quiet' });
   apply();
-  return element('section', {}, [element('div', { className: 'os-filter-bar' }, [search.wrapper, joinableLabel, reset]), resultStatus, grid]);
+
+  const create = element('details', { className: 'os-room-create' }, [
+    element('summary', {}, 'Create a room'),
+  ]);
+  const createName = field({ label: 'Room name', name: 'room-create-name', required: true });
+  createName.input.maxLength = 48;
+  const createRegion = field({ label: 'Region', name: 'room-create-region', required: true });
+  const modeOptions = [
+    isFeatureEnabled?.('mode.tdm.enabled') !== false ? { value: 'tdm', label: 'Team deathmatch' } : null,
+    isFeatureEnabled?.('mode.bomb.enabled') !== false ? { value: 'bomb', label: 'Bomb' } : null,
+  ].filter(Boolean);
+  const mapOptions = [
+    isFeatureEnabled?.('map.the_square.enabled') !== false ? { value: 'the-square', label: 'The Square' } : null,
+  ].filter(Boolean);
+  const createMapWrap = selectControl('Map', 'shell-room-create-map', mapOptions);
+  const createModeWrap = selectControl('Mode', 'shell-room-create-mode', modeOptions);
+  const createCapacity = field({ label: 'Capacity', name: 'room-create-capacity', type: 'number', required: true });
+  createCapacity.input.min = '2'; createCapacity.input.max = '12'; createCapacity.input.value = '12';
+  const createPassword = field({ label: 'Password (optional)', name: 'room-create-password', type: 'password', autocomplete: 'new-password' });
+  const createStatus = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite' });
+  const createSubmit = submitButton('Create and join');
+  createSubmit.disabled = !modeOptions.length || !mapOptions.length;
+  const createForm = element('form', { className: 'os-form' }, [
+    createName.wrapper, createRegion.wrapper, createMapWrap, createModeWrap,
+    createCapacity.wrapper, createPassword.wrapper,
+    !modeOptions.length || !mapOptions.length
+      ? element('p', { className: 'os-notice', role: 'status' }, 'Room creation is unavailable because no approved mode and map combination is enabled.') : null,
+    createStatus, createSubmit,
+  ]);
+  createForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    actions.submit('createRoom', {
+      name: createName.input.value.trim(), region: createRegion.input.value.trim(),
+      mapId: createMapWrap.querySelector('select').value, mode: createModeWrap.querySelector('select').value,
+      capacity: Number(createCapacity.input.value), password: createPassword.input.value || undefined,
+    }, {
+      secretInputs: [createPassword.input],
+      onSuccess: (result) => actions.navigate(`/room/${encodeURIComponent(result.room.roomId)}`),
+      onError: (error) => { createStatus.textContent = safeError(error).message; createStatus.focus(); },
+    });
+  });
+  create.append(createForm);
+
+  const presence = element('section', { className: 'os-presence-list', 'aria-labelledby': 'os-online-heading' }, [
+    element('h2', { id: 'os-online-heading' }, 'Online players'),
+    view.data?.presenceUnavailable
+      ? element('p', { className: 'os-hint' }, 'Presence is temporarily unavailable. Room browsing still works.')
+      : online.length
+        ? element('ul', {}, online.map((player) => element('li', {}, [
+          element('strong', {}, player.displayName),
+          element('span', {}, ` — ${String(player.state).replaceAll('-', ' ')}`),
+          player.joinable && player.roomId
+            ? shellLink('View room', `/play/rooms/${encodeURIComponent(player.roomId)}`, { className: 'os-button os-button--quiet' })
+            : null,
+        ])))
+        : element('p', {}, 'No privacy-visible players are online.'),
+  ]);
+
+  return element('section', {}, [
+    create,
+    presence,
+    emptyRoomNotice,
+    element('div', { className: 'os-filter-bar' }, [search.wrapper, modeControl, regionControl, sortControl, joinableLabel, hasSpaceLabel]),
+    actionsRow([
+      actionButton('Refresh rooms', actions.refresh, { className: 'os-button os-button--primary' }),
+      reset,
+      view.data?.nextCursor
+        ? actionButton('Load more rooms', () => actions.loadMore('rooms', view.data.nextCursor), { className: 'os-button os-button--quiet' })
+        : null,
+    ]),
+    lastUpdatedAt ? element('p', { className: 'os-hint' }, `Last confirmed: ${dateText(lastUpdatedAt)}`) : null,
+    view.data?.paginationError
+      ? element('p', { className: 'os-state os-state--error', role: 'alert' }, `More rooms could not be loaded: ${safeError(view.data.paginationError).message}`)
+      : null,
+    resultStatus,
+    grid,
+  ]);
 }
 
 function renderRoomDetail({ view, actions, isFeatureEnabled }) {
   const room = view.data?.room || view.data || {};
+  const id = roomId(room);
+  const ping = roomPing(room);
+  const counts = roomCounts(room);
+  const feedback = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite', tabIndex: -1 });
+  const password = room.hasPassword
+    ? field({ label: 'Room password', name: 'room-password', type: 'password', autocomplete: 'off', required: true })
+    : null;
+  let joinAbort = null;
+  const stageCopy = Object.freeze({
+    'requesting-slot': 'Requesting slot…',
+    'reservation-expired': 'The first slot reservation expired. Retrying once…',
+    'retrying-slot': 'Requesting a fresh slot…',
+    'joining-room-channel': 'Joining room channel…',
+    'synchronizing-roster': 'Synchronizing roster…',
+    ready: 'Room ready.',
+  });
+  const cancelJoin = actionButton('Cancel join', () => {
+    cancelJoin.disabled = true;
+    feedback.textContent = 'Cancelling join…';
+    joinAbort?.abort();
+  }, { className: 'os-button os-button--quiet', dataset: { operation: 'cancel-join' }, disabled: true });
+  cancelJoin.hidden = true;
+  const showStage = (stage) => {
+    feedback.textContent = stageCopy[stage] || 'Joining room…';
+    const cancellable = !['ready'].includes(stage);
+    cancelJoin.hidden = !cancellable;
+    cancelJoin.disabled = !cancellable;
+  };
   return element('section', {}, [
     definitionList([
-      ['Room', room.name],
-      ['Mode', room.mode],
-      ['Map', room.map],
-      ['Players', room.occupancy],
+      ['Room', room.name || id],
+      ['Mode', modeLabel(room.mode)],
+      ['Map', mapLabel(roomMap(room))],
+      ['Players', counts.label],
       ['Region', room.region],
+      ['Measured latency', ping === null ? 'Unknown' : `${ping} ms`],
+      ['Status', room.status],
+      ['Rules version', room.rulesetVersion],
+      ['Join eligibility', roomEligibility(room)],
     ]),
+    password?.wrapper,
+    feedback,
     actionsRow([
-      actionButton('Join room', () => actions.submit('joinRoom', { roomId: room.id }, {
+      actionButton('Join room', () => {
+        joinAbort = new AbortController();
+        return actions.submit('joinRoom', {
+          roomId: id, password: password?.input.value || null,
+          signal: joinAbort.signal, onStage: showStage,
+        }, {
+        secretInputs: password ? [password.input] : [],
         onSuccess: (result) => {
-          const confirmedId = result?.room?.id || result?.roomId;
+          joinAbort = null;
+          showStage('ready');
+          const confirmedId = result?.room?.id || result?.room?.roomId || result?.roomId || id;
           if (confirmedId) actions.navigate(`/room/${encodeURIComponent(confirmedId)}`);
         },
-      }), { className: 'os-button os-button--primary', disabled: !room.id || room.joinable === false }),
+        onError: (error) => {
+          joinAbort = null;
+          cancelJoin.hidden = true;
+          cancelJoin.disabled = true;
+          if (password) password.input.value = '';
+          feedback.textContent = error?.code === 'CLIENT_ABORTED'
+            ? 'Join cancelled. No room state was assumed.'
+            : error?.code === 'SLOT_RESERVATION_EXPIRED'
+              ? 'The fresh slot reservation also expired. Room occupancy may have changed; refresh before trying again.'
+              : safeError(error).message;
+          (password?.input || feedback).focus();
+        },
+        });
+      }, { className: 'os-button os-button--primary', dataset: { operation: 'join' }, disabled: !id || room.joinable === false }),
+      cancelJoin,
       shellLink(homePath(isFeatureEnabled) === '/welcome' ? 'Back to welcome' : 'Back to rooms',
         homePath(isFeatureEnabled), { className: 'os-button os-button--quiet' }),
     ]),
   ]);
 }
 
-function rosterList(members = []) {
-  const list = element('ul', { className: 'os-roster' });
-  for (const member of members) {
-    list.append(element('li', {}, [
-      element('strong', {}, member.displayName || 'Unnamed player'),
-      element('span', {}, `Team: ${member.team || 'Unassigned'}`),
-      statusBadge(member.ready ? 'Ready' : 'Not ready'),
-    ]));
-  }
-  return list;
+const TEAM_LABELS = Object.freeze({ alpha: 'Alpha', bravo: 'Bravo', unassigned: 'Unassigned', A: 'Alpha', B: 'Bravo' });
+const READY_CLEAR_LABELS = Object.freeze({
+  'roster-change': 'Readiness was cleared because the roster changed.',
+  'team-change': 'Readiness was cleared because a team changed.',
+  'loadout-change': 'Readiness was cleared because the loadout changed.',
+  'room-change': 'Readiness was cleared because the room settings changed.',
+});
+
+function normalizedTeam(team) {
+  if (team === 'A') return 'alpha';
+  if (team === 'B') return 'bravo';
+  return ['alpha', 'bravo'].includes(team) ? team : 'unassigned';
 }
 
-function roomNavigation(roomId) {
-  const encoded = encodeURIComponent(roomId || '');
+function memberId(member) {
+  return member?.accountId || member?.id || null;
+}
+
+function pendingIntent(view, kind) {
+  const pending = view.data?.pendingIntent || view.data?.pending;
+  if (typeof pending === 'string') return pending === kind;
+  if (pending?.type === kind || pending?.kind === kind) return true;
+  const types = {
+    team: 'team.request', ready: 'ready.set', loadout: 'loadout.set',
+    chat: 'chat.send', ping: 'ping.send',
+  };
+  return Object.values(pending || {}).some((intent) => intent?.t === types[kind]);
+}
+
+function memberRow(member) {
+  const ping = Number.isFinite(member.estimatedRttMs) ? `${member.estimatedRttMs} ms` : 'Latency unknown';
+  const cleared = member.clearedReason ? READY_CLEAR_LABELS[member.clearedReason] || `Readiness cleared: ${member.clearedReason}` : null;
+  return element('li', { className: 'os-roster-member', dataset: { accountId: memberId(member) || '' } }, [
+    element('div', { className: 'os-roster-member__identity' }, [
+      element('strong', {}, member.displayName || 'Unnamed player'),
+      member.isLocal ? statusBadge('You') : null,
+      member.isOwner ? statusBadge('Host') : null,
+    ]),
+    element('span', {}, member.connection || 'Connection unknown'),
+    element('span', {}, ping),
+    element('span', { className: member.ready ? 'os-ready os-ready--yes' : 'os-ready os-ready--no' }, member.ready ? '✓ READY' : '○ NOT READY'),
+    cleared ? element('span', { className: 'os-ready-reason' }, cleared) : null,
+  ]);
+}
+
+function rosterBoard(members = []) {
+  const board = element('div', { className: 'os-team-grid' });
+  for (const team of ['alpha', 'bravo', 'unassigned']) {
+    const teamMembers = members.filter((member) => normalizedTeam(member.team) === team);
+    const list = element('ul', { className: 'os-roster', 'aria-label': `${TEAM_LABELS[team]} roster` });
+    if (teamMembers.length) teamMembers.forEach((member) => list.append(memberRow(member)));
+    else list.append(element('li', { className: 'os-roster-empty' }, 'No players'));
+    board.append(element('section', { className: `os-team os-team--${team}` }, [
+      element('h2', {}, `${TEAM_LABELS[team]} — ${teamMembers.length}`),
+      list,
+    ]));
+  }
+  return board;
+}
+
+function roomNavigation(roomIdValue) {
+  const encoded = encodeURIComponent(roomIdValue || '');
   return element('nav', { className: 'os-subnav', 'aria-label': 'Room' }, [
     shellLink('Lobby', `/room/${encoded}`),
     shellLink('Roster', `/room/${encoded}/roster`),
@@ -694,70 +980,358 @@ function roomNavigation(roomId) {
   ]);
 }
 
-function renderLobby({ route, view, actions, isFeatureEnabled }) {
-  const room = view.data?.room || {};
+function roomSummary(room) {
+  const ping = roomPing(room);
+  const counts = roomCounts(room);
+  return definitionList([
+    ['Room', room?.name || roomId(room)],
+    ['Map', mapLabel(roomMap(room))],
+    ['Mode', modeLabel(room?.mode)],
+    ['Region', room?.region],
+    ['Measured latency', ping === null ? 'Unknown' : `${ping} ms`],
+    ['Status', room?.status],
+    ['Capacity', counts.label],
+    ['Rules version', room?.rulesetVersion],
+  ]);
+}
+
+function lobbyNotices(view, actions, isFeatureEnabled) {
+  const notices = element('div', { className: 'os-lobby-notices' });
+  const controllerStatus = view.data?.status;
+  const connection = view.data?.lobbyConnection || view.data?.connection
+    || (controllerStatus && !['synchronized', 'countdown', 'allocating', 'handoff-ready'].includes(controllerStatus)
+      ? { state: controllerStatus, ...(view.data?.reconnect || {}) } : null);
+  if (connection && !['live', 'connected', 'synchronized'].includes(connection.state || connection)) {
+    const state = connection.state || connection;
+    const attempt = Number.isInteger(connection.attempt) && Number.isInteger(connection.maxAttempts)
+      ? ` ${connection.attempt}/${connection.maxAttempts}` : '';
+    notices.append(element('section', { className: 'os-state os-state--offline', role: 'status' }, [
+      element('strong', {}, `Lobby connection: ${state}${attempt}`),
+      connection.message ? element('p', {}, connection.message) : null,
+      connection.graceEndsAt ? element('p', {}, `Seat held until: ${dateText(connection.graceEndsAt)}`) : null,
+      connection.canCancel ? actionButton('Cancel reconnect', () => actions.submit('cancelLobbyReconnect', {}, {
+        onError: (error) => actions.announce(safeError(error).message),
+      }), { className: 'os-button os-button--quiet', dataset: { operation: 'cancel-reconnect' } }) : null,
+      ['closed', 'failed'].includes(state) ? actionsRow([
+        shellLink(isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? 'Return to welcome' : 'Return to rooms', homePath(isFeatureEnabled), { className: 'os-button os-button--quiet' }),
+        shellLink('Exit to welcome', '/welcome', { className: 'os-button os-button--quiet' }),
+      ]) : null,
+    ]));
+  }
+  const clearedReason = view.data?.readyClearedReason;
+  if (clearedReason) notices.append(element('p', { className: 'os-notice', role: 'status' }, READY_CLEAR_LABELS[clearedReason] || `Readiness cleared: ${clearedReason}`));
+  if (view.data?.countdownAbortedReason) {
+    notices.append(element('p', { className: 'os-notice', role: 'status' }, `Countdown stopped: ${String(view.data.countdownAbortedReason).replaceAll('-', ' ')}.`));
+  }
+  if (view.data?.intentError) {
+    notices.append(element('p', { className: 'os-state os-state--error', role: 'alert', tabIndex: -1, 'data-error-summary': 'true' }, safeError(view.data.intentError).message));
+  }
+  if (view.data?.failure && !view.data?.intentError) {
+    notices.append(element('p', { className: 'os-state os-state--error', role: 'alert', tabIndex: -1, 'data-error-summary': 'true' }, safeError(view.data.failure).message));
+  }
+  if (view.data?.notice) notices.append(element('p', { className: 'os-notice', role: 'status' }, view.data.notice));
+  if (view.data?.allocation?.state) {
+    notices.append(element('p', { className: 'os-notice', role: 'status' }, view.data.allocation.message || `Match allocation: ${view.data.allocation.state}.`));
+  }
+  return notices;
+}
+
+function countdownPanel(view) {
+  const countdown = view.data?.countdown;
+  if (!countdown) return null;
+  const remainingMs = Number.isFinite(countdown.remainingMs)
+    ? countdown.remainingMs
+    : Number.isFinite(view.data?.countdownRemainingMs) ? view.data.countdownRemainingMs : null;
+  return element('section', { className: 'os-countdown', role: 'timer', 'aria-label': 'Match countdown' }, [
+    element('h2', {}, 'Match countdown'),
+    remainingMs === null
+      ? element('p', {}, countdown.endsAt ? `Authoritative end: ${dateText(countdown.endsAt)}` : 'Waiting for the next server tick.')
+      : element('p', { className: 'os-countdown__value' }, `${Math.max(0, Math.ceil(remainingMs / 1000))} seconds`),
+    element('p', {}, `${countdown.currentReady ?? '—'} of ${countdown.requiredReady ?? '—'} required players ready.`),
+  ]);
+}
+
+function lobbyControls({ route, view, actions, isFeatureEnabled }) {
   const members = view.data?.members || view.data?.roster || [];
-  return element('section', {}, [
-    roomNavigation(route.params.roomId),
-    room.name ? element('p', { className: 'os-lede' }, room.name) : null,
-    rosterList(members),
+  const local = members.find((member) => member.isLocal) || view.data?.you || {};
+  const currentReady = view.data?.selfReady ?? local.ready === true;
+  const frozen = Boolean(view.data?.countdown) || view.data?.room?.status === 'countdown';
+  const connected = !view.data?.status || ['synchronized', 'countdown'].includes(view.data.status);
+  const teamPending = pendingIntent(view, 'team');
+  const readyPending = pendingIntent(view, 'ready');
+  const optimisticTeam = view.data?.optimistic?.team || view.data?.pendingIntent?.team || null;
+  const optimisticReady = view.data?.optimistic?.ready;
+  const feedback = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite', tabIndex: -1 });
+  const submitIntent = (operation, payload, pendingMessage, successMessage) => {
+    feedback.textContent = pendingMessage;
+    return actions.submit(operation, payload, {
+      onSuccess: (result) => {
+        feedback.textContent = successMessage;
+        if (result) actions.refresh();
+      },
+      onError: (error) => {
+        feedback.textContent = `${safeError(error).message} The authoritative roster has not changed.`;
+        feedback.focus();
+      },
+    });
+  };
+  const roomIdValue = route.params.roomId;
+  return element('section', { className: 'os-lobby-controls' }, [
+    feedback,
+    teamPending ? element('p', { className: 'os-notice', role: 'status' }, `Team change pending${optimisticTeam ? `: ${optimisticTeam === 'auto' ? 'automatic assignment' : TEAM_LABELS[normalizedTeam(optimisticTeam)]}` : ''}. The roster remains authoritative.`) : null,
+    readyPending ? element('p', { className: 'os-notice', role: 'status' }, `${optimisticReady === false ? 'Not-ready' : 'Ready'} request pending. The roster label remains authoritative until the server answers.`) : null,
     actionsRow([
-      actionButton(view.data?.selfReady ? 'Mark not ready' : 'Mark ready', () => actions.submit('setReady', { roomId: route.params.roomId, ready: !view.data?.selfReady }, {
-        onSuccess: actions.refresh,
-      }), { className: 'os-button os-button--primary' }),
+      actionButton('Join Alpha', () => submitIntent('setTeam', { roomId: roomIdValue, team: 'alpha' }, 'Requesting Alpha…', 'Team response received.'), {
+        className: 'os-button os-button--quiet', dataset: { operation: 'team-alpha' }, disabled: !connected || frozen || teamPending,
+      }),
+      actionButton('Join Bravo', () => submitIntent('setTeam', { roomId: roomIdValue, team: 'bravo' }, 'Requesting Bravo…', 'Team response received.'), {
+        className: 'os-button os-button--quiet', dataset: { operation: 'team-bravo' }, disabled: !connected || frozen || teamPending,
+      }),
+      actionButton('Unassigned', () => submitIntent('setTeam', { roomId: roomIdValue, team: 'auto' }, 'Requesting automatic assignment…', 'Team response received.'), {
+        className: 'os-button os-button--quiet', dataset: { operation: 'team-auto' }, disabled: !connected || frozen || teamPending,
+      }),
+    ]),
+    actionsRow([
+      actionButton(currentReady ? '✓ READY — select to cancel' : '○ GREEN UP', () => submitIntent('setReady', {
+        roomId: roomIdValue, ready: !currentReady,
+      }, currentReady ? 'Cancelling ready state…' : 'Requesting ready state…', 'Ready response received.'), {
+        className: currentReady ? 'os-button os-button--quiet' : 'os-button os-button--primary',
+        dataset: { operation: 'ready' }, disabled: !connected || readyPending || Boolean(view.data?.readyUnavailableReason),
+        'aria-pressed': currentReady ? 'true' : 'false',
+      }),
+      local.isOwner ? actionButton('Launch when ready', () => submitIntent('launchRoom', { roomId: roomIdValue }, 'Requesting launch…', 'Launch request accepted.'), {
+        className: 'os-button os-button--primary', dataset: { operation: 'launch' }, disabled: !connected || frozen,
+      }) : null,
       actionButton('Leave room', (event) => actions.openModal({
         title: 'Leave this room?',
         message: 'Your place in the room is released only after the service confirms the request.',
         confirmLabel: 'Leave room',
         opener: event.currentTarget,
-        onConfirm: () => actions.submit('leaveRoom', { roomId: route.params.roomId }, {
+        onConfirm: () => actions.submit('leaveRoom', { roomId: roomIdValue }, {
           onSuccess: () => {
             actions.recordLobbyAbandoned(view.data?.countdown ? 'countdown' : 'in-lobby');
             actions.navigate(homePath(isFeatureEnabled));
           },
+          onError: (error) => {
+            feedback.textContent = safeError(error).message;
+            feedback.focus();
+          },
         }),
-      }), { className: 'os-button os-button--danger' }),
+      }), { className: 'os-button os-button--danger', dataset: { operation: 'leave' }, disabled: !connected }),
     ]),
+    view.data?.readyUnavailableReason ? element('p', { className: 'os-warning' }, view.data.readyUnavailableReason) : null,
   ]);
 }
 
-function renderRoster({ route, view, actions }) {
+function renderLobby({ route, view, actions, isFeatureEnabled }) {
+  const room = view.data?.room || {};
   const members = view.data?.members || view.data?.roster || [];
   return element('section', {}, [
     roomNavigation(route.params.roomId),
-    rosterList(members),
-    actionsRow([
-      actionButton('Join team A', () => actions.submit('setTeam', { roomId: route.params.roomId, team: 'A' }, { onSuccess: actions.refresh }), { className: 'os-button os-button--quiet' }),
-      actionButton('Join team B', () => actions.submit('setTeam', { roomId: route.params.roomId, team: 'B' }, { onSuccess: actions.refresh }), { className: 'os-button os-button--quiet' }),
-    ]),
+    lobbyNotices(view, actions, isFeatureEnabled),
+    roomSummary(room),
+    countdownPanel(view),
+    rosterBoard(members),
+    lobbyControls({ route, view, actions, isFeatureEnabled }),
+  ]);
+}
+
+function renderRoster({ route, view, actions, isFeatureEnabled }) {
+  const members = view.data?.members || view.data?.roster || [];
+  return element('section', {}, [
+    roomNavigation(route.params.roomId),
+    lobbyNotices(view, actions, isFeatureEnabled),
+    rosterBoard(members),
+    lobbyControls({ route, view, actions, isFeatureEnabled }),
   ]);
 }
 
 function renderChat({ route, view, actions, isFeatureEnabled }) {
-  const messages = view.data?.messages || [];
+  const expectedRoomId = route.params.roomId;
+  const connected = !view.data?.status || ['synchronized', 'countdown'].includes(view.data.status);
+  const historyRoomId = view.data?.historyRoomId || view.data?.roomId || expectedRoomId;
+  const messages = historyRoomId === expectedRoomId
+    ? view.data?.messages || view.data?.chatHistory || []
+    : [];
   const list = element('ol', { className: 'os-chat-log', 'aria-label': 'Room messages' });
   for (const message of messages) {
-    list.append(element('li', {}, [
-      element('strong', {}, message.author || 'Unknown player'),
-      element('p', {}, message.text || ''),
-      message.sentAt ? element('time', { dateTime: message.sentAt }, dateText(message.sentAt)) : null,
+    const accountId = message.accountId || message.authorId;
+    const report = accountId && isFeatureEnabled?.('reports.enabled') !== false
+      ? element('details', { className: 'os-chat-report' }, [
+        element('summary', {}, `Report ${message.displayName || message.author || 'player'}`),
+      ]) : null;
+    if (report) {
+      const category = element('select', { 'aria-label': 'Report category' }, [
+        element('option', { value: 'cheating' }, 'Cheating'),
+        element('option', { value: 'harassment' }, 'Harassment'),
+        element('option', { value: 'offensive-name' }, 'Offensive name'),
+        element('option', { value: 'griefing' }, 'Griefing'),
+        element('option', { value: 'other' }, 'Other'),
+      ]);
+      const description = element('textarea', { 'aria-label': 'Optional report details', maxLength: 500, rows: 3 });
+      const reportStatus = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite' });
+      const submitReport = actionButton('Submit report', (event) => actions.openModal({
+        title: 'Submit this report?',
+        message: 'The platform will review the report under the selected category.',
+        confirmLabel: 'Submit report',
+        opener: event.currentTarget,
+        onConfirm: () => actions.submit('reportPlayer', {
+          subjectAccountId: accountId,
+          category: category.value,
+          description: description.value || undefined,
+        }, {
+          onSuccess: (result) => {
+            reportStatus.textContent = result?.reportId ? `Report submitted: ${result.reportId}.` : 'Report submitted.';
+            description.value = '';
+            report.open = false;
+          },
+          onError: (error) => { reportStatus.textContent = safeError(error).message; },
+        }),
+      }), { className: 'os-button os-button--quiet', dataset: { operation: 'report' } });
+      report.append(category, description, submitReport, reportStatus);
+    }
+    list.append(element('li', { dataset: { messageId: message.id || '' } }, [
+      element('strong', {}, message.displayName || message.author || 'Unknown player'),
+      element('p', {}, message.removed ? 'Message removed by moderation.' : message.text || ''),
+      message.filtered ? statusBadge('Filtered') : null,
+      message.ts || message.sentAt ? element('time', { dateTime: message.ts || message.sentAt }, dateText(message.ts || message.sentAt)) : null,
+      accountId ? actionButton(`Mute ${message.displayName || message.author || 'player'}`, () => actions.submit('mutePlayer', {
+        accountId, roomId: expectedRoomId, muted: true,
+      }, { onError: (error) => actions.announce(safeError(error).message) }), {
+        className: 'os-button os-button--quiet', dataset: { operation: 'mute' },
+      }) : null,
+      report,
     ]));
   }
+  if (!messages.length) list.append(element('li', {}, historyRoomId === expectedRoomId ? 'No messages have been sent in this room.' : 'Synchronizing this room’s history. Messages from another room are never displayed.'));
+  const mutedAccountIds = Array.isArray(view.data?.mutedAccountIds) ? view.data.mutedAccountIds : [];
+  const members = view.data?.members || view.data?.roster || [];
+  const muted = mutedAccountIds.length ? element('section', { className: 'os-muted-players' }, [
+    element('h2', {}, 'Muted players'),
+    ...mutedAccountIds.map((accountId) => {
+      const player = members.find((member) => memberId(member) === accountId);
+      return element('div', { className: 'os-actions' }, [
+        element('span', {}, player?.displayName || 'Muted player'),
+        actionButton(`Unmute ${player?.displayName || 'player'}`, () => actions.submit('mutePlayer', {
+          accountId, roomId: expectedRoomId, muted: false,
+        }, { onError: (error) => actions.announce(safeError(error).message) }), {
+          className: 'os-button os-button--quiet', dataset: { operation: 'unmute' },
+        }),
+      ]);
+    }),
+  ]) : null;
   let composer;
   if (isFeatureEnabled?.('chat.text.enabled') !== false) {
     const body = field({ label: 'Message', name: 'chat-message', autocomplete: 'off', required: true });
-    composer = element('form', { className: 'os-form os-form--inline' }, [body.wrapper, submitButton('Send')]);
+    body.input.maxLength = 200;
+    const sendStatus = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite' });
+    const remaining = element('span', { className: 'os-hint' }, '200 characters remaining');
+    body.input.addEventListener('input', () => { remaining.textContent = `${200 - body.input.value.length} characters remaining`; });
+    const send = submitButton('Send');
+    send.disabled = !connected;
+    composer = element('form', { className: 'os-form os-form--inline' }, [body.wrapper, remaining, sendStatus, send]);
     composer.addEventListener('submit', (event) => {
       event.preventDefault();
       actions.submit('sendChat', { roomId: route.params.roomId, text: body.input.value }, {
         secretInputs: [body.input],
-        onSuccess: actions.refresh,
+        onSuccess: () => { sendStatus.textContent = 'Message accepted.'; },
+        onError: (error) => { sendStatus.textContent = safeError(error).message; },
       });
     });
   } else {
     composer = element('p', { className: 'os-notice', role: 'status' }, 'Text chat is unavailable. Existing room history remains visible.');
   }
-  return element('section', {}, [roomNavigation(route.params.roomId), list, composer]);
+
+  const pingOptions = Array.isArray(view.data?.pingOptions) ? view.data.pingOptions : [];
+  let pingControls;
+  if (isFeatureEnabled?.('chat.pings.enabled') === false) {
+    pingControls = element('p', { className: 'os-notice', role: 'status' }, 'Tactical pings are unavailable.');
+  } else if (pingOptions.length) {
+    const select = element('select', { 'aria-label': 'Tactical ping' }, pingOptions.map((option) => element('option', { value: option.kind }, option.label || option.kind)));
+    pingControls = element('div', { className: 'os-actions' }, [
+      select,
+      actionButton('Send tactical ping', () => actions.submit('sendPing', {
+        roomId: expectedRoomId, kind: select.value,
+      }, { onError: (error) => actions.announce(safeError(error).message) }), {
+        className: 'os-button os-button--quiet', dataset: { operation: 'ping' }, disabled: !connected,
+      }),
+    ]);
+  } else {
+    pingControls = element('p', { className: 'os-hint' }, 'Tactical ping choices will appear when the room supplies its canned callouts.');
+  }
+  return element('section', {}, [
+    roomNavigation(route.params.roomId),
+    lobbyNotices(view, actions, isFeatureEnabled),
+    view.data?.chatRateLimit ? element('p', { className: 'os-warning', role: 'status' }, view.data.chatRateLimit.message || 'Chat is rate limited. Try again when the server allows it.') : null,
+    list,
+    muted,
+    pendingIntent(view, 'chat') ? element('p', { className: 'os-notice', role: 'status' }, 'A message is awaiting authoritative confirmation.') : null,
+    composer,
+    element('section', { className: 'os-ping-controls' }, [element('h2', {}, 'Tactical pings'), pingControls]),
+  ]);
+}
+
+function loadoutOption(option) {
+  if (typeof option === 'number') return { value: option, label: `Slot ${option}` };
+  return { value: option?.index ?? option?.id, label: option?.label || option?.name || `Slot ${option?.index ?? option?.id}` };
+}
+
+function renderRoomLoadout(context) {
+  const { route, view, actions } = context;
+  const members = view.data?.members || view.data?.roster || [];
+  const local = members.find((member) => member.isLocal) || view.data?.you || {};
+  const current = view.data?.loadout || local.loadout || {};
+  const optimistic = view.data?.optimistic?.loadout || null;
+  const connected = !view.data?.status || view.data.status === 'synchronized';
+  const options = view.data?.loadoutOptions || {};
+  const primaryOptions = Array.isArray(options.primary) ? options.primary.map(loadoutOption).filter((option) => option.value !== undefined) : [];
+  const secondaryOptions = Array.isArray(options.secondary) ? options.secondary.map(loadoutOption).filter((option) => option.value !== undefined) : [];
+  const feedback = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite', tabIndex: -1 });
+  const body = [
+    roomNavigation(route.params.roomId),
+    lobbyNotices(view, actions, context.isFeatureEnabled),
+    definitionList([
+      ['Current primary slot', current.primaryIdx],
+      ['Current secondary slot', current.secondaryIdx],
+    ]),
+  ];
+  if (!primaryOptions.length || !secondaryOptions.length) {
+    body.push(element('p', { className: 'os-notice', role: 'status' }, 'Authoritative loadout choices are unavailable. The current loadout is unchanged.'));
+    return element('section', {}, body);
+  }
+  const primary = element('select', { id: 'shell-loadout-primary', name: 'loadout-primary' }, primaryOptions.map((option) => element('option', { value: option.value }, option.label)));
+  const secondary = element('select', { id: 'shell-loadout-secondary', name: 'loadout-secondary' }, secondaryOptions.map((option) => element('option', { value: option.value }, option.label)));
+  primary.disabled = !connected;
+  secondary.disabled = !connected;
+  primary.value = String(optimistic?.primaryIdx ?? current.primaryIdx ?? primaryOptions[0].value);
+  secondary.value = String(optimistic?.secondaryIdx ?? current.secondaryIdx ?? secondaryOptions[0].value);
+  const form = element('form', { className: 'os-form' }, [
+    element('div', { className: 'os-field' }, [element('label', { htmlFor: primary.id }, 'Primary'), primary]),
+    element('div', { className: 'os-field' }, [element('label', { htmlFor: secondary.id }, 'Secondary'), secondary]),
+    optimistic ? element('p', { className: 'os-notice', role: 'status' }, 'Loadout request pending. The current slots above remain authoritative until the roster confirms it.') : null,
+    feedback,
+    Object.assign(submitButton('Request loadout change'), { disabled: !connected || pendingIntent(view, 'loadout') }),
+  ]);
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    feedback.textContent = 'Loadout change pending. The current loadout remains authoritative.';
+    actions.submit('setLoadout', {
+      roomId: route.params.roomId,
+      primaryIdx: Number(primary.value),
+      secondaryIdx: Number(secondary.value),
+    }, {
+      onSuccess: (result) => {
+        feedback.textContent = 'Loadout response received.';
+        if (result) actions.refresh();
+      },
+      onError: (error) => {
+        feedback.textContent = `${safeError(error).message} The previous loadout remains selected.`;
+        feedback.focus();
+      },
+    });
+  });
+  body.push(form);
+  return element('section', {}, body);
 }
 
 function statCards(entries) {
@@ -1026,7 +1600,7 @@ export function renderShellScreen(context) {
     case 'play.roomDetail': content = renderRoomDetail(context); break;
     case 'room.home': content = renderLobby(context); break;
     case 'room.roster': content = renderRoster(context); break;
-    case 'room.loadout': content = element('section', {}, [roomNavigation(route.params.roomId), renderSettingsHook({ ...context, loadout: true })]); break;
+    case 'room.loadout': content = renderRoomLoadout(context); break;
     case 'room.chat': content = renderChat(context); break;
     case 'career.overview': content = renderCareerOverview(context); break;
     case 'career.modes': content = renderNamedStats(view.data?.modes || view.data?.items, [['Matches', 'matches'], ['Wins', 'wins']]); break;

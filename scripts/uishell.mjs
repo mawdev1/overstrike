@@ -455,13 +455,22 @@ const settings = {
 
 window.__HARNESS_AUTH_CALLS__ = 0;
 window.__HARNESS_RUNTIME_LOADS__ = 0;
+const connection = {
+  value: { platform: 'unknown', lobby: 'disconnected', match: 'idle' },
+  listener: null,
+  getSnapshot() { return this.value; },
+  subscribe(listener) { this.listener = listener; return () => { this.listener = null; }; },
+  set(value) { this.value = value; this.listener?.(value); },
+};
 const client = {
+  connection,
   async signIn() {
     window.__HARNESS_AUTH_CALLS__++;
     await new Promise((resolve) => setTimeout(resolve, 80));
     return { authenticated: true, profile: { displayName: 'Fixture Player', flags: { setupNextStep: null } } };
   },
 };
+window.__HARNESS_CONNECTION__ = connection;
 const session = {
   value: { authenticated: false },
   getSnapshot() { return this.value; },
@@ -531,6 +540,11 @@ async function browserChecks() {
     await page.waitForFunction(() => window.__HARNESS_READY__ === true);
     equal(await page.locator('main').count(), 1, 'shell must expose exactly one main landmark');
     equal(await page.locator('h1').count(), 1, 'shell must expose exactly one page h1');
+    check(await page.locator('.os-connection').isHidden(), 'unknown platform health is neutral and does not show a false outage banner');
+    await page.evaluate(() => window.__HARNESS_CONNECTION__.set({ platform: 'offline', lobby: 'disconnected', match: 'idle' }));
+    check(await page.locator('.os-connection').isVisible(), 'explicit unhealthy platform state shows the global connection banner');
+    await page.evaluate(() => window.__HARNESS_CONNECTION__.set({ platform: 'healthy', lobby: 'disconnected', match: 'idle' }));
+    check(await page.locator('.os-connection').isHidden(), 'healthy platform state clears the connection banner');
     equal(await page.evaluate(() => window.__HARNESS_GL_CALLS__.length), 0, 'shell boot must not create a WebGL context');
     check(!requests.some((url) => /\/src\/(core\/game|game)\.js|\/three(?:\.module)?\.js|node_modules\/\.vite\/deps\/three/i.test(url)), 'shell boot loaded game/three code');
 
@@ -552,6 +566,74 @@ async function browserChecks() {
         }
       }
     }
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/play/rooms');
+      window.__SHELL__.injectFixture('play.rooms', 'ready');
+    });
+    equal(await page.locator('.os-room-card h2').allTextContents(), ['Fixture Alpha', 'Fixture Charlie', 'Fixture Bravo'], 'room browser default order must be joinability, measured latency, then occupancy');
+    await page.locator('#shell-room-mode').selectOption('bomb');
+    equal(await page.locator('.os-room-card h2').allTextContents(), ['Fixture Bravo'], 'room browser mode filter must retain the exact matching mode');
+    check((await page.getByText('1 room shown.', { exact: true }).count()) === 1, 'room browser must expose its filtered result count');
+    await page.getByRole('button', { name: 'Reset filters', exact: true }).click();
+    check((await page.getByRole('button', { name: 'Load more rooms', exact: true }).count()) === 1, 'room browser pagination must be cursor-gated');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/play/rooms/password-room');
+      window.__SHELL__.injectFixture('play.roomDetail', {
+        variant: 'ready',
+        data: { roomId: 'password-room', name: 'Private room', mode: 'bomb', mapId: 'the-square',
+          mapVersion: '1.0.0', region: 'yyz', status: 'open', capacity: 12, playerCount: 4,
+          joinable: true, joinBlockedReason: 'password', hasPassword: true, rulesetVersion: 'bomb-1.0.0' },
+      });
+    });
+    equal(await page.getByLabel('Room password').getAttribute('type'), 'password', 'password-protected room must collect its secret without putting it in the route');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/room/fixture-room-alpha');
+      window.__SHELL__.injectFixture('room.home', 'ready');
+    });
+    equal(await page.locator('.os-team > h2').allTextContents(), ['Alpha — 1', 'Bravo — 1', 'Unassigned — 1'], 'lobby must expose Alpha, Bravo, and unassigned columns');
+    check((await page.getByText('✓ READY', { exact: true }).count()) === 1, 'ready state must have a non-color label');
+    check((await page.getByText('○ NOT READY', { exact: true }).count()) === 2, 'not-ready state must have a non-color label');
+    check((await page.getByText('Readiness was cleared because a team changed.', { exact: true }).count()) === 1, 'ready clear reason must remain visible');
+    check((await page.getByText('Host', { exact: true }).count()) === 1, 'lobby must identify the host');
+
+    await page.evaluate(() => window.__SHELL__.injectFixture('room.home', {
+      variant: 'ready',
+      data: {
+        status: 'synchronized', roomId: 'fixture-room-alpha',
+        room: { roomId: 'fixture-room-alpha', name: 'Fixture Alpha', status: 'open',
+          capacity: 10, playerCount: 1 },
+        roster: [{ accountId: 'fixture-local', displayName: 'Authoritative Player', team: 'alpha',
+          ready: false, isOwner: true, isLocal: true, connection: 'connected', estimatedRttMs: 24,
+          loadout: { primaryIdx: 0, secondaryIdx: 1 } }],
+        pending: {
+          'fixture-team-intent': { t: 'team.request', d: { team: 'bravo' }, accountId: 'fixture-local' },
+          'fixture-ready-intent': { t: 'ready.set', d: { ready: true }, accountId: 'fixture-local' },
+        },
+        optimistic: { team: 'bravo', ready: true, loadout: null },
+      },
+    }));
+    equal(await page.locator('.os-team > h2').allTextContents(), ['Alpha — 1', 'Bravo — 0', 'Unassigned — 0'], 'pending team intent must not move the authoritative roster');
+    check((await page.getByText('Team change pending: Bravo. The roster remains authoritative.', { exact: true }).count()) === 1, 'pending team intent must have a separate visible treatment');
+    check((await page.getByText('Ready request pending. The roster label remains authoritative until the server answers.', { exact: true }).count()) === 1, 'pending ready intent must not replace the authoritative ready label');
+    check((await page.getByRole('button', { name: '○ GREEN UP', exact: true }).isDisabled()), 'pending ready action must stay single-flight until the server answers');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/room/fixture-room-alpha/loadout');
+      window.__SHELL__.injectFixture('room.loadout', 'ready');
+    });
+    equal(await page.locator('#shell-loadout-primary').count(), 1, 'lobby loadout must render supplied authoritative primary choices');
+    equal(await page.locator('#shell-loadout-secondary').count(), 1, 'lobby loadout must render supplied authoritative secondary choices');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/room/fixture-room-alpha/chat');
+      window.__SHELL__.injectFixture('room.chat', 'ready');
+    });
+    check((await page.getByRole('button', { name: 'Mute Fixture Rival', exact: true }).count()) === 1, 'chat must expose mute controls');
+    check((await page.getByText('Report Fixture Rival', { exact: true }).count()) === 1, 'chat must expose report controls');
+    check((await page.getByRole('button', { name: 'Send tactical ping', exact: true }).count()) === 1, 'chat must expose controller-supplied ping controls');
 
     await page.evaluate(() => window.__SHELL__.navigate('/career/overview'));
     await page.waitForFunction(() => document.activeElement?.id === 'os-shell-title');
@@ -744,6 +826,10 @@ async function browserChecks() {
         return respond(200, { accountId, displayName: 'Fixture Player', createdAt: '2026-08-20T16:00:00.000Z',
           privacy: { statsVisibility: 'public', presenceVisibility: 'public' }, presence: { roomId: null },
           consent: null, flags: { setupNextStep: null } });
+      }
+      if (url.pathname === `/v1/profile/${accountId}`) {
+        return respond(200, { accountId, displayName: 'Fixture Player', createdAt: '2026-08-20T16:00:00.000Z',
+          stats: null, presence: { state: 'online', joinable: false, roomId: null } });
       }
       if (url.pathname === '/v1/onboarding/consent') {
         return respond(200, { telemetryPersonal: false, policyVersion: 1,

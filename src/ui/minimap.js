@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { resolveManifestCallout, sitesFromManifest } from './bomb/local.js';
 
 /**
  * Minimap — canvas radar.
@@ -53,6 +54,12 @@ export class Minimap {
     this.el.appendChild(tag);
     this.tagEl = tag;
 
+    const callout = document.createElement('div');
+    callout.className = 'mm-callout';
+    callout.textContent = 'LOCATION UNKNOWN';
+    this.el.appendChild(callout);
+    this.calloutEl = callout;
+
     root?.appendChild(this.el);
 
     this.ctx = this.canvas.getContext('2d', { alpha: true });
@@ -66,6 +73,7 @@ export class Minimap {
     this._cssSize = 0;
     this._visible = true;
     this._uav = false;
+    this._callout = '';
 
     /**
      * Everything below is derived from the backing-store size and therefore only
@@ -87,6 +95,7 @@ export class Minimap {
 
     // Explosions light up the map too — they are loud, so they are a contact.
     this._unsubBoom = game?.bus?.on?.('explosion', (p) => {
+      if (this._bombSpectator()) { this.contacts.clear(); return; }
       if (!p?.point) return;
       this._addContact(-1 - (this.contacts.size % 8), p.point.x, p.point.z, 1.4);
     }) || null;
@@ -124,7 +133,9 @@ export class Minimap {
     this._pulse = 0;
     this._skipDt = 0;
     this._deadTick = 0;
-    if (this._uav) { this._uav = false; this.el.classList.remove('uav'); this.tagEl.textContent = 'radar'; }
+    if (this._uav) { this._uav = false; this.el.classList.remove('uav'); }
+    this._callout = '';
+    this._updateLabels();
     // The level is static today (`World.reset()` is a documented no-op), but if a
     // future rebuild ever changes the collider set we must not keep a stale bake.
     // Either way the work happens HERE — inside startMatch, alongside every other
@@ -159,6 +170,7 @@ export class Minimap {
     const shooter = p?.shooter;
     const me = this.game?.player;
     if (!shooter || !me) return;
+    if (this._bombSpectator()) { this.contacts.clear(); return; }
     if (shooter === me || p.isPlayer) return;
     if (shooter.team === me.team) return;       // friendly fire is not a contact
     const pos = p.origin ?? shooter.position;
@@ -174,6 +186,16 @@ export class Minimap {
     } else {
       this.contacts.set(id, { x, z, t: 0, life });
     }
+  }
+
+  _bombSpectator() {
+    if (this.game?.match?.modeId !== 'bomb') return false;
+    const player = this.game?.player;
+    const referee = this.game?.match?.bombRules;
+    if (typeof referee?.isAlive === 'function') {
+      try { return referee.isAlive(player) !== true; } catch { return true; }
+    }
+    return player?.alive !== true;
   }
 
   /** Round-robin LOS sampling so hostiles you can actually see stay painted. */
@@ -291,6 +313,38 @@ export class Minimap {
       c.strokeRect(toX(b.min.x), toZ(b.min.z), (b.max.x - b.min.x) * ppm, (b.max.z - b.min.z) * ppm);
     }
 
+    // Bomb sites come from the same manifest IDs/callouts used by the referee and HUD.
+    // A triangle and double-outline square remain distinct without colour.
+    c.save();
+    c.textAlign = 'center';
+    c.textBaseline = 'top';
+    c.font = `700 ${Math.max(12, Math.round(ppm * 1.65))}px system-ui, sans-serif`;
+    for (const site of sitesFromManifest(world.manifest)) {
+      const x = toX(site.center.x);
+      const y = toZ(site.center.z);
+      const size = Math.max(7, ppm * 0.8);
+      c.beginPath();
+      if (site.site === 'A') {
+        c.moveTo(x, y - size);
+        c.lineTo(x + size, y + size);
+        c.lineTo(x - size, y + size);
+        c.closePath();
+      } else {
+        c.rect(x - size, y - size, size * 2, size * 2);
+      }
+      c.fillStyle = site.site === 'A' ? '#86ddd3' : '#ffd07d';
+      c.fill();
+      c.lineWidth = Math.max(2, ppm * 0.18);
+      c.strokeStyle = '#071012';
+      c.stroke();
+      if (site.site === 'B') {
+        c.strokeRect(x - size * 0.62, y - size * 0.62, size * 1.24, size * 1.24);
+      }
+      c.fillStyle = '#f7fbf8';
+      c.fillText(`${site.site} · ${site.callout}`, x, y + size + 3);
+    }
+    c.restore();
+
     this.baked = cv;
     this.bakeInfo = { originX, originZ, span, ppm };
     this._bakeBoxes = boxes.length;
@@ -377,6 +431,16 @@ export class Minimap {
     const g = this.game;
     const me = g?.player;
     if (!me?.position) return;
+    const callout = resolveManifestCallout(g?.world?.manifest, me.position) || 'LOCATION UNKNOWN';
+    if (callout !== this._callout) {
+      this._callout = callout;
+      this._updateLabels();
+    }
+    const bombSpectator = this._bombSpectator();
+    if (bombSpectator) {
+      this.contacts.clear();
+      if (this._uav) { this._uav = false; this.el.classList.remove('uav'); }
+    }
 
     // Any open menu shell puts a ~96%-opaque scrim over this corner AND stops the
     // simulation, so a redraw here is invisible work on a frame the player is
@@ -402,14 +466,14 @@ export class Minimap {
     this._skipDt = 0;
 
     this._pulse += dt;
-    this._sampleVisibility();
+    if (!bombSpectator) this._sampleVisibility();
 
     // UAV: `match.uavActive(team)` is the authority, and it is cheap (one map read).
-    const uav = !!g.match?.uavActive?.(me.team);
+    const uav = !bombSpectator && !!g.match?.uavActive?.(me.team);
     if (uav !== this._uav) {
       this._uav = uav;
       this.el.classList.toggle('uav', uav);
-      this.tagEl.textContent = uav ? 'uav · sat link' : 'radar';
+      this._updateLabels();
     }
 
     // Age contacts. Iterating keys rather than entries avoids the two-element
@@ -469,7 +533,7 @@ export class Minimap {
 
     // Friendlies.
     const list = g.entities;
-    if (list) {
+    if (!bombSpectator && list) {
       for (let i = 0; i < list.length; i++) {
         const e = list[i];
         if (!e || e === me || !e.alive) continue;
@@ -499,7 +563,7 @@ export class Minimap {
 
     // Hostile contacts. While a UAV is up every living hostile is a contact, drawn
     // at full strength; otherwise only decaying gunshot / line-of-sight blips show.
-    if (this._uav && list) {
+    if (!bombSpectator && this._uav && list) {
       for (let i = 0; i < list.length; i++) {
         const e = list[i];
         if (!e || e === me || !e.alive || e.team === me.team) continue;
@@ -510,7 +574,7 @@ export class Minimap {
         this._marker(ctx, cx, cy, sx, sy, edge, yaw - (e.yaw || 0), '#ff4433', 1);
       }
     }
-    for (const c of this.contacts.values()) {
+    for (const c of bombSpectator ? [] : this.contacts.values()) {
       const dx = c.x - px;
       const dz = c.z - pz;
       const sx = (dx * cosY - dz * sinY) * s;
@@ -521,7 +585,7 @@ export class Minimap {
 
     // Grenades / live projectiles. `ProjectileSystem.pool` is the real store; every
     // record carries `active` and a `pos` vector (NOT `position`).
-    const projList = this.game.projectiles?.pool;
+    const projList = bombSpectator ? null : this.game.projectiles?.pool;
     if (projList) {
       const pulse = 0.55 + 0.45 * Math.sin(this._pulse * 9);
       for (let i = 0; i < projList.length; i++) {
@@ -580,6 +644,11 @@ export class Minimap {
     ctx.strokeStyle = 'rgba(142, 247, 196, 0.10)';
     ctx.lineWidth = Math.max(1, W * 0.004);
     ctx.stroke();
+  }
+
+  _updateLabels() {
+    this.tagEl.textContent = this._uav ? 'uav · sat link' : 'radar';
+    this.calloutEl.textContent = this._callout || 'LOCATION UNKNOWN';
   }
 
   /** Chevron marker with edge clamping for off-map contacts. */

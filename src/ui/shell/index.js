@@ -28,6 +28,7 @@ const ROUTE_LOADERS = Object.freeze({
   'play.roomDetail': 'getRoom',
   'room.home': 'getLobbySnapshot',
   'room.roster': 'getLobbySnapshot',
+  'room.loadout': 'getLobbySnapshot',
   'room.chat': 'getChatHistory',
   'career.overview': 'getCareerOverview',
   'career.modes': 'getCareerModes',
@@ -57,7 +58,8 @@ function isAuthenticatedRoute(route) {
 
 function canPreserveDeepLink(route) {
   return route.id.startsWith('play.') || route.id.startsWith('career.')
-    || route.id === 'settings.category' || route.id === 'sessions' || route.id === 'results';
+    || route.id.startsWith('room.') || route.id === 'settings.category'
+    || route.id === 'sessions' || route.id === 'results';
 }
 
 function canPreserveWhileInRoom(route) {
@@ -146,7 +148,8 @@ function errorVariant(error) {
   const terminalCodes = new Set([
     'AUTH_ELIGIBILITY_DENIED', 'AUTH_ACCOUNT_RESTRICTED', 'AUTH_SESSION_REVOKED',
     'CLIENT_UPDATE_REQUIRED', 'UPDATE_REQUIRED', 'MAINTENANCE', 'UNSUPPORTED_CLIENT', 'RECONNECT_GRACE_EXPIRED',
-    'ROOM_KICKED', 'ROOM_CLOSED', 'MATCH_INVALIDATED',
+    'ROOM_REMOVED', 'ROOM_CLOSED', 'MATCH_INVALIDATED', 'MATCH_ALLOCATION_FAILED',
+    'MATCH_SERVER_UNREACHABLE', 'PROTOCOL_VERSION_MISMATCH', 'MATCH_ABORTED',
   ]);
   let normalizedError = error;
   if (error?.code === 'AUTH_INVALID_CREDENTIALS') {
@@ -225,7 +228,9 @@ function connectionBanner(connection) {
   const platform = connection.platform || connection.http || 'unknown';
   const lobby = connection.lobby || 'disconnected';
   const match = connection.match || 'idle';
-  const unhealthy = !['online', 'healthy'].includes(platform) || !['synchronized', 'disconnected', 'closed'].includes(lobby) || !['idle', 'live', 'ended'].includes(match);
+  const platformUnhealthy = platform !== 'unknown' && !['online', 'healthy'].includes(platform);
+  const unhealthy = platformUnhealthy || !['synchronized', 'disconnected', 'closed'].includes(lobby)
+    || !['idle', 'live', 'ended'].includes(match);
   banner.hidden = !unhealthy;
   banner.append(element('strong', {}, 'Connection status'));
   banner.append(element('span', {}, `Platform: ${platform}; lobby: ${lobby}; match: ${match}.`));
@@ -321,6 +326,7 @@ export function mountAppShell({
     ? Promise.resolve(bootReady).catch(() => null)
     : null;
   let lastFocusedPath = null;
+  let routeLoadRevision = 0;
   let renderCleanups = [];
   const pending = new Map();
   const injectedViews = new Map();
@@ -420,6 +426,23 @@ export function mountAppShell({
 
   function render({ focus = false } = {}) {
     if (destroyed) return;
+    const draftValues = new Map();
+    for (const field of screenHost.querySelectorAll('input[name], textarea[name], select[name]')) {
+      draftValues.set(`${field.tagName}:${field.name}`, {
+        value: field.value, checked: field.checked,
+      });
+    }
+    const activeField = root.ownerDocument.activeElement;
+    const focusedFieldKey = screenHost.contains(activeField) && activeField?.name
+      ? `${activeField.tagName}:${activeField.name}` : null;
+    const focusedAction = screenHost.contains(activeField) && activeField?.matches?.('button, a[href]')
+      ? {
+        operation: activeField.dataset?.operation || null,
+        href: activeField.getAttribute?.('href') || null,
+        text: activeField.textContent,
+      } : null;
+    const selection = focusedFieldKey && typeof activeField.selectionStart === 'number'
+      ? [activeField.selectionStart, activeField.selectionEnd] : null;
     clearRenderCleanups();
     root.dataset.route = route.id;
     root.dataset.variant = view.variant;
@@ -439,6 +462,31 @@ export function mountAppShell({
     });
     const progress = setupProgress(route);
     screenHost.replaceChildren(...(progress ? [progress, screen] : [screen]));
+    for (const field of screenHost.querySelectorAll('input[name], textarea[name], select[name]')) {
+      const saved = draftValues.get(`${field.tagName}:${field.name}`);
+      if (!saved) continue;
+      if ('checked' in field && ['checkbox', 'radio'].includes(field.type)) field.checked = saved.checked;
+      else field.value = saved.value;
+    }
+    if ((focusedFieldKey || focusedAction) && !focus && lastFocusedPath === route.pathname) {
+      const restored = focusedFieldKey
+        ? [...screenHost.querySelectorAll('input[name], textarea[name], select[name]')]
+          .find((field) => `${field.tagName}:${field.name}` === focusedFieldKey)
+        : [...screenHost.querySelectorAll('button, a[href]')].find((candidate) => (
+          focusedAction.operation
+            ? candidate.dataset?.operation === focusedAction.operation
+            : focusedAction.href
+              ? candidate.getAttribute('href') === focusedAction.href
+              : candidate.textContent === focusedAction.text
+        ));
+      if (restored) queueMicrotask(() => {
+        if (destroyed || modal.isOpen()) return;
+        restored.focus({ preventScroll: true });
+        if (selection && typeof restored.setSelectionRange === 'function') {
+          restored.setSelectionRange(...selection);
+        }
+      });
+    }
     const errorSummary = screenHost.querySelector('[data-error-summary]');
     if (errorSummary) queueMicrotask(() => errorSummary.focus());
     const changedPath = lastFocusedPath !== route.pathname;
@@ -457,6 +505,7 @@ export function mountAppShell({
   }
 
   async function loadRoute({ preferFixture = true } = {}) {
+    const loadRevision = ++routeLoadRevision;
     const unavailable = disabledRouteView(route);
     if (unavailable) {
       view = unavailable;
@@ -485,7 +534,7 @@ export function mountAppShell({
       render();
       await bootGate;
       bootGate = null;
-      if (destroyed || route.pathname !== requestedPath) return null;
+      if (destroyed || route.pathname !== requestedPath || routeLoadRevision !== loadRevision) return null;
     }
     const canLoad = typeof client?.loadRoute === 'function' || (loader && typeof client?.[loader] === 'function');
     if (!canLoad) {
@@ -500,7 +549,7 @@ export function mountAppShell({
       const result = typeof client.loadRoute === 'function'
         ? unwrapResult(await client.loadRoute(route))
         : await callClient(loader, routePayload(route));
-      if (route.pathname !== requestedPath || destroyed) return null;
+      if (route.pathname !== requestedPath || destroyed || routeLoadRevision !== loadRevision) return null;
       const nowUnavailable = disabledRouteView(route);
       if (nowUnavailable) {
         view = nowUnavailable;
@@ -511,7 +560,7 @@ export function mountAppShell({
       render();
       return view;
     } catch (error) {
-      if (route.pathname !== requestedPath || destroyed) return null;
+      if (route.pathname !== requestedPath || destroyed || routeLoadRevision !== loadRevision) return null;
       view = normalizeView(errorVariant(error));
       render();
       return view;
@@ -548,10 +597,11 @@ export function mountAppShell({
     }
   }
 
-  async function submit(operation, payload, { onSuccess, secretInputs = [] } = {}) {
+  async function submit(operation, payload, { onSuccess, onError, secretInputs = [] } = {}) {
     if (pending.has(operation)) return pending.get(operation);
-    const buttons = [...screenHost.querySelectorAll('button[type="submit"], button[data-operation]')];
-    buttons.forEach((button) => { button.disabled = true; });
+    const buttons = [...screenHost.querySelectorAll('button[type="submit"], button[data-operation]')]
+      .map((button) => ({ button, wasDisabled: button.disabled }));
+    buttons.forEach(({ button }) => { button.disabled = true; });
     const pendingStatus = element('p', { className: 'os-pending-status', role: 'status' }, 'Request in progress…');
     screenHost.prepend(pendingStatus);
     root.setAttribute('aria-busy', 'true');
@@ -562,14 +612,23 @@ export function mountAppShell({
         await onSuccess?.(result);
         return result;
       } catch (error) {
-        setView(errorVariant(error));
+        if (typeof onError === 'function') await onError(error);
+        else setView(errorVariant(error));
         throw error;
       } finally {
-        for (const input of secretInputs) if (input) input.value = '';
+        for (const input of secretInputs) {
+          if (!input) continue;
+          input.value = '';
+          if (input.name) {
+            for (const current of screenHost.querySelectorAll('input[name], textarea[name]')) {
+              if (current.name === input.name) current.value = '';
+            }
+          }
+        }
         pending.delete(operation);
         pendingStatus.remove();
         root.removeAttribute('aria-busy');
-        buttons.forEach((button) => { if (button.isConnected) button.disabled = false; });
+        buttons.forEach(({ button, wasDisabled }) => { if (button.isConnected) button.disabled = wasDisabled; });
       }
     })();
     pending.set(operation, task);
@@ -584,19 +643,27 @@ export function mountAppShell({
     if (pending.has(requestKey)) return pending.get(requestKey);
     const requestedPath = route.pathname;
     const requestedCursor = cursor;
+    const requestedLoadRevision = routeLoadRevision;
     const task = (async () => {
       try {
         const result = await request(loader, { ...routePayload(route), cursor: requestedCursor });
-        if (destroyed || route.pathname !== requestedPath || view.data?.nextCursor !== requestedCursor) return null;
+        if (destroyed || route.pathname !== requestedPath || routeLoadRevision !== requestedLoadRevision
+          || view.data?.nextCursor !== requestedCursor) return null;
         const page = result?.data ?? result ?? {};
         const currentItems = view.data?.[collectionKey] || view.data?.items || [];
         const nextItems = page?.[collectionKey] || page?.items || [];
-        const seen = new Set(currentItems.map((item) => item?.id).filter(Boolean));
-        const merged = [...currentItems, ...nextItems.filter((item) => !item?.id || !seen.has(item.id))];
-        setView({ variant: 'ready', data: { ...view.data, ...page, [collectionKey]: merged } });
+        const identity = (item) => item?.id || item?.roomId || item?.matchId || item?.sessionId || null;
+        const seen = new Set(currentItems.map(identity).filter(Boolean));
+        const merged = [...currentItems, ...nextItems.filter((item) => !identity(item) || !seen.has(identity(item)))];
+        setView({ variant: 'ready', data: { ...view.data, ...page, paginationError: null, [collectionKey]: merged } });
         return page;
       } catch (error) {
-        announce(error?.message || 'The next page could not be loaded.');
+        const message = error?.message || 'The next page could not be loaded.';
+        announce(message);
+        if (!destroyed && route.pathname === requestedPath && routeLoadRevision === requestedLoadRevision
+          && view.data?.nextCursor === requestedCursor) {
+          setView({ variant: 'ready', data: { ...view.data, paginationError: { code: error?.code, message } } });
+        }
         return null;
       } finally {
         pending.delete(requestKey);

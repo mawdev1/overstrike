@@ -121,6 +121,7 @@ export class Settings {
     shadowQuality: ['off', 'low', 'high'],
     crosshairStyle: ['dynamic', 'static', 'dot'],
     difficulty: ['recruit', 'regular', 'hardened', 'veteran'],
+    mode: ['tdm', 'bomb'],
   };
 
   /**

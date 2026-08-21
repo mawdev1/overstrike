@@ -1,3 +1,5 @@
+@import './ui/bomb/bomb.css';
+
 /* ============================================================================
    OVERSTRIKE — 2D layer visual language
    ----------------------------------------------------------------------------
@@ -1303,6 +1305,22 @@ html.os-prefer-reduced-motion *::after {
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--fg-4);
+}
+.minimap .mm-callout {
+  position: absolute;
+  left: calc(var(--hud-s) * 0.25);
+  right: calc(var(--hud-s) * 0.25);
+  bottom: calc(var(--hud-s) * -0.8);
+  overflow: hidden;
+  color: var(--fg-2);
+  font-family: var(--f-mono);
+  font-size: calc(var(--hud-s) * 0.46);
+  letter-spacing: 0.1em;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
 /* ============================================================ perf readout */

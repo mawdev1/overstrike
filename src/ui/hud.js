@@ -4,6 +4,7 @@ import { progression, XP_VALUES } from '../game/progression.js';
 import { Killfeed, weaponGlyph } from './killfeed.js';
 import { Minimap } from './minimap.js';
 import { Scoreboard, modeLabel, formatClock } from './scoreboard.js';
+import { createLocalBombHud } from './bomb/index.js';
 
 /**
  * HUD — DOM overlay mounted under `#hud`, per ARCHITECTURE §10.
@@ -184,6 +185,7 @@ export class HUD {
     this.root?.appendChild(this._center);
     this.scoreboard = new Scoreboard(game, this.root);
     this.root?.appendChild(this.el.death);
+    this.bombHud = createLocalBombHud({ game, root: this.root });
 
     this._onResize = this._onResize.bind(this);
     window.addEventListener('resize', this._onResize);
@@ -222,7 +224,7 @@ export class HUD {
       this.root.id = 'hud';
     }
     const r = this.root;
-    r.setAttribute('aria-hidden', 'true');
+    r.removeAttribute('aria-hidden');
     r.className = 'enter';
     r.innerHTML = '';
 
@@ -901,6 +903,7 @@ export class HUD {
     this.killfeedUI.reset();
     this.minimap.reset();
     this.scoreboard.reset();
+    this.bombHud.reset();
     this.scoreboard.setVisible(false);
     this._hideDeath();
     this.el.notice.classList.remove('on', 'anim', 'fade');
@@ -979,8 +982,12 @@ export class HUD {
       this.scoreboard.setVisible(wantSb);
       this.scoreboard.update(dt);
       this.minimap.draw(dt);
+      this.bombHud.update(dt);
     } else if (this.scoreboard.visible) {
       this.scoreboard.setVisible(false);
+      this.bombHud.update(dt);
+    } else {
+      this.bombHud.update(dt);
     }
 
     this._tickPerf(dt);
@@ -994,6 +1001,7 @@ export class HUD {
     this.killfeedUI.dispose();
     this.minimap.dispose();
     this.scoreboard.dispose();
+    this.bombHud.destroy();
     if (this.root) this.root.innerHTML = '';
   }
 
@@ -1174,7 +1182,8 @@ export class HUD {
     const b = String(lab?.right ?? names?.[1] ?? 'BRAVO').toUpperCase();
     if (a !== this._c.tagA) { this._c.tagA = a; this.el.tagA.textContent = a; }
     if (b !== this._c.tagB) { this._c.tagB = b; this.el.tagB.textContent = b; }
-    const met = String(lab?.metric ?? '').toUpperCase();
+    const metric = String(lab?.metric ?? 'KILLS').toUpperCase();
+    const met = `${metric} · FIRST TO ${m.killLimit | 0}`;
     if (met !== this._c.metric) { this._c.metric = met; this.el.metric.textContent = met; }
   }
 

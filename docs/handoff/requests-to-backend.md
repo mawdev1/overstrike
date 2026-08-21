@@ -694,3 +694,91 @@ backend-owned module.
   the real browser transport outcomes local; it does not relabel them as server failures.
 - Status: OPEN
 - Response:
+
+### REQ-CC-062 — Mount the P2 presence, room, lobby, allocation, and match-handoff seams
+- Phase: P2
+- Blocking: yes
+- Needed by: H2.1–H2.3 / P2 exit criteria
+- Contract affected: `contracts/http-api.md` room and presence routes; `contracts/realtime-lobby.md`; `contracts/net-facade.md`; `contracts/wire-protocol.md`
+- Ask: The frozen P2 contracts and deterministic lobby timelines exist, but the production composition mounts no live presence, room lifecycle, lobby WebSocket, allocation, or control-plane modules. The lobby stub is an in-process timeline generator rather than a browser-connectable WebSocket. The match server accepts unauthenticated sockets and the browser has no CC-owned `src/net/facade.js`; the live client/server path still bypasses the contracted hello/reject/match-state/outcome lifecycle. CX can build and exhaustively test a contract-exact reducer and presentation island, but cannot complete H2.1, switch to live H2.2, or demonstrate the two-/six-client gates without these surfaces.
+- Proposed shape: Mount same-origin authenticated presence/room routes and a browser-consumable lobby WebSocket stub implementing every realtime-lobby §10 timeline. Implement the live lobby channel with single-use account/room-bound tickets, reservation conversion, heartbeat/expiry, monotonic sequence/resync, room-scoped chat/mute/report/ping enforcement, readiness/countdown/allocation, return/rematch, and zombie cleanup. Publish and mount the frozen browser `src/net/facade.js`, wire ticket-authenticated match hello/reject/reconnect, and add two-client plus six-client end-to-end tests. Preserve feature-flag defaults and exact correlation propagation.
+- Requester's workaround until then: CX implements the reducer/controller, server-browser/lobby views, and deterministic UI harnesses against injected transports. Real handoffs remain fail-closed and are not relabelled as local practice.
+- Status: OPEN
+- Response:
+
+### REQ-CC-063 — Provide a lane-legal P3 graybox/tooling handoff and Square-aware guards
+- Phase: P3
+- Blocking: yes
+- Needed by: H3.1/H3.2 / The Square geometry acceptance
+- Contract affected: `contracts/map-data.md`; Build Plan P3.A1–A3/P3.B1–B2; `docs/lane-ownership.json`
+- Ask: H3.1 says CC ships a graybox stub while the ownership model forbids CC from writing the only permitted producer files, `src/world/level.js` and `src/world/props.js`. The Square now retains MERIDIAN through an explicit fixture export in the lane-legal producer, and the manifest/nav consumer plus `navtest.mjs` are present and green. The contract-required deterministic `scripts/navbake.mjs` and committed `src/world/navdata/the-square.json` are still absent, however, and both currently resolve outside the CX lane. The legacy `mapbalance`/`geomtest` reports also retain MERIDIAN landmarks and do not enforce the frozen Square contact/site/rotation or measured p95 scene-budget gates; those exact thresholds are independently enforced in `scripts/uimap.mjs`, but that CX harness is not registered in the machine map guard or CI.
+- Proposed shape: Define H3.1 as a CC-owned manifest/consumer/tooling handoff, not an edit to CX geometry. Add explicit CX ownership for the approved Square module/retained-MERIDIAN fixture path and `src/world/navdata/**`; provide deterministic `navbake.mjs`/`navtest.mjs`; update every map guard to select a map and enforce map-data 1.2 exactly, including deliberate-bad-map controls, bake freshness, callout coverage, spawn groups/reachability, objective volumes, removable boundary, the 88 m/timing/sightline envelope, and both map-only and whole-scene budgets. Add all required harnesses to `mapGuard.requiredHarnesses`.
+- Requester's workaround until then: CX may author the exact manifest and fixture-preserving geometry in the already-owned `level.js`, plus independent CX structural tests, but cannot produce the mandated nav artifact or claim H3.2/guard acceptance.
+- Status: OPEN
+- Response:
+
+### REQ-CC-064 — Finish the browser Bomb facade and freeze snapshot-staleness behavior
+- Phase: P3
+- Blocking: yes
+- Needed by: H3.3 / P3.B3–B4 integrated Bomb presentation
+- Contract affected: `contracts/wire-protocol.md`; `contracts/net-facade.md`; `contracts/bomb-rules.md`; `design/hud-bomb.md`
+- Ask: The contracts describe Bomb state and scenarios, but the current protocol/live path does not implement the hello/reject/match-state/outcome/interact fields and events, and no browser `src/net/facade.js` exists. CX therefore has no lawful live source for server-held plant/defuse progress, bomb visibility, spectator policy, ordered outcomes, measured diagnostics, or authoritative lifecycle telemetry. The HUD also needs one numeric freshness rule for when locally projected server time must stop and display `SYNCING`; the current documents require a contracted tolerance but publish none.
+- Proposed shape: Implement and mount the exact frozen protocol/facade, including all named scenarios, authoritative full snapshots on reconnect, hidden-position purging, spectator-policy phase changes, interaction refusals, measured net statistics, and terminal HTTP handoff. Freeze either a snapshot-stale threshold or an exact derivation from server cadence/heartbeat so CX does not invent one. Provide browser-consumable deterministic scenarios and a full bot Bomb match vector.
+- Requester's workaround until then: CX builds a fixture-first Bomb presentation module that accepts the frozen match-state projection, holds progress, purges hidden fields, and takes freshness tolerance as an injected policy. It does not connect to protocol internals or simulate Bomb completion.
+- Status: OPEN
+- Response:
+
+### REQ-CC-065 — Close the lobby interaction vocabulary and terminal transport gaps
+- Phase: P2
+- Blocking: yes
+- Needed by: H2.1/H2.2 and P2.B2–B3 live integration
+- Contract affected: `contracts/realtime-lobby.md` §§3–5 and §10; `contracts/http-api.md` §11.3; `contracts/errors.md`
+- Ask: The CX lobby controller and shell can now consume a validated welcome, preserve an authoritative roster beside pending intent, and map every currently named client message. Four required UI actions still have no exact producer vocabulary. First, mute is promised as server-enforced delivery filtering, but there is no client mute/unmute intent, acknowledgement/error event, rate limit, or reconnect snapshot field; `setMuted` can therefore suppress locally only. Second, `ping.send`/`ping.placed` accept an undefined `kind` string and an undefined `target` shape, while no snapshot/config endpoint supplies the canned callouts the UI must offer. Third, fatal socket failures are said to close with an errors payload but there is no closed WebSocket close-code → platform-error mapping or exact reason transport; the client currently cannot distinguish kicked, sanctioned, room removed, expired seat, session replacement, protocol mismatch, and ordinary network loss without guessing from a free-form close reason. Fourth, lobby state carries only selected loadout indices and exposes no allowed loadout catalog, labels, ruleset eligibility, or revision from which a valid selector can be built.
+- Proposed shape: Add exact `mute.set { accountId, muted }` request/answer semantics and reconnect projection; freeze ping `kind` values and a closed `target` union (or publish them in an authenticated config projection with versioning); publish reserved close codes with an exact typed error mapping and retry/route outcome; and provide a ruleset-versioned loadout catalog containing stable indices/labels/eligibility that the room snapshot can reference. Add deterministic stub timelines for success, refusal/rate limit, reconnect persistence, every terminal close outcome, unknown ping/catalog versions, and catalog changes that clear readiness.
+- Requester's workaround until then: CX maps mute to local display suppression, renders pings only when choices are injected, treats unmapped closes as `CLIENT_NETWORK`, and leaves loadout read-only when no catalog is supplied. None of those fallbacks is claimed as H2.1/H2.2 server enforcement.
+- Status: OPEN
+- Response:
+
+### REQ-CC-066 — Define reload resync and mount the remaining P2 safety/realtime surfaces
+- Phase: P2
+- Blocking: yes
+- Needed by: H2.1–H2.3 / active-lobby reload and browser acceptance
+- Contract affected: `contracts/realtime-lobby.md` §§3, 8, 10; `contracts/http-api.md` reports/presence/rooms; platform composition and browser stub transport
+- Ask: A reconnect with an in-memory `lastSeq` can send the exact `state.resync` request, but a page reload has no sequence to send and the frozen payload forbids null/omission. The current deterministic stub masks this by sending a fresh `lobby.welcome`; the contract only documents reconnect as resync. Production still lacks the browser WebSocket endpoint, live report route, room/presence/allocation modules, and same-origin development transport needed to exercise either path. Consequently a report entry point can be rendered while the live endpoint is absent, and active-room discovery cannot prove a reload-to-authoritative-snapshot flow.
+- Proposed shape: Choose one exact cold-reload handshake: either a reconnect ticket explicitly authorizes a fresh `lobby.welcome`, or `state.resync` gains a closed no-sequence variant. Mount that behavior in both live and browser-stub WebSockets. Mount the already frozen reports, presence, room lifecycle, reconnect-ticket, allocation, and return/rematch routes in the production composition. Add a real-browser test for join → welcome → reload → discovery → cold resync/welcome, plus report success/refusal, with no ticket in URL/storage/logs after socket construction.
+- Requester's workaround until then: CX keeps the controller strict: an ordinary fresh ticket accepts `lobby.welcome`; an in-process reconnect with known sequence requires a correlation-matched `state.snapshot`. It does not fabricate a sequence across reload or claim H2.1 browser integration.
+- Status: OPEN
+- Response:
+
+### REQ-CC-067 — Supply autonomous Bomb bots and the remaining authoritative presentation projections
+- Phase: P3
+- Blocking: yes
+- Needed by: H3.3/H3.4 / P3.B3–B5 exit criteria
+- Contract affected: `contracts/bomb-rules.md`; `contracts/net-facade.md`; Build Plan P3.A4/P3.B3–B5
+- Ask: Current Bomb tests teleport actors and call plant/defuse requests directly; no bot chooses a site, carries/recovers the bomb, plants, defends, retakes, or defuses. That is a scripted rules test, not the required full bot Bomb match. The registered Bomb mode now correctly declares its fixed protected-spawn policy, and the balance harness proves that path, so that former subfinding is closed. The frozen facade still supplies no Bomb scoreboard plants/defuses/round-history projection and no authorized camera/world marker projection for distance, occlusion, and safe-edge direction. Finally, spectator policy conflicts across frozen sources: `net-facade.md` permits freecam during warmup/freeze while `bomb-rules.md` and the implemented rules allow it only at roundEnd/matchEnd.
+- Proposed shape: Set the Bomb mode's fixed protected-spawn policy in the authoritative registry. Add objective-aware bot states and a deterministic autonomous full-match harness proving both sides plant/defuse/retake and complete a legal series without test teleportation. Extend the facade with exact authorized Bomb scoreboard rows/round history and a privacy-filtered world-marker projection (or name the existing CC adapter that owns those calculations). Resolve the freecam matrix with one normative phase table and exercise every row. Keep hidden bomb/carrier data absent, including after reconnect and spectator-policy transitions.
+- Requester's workaround until then: CX ships a pure Bomb presentation island, including frozen clocks/progress, privacy purge, authorized marker rendering, accessibility, and visual fixtures. It does not read simulation internals, invent plants/defuses, or label the scripted rules harness H3.3.
+- Status: OPEN
+- Response:
+
+### REQ-CC-068 — Make every browser lobby timeline satisfy the frozen identity invariants
+- Phase: P2
+- Blocking: yes
+- Needed by: H2.1 browser-stub acceptance
+- Contract affected: `contracts/realtime-lobby.md` §3 and §10; platform lobby fixtures
+- Ask: The strict CX lobby receiver now enforces global ULID/UTC-millisecond/error-code rules and the snapshot authority invariants: exactly one local roster member matching `you`, exactly one owner matching `room.ownerAccountId`, truthful countdown ready totals, and a `match.ready` descriptor whose immutable `mapId`, `mapVersion`, `mode`, and `rulesetVersion` equal RoomCore. Five published timelines currently fail that closed contract. `team-full`, `countdown-continues`, and `countdown-abort-imbalance` name `01JTEVW3000NF2FD0NTAK14Q6S` as RoomCore owner while a different account, `01K2GBKZ00T4VSF02W15GP8N2N`, is the sole `isOwner:true` roster member. `happy-path` and `handoff-version-mismatch` welcome the client to a TDM room and later send a Bomb handoff. A browser client must reject all five; accepting them would let two authoritative projections disagree.
+- Proposed shape: Correct the three owner projections and make both handoff timelines preserve the immutable room map/mode/ruleset tuple (while varying only the intended version-mismatch field in that scenario). Add a platform stub test that runs every §10 server frame through the frozen closed schema plus owner/local/countdown/handoff semantic checks. Do not weaken the receiver or add a second authority source.
+- Requester's workaround until then: CX keeps the receiver fail-closed and excludes exactly the five malformed timelines from positive integrated acceptance; the exact defects remain visible in its harness output/request ledger.
+- Status: OPEN
+- Response:
+
+### REQ-CC-069 — Register the P2/P3 CX acceptance harnesses and Square bake artifacts in release CI
+- Phase: P2/P3
+- Blocking: yes
+- Needed by: H2.1/H3.2 and continuous P3 acceptance
+- Contract affected: Build Plan §0.7/P3; `contracts/map-data.md` §6; package/CI ownership
+- Ask: `scripts/uilobby.mjs`, `scripts/uibomb.mjs`, and `scripts/uimap.mjs` are CX-owned and executable directly, but package scripts and CI are CC-owned. The current CI/map job does not run these browser/reducer/producer acceptance suites, nor all of `navtest`, `vertprobe`, `mapbalance`, and the required future nav-bake freshness check. A local green run can therefore regress without blocking a merge.
+- Proposed shape: Add named package scripts for the three CX harnesses; run them in CI alongside the full existing P1/P2/P3 suite. Make the map job execute every map-data §6 guard plus deterministic nav bake and byte-for-byte freshness comparison against `src/world/navdata/the-square.json`. Retain deliberate-bad-map controls so a guard that stops enforcing a threshold fails CI.
+- Requester's workaround until then: Codex runs every harness directly and records exact counts, but does not call H2.1/H3.2 continuously enforced.
+- Status: OPEN
+- Response:

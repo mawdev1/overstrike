@@ -1,5 +1,5 @@
 import { DEFAULTS } from '../core/settings.js';
-import { MODE_LIST } from '../game/modes.js';
+import { MODE_LIST, bombAvailable } from '../game/modes.js';
 import { PRIMARIES, SECONDARIES, WEAPON_LIST } from '../weapons/weaponDefs.js';
 import { progression, LEVEL_MAX } from '../game/progression.js';
 import { keyLabel } from './hud.js';
@@ -14,8 +14,8 @@ import { modeLabel, formatClock } from './scoreboard.js';
  * the panels themselves are built once and reused.
  *
  * Everything here reads a real API:
- *   modes      `game.match.modeList` (MODE_LIST) — id/name/description/scoreLimit/
- *              timeLimit/teamBased/hudLabels, straight off the rule objects
+ *   mode       `game.match.modeList` (one-entry MODE_LIST) — TDM metadata straight off
+ *              the rule object; the per-round kill limit comes from settings/Match
  *   weapons    `PRIMARIES` / `SECONDARIES` from weaponDefs.js — a STATIC import;
  *              the loadout panel is core UI and must never silently degrade
  *   unlocks    `progression.getLevel()` vs `def.unlockLevel`
@@ -94,6 +94,7 @@ const SCHEMA = {
     { grp: 'Match defaults' },
     { k: 'difficulty', label: 'Bot difficulty', type: 'seg', options: DIFFICULTIES.map((d) => [d.id, d.name]) },
     { k: 'botCount', label: 'Bot count', type: 'range', min: 0, max: 15, step: 1, fmt: (v) => String(v | 0) },
+    { k: 'killLimit', label: 'Team kill limit', hint: 'First team to this many kills wins', type: 'range', min: 5, max: 200, step: 5, fmt: (v) => String(v | 0) },
   ],
   hud: [
     { grp: 'Reticle' },
@@ -435,7 +436,7 @@ export class Menu {
     const m = this.game?.match;
     if (!el || !m) return;
     el.mode.textContent = String(m.modeName || modeLabel(m.mode));
-    el.obj.textContent = String(m.mode?.hudLabels?.objective || m.mode?.description || '');
+    el.obj.textContent = `${String(m.mode?.hudLabels?.objective || m.mode?.description || '')} · FIRST TO ${m.killLimit | 0}`;
     const lab = m.mode?.hudLabels;
     el.an.textContent = String(lab?.left || m.teamNames[0] || 'ALPHA');
     el.bn.textContent = String(lab?.right || m.teamNames[1] || 'BRAVO');
@@ -477,6 +478,8 @@ export class Menu {
       { ...SCHEMA.gameplay.find((x) => x.k === 'botCount'), hint: 'Hostiles and allies filling the sector' }));
     grp.appendChild(this._schemaRow(
       { ...SCHEMA.gameplay.find((x) => x.k === 'difficulty'), hint: 'Reaction time, accuracy and aggression' }));
+    grp.appendChild(this._schemaRow(
+      { ...SCHEMA.gameplay.find((x) => x.k === 'killLimit'), hint: 'First team to this many eliminations wins the round' }));
     const dhint = h('div', 'diff-hint');
     grp.appendChild(dhint);
     this._diffHint = dhint;
@@ -496,6 +499,7 @@ export class Menu {
     p.appendChild(foot);
 
     this._reg('botCount', () => this._paintDeploySummary());
+    this._reg('killLimit', () => { this._buildModes(); this._paintDeploySummary(); });
 
     return p;
   }
@@ -511,14 +515,22 @@ export class Menu {
     if (!this._deploySum) return;
     const m = this._modes().find((x) => x.id === this._mode);
     const bots = (this.settings?.get('botCount') ?? DEFAULTS.botCount) | 0;
+    const kills = (this.settings?.get('killLimit') ?? DEFAULTS.killLimit) | 0;
     const diff = String(this.settings?.get('difficulty') ?? DEFAULTS.difficulty).toUpperCase();
+    const objective = m?.id === 'bomb' ? 'FIRST TO 7 ROUNDS' : `FIRST TO ${kills}`;
     this._deploySum.innerHTML = m
-      ? `<b>${esc(m.name)}</b> · ${bots} BOT${bots === 1 ? '' : 'S'} · ${esc(diff)}`
+      ? `<b>${esc(m.name)}</b> · ${objective} · ${bots} BOT${bots === 1 ? '' : 'S'} · ${esc(diff)}`
       : '';
   }
 
   /** The real mode rule objects. Match publishes them; MODE_LIST is the same array. */
-  _modes() { return this.game?.match?.modeList ?? MODE_LIST; }
+  _modes() {
+    const modes = this.game?.match?.modeList ?? MODE_LIST;
+    return modes.filter((mode) => mode.id !== 'bomb'
+      || (this.game?.clientFeatureFlags?.['mode.bomb.enabled'] === true
+        && this.game?.clientFeatureFlags?.['map.the_square.enabled'] === true
+        && bombAvailable(this.game)));
+  }
 
   get _mode() {
     const want = this.settings?.get('mode') ?? DEFAULTS.mode;
@@ -532,16 +544,18 @@ export class Menu {
     const list = this._modes();
     const el = this._modesEl;
     el.innerHTML = '';
+    const killLimit = (this.settings?.get('killLimit') ?? DEFAULTS.killLimit) | 0;
     for (const m of list) {
       const mins = Math.round((m.timeLimit || 600) / 60);
+      const meta = m.id === 'bomb'
+        ? ['TEAM', 'FIRST TO 7 ROUNDS', '12 ROUND MAX']
+        : ['TEAM', `KILL LIMIT ${killLimit}`, `${mins} MIN`];
       const card = h('button', 'mode-card', `
         <span class="mabbr">${esc(abbrOf(m.name))}</span>
         <span class="mname">${esc(m.name)}</span>
         <span class="mdesc">${esc(m.description || '')}</span>
         <span class="mmeta">
-          <span>${m.teamBased ? 'TEAM' : 'FREE-FOR-ALL'}</span>
-          <span>${m.scoreLimit > 0 ? `LIMIT ${m.scoreLimit}` : 'FULL ARSENAL'}</span>
-          <span>${mins} MIN</span>
+          ${meta.map((item) => `<span>${esc(item)}</span>`).join('')}
         </span>`);
       card.type = 'button';
       card.dataset.nav = '';
@@ -577,6 +591,7 @@ export class Menu {
     this.close();
     const opts = {
       mode: this._mode,
+      killLimit: (this.settings?.get('killLimit') ?? DEFAULTS.killLimit) | 0,
       botCount: (this.settings?.get('botCount') ?? DEFAULTS.botCount) | 0,
       difficulty: this.settings?.get('difficulty') ?? DEFAULTS.difficulty,
     };
@@ -1269,8 +1284,6 @@ export class Menu {
     this.el.root.style.setProperty('--end-tint',
       outcome === 'draw' ? 'rgba(255,179,71,0.12)' : outcome === 'win' ? 'rgba(142,247,196,0.16)' : 'rgba(255,47,36,0.14)');
 
-    // Team scores only mean something in a team mode; in FFA the per-operator
-    // table below is the whole story, so the versus line is dropped entirely.
     const teamBased = !!g?.match?.mode?.teamBased;
     el.a.textContent = String(a);
     el.b.textContent = String(b);
@@ -1278,7 +1291,9 @@ export class Menu {
     el.mode.textContent = [
       String(res?.modeName || modeLabel(res?.mode ?? g?.match?.mode)),
       res?.winnerName ? `${res.winnerName} WINS` : '',
-      res?.reason === 'time' ? 'TIME EXPIRED' : res?.reason === 'score' ? 'SCORE LIMIT' : '',
+      res?.reason === 'time' ? 'TIME EXPIRED'
+        : res?.reason === 'killLimit' ? `KILL LIMIT ${res?.killLimit ?? g?.match?.killLimit ?? ''}`
+          : '',
       res?.duration ? formatClock(res.duration) : '',
     ].filter(Boolean).join('  ·  ');
 
@@ -1301,8 +1316,6 @@ export class Menu {
     // ---- results table, straight from the referee's rows ----
     const rows = res?.rows || g?.match?.getScoreboardRows?.() || [];
     const names = res?.teamNames || g?.match?.teamNames || ['ALPHA', 'BRAVO'];
-    // In free-for-all every entity carries a unique team id, so a TEAM column and
-    // team colouring would be noise — drop both rather than print a column of dashes.
     let html = '<thead><tr><th class="rk">#</th><th class="op">OPERATOR</th>'
       + (teamBased ? '<th class="tm">TEAM</th>' : '')
       + '<th>K</th><th>D</th><th>A</th><th>K/D</th><th>ACC</th><th>STK</th><th>SCORE</th></tr></thead><tbody>';
@@ -1379,7 +1392,7 @@ export class Menu {
         return [
           ['PLAY AGAIN', 'primary', null, () => this._deploy()],
           ['AFTER ACTION', '', 'results', () => this.show('results')],
-          ['CHANGE MODE', '', 'play', () => this.show('play')],
+          ['MATCH SETUP', '', 'play', () => this.show('play')],
           ['LOADOUT', '', 'loadout', () => this.show('loadout')],
           ['SETTINGS', '', 'settings', () => this.show('settings')],
           ['MAIN MENU', 'danger', null, () => { this._sfx('uiBack'); this.game?.returnToMenu?.(); }],
@@ -1563,13 +1576,10 @@ export class Menu {
     /**
      * Player.respawn() asks the weapon system for a loadout with no ids, which means
      * `DEFAULT_LOADOUT` — so a respawn silently reverts the player's chosen kit. We
-     * re-equip on every player spawn. Match subscribes to `spawn` before we do
-     * (it is constructed first), so gun game has already handed out its ladder
-     * weapon by now; leave that mode alone.
+     * re-equip on every player spawn.
      */
     on('spawn', (p) => {
       if (!p || p.entity !== this.game?.player) return;
-      if (this.game?.match?.modeId === 'gungame') return;
       this._equipLoadout();
     });
 

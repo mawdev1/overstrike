@@ -94,6 +94,302 @@ const HAZARD = 0xe8c24a;        // safety yellow
 // multiply and still read as distinct colours at 30 m.
 const LAUNDRY = [0xffffff, 0x7fd4ff, 0xff9a7a, 0xa8f088, 0xffd24a, 0xd0a8ff, 0xffffff, 0x9fe8e0];
 
+// ── The Square — competitive map-data 1.2 producer ────────────────────────────────
+
+export const MAP_ID = 'the-square';
+export const MAP_VERSION = '1.0.0';
+
+const SQUARE_EDGE = 44;
+const v3 = (x, y, z) => new THREE.Vector3(x, y, z);
+const volume = (x0, y0, z0, x1, y1, z1) => ({ min: v3(x0, y0, z0), max: v3(x1, y1, z1) });
+
+/**
+ * Competitive containment is deliberately data, not district architecture. P6 can embed
+ * the district by omitting this layer without deleting or re-authoring any civic building.
+ */
+export const COMPETITIVE_BOUNDARY = Object.freeze([
+  volume(-44, -1, -44, -42, 15, 44),
+  volume(42, -1, -44, 44, 15, 44),
+  volume(-42, -1, -44, 42, 15, -42),
+  volume(-42, -1, 42, 42, 15, 44),
+]);
+
+const squareSpawns = Object.freeze([
+  // Alpha protected Bomb group, south service court.
+  ['alpha-court-1', -10, 0, 34, 0, 0, 'alpha-main'],
+  ['alpha-court-2', -8, 0, 34, 0, 0, 'alpha-main'],
+  ['alpha-court-3', -6, 0, 34, 0, 0, 'alpha-main'],
+  ['alpha-court-4', -4, 0, 34, 0, 0, 'alpha-main'],
+  ['alpha-court-5', -2, 0, 34, 0, 0, 'alpha-main'],
+  ['alpha-market-1', 34, 0, 31, -0.35, 0, 'alpha-market'],
+  ['alpha-transit-1', 31, 0, 32, 0.35, 0, 'alpha-transit'],
+  ['alpha-plaza-1', -34, 0, 38, 0.15, 0, 'alpha-plaza'],
+  // Bravo protected Bomb group, north municipal court.
+  ['bravo-court-1', 36, 0, -28, -Math.PI / 2, 1, 'bravo-main'],
+  ['bravo-court-2', 36, 0, -26, -Math.PI / 2, 1, 'bravo-main'],
+  ['bravo-court-3', 36, 0, -24, -Math.PI / 2, 1, 'bravo-main'],
+  ['bravo-court-4', 36, 0, -22, -Math.PI / 2, 1, 'bravo-main'],
+  ['bravo-court-5', 36, 0, -20, -Math.PI / 2, 1, 'bravo-main'],
+  ['bravo-market-1', -38, 0, -28, Math.PI + 0.35, 1, 'bravo-market'],
+  ['bravo-transit-1', 31, 0, -32, Math.PI - 0.35, 1, 'bravo-transit'],
+  ['bravo-plaza-1', 34, 0, -38, Math.PI - 0.15, 1, 'bravo-plaza'],
+].map(([id, x, y, z, yaw, team, group]) => Object.freeze({
+  id, position: v3(x, y, z), yaw, team, group, protectionRadius: 4,
+  modes: Object.freeze(['tdm', 'bomb']),
+})));
+
+const squareCallouts = Object.freeze([
+  // The low-priority district catch-all guarantees one spoken name for every standable
+  // point; named subregions win deterministically where they overlap it.
+  { id: 'district', name: 'District', box: volume(-42, -4, -42, 42, 14, 42), priority: -100 },
+  { id: 'alpha-court', name: 'South Court', box: volume(-14, -1, 30, 14, 4, 42), priority: 10 },
+  { id: 'bravo-court', name: 'North Court', box: volume(-14, -1, -42, 14, 4, -30), priority: 10 },
+  { id: 'plaza-fountain', name: 'Fountain', box: volume(-13, -1, -12, 13, 4, 12), priority: 20 },
+  { id: 'plaza-east', name: 'Plaza East', box: volume(13, -1, -18, 25, 5, 18), priority: 12 },
+  { id: 'plaza-west', name: 'Plaza West', box: volume(-25, -1, -18, -13, 5, 18), priority: 12 },
+  { id: 'civic-archive', name: 'Civic Archive', box: volume(-42, -1, -29, -20, 10, -5), priority: 30 },
+  { id: 'civic-court', name: 'Archive Court', box: volume(-30, -1, -12, -16, 5, 11), priority: 25 },
+  { id: 'market-arcade', name: 'Market Arcade', box: volume(-42, -1, 7, -20, 8, 29), priority: 20 },
+  { id: 'market-alley', name: 'Delivery Alley', box: volume(-42, -1, 29, -14, 5, 42), priority: 18 },
+  { id: 'transit-control', name: 'Transit Control', box: volume(20, -1, 5, 42, 10, 29), priority: 30 },
+  { id: 'transit-platform', name: 'Platform', box: volume(16, -1, -14, 42, 5, 8), priority: 22 },
+  { id: 'service-tunnel', name: 'Service Tunnel', box: volume(14, -1, 20, 42, 5, 42), priority: 18 },
+  { id: 'upper-walk', name: 'Upper Walk', box: volume(-20, 3.5, -8, 20, 8, 8), priority: 40 },
+]);
+
+const squareRoofBlockers = Object.freeze([
+  // Archive/market and transit roofs are backdrop, not traversable playspace. The
+  // three usable levels are the plaza ground, upper walk, and signal bridge.
+  volume(-42, 3.5, -42, -20, 4.5, 42),
+  volume(20, 3.5, -42, 42, 4.5, 42),
+]);
+
+export const MAP_MANIFEST = Object.freeze({
+  bounds: Object.freeze(volume(-SQUARE_EDGE, -4, -SQUARE_EDGE, SQUARE_EDGE, 18, SQUARE_EDGE)),
+  spawns: squareSpawns,
+  objectives: Object.freeze([
+    { id: 'site-A', kind: 'plant', site: 'A', box: volume(-19.5, 0, -11, -16.5, 2.4, -9), requiresGround: true },
+    { id: 'site-B', kind: 'plant', site: 'B', box: volume(16, 0, 26, 18, 2.4, 28), requiresGround: true },
+  ]),
+  callouts: squareCallouts,
+  navHints: Object.freeze({
+    walkable: Object.freeze([
+      volume(-42, -0.1, -42, 42, 0.35, 42),
+      volume(-12, 3.8, -5, 12, 4.25, 5),
+      volume(-2, 7.8, -5, 2, 8.25, 5),
+    ]),
+    // Boundary caps are unwalkable only while that removable layer is installed. Reuse
+    // the layer objects instead of cloning them so consumers can subtract it exactly.
+    blocked: Object.freeze([...squareRoofBlockers, ...COMPETITIVE_BOUNDARY]),
+    links: Object.freeze([
+      { from: v3(-21.5, 0, -3), to: v3(-12, 4, -3), kind: 'stair' },
+      { from: v3(21.5, 0, 3), to: v3(12, 4, 3), kind: 'stair' },
+      { from: v3(-9.5, 4, 3), to: v3(-1.5, 8, 3), kind: 'stair' },
+      { from: v3(9.5, 4, -3), to: v3(1.5, 8, -3), kind: 'stair' },
+    ]),
+    cover: Object.freeze([
+      { position: v3(-8, 0, -9), facing: 0 }, { position: v3(8, 0, 9), facing: Math.PI },
+      { position: v3(-25, 0, -10), facing: Math.PI / 2 }, { position: v3(25, 0, 10), facing: -Math.PI / 2 },
+    ]),
+  }),
+  budgets: Object.freeze({
+    profileId: 'ref-integrated-1080p', drawCalls: 140, triangles: 300000,
+    materials: 48, lights: 6, colliders: 1200,
+  }),
+});
+
+/** Exact manifest projection for embedding the district without its competitive wall. */
+export function squareManifest({ competitiveBoundary = true } = {}) {
+  if (competitiveBoundary) return MAP_MANIFEST;
+  return Object.freeze({
+    ...MAP_MANIFEST,
+    navHints: Object.freeze({
+      ...MAP_MANIFEST.navHints,
+      blocked: squareRoofBlockers,
+    }),
+  });
+}
+
+/** Empty, collision-free commercial placements. They are metadata, never ad content. */
+export const COMMERCIAL_ANCHORS = Object.freeze([
+  { id: 'sponsor.event.plaza-east', position: v3(17, 2.2, -7), yaw: -Math.PI / 2, maxSize: v3(3.6, 1.8, 0.08), visibleFrom: ['plaza-fountain'], emissiveMax: 0.15 },
+  { id: 'sponsor.rooftop.transit', position: v3(30, 7.2, 17), yaw: Math.PI, maxSize: v3(4.0, 1.4, 0.08), visibleFrom: ['transit-platform'], emissiveMax: 0.1 },
+  { id: 'sponsor.billboard.market-north', position: v3(-30, 4.8, 8), yaw: 0, maxSize: v3(4.5, 2.0, 0.08), visibleFrom: ['market-arcade'], emissiveMax: 0.12 },
+  { id: 'storefront.market.01', position: v3(-40, 2.0, 13), yaw: Math.PI / 2, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['market-arcade'], emissiveMax: 0 },
+  { id: 'storefront.market.02', position: v3(-40, 2.0, 21), yaw: Math.PI / 2, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['market-arcade'], emissiveMax: 0 },
+  { id: 'storefront.civic.01', position: v3(-27, 2.0, -28), yaw: 0, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['civic-archive'], emissiveMax: 0 },
+  { id: 'storefront.civic.02', position: v3(-35, 2.0, -28), yaw: 0, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['civic-archive'], emissiveMax: 0 },
+]);
+
+/** Build The Square. Architecture remains when COMPETITIVE_BOUNDARY is omitted in P6. */
+export function buildLevel(game, world, { competitiveBoundary = true } = {}) {
+  const B = new Builder(game, world);
+  world.manifest = squareManifest({ competitiveBoundary });
+  world.setBounds(MAP_MANIFEST.bounds.min, MAP_MANIFEST.bounds.max);
+  buildSquareGround(B);
+  buildSquareDistrict(B);
+  if (competitiveBoundary) buildSquareBoundary(B);
+  const stats = B.finish();
+  world.buildStats.drawCalls = stats.meshes + stats.instanced;
+  world.buildStats.triangles = Math.round(stats.triangles);
+  world.buildStats.colliders = world.boxes.length;
+}
+
+/** Retained comparison fixture; intentionally not part of the live Square rotation. */
+export const MERIDIAN_FIXTURE = Object.freeze({
+  MAP_ID: 'meridian',
+  MAP_VERSION: '1.0.0-fixture',
+  buildLevel: buildMeridianFixture,
+});
+
+function buildSquareGround(B) {
+  B.groundPlane(-42, -42, 42, 42, 0, 'concreteDark', 'concrete');
+  B.floorFinish(-14, -14, 14, 14, 0.02, 'tile', { cast: false });
+  B.floorFinish(-41, 8, -20, 29, 0.025, 'brick', { cast: false });
+  B.floorFinish(20, -14, 41, 29, 0.025, 'asphalt', { cast: false });
+  // Directional paving breaks orientation without introducing a second callout vocabulary.
+  for (let z = -36; z <= 36; z += 8) B.deco(-1.8, 0.03, z, 1.8, 0.045, z + 2.4, 'concrete', { cast: false });
+}
+
+function buildingShell(B, x0, z0, x1, z1, material, doors = []) {
+  const t = 0.45;
+  const bySide = (side) => doors.filter((d) => d.side === side).map((d) => ({
+    a0: d.a0, a1: d.a1, y0: 0, y1: 2.8, frame: 'door',
+  }));
+  B.wall(x0, z0, x1, z0 + t, 0, 7.4, material, 'concrete', { openings: bySide('north') });
+  B.wall(x0, z1 - t, x1, z1, 0, 7.4, material, 'concrete', { openings: bySide('south') });
+  B.wall(x0, z0, x0 + t, z1, 0, 7.4, material, 'concrete', { openings: bySide('west') });
+  B.wall(x1 - t, z0, x1, z1, 0, 7.4, material, 'concrete', { openings: bySide('east') });
+  B.box(x0, 3.8, z0, x1, 4.0, z1, 'concreteDark', 'concrete');
+}
+
+function buildSquareDistrict(B) {
+  // Civic Archive / Site A: orthogonal cover, two public entries and a service court.
+  buildingShell(B, -40, -29, -20, -7, 'plaster', [
+    { side: 'south', a0: -36, a1: -32 }, { side: 'east', a0: -20, a1: -16 },
+    { side: 'north', a0: -28, a1: -24 },
+  ]);
+  B.box(-38, 0, -26, -36, 2.3, -14, 'concreteDark', 'concrete');
+  B.box(-31, 0, -23, -29, 1.5, -12, 'concrete', 'concrete');
+  B.box(-25, 0, -25, -22, 1.1, -20, 'concrete', 'concrete');
+  B.parapet(-40, -29, -20, -29, 4, 1.0, 'concreteDark');
+  B.parapet(-40, -7, -20, -7, 4, 1.0, 'concreteDark');
+
+  // Transit Control / Site B: broken machinery cover and an independently reachable mezzanine.
+  buildingShell(B, 20, 7, 40, 29, 'concreteDark', [
+    { side: 'north', a0: 24, a1: 28 }, { side: 'west', a0: 12, a1: 16 },
+    { side: 'south', a0: 31, a1: 35 },
+  ]);
+  B.box(23, 0, 11, 27, 1.4, 15, 'metal', 'metal');
+  B.box(31, 0, 14, 34, 2.0, 17, 'concrete', 'concrete');
+  B.box(36, 0, 19, 38, 1.2, 26, 'metal', 'metal');
+  B.box(25, 0, 16, 30.5, 3.0, 26, 'concreteDark', 'concrete');
+  B.parapet(20, 7, 40, 7, 4, 1.0, 'metal');
+  B.parapet(20, 29, 40, 29, 4, 1.0, 'metal');
+
+  // Market Row and service tunnel form the concealed rotations around the open plaza.
+  for (const z of [9, 17, 25]) {
+    B.box(-41, 0, z, -34, 3.4, z + 5, 'brick', 'concrete');
+    B.deco(-33.95, 2.2, z + 0.4, -33.85, 2.45, z + 4.6, 'tile', { cast: false });
+  }
+  B.box(-29, 0, 8, -27, 2.1, 28, 'concreteDark', 'concrete');
+  B.box(27, 0, 30, 29, 2.5, 41, 'concreteDark', 'concrete');
+  B.box(36, 0, 30, 38, 2.5, 41, 'concreteDark', 'concrete');
+
+  // Framed transit glazing is consistent and shoot-through: movement is blocked, sight is
+  // not. Panels are freestanding in their openings so no glass is entombed in masonry.
+  for (const x of [-18, 18]) {
+    for (const z of [-37, -29, -21, -13, -5, 13, 21, 29, 37]) {
+      if ((x === -18 || x === 18) && z === -5) continue; // ramp mouths / cross-lane screen
+      B.box(x - 0.025, 0.35, z - 1.7, x + 0.025, 3.05, z + 1.7, 'glass', 'glass',
+        { cast: false, receive: false });
+    }
+  }
+  for (const z of [-18, 18]) {
+    for (const x of [-12, -7, -2, 3, 8]) {
+      B.box(x, 0.35, z - 0.025, x + 3.5, 3.05, z + 0.025, 'glass', 'glass',
+        { cast: false, receive: false });
+    }
+  }
+
+  // Central square: broken cover and a dry fountain around the offset Signal Spire.
+  B.box(-11, 0, -10, -7, 1.0, -4, 'concrete', 'concrete');
+  B.box(7, 0, 4, 11, 1.0, 10, 'concrete', 'concrete');
+  B.box(-10, 0, 7, -4, 0.75, 10, 'concrete', 'concrete');
+  B.box(4, 0, -10, 10, 0.75, -7, 'concrete', 'concrete');
+  // The civic memorial wall breaks the spawn-to-spawn axis and makes the fast plaza
+  // route commit to an east or west shoulder instead of becoming an 88 m rifle lane.
+  B.box(-13, 0, -1, 13, 3.0, 1, 'plaster', 'concrete');
+  B.cylinder(-15, 0, 0, 1.45, 10.5, 12, 'metal', 'metal', { collide: true });
+  B.cylinder(-15, 10.5, 0, 0.45, 2.2, 10, 'metal', 'metal', { collide: false });
+  // The upper information route crosses the plaza but never becomes a dominant roof.
+  B.box(-12, 3.8, -5, 12, 4.0, 5, 'concreteDark', 'concrete');
+  B.box(-2, 7.8, -5, 2, 8.0, 5, 'concreteDark', 'concrete');
+  B.box(-12, 7.8, -5, -10, 8.0, 1.5, 'concreteDark', 'concrete');
+  B.box(10, 7.8, -1.5, 12, 8.0, 5, 'concreteDark', 'concrete');
+  B.ramp({ x0: -20, z0: -5, x1: -12, z1: -2, y0: 0, y1: 4, dir: '+x', matName: 'concrete' });
+  B.ramp({ x0: 12, z0: 2, x1: 20, z1: 5, y0: 0, y1: 4, dir: '-x', matName: 'concrete' });
+  B.ramp({ x0: -10, z0: 2, x1: -2, z1: 5, y0: 4, y1: 8, dir: '+x', matName: 'concrete' });
+  B.ramp({ x0: 2, z0: -5, x1: 10, z1: -2, y0: 4, y1: 8, dir: '-x', matName: 'concrete' });
+  B.parapet(-12, -5, 2, -5, 8, 1.0, 'concreteDark');
+  B.parapet(-2, 5, 12, 5, 8, 1.0, 'concreteDark');
+
+  // Deliberate sightline breaks between opposing courts and across the service routes.
+  B.box(-15, 0, -34, -11, 4.2, -13, 'plaster', 'concrete');
+  B.box(11, 0, 13, 15, 4.2, 34, 'concreteDark', 'concrete');
+  B.box(-4, 0, -28, 4, 2.2, -24, 'concrete', 'concrete');
+  B.box(-4, 0, 24, 4, 2.2, 28, 'concrete', 'concrete');
+  B.box(-8, 0, -21, 8, 2.8, -19, 'plaster', 'concrete');
+  B.box(-8, 0, 19, 8, 2.8, 21, 'plaster', 'concrete');
+  // These cross-lane screens flank rather than occupy the two ground-to-L1 ramps.
+  B.box(-21, 0, -8, -17.5, 2.8, -5.8, 'concreteDark', 'concrete');
+  B.box(-21, 0, -1.2, -17.5, 2.8, 8, 'concreteDark', 'concrete');
+  B.box(17.5, 0, -8, 21, 2.8, 1.2, 'concreteDark', 'concrete');
+  B.box(17.5, 0, 5.8, 21, 2.8, 8, 'concreteDark', 'concrete');
+  B.box(-29, 0, -13, -27, 3.0, 13, 'concreteDark', 'concrete');
+  B.box(27, 0, -13, 29, 3.0, 13, 'concreteDark', 'concrete');
+  // Long baffles are deliberately broken into staggered segments. Solid lines across a
+  // district make a fine ray-test wall and an unplayable map: these gaps preserve the
+  // sightline break while keeping every court connected to both sites.
+  for (const x of [-14, 14]) {
+    B.box(x - 1, 0, -42, x + 1, 3.4, -31, 'plaster', 'concrete');
+    B.box(x - 1, 0, -27, x + 1, 3.4, -18, 'plaster', 'concrete');
+    B.box(x - 1, 0, 18, x + 1, 3.4, 27, 'plaster', 'concrete');
+    B.box(x - 1, 0, 31, x + 1, 3.4, 42, 'plaster', 'concrete');
+  }
+  // Offset cover closes the only >48 m diagonal through the north-east service gap
+  // without turning that gap into a sealed wall.
+  B.box(11, 0, -30.5, 16, 2.8, -27, 'concreteDark', 'concrete');
+  B.box(25.5, 0, -19, 30, 2.8, -17, 'plaster', 'concrete');
+  B.box(-30, 0, -19, -27, 2.8, -17, 'plaster', 'concrete');
+  for (const z of [-14, 14]) {
+    B.box(-42, 0, z - 1, -29.5, 3.4, z + 1, 'concreteDark', 'concrete');
+    B.box(-27, 0, z - 1, -19, 3.4, z + 1, 'concreteDark', 'concrete');
+    B.box(19, 0, z - 1, 27, 3.4, z + 1, 'concreteDark', 'concrete');
+    B.box(29.5, 0, z - 1, 42, 3.4, z + 1, 'concreteDark', 'concrete');
+  }
+  B.box(-1, 0, -16.5, 1, 3.4, -11, 'plaster', 'concrete');
+  B.box(-1, 0, -8.5, 1, 3.4, -5, 'plaster', 'concrete');
+  B.box(-1, 0, 5, 1, 3.4, 8.5, 'plaster', 'concrete');
+  B.box(-1, 0, 11, 1, 3.4, 16.5, 'plaster', 'concrete');
+  B.box(-18, 0, -1, -11, 3.4, 1, 'concreteDark', 'concrete');
+  B.box(-7, 0, -1, -5, 3.4, 1, 'concreteDark', 'concrete');
+  B.box(5, 0, -1, 7, 3.4, 1, 'concreteDark', 'concrete');
+  B.box(11, 0, -1, 18, 3.4, 1, 'concreteDark', 'concrete');
+  for (const x of [-14, 14]) {
+    for (const z of [-14, 14]) {
+      B.box(x - 3, 0, z - 3, x + 3, 2.8, z + 3, 'concrete', 'concrete');
+    }
+  }
+}
+
+function buildSquareBoundary(B) {
+  for (const box of COMPETITIVE_BOUNDARY) {
+    B.box(box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z,
+      'concreteDark', 'boundary');
+  }
+}
+
 /**
  * Painted board flat on a wall face, `w` wide × `h` high, bottom edge at `y`.
  * The sign/cloth/shutter family faces +Z at yaw 0, so: +Z → 0, -Z → π, +X → π/2, -X → -π/2.
@@ -135,10 +431,11 @@ function hang(B, x, y, z, yaw, w, h, color) {
 }
 
 /**
- * Build the entire map. Called synchronously from World.init(); everything below runs in
+ * Build the retained MERIDIAN fixture. Called synchronously by an explicit fixture entry;
+ * everything below runs in
  * well under 250 ms because all geometry is merged/instanced in a single pass at the end.
  */
-export function buildLevel(game, world) {
+export function buildMeridianFixture(game, world) {
   const B = new Builder(game, world);
   const rng = game.rng;
 
