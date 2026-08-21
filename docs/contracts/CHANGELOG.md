@@ -1,5 +1,66 @@
 # Contract changelog
 
+## 2026-08-21 — The Square `MAP_VERSION` 1.0.0 → 2.0.0 — site-A's plant volume moved (CCR-001)
+
+`map-data.md` §8 gives exactly one row for this change — *"Objective volume moved/renamed →
+**Major bump + CCR.** Rewrites the meaning of history"* — and the geometry edit that moved the
+volume shipped neither. `MAP_VERSION` sat at `1.0.0` while the volume it is supposed to
+distinguish had already moved 8.3 m, which is the precise failure the field exists to prevent:
+two different maps answering to one version, and every balance argument between them
+unresolvable.
+
+The bump also covers the collision changes landing beside it (§8 row 2: minor bump, fresh bake,
+all guards) — a major bump subsumes it, and the bake and the guards are not optional either way.
+`src/world/navdata/the-square.json` is re-baked in the same change, per §4.
+
+**Two §7 envelope numbers moved with it, and both are recorded rather than smoothed over.**
+The §7.0 48 m sightline ceiling is now MET on The Square — 47.6 m, zero rays over, against
+72.6 m and 1.45% of rays before this change. The cost is §7.1's band-representation floor: the
+long band falls from 4.9% to 1.1% against a 5% floor. It was already under that floor before
+this change, and it is further under now. The two thresholds are in genuine tension and
+`mapbalance.mjs`'s own §7.1 header says so — the long band starts at 34 m and the hard ceiling
+is 48 m, so a fully compliant map has a 14 m window to be long in. Retained as PENDING under
+`REQ-CX-008`, which is where the harness already tracks it. Separately, the spawn-to-site
+comparability row for `alpha-main` crosses its 15% tolerance (16.2%) as a direct consequence of
+the volume move above: `alpha-main -> site-A` lengthens 63.51 m → 64.39 m while
+`alpha-main -> site-B` is unchanged at 55.40 m. No other route on the map moved.
+
+### CCR-001 — The Square site-A plant volume moved
+
+- Contract: contracts/map-data.md
+- Type: breaking
+- Raised by: [CX]
+- Date: 2026-08-21
+- Change: `MAP_MANIFEST.objectives` entry `site-A` changes `box` from
+  `(-19.5, 0, -11) … (-16.5, 2.4, -9)` to `(-21.75, 0, -19) … (-19.5, 2.4, -16.75)` — the
+  plant volume moves 8.3 m south-west, off the open Archive Court and into the Civic
+  Archive's east approach. `MAP_VERSION` goes `1.0.0` → `2.0.0`. The **id is unchanged**:
+  `site-A` still means site A, and no consumer's identifier breaks.
+- Why: there is no additive path. §3.3 gives a site exactly one `box`, and a volume is where
+  it is — a second, optional volume alongside it would mean a bomb that can be planted in two
+  places at once, which is a rules change and not a compatibility shim. The alternative to
+  the CCR is not a gentler migration, it is leaving `MAP_VERSION` wrong.
+- Impact: every stored `match-result.md` §4 record carrying `MAP_VERSION: '1.0.0'` was played
+  on a map whose A site was somewhere else. Nothing breaks at runtime and no row needs
+  rewriting — the damage is analytical, and the fix is that 1.0.0 and 2.0.0 are now
+  distinguishable, so A-site win rates, plant positions and rotation timings from before this
+  change must not be pooled with ones from after it. Consumers that group by `MAP_ID` alone
+  and not by `(MAP_ID, MAP_VERSION)` will silently pool them; that is the one code change this
+  CCR asks for.
+- Dual-support window: **none is available, and this is a deviation being recorded rather than
+  satisfied.** The Amendment-types table asks for ≥1 phase of dual support. A running match
+  resolves plants against one manifest; there is no shape in which both volumes are live, so
+  the window cannot be served by the producer. What is served instead is the durable
+  discriminator: `MAP_VERSION` is in every result, so history stays *readable* even though it
+  cannot stay *uniform*.
+- Migration: none for stored data — 1.0.0 rows keep their meaning under 1.0.0. Analytics and
+  any balance baseline must re-key on `(MAP_ID, MAP_VERSION)` and re-establish A-site
+  baselines from 2.0.0 matches.
+- Approved by: **NOT YET APPROVED** — awaiting the human owner. The bump and this entry land
+  now because the geometry has already moved and an unversioned move is strictly worse than a
+  versioned unapproved one; the CCR is not closed until this line names an approver and a date.
+- Status: PROPOSED
+
 ## 2026-08-21 — `wire-protocol.md` 1.8.0 → 1.9.0 — held interact bit (`PROTOCOL_VERSION` stays 3)
 
 `bomb-rules.md` §6.4 requires the plant key held continuously and nothing on the wire could
