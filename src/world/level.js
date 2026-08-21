@@ -97,7 +97,9 @@ const LAUNDRY = [0xffffff, 0x7fd4ff, 0xff9a7a, 0xa8f088, 0xffd24a, 0xd0a8ff, 0xf
 // ── The Square — competitive map-data 1.2 producer ────────────────────────────────
 
 export const MAP_ID = 'the-square';
-export const MAP_VERSION = '1.0.0';
+// 2.0.0 is a MAJOR bump under map-data.md §8: site-A's plant volume MOVED, which rewrites
+// the meaning of every match result recorded against 1.0.0. Landed with CCR-001.
+export const MAP_VERSION = '2.0.0';
 
 const SQUARE_EDGE = 44;
 const v3 = (x, y, z) => new THREE.Vector3(x, y, z);
@@ -157,18 +159,60 @@ const squareCallouts = Object.freeze([
   { id: 'upper-walk', name: 'Upper Walk', box: volume(-20, 3.5, -8, 20, 8, 8), priority: 40 },
 ]);
 
+// The four pylons that flank the two ground-to-L1 ramps, as [x0, z0, x1, z1] footprints.
+// They were 2.8 m cover blocks, and 2.8 m is the one height that is too tall to be cover
+// and too short to be a wall: nothing can be reached from the ground, and a player who
+// steps off the ramp deck lands on top of one with an eye at 4.42 m and an uninterrupted
+// 63 m read straight across the district. §7.0's ceiling is 48 m. They are building
+// height now, so the surface a player was standing on no longer exists.
+const SQUARE_PYLONS = Object.freeze([
+  Object.freeze([-21, -8, -17.5, -5.8]), Object.freeze([-21, -1.2, -17.5, 8]),
+  Object.freeze([17.5, -8, 21, 1.2]), Object.freeze([17.5, 5.8, 21, 8]),
+]);
+const PYLON_H = 7.4;
+
+// Elevated massing, as [x0, z0, x1, z1] footprints capped at UPPER_H.
+//
+// §7.0's 48 m ceiling and an 84 m district with three usable levels are in tension, and the
+// tension is entirely above head height: at eye 1.62 m the plaza is already chopped into
+// sub-16 m reads, while the upper walk (deck y 4), the two ramps and the signal deck (y 8)
+// looked straight over every one of those breaks. So the breaks grow upward. Each footprint
+// below is a blocker that ALREADY existed at 3.0–3.4 m; only its top moves. No footprint
+// changes, so no nav node, no route, no cover distance and no ground sightline moves — the
+// only rays that change are the ones that were passing over a wall at 5 m of eye height.
+const SQUARE_UPPER_CAPS = Object.freeze([
+  Object.freeze([-29, -13, -27, 13]), Object.freeze([27, -13, 29, 13]),
+  Object.freeze([-18, -1, -11, 1]), Object.freeze([11, -1, 18, 1]),
+  Object.freeze([-1, -16.5, 1, -11]), Object.freeze([-1, -8.5, 1, -5]),
+  Object.freeze([-1, 5, 1, 8.5]), Object.freeze([-1, 11, 1, 16.5]),
+  Object.freeze([-15, -34, -11, -13]), Object.freeze([11, 13, 15, 34]),
+  Object.freeze([13, -27, 15, -18]), Object.freeze([-15, 18, -13, 27]),
+]);
+const UPPER_H = 7.4;   // = PYLON_H: one massing height, and 3.4 m clear of the walk deck
+
 const squareRoofBlockers = Object.freeze([
   // Archive/market and transit roofs are backdrop, not traversable playspace. The
   // three usable levels are the plaza ground, upper walk, and signal bridge.
   volume(-42, 3.5, -42, -20, 4.5, 42),
   volume(20, 3.5, -42, 42, 4.5, 42),
+  // Pylon caps, for the same reason and by the same rule. The nearest standable surface
+  // is the upper walk at y 4, 5.5 m away horizontally and 3.4 m below — no step, no
+  // mantle, no drop reaches them. Left unblocked the baker rasters four islands that are
+  // walkable, unreachable, and counted as playspace by the analytics: the phantom-node
+  // failure §3.5 names.
+  ...SQUARE_PYLONS.map(([x0, z0, x1, z1]) => volume(x0, PYLON_H - 0.6, z0, x1, PYLON_H + 0.6, z1)),
+  // Same rule and same height for the elevated massing caps. 7.4 m is not a round number:
+  // the player's jump apex is 1.15 m and MANTLE_MAX_H is 1.35 m, so 2.50 m is exactly what
+  // can be climbed, and a cap 3.4 m above the walk deck is the first height that cannot be.
+  // A cap the player CAN reach is playspace and must not be declared blocked here.
+  ...SQUARE_UPPER_CAPS.map(([x0, z0, x1, z1]) => volume(x0, UPPER_H - 0.6, z0, x1, UPPER_H + 0.6, z1)),
 ]);
 
 export const MAP_MANIFEST = Object.freeze({
   bounds: Object.freeze(volume(-SQUARE_EDGE, -4, -SQUARE_EDGE, SQUARE_EDGE, 18, SQUARE_EDGE)),
   spawns: squareSpawns,
   objectives: Object.freeze([
-    { id: 'site-A', kind: 'plant', site: 'A', box: volume(-19.5, 0, -11, -16.5, 2.4, -9), requiresGround: true },
+    { id: 'site-A', kind: 'plant', site: 'A', box: volume(-21.75, 0, -19, -19.5, 2.4, -16.75), requiresGround: true },
     { id: 'site-B', kind: 'plant', site: 'B', box: volume(16, 0, 26, 18, 2.4, 28), requiresGround: true },
   ]),
   callouts: squareCallouts,
@@ -335,47 +379,90 @@ function buildSquareDistrict(B) {
   B.parapet(-2, 5, 12, 5, 8, 1.0, 'concreteDark');
 
   // Deliberate sightline breaks between opposing courts and across the service routes.
-  B.box(-15, 0, -34, -11, 4.2, -13, 'plaster', 'concrete');
-  B.box(11, 0, 13, 15, 4.2, 34, 'concreteDark', 'concrete');
+  // The two long court slabs and the two middle baffle segments carry the elevated
+  // diagonals off the ramps as well as the ground read, so they run to UPPER_H. At 4.2 m
+  // and 3.4 m a player on either ramp looked straight over them and out to the district
+  // edge; nothing at ground level changes, because a 1.62 m eye never saw past them.
+  B.box(-15, 0, -34, -11, UPPER_H, -13, 'plaster', 'concrete');
+  B.box(11, 0, 13, 15, UPPER_H, 34, 'concreteDark', 'concrete');
   B.box(-4, 0, -28, 4, 2.2, -24, 'concrete', 'concrete');
   B.box(-4, 0, 24, 4, 2.2, 28, 'concrete', 'concrete');
   B.box(-8, 0, -21, 8, 2.8, -19, 'plaster', 'concrete');
   B.box(-8, 0, 19, 8, 2.8, 21, 'plaster', 'concrete');
-  // These cross-lane screens flank rather than occupy the two ground-to-L1 ramps.
-  B.box(-21, 0, -8, -17.5, 2.8, -5.8, 'concreteDark', 'concrete');
-  B.box(-21, 0, -1.2, -17.5, 2.8, 8, 'concreteDark', 'concrete');
-  B.box(17.5, 0, -8, 21, 2.8, 1.2, 'concreteDark', 'concrete');
-  B.box(17.5, 0, 5.8, 21, 2.8, 8, 'concreteDark', 'concrete');
-  B.box(-29, 0, -13, -27, 3.0, 13, 'concreteDark', 'concrete');
-  B.box(27, 0, -13, 29, 3.0, 13, 'concreteDark', 'concrete');
+  // These pylons flank rather than occupy the two ground-to-L1 ramps: each ramp mouth
+  // keeps its 4.6 m gap, so no route through them changes.
+  for (const [x0, z0, x1, z1] of SQUARE_PYLONS) {
+    B.box(x0, 0, z0, x1, PYLON_H, z1, 'concreteDark', 'concrete');
+  }
+  // The two long plaza-flank screens carry the cardinal east/west read off the upper walk,
+  // which is why they run to UPPER_H rather than the 3.0 m that only stopped a ground eye.
+  B.box(-29, 0, -13, -27, UPPER_H, 13, 'concreteDark', 'concrete');
+  B.box(27, 0, -13, 29, UPPER_H, 13, 'concreteDark', 'concrete');
   // Long baffles are deliberately broken into staggered segments. Solid lines across a
   // district make a fine ray-test wall and an unplayable map: these gaps preserve the
   // sightline break while keeping every court connected to both sites.
+  // The middle segment is emitted only on the side where the taller sightline-break slab
+  // above does not already occupy it. West of the plaza that slab spans x -15..-11 over
+  // z -34..-13 and swallowed the x=-14 / z -27..-18 segment whole; the mirror swallowed
+  // x=+14 / z 18..27. A box wholly inside another is inert — it blocks nothing the
+  // enclosing box did not already block, contradicts §3.1's "no third state", and still
+  // costs every move/raycast/losClear query against the §3.6 collider budget.
   for (const x of [-14, 14]) {
-    B.box(x - 1, 0, -42, x + 1, 3.4, -31, 'plaster', 'concrete');
-    B.box(x - 1, 0, -27, x + 1, 3.4, -18, 'plaster', 'concrete');
-    B.box(x - 1, 0, 18, x + 1, 3.4, 27, 'plaster', 'concrete');
-    B.box(x - 1, 0, 31, x + 1, 3.4, 42, 'plaster', 'concrete');
+    // The outer segments end at |z| = 30, not 31. At 31 they left a 1 m slot that the
+    // nav raster samples at z = -30.9 and z = 30.6, and that slot was a clear 52 m
+    // ground lane the length of the service road — the only >48 m reads left at eye
+    // height. The staggered gap that keeps the courts connected is 3 m instead of 4.
+    B.box(x - 1, 0, -42, x + 1, 3.4, -30, 'plaster', 'concrete');
+    if (x > 0) B.box(x - 1, 0, -27, x + 1, UPPER_H, -18, 'plaster', 'concrete');
+    if (x < 0) B.box(x - 1, 0, 18, x + 1, UPPER_H, 27, 'plaster', 'concrete');
+    B.box(x - 1, 0, 30, x + 1, 3.4, 42, 'plaster', 'concrete');
   }
   // Offset cover closes the only >48 m diagonal through the north-east service gap
   // without turning that gap into a sealed wall.
   B.box(11, 0, -30.5, 16, 2.8, -27, 'concreteDark', 'concrete');
   B.box(25.5, 0, -19, 30, 2.8, -17, 'plaster', 'concrete');
   B.box(-30, 0, -19, -27, 2.8, -17, 'plaster', 'concrete');
+  // The outer cross-runs stop at |x| = 29, not 29.5. The half-metre slot they left between
+  // themselves and the plaza-flank screens at |x| 27..29 was a 48 m north-south ground lane
+  // the full depth of the market and transit flanks — the last one at eye height. The
+  // rotation gap between the two runs is 2 m rather than 2.5 and is still walkable.
   for (const z of [-14, 14]) {
-    B.box(-42, 0, z - 1, -29.5, 3.4, z + 1, 'concreteDark', 'concrete');
+    B.box(-42, 0, z - 1, -29, 3.4, z + 1, 'concreteDark', 'concrete');
     B.box(-27, 0, z - 1, -19, 3.4, z + 1, 'concreteDark', 'concrete');
     B.box(19, 0, z - 1, 27, 3.4, z + 1, 'concreteDark', 'concrete');
-    B.box(29.5, 0, z - 1, 42, 3.4, z + 1, 'concreteDark', 'concrete');
+    B.box(29, 0, z - 1, 42, 3.4, z + 1, 'concreteDark', 'concrete');
   }
-  B.box(-1, 0, -16.5, 1, 3.4, -11, 'plaster', 'concrete');
-  B.box(-1, 0, -8.5, 1, 3.4, -5, 'plaster', 'concrete');
-  B.box(-1, 0, 5, 1, 3.4, 8.5, 'plaster', 'concrete');
-  B.box(-1, 0, 11, 1, 3.4, 16.5, 'plaster', 'concrete');
-  B.box(-18, 0, -1, -11, 3.4, 1, 'concreteDark', 'concrete');
+  // Upper-storey skyline returns: a closed clerestory ring 29.5 m out, from y 3.0 — clear of
+  // a standing player — to y 12. It is the ONLY thing on this map that bounds an elevated
+  // ray without shortening it: a lane off the walk or the signal deck used to run to the
+  // 42 m boundary at 48–63 m, and it now ends at the ring at 30–38 m, which is still inside
+  // §7.1's long band. Blocking the same lane close to its source would have satisfied the
+  // ceiling by deleting the long read instead of framing it.
+  //
+  // The four faces run unbroken. They were authored with a 16 m opening on each face on the
+  // argument that it preserved the cardinal reads, and the opening was exactly where every
+  // remaining breach went: the elevated routes sit on the spine, so the spine axes are the
+  // lanes, and an opening centred on them opens the only ones that were over.
+  //
+  // Nothing below 3.0 m exists here, so no ground route, ground sightline, cover distance
+  // or nav node is touched — the ring is invisible to everything except an elevated eye.
+  // 29.5, not 30: the last ray over the ceiling was the 45-degree diagonal off the signal
+  // ramp into the ring's inside corner, at 48.3 m. The corner is the furthest point of a
+  // square ring from its centre, so it is the one place the ring is weakest, and half a
+  // metre of inset is what that corner was over by.
+  for (const x of [-29.5, 29.5]) B.box(x - 0.5, 3.0, -29.5, x + 0.5, 12, 29.5, 'plaster', 'concrete');
+  for (const z of [-29.5, 29.5]) B.box(-29.5, 3.0, z - 0.5, 29.5, 12, z + 0.5, 'concreteDark', 'concrete');
+  // The four spine fins run to UPPER_H: at 3.4 m their tops were a step down off the walk
+  // deck, so a player who left the walk stood at eye 5.02 m with the plaza spine to
+  // themselves. There is no surface there now.
+  B.box(-1, 0, -16.5, 1, UPPER_H, -11, 'plaster', 'concrete');
+  B.box(-1, 0, -8.5, 1, UPPER_H, -5, 'plaster', 'concrete');
+  B.box(-1, 0, 5, 1, UPPER_H, 8.5, 'plaster', 'concrete');
+  B.box(-1, 0, 11, 1, UPPER_H, 16.5, 'plaster', 'concrete');
+  B.box(-18, 0, -1, -11, UPPER_H, 1, 'concreteDark', 'concrete');
   B.box(-7, 0, -1, -5, 3.4, 1, 'concreteDark', 'concrete');
   B.box(5, 0, -1, 7, 3.4, 1, 'concreteDark', 'concrete');
-  B.box(11, 0, -1, 18, 3.4, 1, 'concreteDark', 'concrete');
+  B.box(11, 0, -1, 18, UPPER_H, 1, 'concreteDark', 'concrete');
   for (const x of [-14, 14]) {
     for (const z of [-14, 14]) {
       B.box(x - 3, 0, z - 3, x + 3, 2.8, z + 3, 'concrete', 'concrete');
