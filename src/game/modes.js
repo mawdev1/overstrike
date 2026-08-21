@@ -135,6 +135,24 @@ export const BOMB = {
    * `timeRemaining` is not consulted by `checkEnd`, so a zero here ends nothing.
    */
   timeLimit: 0,
+  /**
+   * §2/§8: Bomb uses FIXED protected team spawns. Without this the spawner's default is
+   * 'dynamic', so Bomb was silently placing players through the TDM enemy-distance scorer —
+   * the one thing the ruleset says it must not do. A protected spawn that is chosen by
+   * looking at where the enemies are is not protected; it is just a different guess.
+   *
+   * No `fixedSpawnGroup` is declared, so the spawner uses each team's largest own-team group
+   * (`alpha-main` / `bravo-main`). That matches how the map declares its groups —
+   * `map-data.md` §3.2 asks for "1 protected group of >=5 adjacent points" PER TEAM, and The
+   * Square supplies exactly that — so a team keeps its physical spawn across the round-6 side
+   * switch and changes role, rather than teleporting to the other end of the district.
+   *
+   * That is only FAIR while the two mains are equidistant from the sites, and on The Square
+   * today they are not: alpha-main is 18.5 m from site-B, bravo-main is 63.7 m. §3.2's own
+   * table requires both sites within 15% of each other. Filed as part of REQ-CX-008; it is a
+   * geometry defect, not a rules defect, and no spawn policy here can correct it.
+   */
+  spawnPolicy: 'fixed',
   roundsToWin: BOMB_PARAMS.roundsToWin,
   maxRounds: BOMB_PARAMS.maxRounds,
   hudLabels: {

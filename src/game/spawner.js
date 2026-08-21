@@ -22,6 +22,30 @@ const _down = new THREE.Vector3(0, -1, 0);
 const _up = new THREE.Vector3(0, 1, 0);
 const _probe = new THREE.Vector3();
 
+/**
+ * ── The interface this file needs from a MODE ────────────────────────────────────────
+ *
+ * `src/game/modes.js` and `src/game/match.js` are owned by another lane. The spawner does
+ * not import either; it reads two optional properties off `match.mode` and nothing else.
+ *
+ *   mode.spawnPolicy : 'dynamic' | 'fixed'
+ *       ABSENT means 'dynamic'. TDM is dynamic. Bomb declares 'fixed' — bomb-rules.md §2
+ *       has no respawn at all, so a round's placement is a positioning ritual at `freeze`,
+ *       not a tactical response to a live fight, and running the dynamic scorer over it
+ *       would move a team's spawn depending on where the enemy happened to be standing.
+ *
+ *   mode.fixedSpawnGroup(match, team) -> string | null      (only read when policy==='fixed')
+ *       The manifest `group` id that `team` occupies for the CURRENT round. This is where
+ *       Bomb's side switch after round 6 lives: the mode returns the other group id, and
+ *       the spawner needs to know nothing about rounds. Returning null (or not
+ *       implementing it) falls back to that team's largest own-team group, which is
+ *       correct for a two-group map and reported by `describeGroups()` either way.
+ *
+ * Nothing else is consulted. A mode that declares neither property gets exactly today's
+ * TDM behaviour.
+ */
+export const SPAWN_POLICY = Object.freeze({ DYNAMIC: 'dynamic', FIXED: 'fixed' });
+
 /** Scoring weights. Positive = desirable. */
 export const SPAWN_WEIGHTS = {
   base: 100,
@@ -42,6 +66,51 @@ export const SPAWN_WEIGHTS = {
   teamMatch: 220,       // point tagged for your team
   teamMismatch: -500,   // point tagged for theirs
   jitter: 90,           // random tiebreak so spawns never become campable patterns
+
+  // ── added for P3.A2, each one paid for by a metric in scripts/mapbalance.mjs ────────
+
+  /**
+   * The point is inside a living enemy's ENGAGEMENT ENVELOPE: close enough to shoot, in
+   * front of them, and with a clear line. This is exactly the event
+   * `spawn-flip-into-enemy rate` counts, so it gets its own term rather than being left
+   * to `losEnemy` — LOS alone fires for an enemy who is 70 m away with their back turned,
+   * which is not the failure anybody feels.
+   *
+   * `enemyConeCos` is cos(50°); a 100° total cone is a little wider than the default
+   * 90° horizontal FOV so that "just off screen, one flick away" still counts as caught.
+   */
+  enemyCone: -1700,
+  enemyConeRange: 30,
+  enemyConeCos: 0.6428,
+
+  /**
+   * Recent death locations — ANYONE's, not just yours. `deathSpot` above only knows where
+   * the spawning entity itself died; the plan asks for recent death locations as a
+   * tactical input, and a cell where three people have just died in 20 s is contested
+   * ground whether or not one of them was you.
+   */
+  deathHeat: -140,      // per recent death inside `deathHeatRadius`, decayed by age
+  deathHeatRadius: 11,
+  deathHeatMax: 4,      // cap so one massacre cannot outweigh a live enemy in your face
+  deathHeatWindow: 20,
+
+  /**
+   * Combat pressure: shots fired and damage landed near the point in the last
+   * `pressureWindow` seconds. Deaths are a lagging indicator of a firefight; muzzle
+   * flashes are the leading one, and a spawn wants the leading one.
+   */
+  pressure: -260,
+  pressureRadius: 15,
+  pressureMax: 6,
+  pressureWindow: 7,
+
+  // ── group-level terms (map-data.md §3.2: "group is what the scorer selects between") ──
+  groupFriendly: 90,        // per living team-mate anywhere in the group, capped
+  groupFriendlyMax: 3,
+  groupEnemy: -650,         // per living enemy inside the group's footprint, capped
+  groupEnemyMax: 3,
+  groupRecentUse: -220,     // the group was used this instant; decays over the window
+  groupRecentWindow: 7,
 };
 
 const CLAIM_RADIUS = 2.0;      // two entities may never spawn this close together...
@@ -55,7 +124,7 @@ const EYE_DEFAULT = 1.62;
  * `losMaxCount` bounds how many CLEAR lines are priced in; it does not bound the work,
  * because a blocked line costs a full march and is not counted. On a cover-dense map
  * that meant every enemy within `LOS_RANGE` was marched for every point — measured at
- * 220 marches for a single mid-match pick in free-for-all. The three nearest enemies are
+ * 220 marches for a single mid-match pick. The three nearest enemies are
  * the only ones whose sightline can plausibly matter, so probing is hard-capped at three
  * regardless of outcome and served nearest-first.
  */
@@ -69,17 +138,53 @@ const LOS_RANGE_SQ = 6400;     // 80 m
  */
 const MIN_TEAM_CANDIDATES = 6;
 
+/**
+ * Groups a DERIVED manifest is split into, per team.
+ *
+ * map-data.md §3.2 wants ≥3 groups per team and makes `group` the thing the scorer selects
+ * between. MERIDIAN predates the contract, so `world.js` derives ONE group per team
+ * (`meridian-alpha`, `meridian-bravo`, `meridian-neutral`) — which leaves the group-level
+ * terms with nothing to discriminate. When, and only when, the manifest reports its groups
+ * as derived, each is split into this many (see `_subCluster`). A map that DECLARES its
+ * groups is used exactly as declared and is never re-clustered — this is a compatibility
+ * shim for pre-contract geometry, not a policy.
+ */
+const DERIVED_GROUPS_PER_TEAM = 3;
+
 export class Spawner {
   constructor(game, match = null) {
     this.game = game;
     this.match = match || game.match || null;
-    /** @type {Array<{position:THREE.Vector3, yaw:number, team:number, lastUsed:number}>} */
+    /** @type {Array<{id:string, position:THREE.Vector3, yaw:number, team:number, group:number, groupId:string, protectionRadius:number, lastUsed:number}>} */
     this.points = [];
+    /** @type {Array<{id:string, team:number, points:number[], centre:THREE.Vector3, radius:number, lastUsed:number}>} */
+    this.groups = [];
+    /** Per-group scratch, resized with `groups`. Filled once per pickSpawn(). */
+    this._gFriend = [];
+    this._gEnemy = [];
+    /** Where the spawns came from — 'declared' | 'derived' | 'legacy'. Reported, not asserted on. */
+    this.spawnSource = 'legacy';
+    /**
+     * Last placement made, for harnesses and evidence. Rewritten in place — never kept.
+     * @type {{index:number, id:string, groupId:string, policy:string, entityId:number}}
+     */
+    this.lastPick = { index: -1, id: '', groupId: '', policy: SPAWN_POLICY.DYNAMIC, entityId: -1 };
     /** @type {Array<{x:number,y:number,z:number,t:number}>} */
     this._claims = [];
     /** @type {Map<number, {position:THREE.Vector3, time:number}>} */
     this._deaths = new Map();
-    /** @type {THREE.Vector3[]} cached open-space samples, also used by DOMINATION. */
+    /**
+     * Recent death sites and recent gunfire, as flat number records.
+     *
+     * Deliberately NOT entity references. `auditG.mjs` exists because this class has
+     * leaked cross-match entity references before; a ring of plain floats cannot.
+     * @type {Array<{x:number,y:number,z:number,t:number}>}
+     */
+    this._deathHeat = [];
+    /** @type {Array<{x:number,y:number,z:number,t:number}>} */
+    this._pressure = [];
+    this._busUnsub = [];
+    /** @type {THREE.Vector3[]} cached open-space samples for spawn analysis/tooling. */
     this._open = null;
     /** The request that produced `_open` — see sampleOpenSpace() for why length is not it. */
     this._openCount = -1;
@@ -89,7 +194,7 @@ export class Spawner {
      *
      * It is level geometry, not gameplay randomness: the same map must yield the same
      * objective placement on every machine and in every match. Taking it off the sim RNG
-     * also removes ~960 draws from the start of a DOMINATION match, which is what made
+     * also removes hundreds of draws from match start, which is what made
      * "cache the sweep" change the RNG stream between the first match of a session and
      * every later one.
      */
@@ -107,12 +212,42 @@ export class Spawner {
     game.spawner = this;
   }
 
-  init() { this.buildPoints(); }
+  init() {
+    this.buildPoints();
+    this._subscribe();
+  }
+
+  /**
+   * Combat pressure comes off the event bus, not from a hook another lane has to remember
+   * to call. `shot` is the leading indicator (a muzzle flash means a fight is HAPPENING
+   * there); `damage` confirms it. Both carry a world position already, so this costs one
+   * push per event and no allocation beyond the ring.
+   */
+  _subscribe() {
+    this._unsubscribe();
+    const bus = this.game?.bus;
+    if (!bus || typeof bus.on !== 'function') return;
+    const push = (v) => {
+      if (!v) return;
+      this._pressure.push({ x: v.x, y: v.y, z: v.z, t: this.now });
+      if (this._pressure.length > 256) this._pressure.shift();
+    };
+    this._busUnsub.push(bus.on('shot', (p) => push(p?.origin)));
+    this._busUnsub.push(bus.on('damage', (p) => push(p?.point)));
+  }
+
+  _unsubscribe() {
+    for (const off of this._busUnsub) { if (typeof off === 'function') off(); }
+    this._busUnsub.length = 0;
+  }
 
   reset() {
     this.buildPoints();
     this._claims.length = 0;
     this._deaths.clear();
+    this._deathHeat.length = 0;
+    this._pressure.length = 0;
+    for (const g of this.groups) g.lastUsed = -999;
     for (const p of this.points) p.lastUsed = -999;
     // The open-space sweep has its own fixed stream (see the constructor) so it cannot
     // be perturbed by gameplay draws — but it still has to be rewound per match, or a
@@ -126,39 +261,203 @@ export class Spawner {
 
   // ------------------------------------------------------------------- points
 
-  /** Snapshot the level's spawn points; top up with open-space samples if it is thin. */
+  /**
+   * Snapshot the map's spawn markers; top up with open-space samples if it is thin.
+   *
+   * The source of truth is the MAP MANIFEST (`world.manifest.spawns`, map-data.md §3.2) —
+   * there are no spawn coordinates in this file and there never will be. `world.spawnPoints`
+   * is the pre-contract fallback for a world built without a manifest (a bare harness, or
+   * a level module that predates `buildManifest`); it carries the same `{position, yaw,
+   * team}` records, just without ids, groups or mode tags.
+   */
   buildPoints() {
     const world = this.game.world;
     this.points.length = 0;
-    const src = world?.spawnPoints;
-    if (Array.isArray(src)) {
-      for (const sp of src) {
-        if (!sp?.position) continue;
-        this.points.push({
-          position: new THREE.Vector3(sp.position.x, sp.position.y, sp.position.z),
-          yaw: typeof sp.yaw === 'number' ? sp.yaw : 0,
-          team: typeof sp.team === 'number' ? sp.team : -1,
-          lastUsed: -999,
-        });
+    this.groups.length = 0;
+
+    const manifest = world?.manifest;
+    const declared = manifest !== null && manifest !== undefined && Array.isArray(manifest.spawns);
+    const src = declared ? manifest.spawns : (Array.isArray(world?.spawnPoints) ? world.spawnPoints : []);
+    this.spawnSource = declared
+      ? (manifest.provenance?.spawns === 'declared' ? 'declared' : 'derived')
+      : 'legacy';
+
+    /**
+     * `modes` is only honoured when the producer AUTHORED it. `world.js` stamps
+     * `modes: ['tdm']` onto every derived spawn as a default, so honouring it on a derived
+     * manifest would leave Bomb on MERIDIAN with zero candidates — a filter that empties
+     * the field is worse than no filter, and "the map never said" is not "the map said no".
+     */
+    const modeId = this.match?.mode?.id ?? this.match?.modeId ?? null;
+    const filterModes = this.spawnSource === 'declared' && typeof modeId === 'string';
+
+    const take = (sp, i) => this.points.push({
+      id: typeof sp.id === 'string' ? sp.id : `unnamed-${i}`,
+      position: new THREE.Vector3(sp.position.x, sp.position.y, sp.position.z),
+      yaw: typeof sp.yaw === 'number' ? sp.yaw : 0,
+      team: typeof sp.team === 'number' ? sp.team : -1,
+      groupId: typeof sp.group === 'string' ? sp.group : '',
+      protectionRadius: typeof sp.protectionRadius === 'number' ? sp.protectionRadius : 4.0,
+      group: -1,
+      lastUsed: -999,
+    });
+
+    for (let i = 0; i < src.length; i++) {
+      const sp = src[i];
+      if (!sp || !sp.position) continue;
+      if (filterModes && Array.isArray(sp.modes) && !sp.modes.includes(modeId)) continue;
+      take(sp, i);
+    }
+
+    /**
+     * A mode filter that leaves a team with nothing is a map-authoring mistake, and the
+     * spawner's job is to keep the match playable while making the mistake loud. Falling
+     * back to the unfiltered set puts players on the map; refusing to would stack the
+     * whole team on the play-space centre, which is how a data error becomes a bug report
+     * about spawning.
+     */
+    if (filterModes) {
+      const per = [0, 0];
+      for (const p of this.points) { if (p.team === 0 || p.team === 1) per[p.team]++; }
+      const rawPer = [0, 0];
+      for (const sp of src) { const t = sp?.team; if (t === 0 || t === 1) rawPer[t]++; }
+      if ((per[0] === 0 && rawPer[0] > 0) || (per[1] === 0 && rawPer[1] > 0)) {
+        console.warn(`[spawner] no '${modeId}' spawns declared for team ${per[0] === 0 ? 0 : 1} on ${manifest.mapId ?? 'this map'} — ignoring the mode filter`);
+        this.points.length = 0;
+        for (let i = 0; i < src.length; i++) { if (src[i]?.position) take(src[i], i); }
       }
     }
+
     if (this.points.length < 8) {
       const extra = this.sampleOpenSpace(16 - this.points.length);
-      for (const p of extra) {
+      for (let i = 0; i < extra.length; i++) {
         this.points.push({
-          position: p.clone(),
+          id: `open-space-${i}`,
+          position: extra[i].clone(),
           yaw: (this.game.rng?.() ?? Math.random()) * Math.PI * 2,
           team: -1,
+          groupId: 'open-space',
+          protectionRadius: 4.0,
+          group: -1,
           lastUsed: -999,
         });
       }
     }
+
+    this._buildGroups();
     return this.points;
+  }
+
+  // -------------------------------------------------------------------- groups
+
+  /**
+   * Partition the points into the groups the scorer selects between.
+   *
+   * Declared groups are used verbatim — the producer said what a pocket is and that is
+   * the end of it. Derived groups (see GROUP_LINK_FACTOR) are sub-clustered, because
+   * "every alpha spawn is one group" gives the group terms nothing to choose between.
+   */
+  _buildGroups() {
+    const byId = new Map();
+    for (let i = 0; i < this.points.length; i++) {
+      const key = `${this.points[i].groupId}#${this.points[i].team}`;
+      let bucket = byId.get(key);
+      if (!bucket) byId.set(key, (bucket = []));
+      bucket.push(i);
+    }
+
+    const emit = (label, team, idxs) => {
+      const g = {
+        id: label,
+        team,
+        points: idxs,
+        centre: new THREE.Vector3(),
+        radius: 0,
+        lastUsed: -999,
+      };
+      for (const i of idxs) g.centre.add(this.points[i].position);
+      g.centre.multiplyScalar(1 / Math.max(1, idxs.length));
+      for (const i of idxs) {
+        const d = this.points[i].position.distanceTo(g.centre);
+        if (d > g.radius) g.radius = d;
+      }
+      // A single-point group still owns the ground around it; use its protection volume.
+      g.radius = Math.max(g.radius, this.points[idxs[0]].protectionRadius);
+      const gi = this.groups.length;
+      this.groups.push(g);
+      for (const i of idxs) { this.points[i].group = gi; this.points[i].groupId = label; }
+    };
+
+    for (const [key, idxs] of byId) {
+      const label = key.slice(0, key.lastIndexOf('#'));
+      const team = this.points[idxs[0]].team;
+      if (this.spawnSource === 'declared' || idxs.length < 3) { emit(label, team, idxs); continue; }
+      const clusters = this._subCluster(idxs);
+      if (clusters.length === 1) { emit(label, team, clusters[0]); continue; }
+      for (let c = 0; c < clusters.length; c++) emit(`${label}-${c + 1}`, team, clusters[c]);
+    }
+
+    this._gFriend.length = this.groups.length;
+    this._gEnemy.length = this.groups.length;
+    return this.groups;
+  }
+
+  /**
+   * Split one DERIVED group into the contract's minimum number of groups.
+   *
+   * `k = min(DERIVED_GROUPS_PER_TEAM, n)`, cut at the k-1 widest gaps along the group's
+   * longer horizontal axis. Two properties matter more than cluster quality:
+   *
+   *  - it is SYMMETRIC. A threshold rule gave MERIDIAN's team 0 two groups and team 1 one,
+   *    purely because one lane gap fell either side of the threshold — and then the
+   *    group-recency term applied to one team and not the other, which is a spawn-fairness
+   *    bug invented by the clustering rule rather than present in the map.
+   *  - the count comes from map-data.md §3.2 ("Minimum per team, TDM: 8, spread across ≥3
+   *    groups"), not from a tuned metres constant.
+   */
+  _subCluster(idxs) {
+    const n = idxs.length;
+    const k = Math.min(DERIVED_GROUPS_PER_TEAM, n);
+    if (k < 2) return [idxs];
+    const pos = idxs.map((i) => this.points[i].position);
+    let minX = Infinity; let maxX = -Infinity; let minZ = Infinity; let maxZ = -Infinity;
+    for (const p of pos) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+    }
+    const alongX = (maxX - minX) >= (maxZ - minZ);
+    const order = idxs.map((v, j) => j);
+    const key = (j) => (alongX ? pos[j].x : pos[j].z);
+    // Sort on the axis, ties broken by the other axis then by manifest index: a total
+    // order, so the partition cannot depend on the sort implementation.
+    order.sort((a, b) => (key(a) - key(b))
+      || ((alongX ? pos[a].z - pos[b].z : pos[a].x - pos[b].x))
+      || (idxs[a] - idxs[b]));
+    const gaps = [];
+    for (let j = 1; j < n; j++) gaps.push({ at: j, d: key(order[j]) - key(order[j - 1]) });
+    gaps.sort((a, b) => (b.d - a.d) || (a.at - b.at));
+    const cuts = new Set(gaps.slice(0, k - 1).map((g) => g.at));
+    const out = [];
+    let cur = [];
+    for (let j = 0; j < n; j++) {
+      if (cuts.has(j) && cur.length) { out.push(cur); cur = []; }
+      cur.push(idxs[order[j]]);
+    }
+    if (cur.length) out.push(cur);
+    return out;
+  }
+
+  /** Human-readable group table. Used by harnesses and the balance report. */
+  describeGroups() {
+    return this.groups.map((g) => ({
+      id: g.id, team: g.team, count: g.points.length,
+      centre: { x: g.centre.x, y: g.centre.y, z: g.centre.z }, radius: g.radius,
+    }));
   }
 
   /**
    * Random points on walkable floor with headroom, spread apart. Used to top up thin
-   * spawn data and to place DOMINATION objectives. Called at load/reset only.
+   * spawn data and offline map analysis. Called at load/reset only.
    * @returns {THREE.Vector3[]} freshly allocated (not pooled) — safe to keep.
    */
   sampleOpenSpace(count = 12, minSeparation = 6) {
@@ -166,7 +465,7 @@ export class Spawner {
     // points came back. A map that cannot fit `count` points at `minSeparation` can
     // never satisfy a length test, so the old `_open.length >= count` guard re-ran the
     // full max(80, count*40)-attempt sweep — 960 attempts at up to two raycasts each —
-    // on every single DOMINATION match start, forever.
+    // on every single match start, forever.
     if (this._open && this._openCount >= count && this._openSep === minSeparation) {
       return this._open.slice(0, Math.min(count, this._open.length));
     }
@@ -227,6 +526,43 @@ export class Spawner {
     if (!rec) this._deaths.set(entity.id, (rec = { position: new THREE.Vector3(), time: 0 }));
     rec.position.copy(position);
     rec.time = this.now;
+    // ...and to the shared heat map, which every entity reads. See SPAWN_WEIGHTS.deathHeat.
+    this._deathHeat.push({ x: position.x, y: position.y, z: position.z, t: this.now });
+    if (this._deathHeat.length > 128) this._deathHeat.shift();
+  }
+
+  /** Drop heat and pressure records that have aged out of their windows. */
+  _pruneVolatile() {
+    const now = this.now;
+    const W = SPAWN_WEIGHTS;
+    for (let i = this._deathHeat.length - 1; i >= 0; i--) {
+      if (now - this._deathHeat[i].t > W.deathHeatWindow) this._deathHeat.splice(i, 1);
+    }
+    for (let i = this._pressure.length - 1; i >= 0; i--) {
+      if (now - this._pressure[i].t > W.pressureWindow) this._pressure.splice(i, 1);
+    }
+  }
+
+  /**
+   * Sum of age-decayed records within `radius` of a point, capped at `cap`.
+   * Shared by the death-heat and combat-pressure terms — same shape, same decay.
+   */
+  _heatAt(list, point, radius, window, cap) {
+    const now = this.now;
+    const r2 = radius * radius;
+    let sum = 0;
+    for (let i = 0; i < list.length && sum < cap; i++) {
+      const h = list[i];
+      const age = now - h.t;
+      if (age < 0 || age > window) continue;
+      const dx = h.x - point.x;
+      const dy = h.y - point.y;
+      const dz = h.z - point.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > r2) continue;
+      sum += (1 - age / window) * (1 - Math.sqrt(d2) / radius);
+    }
+    return Math.min(sum, cap);
   }
 
   // ------------------------------------------------------------------ scoring
@@ -249,6 +585,31 @@ export class Spawner {
       }
     }
     if (enemies.length > 0) this._enemyCentroid.multiplyScalar(1 / enemies.length);
+    this._gatherGroupOccupancy();
+  }
+
+  /**
+   * Who is standing in each group's footprint right now.
+   *
+   * Computed once per pick rather than once per candidate point: a group of six points
+   * would otherwise re-count the same bodies six times. `radius + 6` because a group is
+   * a pocket you spawn INTO and someone six metres outside its outermost point is
+   * already in the fight you are about to land in.
+   */
+  _gatherGroupOccupancy() {
+    const gs = this.groups;
+    for (let g = 0; g < gs.length; g++) { this._gFriend[g] = 0; this._gEnemy[g] = 0; }
+    for (let g = 0; g < gs.length; g++) {
+      const grp = gs[g];
+      const r = grp.radius + 6;
+      const r2 = r * r;
+      for (let i = 0; i < this._enemies.length; i++) {
+        if (this._enemies[i].position.distanceToSquared(grp.centre) < r2) this._gEnemy[g]++;
+      }
+      for (let i = 0; i < this._friends.length; i++) {
+        if (this._friends[i].position.distanceToSquared(grp.centre) < r2) this._gFriend[g]++;
+      }
+    }
   }
 
   _hostile(a, b) {
@@ -338,14 +699,36 @@ export class Spawner {
       else if (dSq < d2) { d2 = dSq; n2 = e; }
     }
     let losCount = 0;
-    for (let k = 0; k < LOS_PROBE_MAX && losCount < W.losMaxCount; k++) {
+    const coneRangeSq = W.enemyConeRange * W.enemyConeRange;
+    for (let k = 0; k < LOS_PROBE_MAX; k++) {
       const e = k === 0 ? n0 : (k === 1 ? n1 : n2);
       if (!e) break;
       this._eyeOf(e, _eyeB);
-      if (!world?.losClear || world.losClear(_eyeA, _eyeB)) {
-        losCount++;
-        score += W.losEnemy;
-      }
+      if (world?.losClear && !world.losClear(_eyeA, _eyeB)) continue;
+      if (losCount < W.losMaxCount) { losCount++; score += W.losEnemy; }
+      // ENGAGEMENT ENVELOPE, not merely a clear line: close, in front of them, visible.
+      // The same march has already been paid for, so this term is free.
+      const dSq = k === 0 ? d0 : (k === 1 ? d1 : d2);
+      if (dSq > coneRangeSq) continue;
+      _fwd.set(-Math.sin(e.yaw ?? 0), 0, -Math.cos(e.yaw ?? 0));
+      _toEnemy.set(point.position.x - e.position.x, 0, point.position.z - e.position.z);
+      if (_toEnemy.lengthSq() < 1e-4) { score += W.enemyCone; continue; }
+      _toEnemy.normalize();
+      if (_fwd.dot(_toEnemy) >= W.enemyConeCos) score += W.enemyCone;
+    }
+
+    // --- contested ground: where people have been dying, and where the shooting is
+    score += W.deathHeat * this._heatAt(this._deathHeat, point.position, W.deathHeatRadius, W.deathHeatWindow, W.deathHeatMax);
+    score += W.pressure * this._heatAt(this._pressure, point.position, W.pressureRadius, W.pressureWindow, W.pressureMax);
+
+    // --- the group this point belongs to (map-data.md §3.2)
+    const gi = point.group;
+    if (gi >= 0 && gi < this.groups.length) {
+      const grp = this.groups[gi];
+      score += W.groupFriendly * Math.min(this._gFriend[gi] ?? 0, W.groupFriendlyMax);
+      score += W.groupEnemy * Math.min(this._gEnemy[gi] ?? 0, W.groupEnemyMax);
+      const gAge = now - grp.lastUsed;
+      if (gAge < W.groupRecentWindow) score += W.groupRecentUse * (1 - gAge / W.groupRecentWindow);
     }
 
     // --- friendlies: spawning with the squad is good, spawning inside them is not
@@ -391,6 +774,13 @@ export class Spawner {
    */
   pickSpawn(entity) {
     this._pruneClaims();
+    this._pruneVolatile();
+
+    // Bomb (bomb-rules.md §2, §8) never consults the scorer. Branch BEFORE _gatherActors:
+    // the fixed path must not even look at where the enemy is standing, or "fixed" is a
+    // label rather than a property.
+    if (this.policy === SPAWN_POLICY.FIXED) return this._pickFixed(entity);
+
     this._gatherActors(entity);
 
     const pts = this.points;
@@ -455,11 +845,95 @@ export class Spawner {
       return out;
     }
 
-    const p = pts[bestIdx];
+    return this._emit(bestIdx, entity, SPAWN_POLICY.DYNAMIC);
+  }
+
+  /** Fill and return the pooled pick record, and log what was chosen. */
+  _emit(index, entity, policy) {
+    const out = this._pick;
+    const p = this.points[index];
     out.position.copy(p.position);
     out.yaw = p.yaw;
-    out.index = bestIdx;
+    out.index = index;
+    const lp = this.lastPick;
+    lp.index = index;
+    lp.id = p.id;
+    lp.groupId = p.groupId;
+    lp.policy = policy;
+    lp.entityId = entity?.id ?? -1;
     return out;
+  }
+
+  // ------------------------------------------------------------- fixed spawns
+
+  /** `'dynamic'` unless the mode says otherwise. See the mode-interface note at the top. */
+  get policy() {
+    return this.match?.mode?.spawnPolicy === SPAWN_POLICY.FIXED
+      ? SPAWN_POLICY.FIXED
+      : SPAWN_POLICY.DYNAMIC;
+  }
+
+  /**
+   * The group `team` occupies this round under a fixed-spawn ruleset.
+   *
+   * The mode decides (that is where Bomb's side switch lives). With no mode opinion, the
+   * team's largest own-team group wins; ties break on group id, never on iteration order,
+   * so two processes cannot disagree.
+   */
+  fixedGroupFor(team) {
+    const declared = this.match?.mode?.fixedSpawnGroup?.(this.match, team);
+    if (typeof declared === 'string') {
+      for (const g of this.groups) if (g.id === declared) return g;
+    }
+    let best = null;
+    for (const g of this.groups) {
+      if (g.team !== team) continue;
+      if (best === null
+        || g.points.length > best.points.length
+        || (g.points.length === best.points.length && g.id < best.id)) best = g;
+    }
+    return best;
+  }
+
+  /**
+   * Fixed protected spawn (bomb-rules.md §2). No scoring, no LOS marches, no enemy
+   * awareness at all — the round has not started, both teams are placed at the same
+   * instant in `freeze`, and a "safer" point chosen from where the enemy happens to be
+   * would leak enemy positions into a phase where nobody is allowed to know them.
+   *
+   * Within the team's protected group the choice is least-recently-used, which spreads
+   * five players over five points instead of stacking them, with the entity's own seeded
+   * stream breaking exact ties. `scorePoint` is never reached from here — asserted in
+   * `scripts/mapbalance.mjs`.
+   */
+  _pickFixed(entity) {
+    const team = entity?.team === 1 ? 1 : 0;
+    const grp = this.fixedGroupFor(team);
+    const pool = grp ? grp.points : null;
+    if (!pool || pool.length === 0) {
+      const out = this._pick;
+      const b = this.game.world?.bounds;
+      if (b?.min && b?.max) out.position.set((b.min.x + b.max.x) * 0.5, b.min.y + 0.1, (b.min.z + b.max.z) * 0.5);
+      else out.position.set(0, 0.1, 0);
+      out.yaw = 0;
+      out.index = -1;
+      const lp = this.lastPick;
+      lp.index = -1; lp.id = ''; lp.groupId = ''; lp.policy = SPAWN_POLICY.FIXED;
+      lp.entityId = entity?.id ?? -1;
+      return out;
+    }
+    const rng = entity?.rng ?? this.game.rng;
+    let bestIdx = -1;
+    let bestKey = Infinity;
+    for (let k = 0; k < pool.length; k++) {
+      const i = pool[k];
+      // Claimed this tick means another team-mate is already standing there.
+      const claimPenalty = this._claimed(this.points[i].position) ? 1e6 : 0;
+      const key = this.points[i].lastUsed + claimPenalty
+        + (typeof rng === 'function' ? rng() : 0) * 1e-3;
+      if (key < bestKey) { bestKey = key; bestIdx = i; }
+    }
+    return this._emit(bestIdx, entity, SPAWN_POLICY.FIXED);
   }
 
   /**
@@ -471,7 +945,11 @@ export class Spawner {
     if (!entity) return false;
     const pick = this.pickSpawn(entity);
 
-    if (pick.index >= 0) this.points[pick.index].lastUsed = this.now;
+    if (pick.index >= 0) {
+      const p = this.points[pick.index];
+      p.lastUsed = this.now;
+      if (p.group >= 0 && p.group < this.groups.length) this.groups[p.group].lastUsed = this.now;
+    }
     this._claims.push({ x: pick.position.x, y: pick.position.y, z: pick.position.z, t: this.now });
 
     // Prefer the entity's own re-entry routine — it restores the loadout, model,
@@ -525,8 +1003,12 @@ export class Spawner {
   static get PROTECTION_TIME() { return SPAWN_PROTECTION; }
 
   dispose() {
+    this._unsubscribe();
     this.points.length = 0;
+    this.groups.length = 0;
     this._claims.length = 0;
+    this._deathHeat.length = 0;
+    this._pressure.length = 0;
     this._deaths.clear();
     if (this.game.spawner === this) this.game.spawner = null;
   }
