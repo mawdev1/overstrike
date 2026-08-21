@@ -6,6 +6,7 @@
  * that looks like a bug in something else.
  */
 import { ApiError } from './errors.js';
+import { REGION_IDS } from '../shared/regions.js';
 
 const SPEC = {
   // 0 is legitimate and means "let the OS assign a free port" — the standard way a test binds
@@ -52,7 +53,7 @@ const SPEC = {
   alertWebhookUrl: { env: 'PLATFORM_ALERT_WEBHOOK_URL', type: 'string', default: '' },
   matchServerUrl: { env: 'PLATFORM_MATCH_SERVER_URL', type: 'string', default: 'ws://127.0.0.1:8080', requiredInProd: true },
   matchServerAllowedHosts: { env: 'PLATFORM_MATCH_SERVER_ALLOWED_HOSTS', type: 'string', default: '' },
-  matchServerRegion: { env: 'PLATFORM_MATCH_SERVER_REGION', type: 'enum', values: ['yyz', 'ord', 'iad'], default: 'iad' },
+  matchServerRegion: { env: 'PLATFORM_MATCH_SERVER_REGION', type: 'enum', values: [...REGION_IDS], default: 'iad' },
   termsVersion:    { env: 'PLATFORM_TERMS_VERSION', type: 'int', default: 1, min: 1, max: 1e6 },
   env:             { env: 'NODE_ENV', type: 'string', default: 'development' },
 };

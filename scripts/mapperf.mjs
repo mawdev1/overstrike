@@ -140,6 +140,13 @@ try {
       || pathname === '/v1/telemetry/unload/credential') return respond(204);
     if (pathname === '/v1/rooms') return respond(200, { items: [], nextCursor: null });
     if (pathname === '/v1/presence/online') return respond(200, { items: [], nextCursor: null });
+    // http-api.md §11.6, sideloaded by `listRooms` for the create form's region dropdown.
+    // The fixture is CLOSED on purpose — an unlisted path is recorded and 404'd — and it is
+    // what caught this call the moment the sideload was added. Answered with a real region so
+    // the renderer measures the shell a player gets, not a degraded fallback.
+    if (pathname === '/v1/config/regions') return respond(200, { regions: [
+      { id: 'iad', label: 'Ashburn, Virginia', probeUrl: null, available: true },
+    ] });
     unexpectedRequests.push(`${request.method()} ${pathname}`);
     return respond(404, { error: { code: 'NOT_FOUND', message: 'Unexpected renderer request.',
       retryable: false, retryAfterMs: null, details: {} } });

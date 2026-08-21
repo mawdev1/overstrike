@@ -26,7 +26,7 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 
 // The modules a production process MUST have. `stubs` is deliberately absent: in production
 // it is not mounted at all, which is a stronger guarantee than mounting it disabled.
-const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'mail', 'lobby'];
+const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'regions', 'mail', 'lobby'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
@@ -401,6 +401,20 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     deps.flags = flags.createFlagsModule({ config, clock: deps.clock, logger });
     deps.flags.routes(router, { auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth });
     mounted.push('flags');
+  }
+
+  // ── regions: http-api.md §11.6's region list ─────────────────────────────────────────
+  //
+  // Specified since P1 and implemented only in the stub layer, so production answered 404 to
+  // the one call that tells a client what a valid region is — and the room-create form shipped
+  // a free-text box that rejected "Canada" and "US" without naming yyz/ord/iad. Exactly the
+  // shape of the /v1/config/flags gap. Takes the store because `available` is measured against
+  // the live registry rather than declared.
+  const regions = await load('regions', './modules/regions/index.js');
+  if (regions) {
+    deps.regions = regions.createRegionsModule({ store: deps.store, clock: deps.clock });
+    deps.regions.routes(router);
+    mounted.push('regions');
   }
 
   // ── telemetry: the client ingest endpoint ────────────────────────────────────────────

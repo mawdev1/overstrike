@@ -13,6 +13,7 @@ import { LIVE_LOADOUT_CATALOG, publicLoadoutCatalog } from '../../shared/liveCat
 import { evidenceDigest } from '../../shared/evidenceDigest.js';
 import { parseTraceparent, traceparentForCorrelation } from '../../core/observability.js';
 import { describeError } from '../../core/logger.js';
+import { isRegion } from '../../shared/regions.js';
 
 const RESERVATION_MS = 30_000;
 const GRACE_MS = 90_000;
@@ -1334,7 +1335,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       const body = ctx.body;
       if (!exactBody(body, ['serverId', 'region', 'address', 'capacity', 'build'])
         || typeof body.serverId !== 'string' || body.serverId.length < 3 || body.serverId.length > 128
-        || !['yyz', 'ord', 'iad'].includes(body.region) || !validRegisteredAddress(body.address)
+        || !isRegion(body.region) || !validRegisteredAddress(body.address)
         || !Number.isInteger(body.capacity) || body.capacity < 1 || body.capacity > 128
         || typeof body.build !== 'string' || !body.build) {
         throw failValidation('Invalid match-server registration.', 'body');
@@ -1433,7 +1434,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       await ensureHydrated();
       const { name, region, mapId = 'the-square', mode = 'bomb', capacity = 12, password = null } = ctx.body;
       if (typeof name !== 'string' || name.trim().length < 1 || name.length > 60) throw failValidation('Room name is required.', 'name');
-      if (!['yyz', 'ord', 'iad'].includes(region)) throw failValidation('Unsupported region.', 'region');
+      if (!isRegion(region)) throw failValidation('Unsupported region.', 'region');
       if (config.env === 'production') {
         const available = await store.matchServers.healthy(region, iso(now() - HEARTBEAT_MS * 2));
         if (!available.length) throw new ApiError('FEATURE_DISABLED', `No healthy match capacity is available in ${region}.`, {

@@ -626,6 +626,65 @@ await withApp(async ({ call }) => {
   check(ttl === 60_000, '§3.1: expiresAt agrees with the stated max-age of 60s', `${ttl}ms`);
 });
 
+// ── 4b. GET /v1/config/regions ────────────────────────────────────────────────────────
+//
+// §11.6 has specified this since P1 and it existed only in the stub layer, so the deployed
+// platform answered 404 — and the room-create form shipped a free-text Region box that rejected
+// "Canada" and then "US" without ever naming yyz/ord/iad. Asserted over a real socket against
+// the ASSEMBLED app, because "the stub has it" is exactly the belief that produced the outage.
+await withApp(async ({ call, app }) => {
+  section('region list (http-api.md §11.6)');
+
+  const res = await call('GET', '/v1/config/regions');
+  check(res.status === 200, '§3 marks the route P: it answers WITHOUT a credential',
+    `${res.status} ${res.body?.error?.code ?? ''}`);
+
+  const regions = res.body?.regions;
+  check(Array.isArray(regions) && regions.length === 3
+    && regions.map((r) => r.id).join(',') === 'yyz,ord,iad',
+  'the three wire values, in a stable order', JSON.stringify(regions?.map((r) => r.id)));
+
+  check(regions?.every((r) => typeof r.label === 'string' && r.label && r.label !== r.id),
+    'every region carries a human label — the whole point is that nobody knows what "yyz" is',
+    JSON.stringify(regions?.map((r) => r.label)));
+
+  check(regions?.every((r) => Object.keys(r).sort().join(',') === 'available,id,label,probeUrl'),
+    '§11.6 shape exactly: id, label, probeUrl, available',
+    JSON.stringify(Object.keys(regions?.[0] ?? {})));
+
+  // `available` is MEASURED. The stub carried it as a literal `true`, which is what let the
+  // deployment offer yyz and ord while only iad had a server.
+  check(regions?.every((r) => r.available === false && r.probeUrl === null),
+    'with no registered match server, every region reports unavailable and offers no probe',
+    JSON.stringify(regions));
+
+  const heartbeat = new Date().toISOString();
+  await app.deps.store.matchServers.register({ serverId: 'regions-test-1', region: 'ord',
+    address: 'wss://gs.example.invalid', capacity: 12, inUse: 0, status: 'healthy',
+    build: '1.0.0', lastHeartbeatAt: heartbeat });
+
+  const after = await (await call('GET', '/v1/config/regions')).body.regions;
+  const ord = after.find((r) => r.id === 'ord');
+  check(ord.available === true,
+    'registering a healthy server flips exactly that region to available',
+    JSON.stringify(ord));
+  check(after.filter((r) => r.available).length === 1,
+    'and only that one — availability is per-region, never a blanket answer',
+    JSON.stringify(after.map((r) => `${r.id}:${r.available}`)));
+  check(ord.probeUrl === 'https://gs.example.invalid/health',
+    'the probe URL is derived from the registered address, wss mapped to https',
+    String(ord.probeUrl));
+
+  // A server at capacity is not capacity. This is the same predicate room creation applies, so
+  // the dropdown cannot offer a region that POST /v1/rooms will then refuse.
+  await app.deps.store.matchServers.heartbeat('regions-test-1',
+    { inUse: 12, status: 'healthy', capacity: 12, lastHeartbeatAt: new Date().toISOString() });
+  const full = await (await call('GET', '/v1/config/regions')).body.regions;
+  check(full.find((r) => r.id === 'ord').available === false,
+    'a fully occupied server stops counting as available capacity',
+    JSON.stringify(full.find((r) => r.id === 'ord')));
+});
+
 // ── 5. rate limiting is actually consulted ────────────────────────────────────────────
 //
 // This section was named "rate limiting is actually consulted" and did not test that.
