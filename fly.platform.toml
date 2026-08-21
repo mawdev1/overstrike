@@ -105,6 +105,23 @@ primary_region = "yyz"        # ca-central-1 per docs/decisions/P0-decisions.md 
   min_machines_running = 1
   # P2 realtime rooms have one socket authority. Room/member state survives restarts in
   # Postgres, but WebSocket fanout is intentionally single-process until P5 adds the broker.
+  #
+  # `max_machines_running` IS NOT ENOUGH ON ITS OWN — it caps what autostart will bring up, and
+  # does nothing about machines that already exist. This app ran two started machines under this
+  # exact line for a day. The consequence is not a slow lobby, it is a split brain: each process
+  # hydrates a room from Postgres ONCE and then treats its own memory as authoritative, so a
+  # player's socket and their launch request landed on different machines and disagreed about
+  # who was ready. Found live — the roster said `ready: true` and the launch said
+  # `currentReady: 0` for the same account in the same second. The stale process then persisted
+  # its stale roster back over the good one.
+  #
+  # The machine COUNT is what has to be one, and only `fly scale count` sets it:
+  #
+  #   fly scale count 1 --app overstrike-platform
+  #   fly machines list --app overstrike-platform   # must show exactly one
+  #
+  # Check this after any deploy that could have added a machine, and before believing any lobby
+  # bug report. P5's broker is what removes the constraint; until then it is load-bearing.
   max_machines_running = 1
 
   [http_service.concurrency]

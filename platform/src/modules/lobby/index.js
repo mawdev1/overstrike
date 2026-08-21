@@ -863,15 +863,47 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     });
   }
 
-  function startLaunch(room, correlationId,
-    traceparent = traceparentForCorrelation(correlationId, 'platform')) {
+  /**
+   * May this room start? One rule, one place.
+   *
+   * This existed THREE times — in `startLaunch`, in the socket's `launch.request` pre-check, and
+   * in the HTTP `launch` route — and all three collapsed two distinct refusals into one message.
+   * A player alone in a room they had readied up in was told "Everyone has to be ready first"
+   * while the details on that very error read `requiredReady: 1, currentReady: 1`: the message
+   * contradicted its own evidence, and the real blocker (`minPlayers`) was not something
+   * pressing ready could ever satisfy. Fixing one copy changed nothing, because the socket
+   * pre-check refused first — the same shape as the mail rule that was enforced in two places
+   * and relaxed in one.
+   *
+   * ORDER MATTERS. `requiredReady` is clamped to the roster size, so it can never be the short
+   * one when the roster is short. Checking the roster first is the only order in which each
+   * branch describes a condition that is genuinely failing.
+   */
+  function assertLaunchable(room) {
+    if (room.members.size < room.settings.minPlayers) {
+      const needed = room.settings.minPlayers - room.members.size;
+      throw new ApiError('CONFLICT',
+        `This match needs ${room.settings.minPlayers} players to start — ${needed} more to go.`, {
+          details: {
+            reason: 'not-enough-players',
+            minPlayers: room.settings.minPlayers, currentPlayers: room.members.size,
+          },
+        });
+    }
     const requiredReady = Math.min(room.settings.requiredReady, room.members.size);
     const ready = [...room.members.values()].filter((member) => member.ready).length;
-    if (room.members.size < room.settings.minPlayers || ready < requiredReady) {
+    if (ready < requiredReady) {
       throw new ApiError('CONFLICT', 'Everyone has to be ready first.', {
         details: { reason: 'not-all-ready', requiredReady, currentReady: ready },
       });
     }
+  }
+
+  function startLaunch(room, correlationId,
+    traceparent = traceparentForCorrelation(correlationId, 'platform')) {
+    assertLaunchable(room);
+    const requiredReady = Math.min(room.settings.requiredReady, room.members.size);
+    const ready = [...room.members.values()].filter((member) => member.ready).length;
     room.status = 'countdown';
     room.countdown = { endsAt: iso(now() + 3_000), requiredReady, currentReady: ready };
     broadcast(room, 'countdown.started', clone(room.countdown), correlationId);
@@ -1035,15 +1067,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
           if (!member.isOwner) throw new ApiError('AUTH_FORBIDDEN', 'Only the room owner can start the match.');
           if (room.status !== 'open') throw new ApiError('ROOM_IN_PROGRESS', 'That match is already launching.');
           // Validate now, mutate/broadcast only after the launch-request event commits.
-          {
-            const requiredReady = Math.min(room.settings.requiredReady, room.members.size);
-            const ready = [...room.members.values()].filter((item) => item.ready).length;
-            if (room.members.size < room.settings.minPlayers || ready < requiredReady) {
-              throw new ApiError('CONFLICT', 'Everyone has to be ready first.', {
-                details: { reason: 'not-all-ready', requiredReady, currentReady: ready },
-              });
-            }
-          }
+          assertLaunchable(room);
           transitionEvent = roomEvent('room.launch_requested', room, { accountId: member.accountId });
           transitionEvent.afterCommit = async () => { startLaunch(room, correlationId, traceparent); await persistRoom(room); };
           break;
@@ -1594,13 +1618,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       const room = assertRoom(ctx.params.id); const member = internalMember(room, ctx.actor.accountId);
       if (!member?.isOwner) throw new ApiError('AUTH_FORBIDDEN', 'Only the room owner can start the match.');
       if (room.status !== 'open') throw new ApiError('ROOM_IN_PROGRESS', 'That match is already launching or in progress.');
-      const requiredReady = Math.min(room.settings.requiredReady, room.members.size);
-      const ready = [...room.members.values()].filter((item) => item.ready).length;
-      if (room.members.size < room.settings.minPlayers || ready < requiredReady) {
-        throw new ApiError('CONFLICT', 'Everyone has to be ready first.', {
-          details: { reason: 'not-all-ready', requiredReady, currentReady: ready },
-        });
-      }
+      assertLaunchable(room);
       await commitEvents(ctx.correlationId, playerActor(member.accountId), roomEvent('room.launch_requested', room, {
         accountId: member.accountId,
       }), (tx) => persistRoom(room, tx));

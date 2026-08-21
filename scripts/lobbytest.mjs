@@ -192,6 +192,58 @@ try {
     'allocator quarantines an unreachable fresh registry row and retries the healthy regional authority');
   faultOwner.ws.close(); faultPeer.ws.close();
 
+  console.log('\n--- launch refusals name the condition that actually failed ---');
+  {
+    /**
+     * Found live: a player alone in a room they had readied up in pressed Launch and was told
+     * "Everyone has to be ready first" — while the details on that same error read
+     * `requiredReady: 1, currentReady: 1`. The message contradicted its own evidence, and the
+     * real blocker (minPlayers) was not something pressing ready could ever satisfy.
+     *
+     * Both refusals are asserted, because collapsing them was the defect: a test that only
+     * checked "launch below the threshold is CONFLICT" passes either way.
+     */
+    const solo = await onboard(60);
+    const soloRoom = await call('POST', '/v1/rooms', { name: 'Solo Refusal', region: 'iad',
+      mapId: 'the-square', mode: 'tdm', capacity: 4, settings: { requiredReady: 1, minPlayers: 2 } },
+    solo.token, { 'idempotency-key': `solo:${ulid()}` });
+    const soloPeer = lobbySocket(soloRoom.body); await soloPeer.opened;
+    await soloPeer.wait((frame) => frame.t === 'lobby.welcome');
+    const soloReady = soloPeer.send('ready.set', { ready: true });
+    await soloPeer.wait((frame) => frame.t === 'ready.changed' && frame.correlationId === soloReady);
+
+    const soloLaunch = soloPeer.send('launch.request', {});
+    const soloError = await soloPeer.wait((frame) => frame.t === 'error'
+      && frame.correlationId === soloLaunch, 8_000);
+    const d = soloError.d.error.details;
+    check(d.reason === 'not-enough-players' && d.minPlayers === 2 && d.currentPlayers === 1,
+      'a ready player alone in the room is refused for the ROSTER, not for readiness',
+      JSON.stringify(d));
+    check(!/ready/i.test(soloError.d.error.message) && /2 players/.test(soloError.d.error.message),
+      'and the message names the roster requirement rather than contradicting its own counts',
+      JSON.stringify(soloError.d.error.message));
+
+    // CONTROL: the readiness refusal still exists and is still reachable — otherwise the check
+    // above would pass just as well if readiness had stopped being enforced entirely.
+    // The mate must CONNECT, not merely reserve: `/join` mints a reservation and the member
+    // enters `room.members` when their socket opens, which is what the roster gate counts.
+    const mate = await onboard(61);
+    const mateJoin = await call('POST', `/v1/rooms/${soloRoom.body.room.roomId}/join`, {}, mate.token,
+      { 'idempotency-key': `solo-join:${ulid()}` });
+    const matePeer = lobbySocket(mateJoin.body); await matePeer.opened;
+    await matePeer.wait((frame) => frame.t === 'lobby.welcome');
+    const unready = soloPeer.send('ready.set', { ready: false });
+    await soloPeer.wait((frame) => frame.t === 'ready.changed' && frame.correlationId === unready);
+    const secondLaunch = soloPeer.send('launch.request', {});
+    const readyError = await soloPeer.wait((frame) => frame.t === 'error'
+      && frame.correlationId === secondLaunch, 8_000);
+    check(readyError.d.error.details.reason === 'not-all-ready'
+      && /ready/i.test(readyError.d.error.message),
+    'CONTROL: with the roster satisfied, an unready player still gets the readiness refusal',
+    JSON.stringify(readyError.d.error.details));
+    soloPeer.ws.close(); matePeer.ws.close();
+  }
+
   console.log('\n--- six authenticated clients browse, join and synchronize ---');
   const users = await Promise.all(Array.from({ length: 6 }, (_, index) => onboard(index)));
   await Promise.all(users.map((user, index) => call('PATCH', '/v1/profile/me', {
