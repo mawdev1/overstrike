@@ -96,9 +96,16 @@ export function createMailer({ config = {}, logger = null, fetchImpl = globalThi
       + 'tokens are credentials. Refusing to start in production. Use `resend` with '
       + 'PLATFORM_MAIL_API_KEY, or `none` to disable mail deliberately.');
   }
-  if (transport === 'none' && config.env === 'production') {
-    throw new Error('PLATFORM_MAIL_TRANSPORT=resend is required in production');
-  }
+  // RELAXED with core/config.js, on the human owner's instruction, 2026-08-21.
+  //
+  // The rule lived in TWO places — the config validator and here — and relaxing only the first
+  // left production refusing to boot from the second, one deploy later. A rule enforced twice
+  // is a rule that can be half-changed, and the half that stays is the one nobody remembers.
+  //
+  // What `none` costs is recorded at the config site: no verification mail, no recovery
+  // delivery. Signup still completes. The `log` refusal above stays, because it prints tokens
+  // and a token IS the credential, and the resend/key pairing below stays, because a transport
+  // that is configured and cannot send reports success to every caller and delivers nothing.
   if (transport === 'resend' && !config.mailApiKey) {
     throw new Error('PLATFORM_MAIL_TRANSPORT=resend requires PLATFORM_MAIL_API_KEY');
   }
