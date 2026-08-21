@@ -22,6 +22,20 @@ COPY src ./src
 COPY server ./server
 COPY platform/src/shared ./platform/src/shared
 
+# Two files out of platform/src/core, not the directory.
+#
+# server/index.js imports the platform's logger and its W3C trace-context helper so a match
+# server's logs and correlation ids are the same shape as the control plane's. Both are
+# self-contained — node:crypto and nothing else — so this copies exactly those two rather than
+# core/, which would drag config, the store and the HTTP router into an image that has no use
+# for them and would silently let a future import of any of them succeed.
+#
+# The image previously copied neither, and the game server crash-looped ten times on
+# ERR_MODULE_NOT_FOUND for core/logger.js: the code was committed with the dependency and the
+# Dockerfile was not.
+COPY platform/src/core/logger.js ./platform/src/core/logger.js
+COPY platform/src/core/observability.js ./platform/src/core/observability.js
+
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080
