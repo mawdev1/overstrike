@@ -462,8 +462,15 @@ const connection = {
   subscribe(listener) { this.listener = listener; return () => { this.listener = null; }; },
   set(value) { this.value = value; this.listener?.(value); },
 };
+window.__SOLO_SUBMISSIONS__ = [];
 const client = {
   connection,
+  // Records what the create-room form actually SENDS. A checkbox that renders and submits
+  // nothing is the same defect one layer in, so the assertion is on the payload, not the DOM.
+  async createRoom(payload) {
+    window.__SOLO_SUBMISSIONS__.push(payload);
+    return { room: { roomId: 'harness-room' } };
+  },
   async signIn() {
     window.__HARNESS_AUTH_CALLS__++;
     await new Promise((resolve) => setTimeout(resolve, 80));
@@ -577,6 +584,64 @@ async function browserChecks() {
     check((await page.getByText('1 room shown.', { exact: true }).count()) === 1, 'room browser must expose its filtered result count');
     await page.getByRole('button', { name: 'Reset filters', exact: true }).click();
     check((await page.getByRole('button', { name: 'Load more rooms', exact: true }).count()) === 1, 'room browser pagination must be cursor-gated');
+
+    // ── solo play, and the practice button a signed-in player could not reach ───────────
+    //
+    // A room defaults to minPlayers 2, so a lone player readies up, presses Launch and is told
+    // the match needs two — with no control anywhere to change it. And `Local practice` lived
+    // only on `renderWelcome`, which redirects a signed-in player straight to this page, so
+    // finishing onboarding made the feature unreachable. Both are asserted here because both
+    // are "the player has no way to play", which no unit test would have called a failure.
+    await page.locator('summary', { hasText: 'Create a room' }).click();
+    const soloBox = page.locator('#shell-room-create-solo');
+    check((await soloBox.count()) === 1, 'the create form offers a solo option at all');
+    check(!(await soloBox.isChecked()), 'solo is OFF by default — a normal room still wants two players');
+
+    // The setting must reach the REQUEST. A checkbox that renders and sends nothing is this
+    // same defect one layer further in, so the assertion is on the submitted payload.
+    //
+    // Submitted with `requestSubmit()` rather than a click because this harness mounts with no
+    // feature-flag source, so `map.the_square.enabled` falls back to false, the map list is
+    // empty and the button is disabled for reasons that predate solo play. That gate is
+    // asserted on its own below; this drives the handler where the settings mapping lives.
+    const submitCreate = async (name, solo) => {
+      // A successful create navigates to the room, so the form is gone by the next call. Put
+      // the browser back before each submission rather than assuming it survived the last one.
+      await page.evaluate(() => {
+        window.__SOLO_SUBMISSIONS__ = [];
+        window.__SHELL__.navigate('/play/rooms');
+        window.__SHELL__.injectFixture('play.rooms', 'ready');
+      });
+      await page.locator('summary', { hasText: 'Create a room' }).click();
+      await page.fill('input[name="room-create-name"]', name);
+      await page.locator('#shell-room-create-solo').setChecked(solo);
+      await page.evaluate(() => document.querySelector('#shell-room-create-name').form.requestSubmit());
+      return page.evaluate(() => window.__SOLO_SUBMISSIONS__?.[0] ?? null);
+    };
+
+    const soloPayload = await submitCreate('Solo Probe', true);
+    check(soloPayload?.settings?.minPlayers === 1 && soloPayload?.settings?.requiredReady === 1,
+      'ticking solo sends minPlayers 1 — the value that was actually doing the blocking',
+      JSON.stringify(soloPayload?.settings));
+
+    const duoPayload = await submitCreate('Duo Probe', false);
+    check(duoPayload && duoPayload.settings === undefined,
+      'CONTROL: leaving solo unticked sends no settings override at all',
+      JSON.stringify(duoPayload?.settings));
+    check(duoPayload?.region === 'iad',
+      'and the region comes from the dropdown, defaulted to one with capacity',
+      String(duoPayload?.region));
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/play/rooms');
+      window.__SHELL__.injectFixture('play.rooms', 'ready');
+    });
+    await page.locator('summary', { hasText: 'Create a room' }).click();
+    check((await page.getByRole('button', { name: 'Create and join', exact: true }).isDisabled()),
+      'the submit gate still refuses when no approved map is enabled — solo does not bypass it');
+
+    check((await page.getByRole('button', { name: 'Local practice', exact: true }).count()) === 1,
+      'a signed-in player can reach Local practice without signing out');
 
     await page.evaluate(() => {
       window.__SHELL__.navigate('/play/rooms/password-room');

@@ -806,12 +806,33 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
   const createCapacity = field({ label: 'Capacity', name: 'room-create-capacity', type: 'number', required: true });
   createCapacity.input.min = '2'; createCapacity.input.max = '12'; createCapacity.input.value = '12';
   const createPassword = field({ label: 'Password (optional)', name: 'room-create-password', type: 'password', autocomplete: 'new-password' });
+
+  /**
+   * Solo — the only way to play this build without recruiting a second human.
+   *
+   * A room defaults to `minPlayers: 2`, so a lone player readies up, presses Launch and is told
+   * the match needs two. That is correct for a real match and useless for testing a deployment,
+   * and the form gave no way to change it even though `roomSettings` has accepted
+   * `minPlayers`/`requiredReady` since P2 — the settings simply never reached it from here.
+   *
+   * The match itself is NOT empty: the game server fills every match with bots (`--bots`,
+   * default 8), which is who a solo player is actually fighting. So this is a real networked
+   * match through the real allocator against real opponents, not a stripped-down mode — the
+   * only thing it changes is the roster size the lobby will launch with.
+   *
+   * `requiredReady` is set alongside for clarity only; the launch gate already clamps it to the
+   * roster size, so `minPlayers` is the value that was doing the blocking.
+   */
+  const soloInput = element('input', { type: 'checkbox', id: 'shell-room-create-solo' });
+  const soloLabel = element('label', { className: 'os-checkbox', htmlFor: 'shell-room-create-solo' }, [
+    soloInput, element('span', {}, 'Solo — start with one player (bots fill the match)'),
+  ]);
   const createStatus = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite' });
   const createSubmit = submitButton('Create and join');
   createSubmit.disabled = !modeOptions.length || !mapOptions.length || !firstAvailable;
   const createForm = element('form', { className: 'os-form' }, [
     createName.wrapper, createRegionWrap, createMapWrap, createModeWrap,
-    createCapacity.wrapper, createPassword.wrapper,
+    createCapacity.wrapper, createPassword.wrapper, soloLabel,
     !modeOptions.length || !mapOptions.length
       ? element('p', { className: 'os-notice', role: 'status' }, 'Room creation is unavailable because no approved mode and map combination is enabled.') : null,
     regionNotice ? element('p', { className: 'os-notice', role: 'status' }, regionNotice) : null,
@@ -823,6 +844,7 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
       name: createName.input.value.trim(), region: createRegionSelect.value,
       mapId: createMapWrap.querySelector('select').value, mode: createModeWrap.querySelector('select').value,
       capacity: Number(createCapacity.input.value), password: createPassword.input.value || undefined,
+      ...(soloInput.checked ? { settings: { minPlayers: 1, requiredReady: 1 } } : {}),
     }, {
       secretInputs: [createPassword.input],
       onSuccess: (result) => actions.navigate(`/room/${encodeURIComponent(result.room.roomId)}`),
@@ -830,6 +852,30 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
     });
   });
   create.append(createForm);
+
+  /**
+   * Local practice, reachable again once you have an account.
+   *
+   * The button exists on `renderWelcome` — and `/welcome` redirects a signed-in player straight
+   * to this page, so the moment someone finished onboarding the feature became unreachable. It
+   * was not removed or gated; it was simply on the one screen a player with an account never
+   * sees. A capability that ships and cannot be opened is indistinguishable from one that does
+   * not ship.
+   *
+   * It runs the simulation in this tab against bots, with no room, no allocator and no game
+   * server, so it is also the thing that still works when the region has no capacity — which is
+   * exactly when a player most wants something to do.
+   */
+  const practice = element('section', { className: 'os-practice' }, [
+    element('h2', {}, 'Practice offline'),
+    element('p', { className: 'os-hint' },
+      'Play the map against bots in this browser. No room, no other players, and it works even when no region has capacity.'),
+    actionsRow([
+      actionButton('Local practice', () => actions.enterGame({ localPractice: true }), {
+        className: 'os-button os-button--quiet',
+      }),
+    ]),
+  ]);
 
   const presence = element('section', { className: 'os-presence-list', 'aria-labelledby': 'os-online-heading' }, [
     element('h2', { id: 'os-online-heading' }, 'Online players'),
@@ -848,6 +894,7 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
 
   return element('section', {}, [
     create,
+    practice,
     presence,
     emptyRoomNotice,
     element('div', { className: 'os-filter-bar' }, [search.wrapper, modeControl, regionControl, sortControl, joinableLabel, hasSpaceLabel]),

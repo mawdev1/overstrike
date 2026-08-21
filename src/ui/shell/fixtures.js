@@ -32,6 +32,14 @@ export const SHELL_SCREEN_FIXTURES = Object.freeze({
   'play.rooms': screen({
     lastUpdatedAt: FIXTURE_TIME,
     nextCursor: 'fixture-next-page',
+    // http-api.md §11.6, sideloaded by `listRooms`. One available and one not, so the fixture
+    // exercises both branches of the create form's region dropdown rather than only the happy
+    // one — an all-available list would never show that a full region is rendered disabled.
+    regions: [
+      { id: 'yyz', label: 'Toronto', probeUrl: null, available: false },
+      { id: 'iad', label: 'Ashburn, Virginia', probeUrl: 'https://iad.fixture.invalid/health', available: true },
+    ],
+    regionsUnavailable: false,
     rooms: [
       { roomId: 'fixture-room-alpha', name: 'Fixture Alpha', region: 'NA-East', mapId: 'fixture-map-a', mode: 'tdm', rulesetVersion: 1, build: 'fixture-build', status: 'open', capacity: 10, playerCount: 6, joinable: true, joinBlockedReason: null, hasPassword: false, ownerAccountId: 'fixture-account-local', estimatedRttMs: 24, settings: {} },
       { roomId: 'fixture-room-bravo', name: 'Fixture Bravo', region: 'NA-West', mapId: 'fixture-map-b', mode: 'bomb', rulesetVersion: 1, build: 'fixture-build', status: 'open', capacity: 10, playerCount: 10, joinable: false, joinBlockedReason: 'full', hasPassword: false, ownerAccountId: 'fixture-account-host', estimatedRttMs: 62, settings: {} },
