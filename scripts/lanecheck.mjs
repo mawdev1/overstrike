@@ -49,6 +49,39 @@ const arg = (k) => {
 };
 const flag = (k) => process.argv.slice(2).includes(`--${k}`);
 
+/**
+ * Refuse an argument this script does not understand, instead of ignoring it.
+ *
+ * `--range=A..B` takes an `=`. Written `--range A..B`, `arg('range')` found nothing, the
+ * `--range` branch never ran, and the script fell through to its working-tree mode — which on a
+ * clean tree prints "no changed files" and EXITS 0. A command asking it to check three commits
+ * was answered with a confident pass for checking nothing at all.
+ *
+ * That is the defect this repository keeps producing in its own guards: not a wrong answer, but
+ * a green one from a question nobody asked. A lane check is the wrong place to be relaxed about
+ * it — silently degrading to a weaker mode is how a cross-lane commit gets waved through.
+ *
+ * Value-taking options are listed with `=` so `--range A..B` is refused by name rather than
+ * mistaken for the bare flag.
+ */
+{
+  const VALUED = ['range', 'commit', 'base', 'files'];
+  const BARE = ['staged', 'expect-fail'];
+  const unknown = process.argv.slice(2).filter((a) => {
+    const name = a.startsWith('--') ? a.slice(2).split('=')[0] : null;
+    if (!name) return true;                       // a bare positional is not an option
+    if (a.includes('=')) return !VALUED.includes(name);
+    return !BARE.includes(name);                  // includes `--range` with no `=`
+  });
+  if (unknown.length) {
+    console.error(`lanecheck: unrecognised argument(s): ${unknown.join(' ')}`);
+    console.error(`  value options must use '=' — ${VALUED.map((v) => `--${v}=…`).join(' ')}`);
+    console.error(`  flags — ${BARE.map((b) => `--${b}`).join(' ')}`);
+    console.error('  Refusing rather than checking something else and reporting OK.');
+    process.exit(2);
+  }
+}
+
 const git = (...args) => {
   try {
     return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' });
