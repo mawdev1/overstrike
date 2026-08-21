@@ -20,10 +20,13 @@
  *   matches.markResultApplied(matchId, at, tx)       — stamp result_applied_at in the same tx
  *   matches.byId(matchId, tx)                        — the §4.2 detail projection's source
  *   matches.listForAccount(accountId, opts, tx)      — history, newest first
+ *   matchEvidence.put(row, tx)                       — immutable authoritative evidence body
  *   idempotency.get(key, actorId, tx) / idempotency.put(row, tx)   — §5.2/§5.4 replay
  */
 import { createHash } from 'node:crypto';
 import { ApiError } from '../../core/errors.js';
+import { evidenceDigest, reconstructEvidenceResult,
+  authoritativeEvidenceProblems } from '../../shared/evidenceDigest.js';
 import {
   TERMINAL_MATCH_STATUSES, OUTCOME_REASONS, INVALIDATION_REASONS,
   matchOutcomeProblems, submittableResultProblems, assertPageArgs,
@@ -444,7 +447,7 @@ export const idempotencyKeyFor = (matchId) => `match-result:${matchId}`;
 const RESULT_ACTOR = 'service:match-result';
 
 /** A result row is immutable forever; the replay window only has to outlive the retry queue. */
-const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** §4.2's pending variant: how long a client waits before asking for the result again. */
 const PENDING_RETRY_AFTER_MS = 2000;
@@ -461,6 +464,38 @@ function stableStringify(value) {
 }
 
 export const resultHash = (result) => createHash('sha256').update(stableStringify(result)).digest('hex');
+
+function assertEvidence(result, evidence) {
+  if (evidence === null || evidence === undefined || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    throw new ApiError('VALIDATION_FAILED', 'A canonical match result requires its evidence body.', {
+      details: { fields: [{ key: 'evidence', reason: 'required-object' }] },
+    });
+  }
+  const shapeProblems = authoritativeEvidenceProblems(evidence);
+  if (shapeProblems.length) {
+    throw new ApiError('VALIDATION_FAILED', 'AuthoritativeEvidenceV1 has an invalid or truncated shape.', {
+      details: { fields: shapeProblems },
+    });
+  }
+  const digest = evidenceDigest(evidence);
+  if (result.evidenceRef !== `sha256:${digest}`) {
+    throw new ApiError('VALIDATION_FAILED', 'The evidence body does not match evidenceRef.', {
+      details: { fields: [{ key: 'evidenceRef', reason: 'digest-mismatch' }] },
+    });
+  }
+  const { evidenceRef: _evidenceRef, ...resultCore } = result;
+  if (!evidence.result || resultHash(evidence.result) !== resultHash(resultCore)) {
+    throw new ApiError('VALIDATION_FAILED', 'The evidence body is not bound to this terminal result.', {
+      details: { fields: [{ key: 'evidence.result', reason: 'result-mismatch' }] },
+    });
+  }
+  const reconstructed = reconstructEvidenceResult(evidence);
+  if (!reconstructed || resultHash(reconstructed) !== resultHash(resultCore)) {
+    throw new ApiError('VALIDATION_FAILED', 'The terminal result is not independently reconstructable from evidence.', {
+      details: { fields: [{ key: 'evidence', reason: 'result-not-reconstructable' }] },
+    });
+  }
+}
 
 /**
  * @param outbox  REQUIRED. §5.3 makes the result write, the career application and the event one
@@ -496,7 +531,8 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
    * MATCH_STATUS_TRANSITIONS in core/store.js). Refusing is the failure mode that loses nothing;
    * a silent forward-only edit would leave a career that no longer reconciles with its history.
    */
-  async function applyMatchResult({ actor, result, idempotencyKey = null, correlationId = null }) {
+  async function applyMatchResult({ actor, result, evidence = undefined,
+    idempotencyKey = null, correlationId = null }) {
     if (!actor || actor.kind !== 'service') {
       throw new ApiError('AUTH_FORBIDDEN', 'Match results are service-submitted only.', {
         details: { reason: 'service-only' },
@@ -508,17 +544,24 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
     const key = idempotencyKeyFor(result.matchId);
     // §5.2 fixes the key's derivation, so a header that disagrees is a caller bug and not a
     // second, competing key — accepting it would let one match finalise twice under two keys.
-    if (idempotencyKey !== null && idempotencyKey !== undefined && idempotencyKey !== key) {
+    if (idempotencyKey !== key) {
       throw new ApiError('VALIDATION_FAILED', 'Idempotency-Key must be match-result:<matchId>.', {
-        details: { fields: [{ key: 'Idempotency-Key', reason: 'derived-key-mismatch', expected: key }] },
+        details: { fields: [{ key: 'Idempotency-Key',
+          reason: idempotencyKey === null || idempotencyKey === undefined ? 'required' : 'derived-key-mismatch',
+          expected: key }] },
       });
     }
     // The COMPLETE §4.2 check, not just the matrix: a submission missing `rulesSnapshot`,
     // `endedAt` or `players` used to be stored as a finished match, and the row it left behind
     // is one the detail endpoint cannot render and the recompute cannot interpret.
     assertSubmittableResult(result);
+    // Internal match authorities submit the evidence separately from TerminalResult's exact
+    // closed shape. Legacy/service imports can still submit the documented TerminalResult
+    // alone; the live lobby boundary requires evidence and always takes this durable branch.
+    const evidenceRequired = typeof result.evidenceRef === 'string' && result.evidenceRef.startsWith('sha256:');
+    if (evidenceRequired || evidence !== undefined) assertEvidence(result, evidence);
     const sdv = result.statDefinitionVersion || STAT_DEFINITION_VERSION;
-    const requestHash = resultHash(result);
+    const requestHash = resultHash({ result, evidence: evidence ?? null });
 
     return store.tx(async (tx) => {
       // Read INSIDE the transaction. Checking outside it is a read-then-write race, and the
@@ -543,6 +586,15 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
       // Recorded whatever the status — an invalidated match still has an immutable record, it
       // simply never reaches a career total.
       await store.matches.record(result, tx);
+      if (evidence !== undefined) {
+        if (!store.matchEvidence) throw new ApiError('INTERNAL_ERROR', 'The store cannot retain match evidence.');
+        await store.matchEvidence.put({
+          matchId: result.matchId,
+          evidenceRef: result.evidenceRef,
+          evidence,
+          createdAt: new Date(clock.now()).toISOString(),
+        }, tx);
+      }
 
       const appliedTo = [];
       for (const player of result.players || []) {

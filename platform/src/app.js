@@ -20,28 +20,47 @@ import { createStore } from './core/store.js';
 import { createHealth } from './core/health.js';
 import { createRateLimiter } from './core/ratelimit.js';
 import { ApiError } from './core/errors.js';
+import { isUlid } from './core/ids.js';
+import { createObservability } from './core/observability.js';
 import { timingSafeEqual, createHash } from 'node:crypto';
 
 // The modules a production process MUST have. `stubs` is deliberately absent: in production
 // it is not mounted at all, which is a stronger guarantee than mounting it disabled.
-const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'mail'];
+const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'mail', 'lobby'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
   const store = overrides.store || await createStore(config, { logger });
+  if (config.env === 'production' && config.identityProvider === 'supabase') {
+    const readiness = await store.accounts.identityReadiness();
+    if (!readiness.ok) {
+      // Migration 0021 only adds columns; it cannot create remote provider identities. Refuse
+      // the cutover until the explicit admin migration has attached every live account, or a
+      // deploy would turn valid legacy credentials into unrecoverable accounts.
+      try { await store.close(); } catch { /* preserve the actionable boot error */ }
+      throw new Error(`auth: ${readiness.unreadyAccounts} account(s) require the Supabase identity cutover`);
+    }
+  }
   const rateLimiter = overrides.rateLimiter || createRateLimiter();
   // Without a janitor the hit map grows for every unique subject seen and never shrinks.
   const stopJanitor = rateLimiter.startJanitor ? rateLimiter.startJanitor() : () => {};
 
+  const clock = overrides.clock || (() => Date.now());
+  const observability = overrides.observability || createObservability({
+    service: 'platform', clock: { now: clock }, logger,
+    alertWebhookUrl: config.alertWebhookUrl,
+    fetchImpl: overrides.alertFetch || globalThis.fetch,
+  });
   const deps = {
     config, logger, store, rateLimiter,
-    clock: overrides.clock || (() => Date.now()),
+    clock, observability,
     // §7.1 names this dependency `db`. The shape is contract, not a label we choose.
     healthProbes: { db: () => store.health() },
   };
 
   const router = new Router();
   const health = createHealth({ deps });
+  if (config.env === 'production') deps.healthProbes.alerts = () => observability.health();
 
   // §9's read/write/room/report classes are enforced in `core/http.js`, derived from the
   // method, for every client route.
@@ -64,6 +83,43 @@ export async function buildApp(config, overrides = {}) {
     // arriving at a process whose store is down — a fail-open in the one endpoint whose
     // entire job is to fail loudly.
     return body.ok ? body : raw(503, body);
+  }, { requireBuild: false });
+
+  // Service-only operations surface. Metrics contain route templates and counts only; the
+  // incident timeline projects durable event/audit metadata and recent redacted spans, never
+  // event payloads, actor ids, email, tokens, chat, or the alert webhook URL.
+  router.get('/v1/ops/metrics', async (ctx) => {
+    requireServiceCaller(ctx);
+    return { ...observability.snapshot(), outbox: deps.events?.relay?.stats ?? {
+      published: 0, failed: 0, deadLettered: 0,
+    } };
+  }, { requireBuild: false });
+  router.get('/v1/ops/incidents/:correlationId', async (ctx) => {
+    requireServiceCaller(ctx);
+    const correlationId = ctx.params.correlationId;
+    if (!isUlid(correlationId)) {
+      throw new ApiError('VALIDATION_FAILED', 'correlationId must be a ULID.');
+    }
+    const [events, audits] = await Promise.all([
+      store.outbox.list?.({ correlationId, limit: 500 }) ?? [],
+      store.audit.list({ correlationId, limit: 500 }),
+    ]);
+    const timeline = [
+      ...events.map((row) => ({ at: row.recordedAt, tier: 'platform', kind: 'event',
+        name: row.eventType, status: row.deadLetteredAt ? 'dead-lettered'
+          : row.publishedAt ? 'published' : 'pending', eventId: row.eventId,
+        subject: { kind: row.subjectKind } })),
+      ...audits.map((row) => ({ at: row.createdAt, tier: 'platform', kind: 'audit',
+        name: row.action, status: 'recorded', auditId: row.auditId,
+        subject: { kind: row.subjectKind }, reasonCode: row.reasonCode })),
+      ...observability.timelineSpans(correlationId).map((span) => ({
+        at: span.at, tier: span.tier, kind: 'span', name: span.name, status: span.status,
+        traceId: span.traceId, spanId: span.spanId, parentSpanId: span.parentSpanId,
+        durationMs: span.durationMs, attributes: span.attributes,
+      })),
+    ].sort((a, b) => a.at === b.at ? a.kind.localeCompare(b.kind) : a.at.localeCompare(b.at));
+    return { traceId: observability.timelineSpans(correlationId)[0]?.traceId ?? null,
+      timeline, count: timeline.length };
   }, { requireBuild: false });
 
   const mounted = await mountModules({ deps, router, config, logger, overrides });
@@ -105,6 +161,7 @@ export async function buildApp(config, overrides = {}) {
 
   const preRoute = deps.stubs?.preRoute ? [deps.stubs.preRoute] : [];
   const server = createApp({ router, deps, preRoute });
+  deps.lobby?.attach?.(server);
 
   /**
    * The idempotency-key janitor.  http-api.md §8.
@@ -145,6 +202,7 @@ export async function buildApp(config, overrides = {}) {
     // process open — but a test that builds many apps would otherwise accumulate them.
     try { deps.auth?.stop?.(); } catch { /* nothing useful to do while shutting down */ }
     try { deps.events?.relay?.stop?.(); } catch { /* same */ }
+    try { deps.lobby?.stop?.(); } catch { /* same */ }
   };
 
   return {
@@ -268,6 +326,10 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
           subjectId: event.subject?.id, correlationId: event.correlationId,
         });
       },
+      onDeadLetter: ({ event, attempts }) => { void deps.observability.alert({
+        key: `outbox:${event.eventId}`, severity: 'critical', event: 'outbox.dead_letter',
+        correlationId: event.correlationId, component: 'outbox', count: attempts,
+      }); },
     });
     if (config.env !== 'test') deps.events.relay.start();
     mounted.push('events');
@@ -280,11 +342,12 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
   // nowhere a player could reach; onboarding step 5 asked for a code nothing had sent.
   //
   // Built BEFORE auth so it can be injected rather than patched in afterwards. `none` is the
-  // default, so a process with no mail configured still boots and reports its transport instead
-  // of pretending to send.
+  // default outside production, so a local process with no mail configured still boots and
+  // reports its transport. Production config refuses that state before assembly.
   const mail = await load('mail', './modules/mail/index.js');
   if (mail) {
     deps.mail = mail.createMailer({ config, logger });
+    if (config.env === 'production') deps.healthProbes.mail = () => deps.mail.health();
     logger.info('mail.transport', deps.mail.describe());
     mounted.push('mail');
   }
@@ -300,6 +363,9 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
       store: deps.store, config, logger, clock: { now: deps.clock },
       outbox: deps.events?.outbox, audit: deps.events?.audit,
       mailer: deps.mail,
+    });
+    if (config.env === 'production') deps.healthProbes.identity = () => deps.auth.identity.health({
+      accountById: (accountId) => deps.store.accounts.byId(accountId),
     });
     deps.auth.register(router);
     mounted.push('auth');
@@ -363,8 +429,32 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     // authenticated player's telemetry could never be attributed or bound to an account
     // receipt. Pass the real middleware, as the profile module does.
     telemetry.registerTelemetryRoutes(router, { service, optionalAuth: deps.auth?.routes?.optionalAuth });
-    deps.telemetry = { service, consent };
+    const unload = telemetry.createUnloadIngress({
+      config, clock: { now: deps.clock }, service, store: deps.store,
+    });
+    telemetry.registerUnloadRoutes(router, {
+      ingress: unload,
+      requireAuth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth,
+    });
+    deps.telemetry = { service, consent, unload };
     mounted.push('telemetry');
+  }
+
+  // ── P2: presence, rooms, reports and realtime lobby ─────────────────────────────────
+  const lobby = await load('lobby', './modules/lobby/index.js');
+  if (lobby) {
+    deps.lobby = lobby.createLobbyModule({
+      store: deps.store, config, logger, clock: deps.clock,
+      auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth,
+      flags: deps.flags,
+      visibilityFor: deps.profile?.profiles?.visibilityFor,
+      outbox: deps.events?.outbox,
+      resultApplier: deps.profile?.stats?.applyMatchResult,
+      chatModerator: overrides.chatModerator || lobby.localChatModerator,
+      observability: deps.observability,
+    });
+    deps.lobby.routes(router);
+    mounted.push('lobby');
   }
 
   // ── stubs: the fixture layer that unblocks the frontend lane ─────────────────────────

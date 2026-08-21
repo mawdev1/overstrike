@@ -33,6 +33,7 @@ import { loadConfig } from '../src/core/config.js';
 import { ulid } from '../src/core/ids.js';
 import { ApiError } from '../src/core/errors.js';
 import { createAuthModule } from '../src/modules/auth/index.js';
+import { createLocalIdentityProvider } from '../src/modules/auth/identity.js';
 import { fold, resolveScript } from '../src/modules/auth/names.js';
 import { playerActor } from '../src/modules/auth/events.js';
 import { RECOVERY_FLOOR_MS, RECOVERY_TTL_MS, createAuthService } from '../src/modules/auth/service.js';
@@ -119,21 +120,21 @@ function makeClock(now = T0) {
  * (the idempotency race) is INVISIBLE on memory by construction, because that adapter
  * serialises every transaction. A memory-only proof of a locking fix is not a proof.
  */
-function moduleOn(store, clock, { env = {} } = {}) {
+function moduleOn(store, clock, { env = {}, identity = undefined } = {}) {
   const config = loadConfig({ PLATFORM_TOKEN_SECRET: 'test-secret-not-a-real-one', ...env });
   const auth = createAuthModule({
     store, config, logger: silentLogger, clock, sleep: realSleep,
     // No janitor timer in a test: §19 calls the sweep directly, and an interval that fires
     // mid-assertion would make the counts non-deterministic.
-    consentSweepIntervalMs: 0,
+    consentSweepIntervalMs: 0, identity,
   });
   const h = { store, clock, config, ...auth };
   open.push(h);
   return h;
 }
 
-function mk({ now = T0, env = {} } = {}) {
-  return moduleOn(recording(createMemoryStore({}, {})), makeClock(now), { env });
+function mk({ now = T0, env = {}, identity = undefined } = {}) {
+  return moduleOn(recording(createMemoryStore({}, {})), makeClock(now), { env, identity });
 }
 
 /** Every §5 outbox row currently staged, and the §2 envelopes they rehydrate to. */
@@ -662,6 +663,51 @@ section('6. RECOVERY START IS INDISTINGUISHABLE, INCLUDING IN TIMING');
     await codeOf(() => h2.service.signin({ email: 'reset@example.com', password: 'a-brand-new-passphrase' })) === null);
   ok('recovery is audited under account_recovery',
     (await h2.store.audit.list({ action: 'account.recovery_complete' }))[0]?.reasonCode === 'account_recovery');
+}
+
+section('6b. IDENTITY-PROVIDER FAILURES ARE RESUMABLE AND NEVER MASK THE REAL OUTCOME');
+{
+  const local = createLocalIdentityProvider();
+  let failReplacement = true;
+  const flakyIdentity = {
+    ...local,
+    async replace(args) {
+      if (failReplacement) throw new ApiError('SERVICE_UNAVAILABLE', 'Identity service is unavailable.');
+      return local.replace(args);
+    },
+  };
+  const h = mk({ identity: flakyIdentity });
+  await newAccount(h, { email: 'saga@example.com', displayName: `Saga${uniqueTag()}` });
+  const started = await h.service.recoveryStart({ email: 'saga@example.com' });
+  ok('control: recovery issued a live token', !!started.recoveryToken);
+  ok('a provider outage is surfaced without consuming the recovery token',
+    await codeOf(() => h.service.recoveryComplete({ token: started.recoveryToken,
+      newPassword: 'provider-saga-password' })) === 'SERVICE_UNAVAILABLE'
+      && h.ephemeral.peek('recovery', started.recoveryToken).ok);
+  failReplacement = false;
+  ok('the same reserved link resumes and completes after the provider recovers',
+    await codeOf(() => h.service.recoveryComplete({ token: started.recoveryToken,
+      newPassword: 'provider-saga-password' })) === null);
+  ok('only successful saga completion consumes the link',
+    !h.ephemeral.peek('recovery', started.recoveryToken).ok);
+
+  const cleanupLocal = createLocalIdentityProvider();
+  let failCleanup = false;
+  const cleanupIdentity = {
+    ...cleanupLocal,
+    async remove(args) {
+      if (failCleanup) throw new Error('provider cleanup unavailable');
+      return cleanupLocal.remove(args);
+    },
+  };
+  const hc = mk({ identity: cleanupIdentity });
+  const heldName = `Held${uniqueTag()}`;
+  await newAccount(hc, { email: 'held-one@example.com', displayName: heldName });
+  failCleanup = true;
+  ok('failed provider compensation cannot replace the actual NAME_TAKEN outcome',
+    await codeOf(() => newAccount(hc, {
+      email: 'held-two@example.com', displayName: heldName,
+    })) === 'NAME_TAKEN');
 }
 
 // ------------------------------------------- 7. eligibility hides the age and drops the DOB
@@ -1833,9 +1879,9 @@ section('19b. REFUSALS THAT NOTHING WAS ASSERTING ON');
   // ── a locked account cannot sign in, with the credential correct ─────────────────────
   //
   // The credential check above it passes, so nothing but this line stands between a banned
-  // player and a live session. Both statuses, because `banned` alone would let `restricted`
-  // be deleted from the condition without a red suite.
-  for (const status of ['banned', 'restricted']) {
+  // player and a live session. Every non-active status is named because omitting `deleted`
+  // would let a soft-deleted identity mint a fresh session with its old credential.
+  for (const status of ['banned', 'restricted', 'deleted']) {
     const locked = await newAccount(h, { email: `${status}@example.com`, displayName: `Lock${uniqueTag()}` });
     const lockedActor = await actorFor(h, locked);
     await h.store.accounts.update(lockedActor.accountId, { status });

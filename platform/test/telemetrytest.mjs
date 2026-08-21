@@ -10,7 +10,7 @@
  */
 import { createTelemetryService, createCorrelationSeen } from '../src/modules/telemetry/service.js';
 import { createConsentReceipts } from '../src/modules/telemetry/consent.js';
-import { lookupEvent, REGISTRY } from '../src/modules/telemetry/registry.js';
+import { lookupEvent, REGISTRY, CONNECTION_FAILURE_CODES } from '../src/modules/telemetry/registry.js';
 import { LIMITS } from '../src/modules/telemetry/validate.js';
 import { ulid } from '../src/core/ids.js';
 import { createHmac } from 'node:crypto';
@@ -80,6 +80,12 @@ console.log('\nthe registry is the allowlist');
     !Object.keys(REGISTRY.get('funnel.preconsent').fields).includes('decision'));
   assert('client.error carries a class, never a raw message',
     Object.keys(REGISTRY.get('client.error').fields).join(',') === 'errorClass,fatal');
+  assert('connection.failure accepts the closed browser transport outcomes',
+    CONNECTION_FAILURE_CODES.includes('CLIENT_NETWORK')
+      && CONNECTION_FAILURE_CODES.includes('CLIENT_TIMEOUT'));
+  assert('browser transport outcomes are event-only, never platform ApiError codes',
+    !REGISTRY.get('match.handoff_failure').fields.code.values.includes('CLIENT_NETWORK')
+      && REGISTRY.get('connection.failure').fields.code.values.includes('CLIENT_NETWORK'));
 }
 
 // =============================================================================================

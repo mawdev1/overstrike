@@ -63,7 +63,7 @@ const toCamel = (s) => s.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 export const TABLE_COLUMNS = {
   accounts: [
     'accountId', 'status', 'emailHash', 'email', 'displayName', 'displayNameFolded',
-    'passwordHash', 'roles', 'nameChangedAt',
+    'passwordHash', 'identityProvider', 'identitySubject', 'roles', 'nameChangedAt',
     'eligibilityVerdict', 'eligibilityPolicyVer', 'eligibilityDecidedAt',
     'emailVerifiedAt', 'termsVersionAccepted', 'termsAcceptedAt',
     'consentTelemetry', 'consentPolicyVer', 'consentDecidedAt',
@@ -95,6 +95,19 @@ export const TABLE_COLUMNS = {
   match_participants: [
     'matchId', 'accountId', 'team', 'joinedAt', 'leftAt', 'disconnected', 'abandoned', 'stats',
   ],
+  match_evidence: ['matchId', 'evidenceRef', 'evidence', 'createdAt'],
+  match_servers: ['serverId', 'region', 'address', 'capacity', 'inUse', 'status', 'build',
+    'lastHeartbeatAt', 'createdAt', 'updatedAt'],
+  rooms: ['roomId', 'ownerAccountId', 'name', 'region', 'mapId', 'mapVersion', 'mode',
+    'rulesetVersion', 'build', 'capacity', 'status', 'settings', 'passwordHash', 'createdAt',
+    'updatedAt', 'destroyedAt', 'destroyedReason'],
+  room_members: ['roomId', 'accountId', 'displayName', 'team', 'ready', 'isOwner', 'connection',
+    'disconnectedAt', 'estimatedRttMs', 'mutedAccountIds', 'loadout', 'joinedAt', 'leftAt', 'createdAt', 'updatedAt'],
+  reports: ['reportId', 'reporterAccountId', 'subjectAccountId', 'matchId', 'chatMessageId', 'category',
+    'description', 'evidenceRef', 'status', 'resolution', 'resolvedBy', 'resolvedAt', 'createdAt', 'updatedAt'],
+  chat_messages: ['messageId', 'roomId', 'senderAccountId', 'text', 'createdAt', 'expiresAt',
+    'removedAt', 'removedBy', 'removalReason'],
+  match_tickets: ['jti', 'accountId', 'roomId', 'matchId', 'expiresAt', 'consumedAt', 'createdAt'],
 };
 
 /**
@@ -111,6 +124,9 @@ const JSONB_COLUMNS = Object.assign(Object.create(null), {
   audit_log: new Set(['beforeSummary', 'afterSummary']),
   matches: new Set(['rulesSnapshot', 'teamScores', 'rounds']),
   match_participants: new Set(['stats']),
+  match_evidence: new Set(['evidence']),
+  rooms: new Set(['settings']),
+  room_members: new Set(['loadout', 'mutedAccountIds']),
 });
 
 function encode(table, camelKey, value) {
@@ -378,6 +394,19 @@ export async function createPostgresStore(config = {}, deps = {}) {
     async byNameFolded(folded, txh) {
       const { rows } = await q(txh, 'select * from accounts where display_name_folded = $1', [folded]);
       return mapRow(rows[0]);
+    },
+
+    async identityReadiness(txh) {
+      const { rows } = await q(txh, `select count(*)::int as unready_accounts
+        from accounts
+        where deleted_at is null and status <> 'deleted' and (
+          identity_provider is distinct from 'supabase'
+          or identity_subject is null
+          or identity_subject = ''
+          or password_hash is not null
+        )`);
+      const unreadyAccounts = Number(rows[0]?.unready_accounts ?? 0);
+      return { ok: unreadyAccounts === 0, unreadyAccounts };
     },
 
     async update(accountId, patch, txh) {
@@ -682,6 +711,15 @@ export async function createPostgresStore(config = {}, deps = {}) {
   const MATCH_SELECT = MATCH_COLUMNS.map((c) => `m.${toSnake(c)}`).join(', ');
 
   const matches = {
+    async activeForRoom(roomId, txh) {
+      const { rows } = await q(txh, `select * from matches where room_id=$1
+        and status in ('allocated','in-progress') order by allocated_at desc limit 1`, [roomId]);
+      if (!rows.length) return null;
+      const match = mapRow(rows[0]);
+      const { rows: participants } = await q(txh,
+        'select * from match_participants where match_id=$1 order by joined_at,account_id', [match.matchId]);
+      return { ...match, participants: participants.map((row) => mapRow(row)) };
+    },
     /**
      * The match row and its participants, in ONE transaction — creating the row, or advancing an
      * existing non-terminal one to its terminal result.
@@ -756,6 +794,17 @@ export async function createPostgresStore(config = {}, deps = {}) {
         [matchId]);
       m.participants = parts.map((p) => ({ ...mapRow(p), matchId }));
       return m;
+    },
+
+    async latestTerminalForRoom(roomId, txh) {
+      const { rows } = await q(txh, `select * from matches where room_id=$1
+        and status in ('completed','aborted','invalidated') and result_applied_at is not null
+        order by ended_at desc nulls last,match_id desc limit 1`, [roomId]);
+      if (!rows.length) return null;
+      const match = mapRow(rows[0]);
+      const { rows: participants } = await q(txh,
+        'select * from match_participants where match_id=$1 order by joined_at,account_id', [match.matchId]);
+      return { ...match, participants: participants.map((row) => mapRow(row)) };
     },
 
     /**
@@ -987,6 +1036,21 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return mapRow(await insertRow(txh, 'events_outbox', rec));
     },
 
+    async list(filter = {}, txh) {
+      const where = [];
+      const params = [];
+      for (const [field, col] of [['correlationId', 'correlation_id'], ['subjectId', 'subject_id']]) {
+        if (filter[field] !== undefined) {
+          params.push(filter[field]); where.push(`${col} = $${params.length}`);
+        }
+      }
+      params.push(Math.min(500, Math.max(1, Number(filter.limit) || 100)));
+      const { rows } = await q(txh,
+        `select * from events_outbox ${where.length ? `where ${where.join(' and ')}` : ''}
+          order by recorded_at, event_id limit $${params.length}`, params);
+      return rows.map((row) => mapRow(row));
+    },
+
     /**
      * FOR UPDATE SKIP LOCKED is what lets several relay workers run at once: each claims a
      * disjoint set instead of every worker fighting over the same head of the queue and
@@ -1043,7 +1107,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
       const where = [];
       const params = [];
       for (const [field, col] of [['subjectKind', 'subject_kind'], ['subjectId', 'subject_id'],
-        ['actorId', 'actor_id'], ['action', 'action']]) {
+        ['actorId', 'actor_id'], ['action', 'action'], ['correlationId', 'correlation_id']]) {
         if (filter[field] !== undefined) { params.push(filter[field]); where.push(`${col} = $${params.length}`); }
       }
       params.push(filter.limit ?? 100);
@@ -1187,11 +1251,209 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
   };
 
+  const rooms = {
+    async upsert(row, txh) {
+      const { rows } = await q(txh, `insert into rooms
+        (room_id, owner_account_id, name, region, map_id, map_version, mode, ruleset_version,
+         build, capacity, status, settings, password_hash, destroyed_at, destroyed_reason)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15)
+        on conflict (room_id) do update set
+          owner_account_id=excluded.owner_account_id, name=excluded.name, region=excluded.region,
+          map_id=excluded.map_id, map_version=excluded.map_version, mode=excluded.mode,
+          ruleset_version=excluded.ruleset_version, build=excluded.build, capacity=excluded.capacity,
+          status=excluded.status, settings=excluded.settings, password_hash=excluded.password_hash,
+          destroyed_at=excluded.destroyed_at, destroyed_reason=excluded.destroyed_reason
+        returning *`, [row.roomId, row.ownerAccountId, row.name, row.region, row.mapId,
+        row.mapVersion, row.mode, row.rulesetVersion, row.build, row.capacity, row.status,
+        JSON.stringify(row.settings ?? {}), row.passwordHash ?? null, row.destroyedAt ?? null,
+        row.destroyedReason ?? null]);
+      return mapRow(rows[0]);
+    },
+    async byId(roomId, txh) {
+      const { rows } = await q(txh, 'select * from rooms where room_id=$1 and destroyed_at is null', [roomId]);
+      return mapRow(rows[0]);
+    },
+    async list(txh) {
+      const { rows } = await q(txh, 'select * from rooms where destroyed_at is null order by created_at, room_id');
+      return rows.map((row) => mapRow(row));
+    },
+    async remove(roomId, txh) {
+      const { rowCount } = await q(txh, `update rooms set status='destroyed', destroyed_at=now(),
+        destroyed_reason=coalesce(destroyed_reason,'empty') where room_id=$1 and destroyed_at is null`, [roomId]);
+      return rowCount > 0;
+    },
+  };
+
+  const roomMembers = {
+    async upsert(row, txh) {
+      const { rows } = await q(txh, `insert into room_members
+        (room_id,account_id,display_name,team,ready,is_owner,connection,disconnected_at,
+         estimated_rtt_ms,muted_account_ids,loadout,joined_at,left_at)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13)
+        on conflict (room_id,account_id) do update set display_name=excluded.display_name,
+          team=excluded.team, ready=excluded.ready, is_owner=excluded.is_owner,
+          connection=excluded.connection, disconnected_at=excluded.disconnected_at,
+          estimated_rtt_ms=excluded.estimated_rtt_ms, muted_account_ids=excluded.muted_account_ids,
+          loadout=excluded.loadout,
+          left_at=excluded.left_at returning *`, [row.roomId,row.accountId,row.displayName,row.team,
+        row.ready,row.isOwner,row.connection,row.disconnectedAt ?? null,row.estimatedRttMs ?? null,
+        JSON.stringify(row.mutedAccountIds ?? []),JSON.stringify(row.loadout ?? {}),row.joinedAt,row.leftAt ?? null]);
+      return mapRow(rows[0]);
+    },
+    async listForRoom(roomId, txh) {
+      const { rows } = await q(txh, 'select * from room_members where room_id=$1 and left_at is null order by joined_at, account_id', [roomId]);
+      // Array.map passes (row, index); handing mapRow directly made the numeric-column list an
+      // integer and crashed on `numeric.includes` as soon as PostgreSQL returned a member.
+      return rows.map((row) => mapRow(row));
+    },
+    async wasMemberAt(roomId, accountId, at, txh) {
+      const { rows } = await q(txh, `select 1 from room_members where room_id=$1 and account_id=$2
+        and joined_at <= $3 and (left_at is null or left_at >= $3) limit 1`, [roomId,accountId,at]);
+      return rows.length > 0;
+    },
+    async recentFor(accountId, limit = 25, cursor = 0, txh) {
+      const { rows } = await q(txh, `select account_id, encountered_at from (
+          select distinct on (peer.account_id) peer.account_id,
+            greatest(peer.joined_at, coalesce(peer.left_at, peer.joined_at)) as encountered_at
+          from room_members self
+          join room_members peer on peer.room_id=self.room_id and peer.account_id<>self.account_id
+          where self.account_id=$1
+          order by peer.account_id, encountered_at desc
+        ) recent order by encountered_at desc, account_id limit $2 offset $3`, [accountId, limit, cursor]);
+      return rows.map((row) => mapRow(row));
+    },
+    async remove(roomId, accountId, leftAt = new Date().toISOString(), txh) {
+      const { rowCount } = await q(txh, 'update room_members set left_at=$3 where room_id=$1 and account_id=$2 and left_at is null', [roomId, accountId, leftAt]);
+      return rowCount > 0;
+    },
+  };
+
+  const reports = {
+    async create(row, txh) {
+      try {
+        const { rows } = await q(txh, `insert into reports
+          (report_id,reporter_account_id,subject_account_id,match_id,chat_message_id,category,description,evidence_ref,status)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`, [row.reportId,row.reporterAccountId,
+          row.subjectAccountId,row.matchId ?? null,row.chatMessageId ?? null,row.category,row.description ?? null,
+          row.evidenceRef ?? null,row.status ?? 'open']);
+        return mapRow(rows[0]);
+      } catch (error) {
+        if (error.code === 'CONFLICT') throw new ApiError('REPORT_DUPLICATE', 'You already reported this incident.');
+        throw error;
+      }
+    },
+  };
+
+  const chatMessages = {
+    async create(row, txh) { return insertRow(txh, 'chat_messages', row); },
+    async byId(messageId, txh) {
+      const { rows } = await q(txh, 'select * from chat_messages where message_id=$1', [messageId]);
+      return mapRow(rows[0]);
+    },
+    async listForRoom(roomId, limit = 50, at = new Date().toISOString(), txh) {
+      const { rows } = await q(txh, `select * from (
+        select * from chat_messages where room_id=$1 and removed_at is null and expires_at > $3
+        order by created_at desc limit $2) recent order by created_at`, [roomId,limit,at]);
+      return rows.map((row) => mapRow(row));
+    },
+    async remove(messageId, actorId, reason, at, txh) {
+      const { rows } = await q(txh, `update chat_messages set removed_at=coalesce(removed_at,$4),
+        removed_by=coalesce(removed_by,$2),removal_reason=coalesce(removal_reason,$3)
+        where message_id=$1 returning *`, [messageId,actorId,reason,at]);
+      if (!rows.length) throw new ApiError('NOT_FOUND', 'No such chat message.');
+      return mapRow(rows[0]);
+    },
+    async purgeExpired(at, txh) {
+      const { rowCount } = await q(txh, `delete from chat_messages where expires_at <= $1
+        and not exists (select 1 from reports where reports.chat_message_id=chat_messages.message_id
+          and (reports.resolved_at is null or reports.resolved_at + interval '30 days' > $1))`, [at]);
+      return rowCount;
+    },
+  };
+
+  const matchEvidence = {
+    async put(row, txh) {
+      return insertRow(txh, 'match_evidence', row);
+    },
+    async byMatchId(matchId, txh) {
+      const { rows } = await q(txh, 'select * from match_evidence where match_id=$1', [matchId]);
+      return mapRow(rows[0]);
+    },
+    async byEvidenceRef(evidenceRef, txh) {
+      const { rows } = await q(txh, 'select * from match_evidence where evidence_ref=$1', [evidenceRef]);
+      return mapRow(rows[0]);
+    },
+  };
+
+  const matchTickets = {
+    async put(row, txh) { return insertRow(txh, 'match_tickets', row); },
+    async consume(jti, claims, at = new Date().toISOString(), txh) {
+      const { rows } = await q(txh, `update match_tickets set consumed_at=$5
+        where jti=$1 and account_id=$2 and room_id=$3 and match_id=$4
+          and consumed_at is null and expires_at > $5 returning *`,
+      [jti,claims.accountId,claims.roomId,claims.matchId,at]);
+      return mapRow(rows[0]);
+    },
+    async byJti(jti, txh) {
+      const { rows } = await q(txh, 'select * from match_tickets where jti=$1', [jti]);
+      return mapRow(rows[0]);
+    },
+    async purgeExpired(at, txh) {
+      const { rowCount } = await q(txh, `delete from match_tickets
+        where expires_at <= $1::timestamptz - interval '24 hours'`, [at]);
+      return rowCount;
+    },
+  };
+
+  const matchServers = {
+    async register(row, txh) {
+      const { rows } = await q(txh, `insert into match_servers
+        (server_id,region,address,capacity,in_use,status,build,last_heartbeat_at)
+        values ($1,$2,$3,$4,$5,$6,$7,$8)
+        on conflict (server_id) do update set region=excluded.region,address=excluded.address,
+          capacity=excluded.capacity,build=excluded.build,last_heartbeat_at=excluded.last_heartbeat_at
+        returning *`, [row.serverId,row.region,row.address,row.capacity,row.inUse ?? 0,
+        row.status ?? 'healthy',row.build,row.lastHeartbeatAt ?? new Date().toISOString()]);
+      return mapRow(rows[0], ['capacity', 'inUse']);
+    },
+    async heartbeat(serverId, patch, txh) {
+      const { rows } = await q(txh, `update match_servers set in_use=greatest(in_use,$2),status=$3,
+        capacity=$4,last_heartbeat_at=$5 where server_id=$1 returning *`,
+      [serverId,patch.inUse,patch.status,patch.capacity,patch.lastHeartbeatAt ?? new Date().toISOString()]);
+      if (!rows.length) throw new ApiError('NOT_FOUND', 'Match server is not registered.');
+      return mapRow(rows[0], ['capacity', 'inUse']);
+    },
+    async healthy(region, since, txh) {
+      const { rows } = await q(txh, `select * from match_servers where region=$1
+        and status='healthy' and last_heartbeat_at >= $2 and in_use < capacity
+        order by in_use,server_id`, [region,since]);
+      return rows.map((row) => mapRow(row, ['capacity', 'inUse']));
+    },
+    async reserve(region, since, txh) {
+      const { rows } = await q(txh, `with candidate as (
+          select server_id from match_servers where region=$1 and status='healthy'
+            and last_heartbeat_at >= $2 and in_use < capacity
+          order by in_use,server_id for update skip locked limit 1
+        ) update match_servers m set in_use=m.capacity from candidate c
+          where m.server_id=c.server_id returning m.*`, [region,since]);
+      return mapRow(rows[0], ['capacity', 'inUse']);
+    },
+    async release(serverId, txh) {
+      const { rowCount } = await q(txh, 'update match_servers set in_use=0 where server_id=$1', [serverId]);
+      return rowCount > 0;
+    },
+    async byId(serverId, txh) {
+      const { rows } = await q(txh, 'select * from match_servers where server_id=$1', [serverId]);
+      return mapRow(rows[0], ['capacity', 'inUse']);
+    },
+  };
+
   return {
     kind: 'postgres',
     tx,
     accounts, accountNameHistory, sessions, refreshTokens, profiles, stats, weaponStats, matches,
-    preAuthConsent, outbox, audit, idempotency, flags,
+    preAuthConsent, outbox, audit, idempotency, flags, rooms, roomMembers, reports, matchTickets, chatMessages,
+    matchEvidence, matchServers,
     async health() {
       try {
         await pool.query('select 1');

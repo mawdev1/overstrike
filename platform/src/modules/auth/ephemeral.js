@@ -64,13 +64,45 @@ export function createEphemeralTokens({ clock, sweepIntervalMs = 60_000 }) {
      * token was once real, which is one bit more than a bad guess deserves.
      */
     consume(purpose, raw) {
+      const lease = this.reserve(purpose, raw);
+      if (!lease.ok) return lease;
+      lease.complete();
+      return { ok: true, accountId: lease.accountId };
+    },
+
+    /**
+     * Exclusively reserve a token for a multi-step operation, consuming only on completion.
+     * A transient provider/store failure releases it so the same recovery link can resume the
+     * saga instead of leaving the provider password changed and the platform operation dead.
+     */
+    reserve(purpose, raw) {
       const handle = handleOf(raw ?? '');
       const row = byHandle.get(handle);
       if (!row || row.purpose !== purpose || row.usedAt) return { ok: false, reason: 'invalid' };
-      if (clock.now() >= row.expiresAt) { byHandle.delete(handle); return { ok: false, reason: 'expired' }; }
-      byHandle.delete(handle);
-      latestForAccount.delete(`${purpose}:${row.accountId}`);
-      return { ok: true, accountId: row.accountId };
+      if (clock.now() >= row.expiresAt) {
+        byHandle.delete(handle);
+        latestForAccount.delete(`${purpose}:${row.accountId}`);
+        return { ok: false, reason: 'expired' };
+      }
+      row.usedAt = 'reserved';
+      let closed = false;
+      return {
+        ok: true,
+        accountId: row.accountId,
+        complete() {
+          if (closed) return;
+          closed = true;
+          byHandle.delete(handle);
+          if (latestForAccount.get(`${purpose}:${row.accountId}`) === handle) {
+            latestForAccount.delete(`${purpose}:${row.accountId}`);
+          }
+        },
+        release() {
+          if (closed) return;
+          closed = true;
+          if (byHandle.get(handle) === row) row.usedAt = null;
+        },
+      };
     },
 
     /**

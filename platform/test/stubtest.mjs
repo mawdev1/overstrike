@@ -2004,7 +2004,7 @@ console.log('\n--- net-facade stub (net-facade.md §8) ---');
     const row = (phase, alive) => rows.find((r) => r.phase === phase && r.alive === alive);
     check(row('live', true).canFreeCam === false && row('live', false).canUseTeamChat === false
       && row('roundEnd', false).canFreeCam === true && row('roundEnd', false).canUseTeamChat === true
-      && row('warmup', true).canFreeCam === true
+      && row('warmup', true).canFreeCam === false && row('freeze', true).canUseTeamChat === true
       && rows.every((r) => r.canSpectateEnemies === false),
     'spectator policy matches the §5.1.0a table row for row, including the dead relay rule',
     JSON.stringify(rows.map((r) => `${r.phase}/${r.alive}:${r.canFreeCam}${r.canUseTeamChat}`)));
@@ -2714,6 +2714,13 @@ console.log('\n--- realtime-lobby.md §10 lobby stub ---');
     roster: S.arr(ROSTER_MEMBER),
     countdown: S.nullable(COUNTDOWN),
     chatHistory: S.arr(S.obj({ id: S.ulid, accountId: S.ulid, displayName: S.str, text: S.str, ts: S.iso, filtered: S.bool })),
+    mutedAccountIds: S.arr(S.ulid),
+    pingCatalog: S.obj({ version: S.int, kinds: S.arr(S.str) }),
+    loadoutCatalog: S.obj({
+      version: S.str,
+      primary: S.arr(S.obj({ idx: S.int, label: S.str, eligible: S.bool })),
+      secondary: S.arr(S.obj({ idx: S.int, label: S.str, eligible: S.bool })),
+    }),
   }), 'lobby.welcome.d', wp);
   check(wp.length === 0, 'lobby.welcome carries complete, contract-shaped state', wp.slice(0, 4).join('\n       '));
 

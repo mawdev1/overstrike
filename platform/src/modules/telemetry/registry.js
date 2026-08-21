@@ -37,6 +37,11 @@ export const CLIENT_ERROR_CLASSES = [
 /** Error codes are the contract's own set; restating them here is how the two would drift. */
 const ERROR_CODES = Object.keys(CODES);
 
+/** Browser transport failures happen before a platform error envelope can exist. */
+export const CONNECTION_FAILURE_CODES = Object.freeze([
+  ...ERROR_CODES, 'CLIENT_NETWORK', 'CLIENT_TIMEOUT',
+]);
+
 const enumF = (values, { nullable = false } = {}) => ({ kind: 'enum', values, nullable });
 const boolF = () => ({ kind: 'bool', nullable: false });
 const numF = (min, max, { integer = false } = {}) => ({ kind: 'number', min, max, integer, nullable: false });
@@ -129,7 +134,7 @@ export const REGISTRY = new Map(Object.entries({
     version: 1, privacyClass: 'personal', retentionClass: 'standard',
     fields: {
       stage: enumF(['platform', 'lobby', 'match']),
-      code: strEnumF(ERROR_CODES),
+      code: strEnumF(CONNECTION_FAILURE_CODES),
     },
   },
   'settings.friction': {

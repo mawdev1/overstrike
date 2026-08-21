@@ -77,6 +77,13 @@ function welcomePayload(room, clock) {
       { id: stubUlid('chat:1', Date.UTC(2026, 2, 1)), accountId: fx.OTHER_ACCOUNT_ID,
         displayName: 'StubPlayer01', text: 'glhf', ts: clock.fromEpoch(-30 * 1000), filtered: false },
     ],
+    mutedAccountIds: [],
+    pingCatalog: { version: 1, kinds: ['attack-a', 'attack-b', 'defend-a', 'defend-b', 'regroup', 'enemy-spotted'] },
+    loadoutCatalog: {
+      version: 'alpha-1',
+      primary: [0, 1, 2, 3].map((idx) => ({ idx, label: `Primary ${idx + 1}`, eligible: true })),
+      secondary: [0, 1, 2, 3].map((idx) => ({ idx, label: `Secondary ${idx + 1}`, eligible: true })),
+    },
   };
 }
 

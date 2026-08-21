@@ -202,13 +202,20 @@ function parseIfMatch(header) {
 export function createSettingsService({ store, clock = Date, vocab = VOCABULARY }) {
   async function read(accountId, tx) {
     const profile = await store.profiles.byAccountId(accountId, tx);
+    // The default settings document exists logically from account creation even before its
+    // first roaming write. The HTTP contract requires an instant here (and the browser uses
+    // that closed projection during cookie-backed cold start), so do not turn an absent
+    // optional profile row into `updatedAt: null`. Account creation is the stable effective
+    // time for the default document; the epoch is only for narrow injected stores that do not
+    // expose accounts at all.
+    const account = profile?.updatedAt ? null : await store.accounts?.byId?.(accountId, tx);
     const version = profile?.settingsVersion ?? 1;
     const values = profile?.roamingSettings ?? defaultRoamingValues(vocab);
     return {
       schemaVersion: SCHEMA_VERSION,
       version,
       values,
-      updatedAt: profile?.updatedAt ?? null,
+      updatedAt: profile?.updatedAt ?? account?.createdAt ?? new Date(0).toISOString(),
     };
   }
 

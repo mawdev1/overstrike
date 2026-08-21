@@ -18,6 +18,7 @@
 import { createServer } from 'node:http';
 import { ApiError, toApiError } from './errors.js';
 import { ulid, isUlid } from './ids.js';
+import { parseTraceparent, traceparentForCorrelation } from './observability.js';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -280,6 +281,7 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
   async function handle(req, res) {
     const startedAt = process.hrtime.bigint();
     let correlationId = ulid();
+    let traceparent = null;
     let status = 500;
     let payload = null;
     let extraHeaders = null;
@@ -295,6 +297,13 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
       if (typeof supplied === 'string' && isUlid(supplied)) correlationId = supplied;
       else if (supplied !== undefined) {
         logger.warn('correlation.rejected', { correlationId, suppliedLength: String(supplied).length });
+      }
+      const suppliedTrace = req.headers.traceparent;
+      if (typeof suppliedTrace === 'string' && parseTraceparent(suppliedTrace)) {
+        traceparent = suppliedTrace.trim().toLowerCase();
+      } else {
+        traceparent = traceparentForCorrelation(correlationId);
+        if (suppliedTrace !== undefined) logger.warn('traceparent.rejected', { correlationId });
       }
 
       const url = parseTarget(req.url);
@@ -360,6 +369,7 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
 
       const ctx = {
         correlationId,
+        traceparent,
         method: req.method,
         path: url.pathname,
         query: url.searchParams,
@@ -441,6 +451,7 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
     try {
       // §3a.2: a 204 still carries the correlation id — it is the only place it can travel.
       res.setHeader('X-Correlation-Id', correlationId);
+      res.setHeader('Traceparent', traceparent || traceparentForCorrelation(correlationId));
       if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
       // Cookies survive the error path deliberately: signout must clear the refresh cookie
       // even when the response it accompanies is a failure.
@@ -457,7 +468,18 @@ export function createApp({ router, deps, onRequestEnd = null, preRoute = [] }) 
 
     const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
     logger.info('request', { correlationId, method: req.method, path: pathForLog, status, ms });
-    if (onRequestEnd) { try { onRequestEnd({ status, ms, correlationId }); } catch { /* never fatal */ } }
+    try {
+      deps.observability?.recordRequest?.({ status, ms, correlationId, traceparent,
+        method: req.method, path: pathForLog });
+      if (status >= 500) void deps.observability?.alert?.({
+        key: `http:${req.method}:${pathForLog}`, severity: 'critical',
+        event: 'platform.request_5xx', correlationId, component: 'http', errorCode: payload?.error?.code,
+      });
+    } catch { /* instrumentation must never break a response */ }
+    if (onRequestEnd) {
+      try { onRequestEnd({ status, ms, correlationId, traceparent,
+        method: req.method, path: pathForLog }); } catch { /* never fatal */ }
+    }
     }
   }
 }

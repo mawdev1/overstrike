@@ -93,6 +93,13 @@ function emptyState() {
     weaponStats: new Map(),
     matches: new Map(),
     matchParticipants: new Map(),
+    matchEvidence: new Map(),
+    matchServers: new Map(),
+    rooms: new Map(),
+    roomMembers: new Map(),
+    reports: new Map(),
+    matchTickets: new Map(),
+    chatMessages: new Map(),
     outbox: new Map(),
     audit: new Map(),
     idempotency: new Map(),
@@ -131,6 +138,8 @@ const ACCOUNT_COLUMNS = columns({
   // the one every account has, because an account with no roles can do nothing and is a bug
   // rather than a state we ever mean.
   passwordHash: null,
+  identityProvider: null,
+  identitySubject: null,
   roles: ['player'],
   nameChangedAt: null,
   eligibilityVerdict: null,
@@ -485,6 +494,20 @@ export function createMemoryStore(config = {}, deps = {}) {
       });
     },
 
+    identityReadiness(txh) {
+      return read(txh, (st) => {
+        let unreadyAccounts = 0;
+        for (const account of st.accounts.values()) {
+          if (account.deletedAt || account.status === 'deleted') continue;
+          const ready = account.identityProvider === 'supabase'
+            && typeof account.identitySubject === 'string' && account.identitySubject !== ''
+            && account.passwordHash === null;
+          if (!ready) unreadyAccounts++;
+        }
+        return { ok: unreadyAccounts === 0, unreadyAccounts };
+      });
+    },
+
     update(accountId, patch, txh) {
       assertCloneable(patch, 'accounts patch');
       return write(txh, (st) => {
@@ -829,6 +852,13 @@ export function createMemoryStore(config = {}, deps = {}) {
     .filter((p) => p.matchId === matchId);
 
   const matches = {
+    activeForRoom(roomId, txh) {
+      return read(txh, (st) => {
+        const row = [...st.matches.values()].find((item) => item.roomId === roomId
+          && ['allocated', 'in-progress'].includes(item.status));
+        return row ? clone({ ...row, participants: participantsOf(st, row.matchId) }) : null;
+      });
+    },
     /**
      * Create the row, or advance an existing non-terminal one to its terminal result.
      *
@@ -900,6 +930,16 @@ export function createMemoryStore(config = {}, deps = {}) {
         const m = st.matches.get(matchId);
         if (!m) return null;
         return clone({ ...m, participants: participantsOf(st, matchId) });
+      });
+    },
+
+    latestTerminalForRoom(roomId, txh) {
+      return read(txh, (st) => {
+        const rows = [...st.matches.values()].filter((m) => m.roomId === roomId
+          && TERMINAL_MATCH_STATUSES.includes(m.status) && m.resultAppliedAt);
+        rows.sort((a, b) => String(b.endedAt ?? b.matchId).localeCompare(String(a.endedAt ?? a.matchId)));
+        const m = rows[0];
+        return m ? clone({ ...m, participants: participantsOf(st, m.matchId) }) : null;
       });
     },
 
@@ -1169,6 +1209,17 @@ export function createMemoryStore(config = {}, deps = {}) {
       });
     },
 
+    list(filter = {}, txh) {
+      const limit = Math.min(500, Math.max(1, Number(filter.limit) || 100));
+      return read(txh, (st) => [...st.outbox.values()]
+        .filter((row) => filter.correlationId === undefined
+          || row.correlationId === filter.correlationId)
+        .filter((row) => filter.subjectId === undefined || row.subjectId === filter.subjectId)
+        .sort((a, b) => a.recordedAt === b.recordedAt
+          ? (a.eventId < b.eventId ? -1 : 1) : (a.recordedAt < b.recordedAt ? -1 : 1))
+        .slice(0, limit).map(clone));
+    },
+
     claimUnpublished(limit = 100, txh) {
       return read(txh, (st) => [...st.outbox.values()]
         .filter((e) => e.publishedAt === null && e.deadLetteredAt === null)
@@ -1234,12 +1285,13 @@ export function createMemoryStore(config = {}, deps = {}) {
 
     list(filter = {}, txh) {
       return read(txh, (st) => {
-        const { subjectKind, subjectId, actorId, action, limit = 100 } = filter;
+        const { subjectKind, subjectId, actorId, action, correlationId, limit = 100 } = filter;
         return [...st.audit.values()]
           .filter((r) => (subjectKind === undefined || r.subjectKind === subjectKind)
             && (subjectId === undefined || r.subjectId === subjectId)
             && (actorId === undefined || r.actorId === actorId)
-            && (action === undefined || r.action === action))
+            && (action === undefined || r.action === action)
+            && (correlationId === undefined || r.correlationId === correlationId))
           .sort((a, b) => (a.auditId < b.auditId ? -1 : 1))
           .slice(0, limit)
           .map(clone);
@@ -1357,11 +1409,243 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
   };
 
+  const rooms = {
+    upsert(row, txh) {
+      assertCloneable(row, 'rooms row');
+      return write(txh, (st) => {
+        const prior = st.rooms.get(row.roomId);
+        const rec = { ...prior, ...clone(row), createdAt: prior?.createdAt ?? row.createdAt ?? nowIso(), updatedAt: nowIso() };
+        st.rooms.set(row.roomId, rec);
+        return clone(rec);
+      });
+    },
+    byId(roomId, txh) { return read(txh, (st) => clone(st.rooms.get(roomId) ?? null)); },
+    list(txh) { return read(txh, (st) => [...st.rooms.values()].map(clone)); },
+    remove(roomId, txh) { return write(txh, (st) => st.rooms.delete(roomId)); },
+  };
+
+  const roomMembers = {
+    upsert(row, txh) {
+      assertCloneable(row, 'room_members row');
+      return write(txh, (st) => {
+        if (!st.rooms.has(row.roomId)) throw new ApiError('ROOM_NOT_FOUND', 'That room no longer exists.');
+        const k = key(row.roomId, row.accountId);
+        const prior = st.roomMembers.get(k);
+        const rec = { ...prior, ...clone(row), joinedAt: prior?.joinedAt ?? row.joinedAt ?? nowIso(), leftAt: row.leftAt ?? null, updatedAt: nowIso() };
+        st.roomMembers.set(k, rec);
+        return clone(rec);
+      });
+    },
+    listForRoom(roomId, txh) { return read(txh, (st) => [...st.roomMembers.values()].filter((row) => row.roomId === roomId && !row.leftAt).map(clone)); },
+    wasMemberAt(roomId, accountId, at, txh) {
+      return read(txh, (st) => {
+        const row = st.roomMembers.get(key(roomId, accountId));
+        const time = Date.parse(at);
+        return Boolean(row && Date.parse(row.joinedAt) <= time
+          && (!row.leftAt || Date.parse(row.leftAt) >= time));
+      });
+    },
+    recentFor(accountId, limit = 25, cursor = 0, txh) {
+      return read(txh, (st) => {
+        const roomIds = new Set([...st.roomMembers.values()]
+          .filter((row) => row.accountId === accountId).map((row) => row.roomId));
+        const latest = new Map();
+        for (const row of st.roomMembers.values()) {
+          if (!roomIds.has(row.roomId) || row.accountId === accountId) continue;
+          const encounteredAt = row.leftAt || row.joinedAt;
+          const prior = latest.get(row.accountId);
+          if (!prior || Date.parse(encounteredAt) > Date.parse(prior.encounteredAt)) {
+            latest.set(row.accountId, { accountId: row.accountId, encounteredAt });
+          }
+        }
+        return [...latest.values()].sort((a, b) => Date.parse(b.encounteredAt) - Date.parse(a.encounteredAt)
+          || a.accountId.localeCompare(b.accountId)).slice(cursor, cursor + limit).map(clone);
+      });
+    },
+    remove(roomId, accountId, leftAt = nowIso(), txh) {
+      return write(txh, (st) => {
+        const k = key(roomId, accountId); const row = st.roomMembers.get(k);
+        if (!row) return false; st.roomMembers.set(k, { ...row, leftAt: toIso(leftAt), updatedAt: nowIso() }); return true;
+      });
+    },
+  };
+
+  const reports = {
+    create(row, txh) {
+      assertCloneable(row, 'reports row');
+      return write(txh, (st) => {
+        for (const prior of st.reports.values()) {
+          if (prior.reporterAccountId === row.reporterAccountId && prior.subjectAccountId === row.subjectAccountId
+            && prior.matchId === (row.matchId ?? null)
+            && prior.chatMessageId === (row.chatMessageId ?? null) && prior.category === row.category) {
+            throw new ApiError('REPORT_DUPLICATE', 'You already reported this incident.');
+          }
+        }
+        const rec = { ...clone(row), matchId: row.matchId ?? null, chatMessageId: row.chatMessageId ?? null,
+          description: row.description ?? null, evidenceRef: row.evidenceRef ?? null,
+          status: row.status ?? 'open', createdAt: row.createdAt ?? nowIso(), updatedAt: nowIso() };
+        st.reports.set(rec.reportId, rec); return clone(rec);
+      });
+    },
+  };
+
+  const matchTickets = {
+    put(row, txh) {
+      assertCloneable(row, 'match ticket row');
+      return write(txh, (st) => {
+        if (st.matchTickets.has(row.jti)) throw new ApiError('CONFLICT', 'That match ticket exists.');
+        const rec = { ...clone(row), consumedAt: null, createdAt: row.createdAt ?? nowIso() };
+        st.matchTickets.set(rec.jti, rec); return clone(rec);
+      });
+    },
+    consume(jti, claims, at = nowIso(), txh) {
+      return write(txh, (st) => {
+        const row = st.matchTickets.get(jti);
+        if (!row || row.consumedAt || Date.parse(row.expiresAt) <= Date.parse(at)
+          || row.accountId !== claims.accountId || row.roomId !== claims.roomId
+          || row.matchId !== claims.matchId) return null;
+        const next = { ...row, consumedAt: toIso(at) }; st.matchTickets.set(jti, next); return clone(next);
+      });
+    },
+    byJti(jti, txh) { return read(txh, (st) => clone(st.matchTickets.get(jti))); },
+    purgeExpired(at, txh) {
+      const cutoff = Date.parse(at) - 24 * 60 * 60 * 1_000;
+      return write(txh, (st) => { let count = 0; for (const [jti, row] of st.matchTickets) {
+        if (Date.parse(row.expiresAt) > cutoff) continue; st.matchTickets.delete(jti); count++;
+      } return count; });
+    },
+  };
+
+  const chatMessages = {
+    create(row, txh) {
+      assertCloneable(row, 'chat message row');
+      return write(txh, (st) => {
+        if (st.chatMessages.has(row.messageId)) throw new ApiError('CONFLICT', 'That chat message exists.');
+        const rec = { ...clone(row), createdAt: row.createdAt ?? nowIso(), removedAt: null,
+          removedBy: null, removalReason: null };
+        st.chatMessages.set(rec.messageId, rec); return clone(rec);
+      });
+    },
+    byId(messageId, txh) { return read(txh, (st) => clone(st.chatMessages.get(messageId))); },
+    listForRoom(roomId, limit = 50, at = nowIso(), txh) {
+      return read(txh, (st) => [...st.chatMessages.values()].filter((row) => row.roomId === roomId
+        && !row.removedAt && Date.parse(row.expiresAt) > Date.parse(at))
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, limit).reverse().map(clone));
+    },
+    remove(messageId, actorId, reason, at, txh) {
+      return write(txh, (st) => {
+        const row = st.chatMessages.get(messageId);
+        if (!row) throw new ApiError('NOT_FOUND', 'No such chat message.');
+        if (!row.removedAt) Object.assign(row, { removedAt: toIso(at), removedBy: actorId, removalReason: reason });
+        return clone(row);
+      });
+    },
+    purgeExpired(at, txh) {
+      return write(txh, (st) => {
+        let count = 0;
+        for (const [messageId, row] of st.chatMessages) {
+          const atMs = Number(at instanceof Date ? at : new Date(at));
+          const retainedByReport = [...st.reports.values()].some((report) => report.chatMessageId === messageId
+            && (!report.resolvedAt || Date.parse(report.resolvedAt) + 30 * 86400e3 > atMs));
+          if (!retainedByReport && Date.parse(row.expiresAt) <= atMs) {
+            st.chatMessages.delete(messageId); count++;
+          }
+        }
+        return count;
+      });
+    },
+  };
+
+  const matchEvidence = {
+    put(row, txh) {
+      assertCloneable(row, 'match evidence row');
+      return write(txh, (st) => {
+        if (st.matchEvidence.has(row.matchId)) {
+          throw new ApiError('CONFLICT', 'Evidence for that match already exists.');
+        }
+        for (const prior of st.matchEvidence.values()) {
+          if (prior.evidenceRef === row.evidenceRef) {
+            throw new ApiError('CONFLICT', 'That evidence reference already exists.');
+          }
+        }
+        const rec = { ...clone(row), createdAt: row.createdAt ?? nowIso() };
+        st.matchEvidence.set(rec.matchId, rec);
+        return clone(rec);
+      });
+    },
+    byMatchId(matchId, txh) {
+      return read(txh, (st) => clone(st.matchEvidence.get(matchId)));
+    },
+    byEvidenceRef(evidenceRef, txh) {
+      return read(txh, (st) => {
+        for (const row of st.matchEvidence.values()) {
+          if (row.evidenceRef === evidenceRef) return clone(row);
+        }
+        return null;
+      });
+    },
+  };
+
+  const matchServers = {
+    register(row, txh) {
+      assertCloneable(row, 'match server row');
+      return write(txh, (st) => {
+        for (const other of st.matchServers.values()) {
+          if (other.serverId !== row.serverId && other.address === row.address) {
+            throw new ApiError('CONFLICT', 'That match-server address is already registered.');
+          }
+        }
+        const prior = st.matchServers.get(row.serverId) || {};
+        const exists = Object.hasOwn(prior, 'serverId');
+        const rec = { ...prior, ...clone(row), inUse: exists ? prior.inUse : (row.inUse ?? 0),
+          status: exists ? prior.status : (row.status ?? 'healthy'), lastHeartbeatAt: row.lastHeartbeatAt ?? nowIso(),
+          createdAt: prior.createdAt ?? nowIso(), updatedAt: nowIso() };
+        st.matchServers.set(rec.serverId, rec); return clone(rec);
+      });
+    },
+    heartbeat(serverId, patch, txh) {
+      return write(txh, (st) => {
+        const prior = st.matchServers.get(serverId);
+        if (!prior) throw new ApiError('NOT_FOUND', 'Match server is not registered.');
+        Object.assign(prior, clone(patch), { inUse: Math.max(prior.inUse, patch.inUse),
+          lastHeartbeatAt: patch.lastHeartbeatAt ?? nowIso(), updatedAt: nowIso() });
+        return clone(prior);
+      });
+    },
+    healthy(region, since, txh) {
+      return read(txh, (st) => [...st.matchServers.values()]
+        .filter((row) => row.region === region && row.status === 'healthy'
+          && Date.parse(row.lastHeartbeatAt) >= Date.parse(since) && row.inUse < row.capacity)
+        .sort((a, b) => a.inUse - b.inUse || a.serverId.localeCompare(b.serverId)).map(clone));
+    },
+    reserve(region, since, txh) {
+      return write(txh, (st) => {
+        const rows = [...st.matchServers.values()].filter((row) => row.region === region
+          && row.status === 'healthy' && Date.parse(row.lastHeartbeatAt) >= Date.parse(since)
+          && row.inUse < row.capacity)
+          .sort((a, b) => a.inUse - b.inUse || a.serverId.localeCompare(b.serverId));
+        const row = rows[0];
+        if (!row) return null;
+        row.inUse = row.capacity; row.updatedAt = nowIso(); return clone(row);
+      });
+    },
+    release(serverId, txh) {
+      return write(txh, (st) => {
+        const row = st.matchServers.get(serverId);
+        if (!row) return false;
+        row.inUse = 0; row.updatedAt = nowIso(); return true;
+      });
+    },
+    byId(serverId, txh) { return read(txh, (st) => clone(st.matchServers.get(serverId))); },
+  };
+
   return {
     kind: 'memory',
     tx,
     accounts, accountNameHistory, sessions, refreshTokens, profiles, stats, weaponStats, matches,
-    preAuthConsent, outbox, audit, idempotency, flags,
+    preAuthConsent, outbox, audit, idempotency, flags, rooms, roomMembers, reports, matchTickets, chatMessages,
+    matchEvidence, matchServers,
     async health() {
       return closed ? { ok: false, detail: 'closed' } : { ok: true, detail: 'memory' };
     },

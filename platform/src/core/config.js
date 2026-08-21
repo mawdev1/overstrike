@@ -15,9 +15,14 @@ const SPEC = {
   logLevel:        { env: 'PLATFORM_LOG_LEVEL', type: 'enum', values: ['debug', 'info', 'warn', 'error'], default: 'info' },
   databaseUrl:     { env: 'DATABASE_URL', type: 'string', default: null },
   storage:         { env: 'PLATFORM_STORAGE', type: 'enum', values: ['memory', 'postgres'], default: 'memory' },
+  identityProvider: { env: 'PLATFORM_IDENTITY_PROVIDER', type: 'enum', values: ['local', 'supabase'], default: 'local' },
+  supabaseAuthUrl: { env: 'SUPABASE_URL', type: 'string', default: '' },
+  supabaseServiceRoleKey: { env: 'SUPABASE_SERVICE_ROLE_KEY', type: 'string', default: '' },
   accessTokenTtlSec:  { env: 'PLATFORM_ACCESS_TTL', type: 'int', default: 15 * 60, min: 1, max: 86400 },
   refreshTokenTtlSec: { env: 'PLATFORM_REFRESH_TTL', type: 'int', default: 30 * 24 * 3600, min: 60, max: 365 * 24 * 3600 },
   tokenSecret:     { env: 'PLATFORM_TOKEN_SECRET', type: 'string', default: null, requiredInProd: true },
+  matchTicketSecret: { env: 'PLATFORM_MATCH_TICKET_SECRET', type: 'string', default: null, requiredInProd: true },
+  matchControlSecret: { env: 'PLATFORM_MATCH_CONTROL_SECRET', type: 'string', default: null, requiredInProd: true },
   serviceToken:    { env: 'PLATFORM_SERVICE_TOKEN', type: 'string', default: null, requiredInProd: true },
   trustedProxyHops: { env: 'PLATFORM_TRUSTED_PROXY_HOPS', type: 'int', default: 0, min: 0, max: 8 },
   minClientBuild:  { env: 'PLATFORM_MIN_CLIENT_BUILD', type: 'string', default: null },
@@ -29,10 +34,10 @@ const SPEC = {
   // silently does nothing fails at the exact moment it is most needed.
   flagOverrides: { env: 'PLATFORM_FLAG_OVERRIDES', type: 'string', default: '' },
 
-  // Transactional mail. `none` is the default so a process without mail configured runs and
-  // says so, rather than failing to boot; `log` is refused in production because it prints
-  // tokens, and a token IS the credential. See modules/mail.
-  mailTransport: { env: 'PLATFORM_MAIL_TRANSPORT', type: 'string', default: 'none' },
+  // Transactional mail. `none` keeps local development frictionless. Production requires
+  // Resend because verification and recovery are credential paths, not optional notifications;
+  // `log` is never production-safe because it prints the credential itself.
+  mailTransport: { env: 'PLATFORM_MAIL_TRANSPORT', type: 'enum', values: ['none', 'log', 'resend'], default: 'none' },
   mailFrom: { env: 'PLATFORM_MAIL_FROM', type: 'string', default: '' },
   mailApiKey: { env: 'PLATFORM_MAIL_API_KEY', type: 'string', default: '' },
   mailApiUrl: { env: 'PLATFORM_MAIL_API_URL', type: 'string', default: '' },
@@ -41,6 +46,13 @@ const SPEC = {
   // is served from overstrike.fly.dev and proxies /v1 here, so a link built from this process's
   // own host would send players to an API that has no such page.
   publicBaseUrl: { env: 'PLATFORM_PUBLIC_BASE_URL', type: 'string', default: '' },
+  lobbyPublicUrl: { env: 'PLATFORM_LOBBY_PUBLIC_URL', type: 'string', default: '' },
+  // Secret-bearing paging endpoint (PagerDuty/Slack/incident relay). It is optional for local
+  // development; production readiness reports the alert dependency down until it is present.
+  alertWebhookUrl: { env: 'PLATFORM_ALERT_WEBHOOK_URL', type: 'string', default: '' },
+  matchServerUrl: { env: 'PLATFORM_MATCH_SERVER_URL', type: 'string', default: 'ws://127.0.0.1:8080', requiredInProd: true },
+  matchServerAllowedHosts: { env: 'PLATFORM_MATCH_SERVER_ALLOWED_HOSTS', type: 'string', default: '' },
+  matchServerRegion: { env: 'PLATFORM_MATCH_SERVER_REGION', type: 'enum', values: ['yyz', 'ord', 'iad'], default: 'iad' },
   termsVersion:    { env: 'PLATFORM_TERMS_VERSION', type: 'int', default: 1, min: 1, max: 1e6 },
   env:             { env: 'NODE_ENV', type: 'string', default: 'development' },
 };
@@ -75,12 +87,47 @@ export function loadConfig(source = process.env) {
     } else out[key] = raw;
   }
   if (out.storage === 'postgres' && !out.databaseUrl) problems.push('DATABASE_URL is required when PLATFORM_STORAGE=postgres');
+  try {
+    const matchUrl = new URL(out.matchServerUrl);
+    const loopback = matchUrl.protocol === 'ws:' && ['localhost', '127.0.0.1', '[::1]', '::1'].includes(matchUrl.hostname);
+    if (matchUrl.protocol !== 'wss:' && !(source.NODE_ENV !== 'production' && loopback)) {
+      problems.push('PLATFORM_MATCH_SERVER_URL must use wss (ws is allowed only on loopback outside production)');
+    }
+  } catch { problems.push('PLATFORM_MATCH_SERVER_URL must be an absolute WebSocket URL'); }
+  if (out.matchServerAllowedHosts) {
+    const hosts = out.matchServerAllowedHosts.split(',').map((value) => value.trim()).filter(Boolean);
+    if (!hosts.length || hosts.some((host) => host.includes('/') || host.includes('@') || host.includes(':'))) {
+      problems.push('PLATFORM_MATCH_SERVER_ALLOWED_HOSTS must be a comma-separated list of hostnames');
+    }
+  }
+  if (out.env === 'production' && out.identityProvider !== 'supabase') {
+    problems.push('PLATFORM_IDENTITY_PROVIDER=supabase is required in production');
+  }
+  if (out.identityProvider === 'supabase' && (!out.supabaseAuthUrl || !out.supabaseServiceRoleKey)) {
+    problems.push('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for the Supabase identity provider');
+  }
+  if (out.env === 'production' && out.mailTransport !== 'resend') {
+    problems.push('PLATFORM_MAIL_TRANSPORT=resend is required in production');
+  }
+  if (out.mailTransport === 'resend' && (!out.mailFrom || !out.mailApiKey)) {
+    problems.push('PLATFORM_MAIL_FROM and PLATFORM_MAIL_API_KEY are required for the Resend mail transport');
+  }
+  if (out.alertWebhookUrl) {
+    try {
+      const url = new URL(out.alertWebhookUrl);
+      if (url.protocol !== 'https:' && out.env === 'production') {
+        problems.push('PLATFORM_ALERT_WEBHOOK_URL must use https in production');
+      }
+    } catch { problems.push('PLATFORM_ALERT_WEBHOOK_URL must be an absolute URL'); }
+  }
 
   // Secrets are mandatory in production (requiredInProd above). Outside it, a fixed,
   // obviously-fake value keeps local work frictionless without ever being mistakable for a
   // real one — and it is long enough to satisfy the signers, which reject short keys.
   if (out.env !== 'production') {
     if (!out.tokenSecret) out.tokenSecret = 'DEV-ONLY-INSECURE-TOKEN-SECRET-do-not-ship';
+    if (!out.matchTicketSecret) out.matchTicketSecret = 'DEV-ONLY-INSECURE-MATCH-TICKET-SECRET-do-not-ship';
+    if (!out.matchControlSecret) out.matchControlSecret = 'DEV-ONLY-INSECURE-MATCH-CONTROL-SECRET-do-not-ship';
     if (!out.serviceToken) out.serviceToken = 'DEV-ONLY-INSECURE-SERVICE-TOKEN-do-not-ship';
   }
   if (problems.length) {

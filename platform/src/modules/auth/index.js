@@ -13,6 +13,7 @@ import { createEphemeralTokens } from './ephemeral.js';
 import { createSessionService } from './sessions.js';
 import { createAuthService } from './service.js';
 import { createAuthRoutes } from './routes.js';
+import { createIdentityProvider } from './identity.js';
 
 export function createAuthModule(deps) {
   const { store, config, logger, clock = { now: Date.now }, geo = null, mailer = null, sleep } = deps;
@@ -27,8 +28,10 @@ export function createAuthModule(deps) {
   const outbox = deps.outbox ?? createOutbox({ store, clock, logger });
   const audit = deps.audit ?? createAuditLog({ store, clock, logger });
   const sessions = createSessionService({ store, config, clock, logger, geo, outbox, audit });
+  const identity = deps.identity ?? createIdentityProvider({ config, fetchImpl: deps.fetchImpl });
   const service = createAuthService({
-    store, config, clock, logger, sessions, receipts, ephemeral, limiter, outbox, audit, mailer, sleep,
+    store, config, clock, logger, sessions, receipts, ephemeral, limiter, outbox, audit, mailer,
+    identity, sleep,
   });
   const routes = createAuthRoutes({ service, sessions, limiter });
 
@@ -55,7 +58,7 @@ export function createAuthModule(deps) {
   consentTimer?.unref?.();
 
   return {
-    service, sessions, receipts, ephemeral, limiter, outbox, audit, routes,
+    service, sessions, receipts, ephemeral, limiter, outbox, audit, routes, identity,
     register: routes.register,
     /** For a worker, an ops task, or a test that would rather not wait an hour. */
     sweepPreAuthConsent: service.sweepPreAuthConsent,
@@ -68,4 +71,5 @@ export function createAuthModule(deps) {
 }
 
 export { createRateLimiter, createReceipts, createEphemeralTokens, createSessionService, createAuthService, createAuthRoutes };
+export { createIdentityProvider, createLocalIdentityProvider, createSupabaseIdentityProvider } from './identity.js';
 export { fold, normaliseDisplayName, assertCooldown } from './names.js';

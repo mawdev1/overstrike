@@ -182,8 +182,20 @@ export function nameChangeAvailableAt(account, cooldownMs) {
   return new Date(changedAt + cooldownMs).toISOString();
 }
 
+/** First incomplete account-policy step in the frozen onboarding order. */
+export function setupNextStepForAccount(account, termsVersion) {
+  if (account?.eligibilityVerdict !== true) return 'eligibility';
+  if (account.consentTelemetry === null || account.consentTelemetry === undefined) return 'consent';
+  if (typeof account.displayName !== 'string' || !account.displayName.trim()) return 'display-name';
+  if (!account.emailVerifiedAt) return 'verify';
+  if (account.termsVersionAccepted !== termsVersion) return 'terms';
+  if (!account.roamingSettings) return 'essential-settings';
+  return null;
+}
+
 export function createProfileService({
   store, clock = Date, nameChangeCooldownMs = 30 * 24 * 3600e3,
+  termsVersion = 1,
   // Presence is a live lobby-socket value (§5) and has no column; a reader is injected when a
   // presence service exists. Defaulting to null keeps the key present without inventing state.
   readPresence = null,
@@ -210,6 +222,7 @@ export function createProfileService({
   /** §4 `GET /v1/profile/me`. Everything the owner is entitled to see about themselves. */
   async function getOwnProfile(accountId) {
     const account = await requireAccount(accountId);
+    const storedProfile = await store.profiles?.byAccountId?.(accountId);
     return {
       accountId: account.accountId,
       displayName: account.displayName,
@@ -217,7 +230,11 @@ export function createProfileService({
       privacy: normalizePrivacy(account.privacy),
       consent: projectConsent(account),
       moderation: projectModeration(account, await sanctionsFor(accountId)),
-      flags: { nameChangeAvailableAt: nameChangeAvailableAt(account, nameChangeCooldownMs) },
+      flags: {
+        nameChangeAvailableAt: nameChangeAvailableAt(account, nameChangeCooldownMs),
+        setupNextStep: setupNextStepForAccount({ ...account,
+          roamingSettings: storedProfile?.roamingSettings ?? null }, termsVersion),
+      },
     };
   }
 

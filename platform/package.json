@@ -11,7 +11,9 @@
     "test": "node ../scripts/platformtest.mjs",
     "storetest": "node test/storetest.mjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "ws": "^8.21.3"
+  },
   "optionalDependencies": {
     "pg": "^8.13.1"
   },

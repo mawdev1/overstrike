@@ -18,8 +18,10 @@
 import { loadConfig } from '../src/core/config.js';
 import { buildApp } from '../src/app.js';
 import { ulid } from '../src/core/ids.js';
-import { createStatsService } from '../src/modules/profile/stats.js';
+import { createStatsService, idempotencyKeyFor } from '../src/modules/profile/stats.js';
 import { createMemoryStore } from '../src/core/store/memory.js';
+import { createOutbox } from '../src/modules/events/outbox.js';
+import { evidenceDigest, authoritativeEvidenceProblems } from '../src/shared/evidenceDigest.js';
 
 let failures = 0;
 const ok = (name) => console.log(`  ok   ${name}`);
@@ -58,9 +60,19 @@ async function withApp(fn) {
   const base = `http://127.0.0.1:${app.server.address().port}`;
 
   const call = async (method, path, body, headers = {}) => {
+    // Result submissions require a path-derived idempotency key. Most cases in this suite are
+    // about another invariant, so supply the lawful header centrally; a caller can still pass
+    // an explicit empty/wrong header to exercise the key boundary itself.
+    const resultMatch = method === 'POST' && path.match(/^\/v1\/matches\/([^/]+)\/result$/);
+    const requestHeaders = { ...headers };
+    if (resultMatch && requestHeaders['x-service-token']
+        && !Object.hasOwn(requestHeaders, 'idempotency-key')) {
+      requestHeaders['idempotency-key'] = `match-result:${decodeURIComponent(resultMatch[1])}`;
+    }
+    if (resultMatch && body && !Object.hasOwn(body, 'result')) body = authoritativeEnvelope(body);
     const res = await fetch(base + path, {
       method,
-      headers: { 'content-type': 'application/json', 'x-client-build': '1.0.0', ...headers },
+      headers: { 'content-type': 'application/json', 'x-client-build': '1.0.0', ...requestHeaders },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await res.text();
@@ -163,6 +175,46 @@ function result({ matchId, players, mode = 'tdm', status = 'completed',
   };
 }
 
+function authoritativeEnvelope(input) {
+  const submitted = structuredClone(input);
+  if (!Object.hasOwn(submitted, 'evidenceRef')) return { result: submitted, evidence: {} };
+  delete submitted.evidenceRef;
+  const players = Array.isArray(submitted.players) ? submitted.players.filter((row) => row && typeof row === 'object') : [];
+  const roster = Array.isArray(submitted.roster) ? submitted.roster : [];
+  const evidence = {
+    version: 1, matchId: submitted.matchId, rulesetVersion: submitted.rulesetVersion,
+    serverBuild: submitted.serverBuild, protocolVersion: 2,
+    authority: {
+      matchId: submitted.matchId, rulesetVersion: submitted.rulesetVersion,
+      statDefinitionVersion: submitted.statDefinitionVersion, rulesSnapshot: submitted.rulesSnapshot,
+      serverBuild: submitted.serverBuild, mapId: submitted.mapId, mapVersion: submitted.mapVersion,
+      region: submitted.region, mode: submitted.mode, startedAt: submitted.startedAt,
+    },
+    terminalSummary: {
+      status: submitted.status, endedAt: submitted.endedAt,
+      terminationReason: submitted.terminationReason, outcomeReason: submitted.outcomeReason,
+      winnerTeam: submitted.winnerTeam, invalidationReason: submitted.invalidationReason,
+      teamScores: submitted.teamScores, failureReason: null,
+    },
+    participants: players.map(({ accountId, displayName, team, role }) => ({ accountId, displayName, team, role })),
+    roundSummary: Array.isArray(submitted.rounds) ? submitted.rounds : [],
+    combatSummary: players.map(({ accountId, kills, deaths, assists, suicides, teamKills,
+      headshots, shotsFired, shotsHit, damageDealt, plants, defuses, roundsPlayed, score, weapons }) => ({
+      accountId, kills, deaths, assists, suicides, teamKills, headshots, shotsFired, shotsHit,
+      damageDealt, plants, defuses, roundsPlayed, score, weapons,
+    })),
+    connectionSummary: players.map(({ accountId, joinedAt, leftAt, timePlayedSec,
+      disconnected, abandoned }) => ({ accountId, joinedAt, leftAt, timePlayedSec, disconnected, abandoned })),
+    objectives: [], eventTimeline: [], combatSamples: [],
+    combatSampling: { observed: 0, every: 16, retained: 0, killsAlwaysRetained: true },
+    droppedCombatSamples: 0, connectionFacts: [], droppedConnectionFacts: 0,
+    antiCheatFlags: [], droppedAntiCheatFlags: 0, droppedRows: 0,
+    roster, result: structuredClone(submitted),
+  };
+  submitted.evidenceRef = `sha256:${evidenceDigest(evidence)}`;
+  return { result: submitted, evidence };
+}
+
 /** The field paths a VALIDATION_FAILED envelope named. errors.md §3: `details.fields[].path`. */
 const paths = (res) => (res.body?.error?.details?.fields || []).map((f) => f.path ?? f.key);
 
@@ -249,6 +301,12 @@ await withApp(async ({ app, call }) => {
 
   // CONTROL: the same payload with the service token applies. Without this the three refusals
   // above are equally consistent with an endpoint that refuses everything.
+  const missingKey = await call('POST', `/v1/matches/${m1}/result`, r1,
+    { ...asService, 'idempotency-key': '' });
+  expect(missingKey.status === 400 && missingKey.code === 'VALIDATION_FAILED'
+      && missingKey.body?.error?.details?.fields?.[0]?.reason === 'required',
+    '§5.2: the exact Idempotency-Key is required over real HTTP', missingKey.text);
+
   const applied = await call('POST', `/v1/matches/${m1}/result`, r1, asService);
   expect(applied.status === 200 && applied.body?.applied === true,
     'CONTROL: the service-authenticated submission applies', applied.text);
@@ -268,6 +326,15 @@ await withApp(async ({ app, call }) => {
     { ...asService, 'idempotency-key': 'match-result:something-else' });
   expect(otherKey.status === 400 && otherKey.code === 'VALIDATION_FAILED',
     '§5.2: an Idempotency-Key that is not match-result:<matchId> is refused', otherKey.text);
+
+  const contradictory = await call('POST', `/v1/matches/${ulid()}/result`, {
+    ...r1,
+    matchId: undefined,
+    roster: r1.roster.map((entry, i) => i === 0 ? { ...entry, team: 'bravo' } : entry),
+  }, asService);
+  expect(contradictory.status === 400 && contradictory.code === 'VALIDATION_FAILED'
+      && contradictory.body?.error?.details?.fields?.some((f) => f.reason === 'roster-team-mismatch'),
+    '§4.1: contradictory roster/player teams are refused over real HTTP', contradictory.text);
 
   const different = await call('POST', `/v1/matches/${m1}/result`,
     { ...r1, teamScores: { alpha: 1, bravo: 0 } }, asService);
@@ -658,6 +725,89 @@ section('§5.3 — a stats service with no outbox is a wiring error');
   expect(typeof withOutbox.applyMatchResult === 'function',
     'CONTROL: the same construction with an outbox succeeds');
   await store.close();
+}
+
+section('§5.3 — evidence retention is in the result transaction');
+
+{
+  const base = createMemoryStore({ storage: 'memory' });
+  const store = {
+    ...base,
+    matchEvidence: {
+      ...base.matchEvidence,
+      async put() { throw new Error('injected evidence sink failure'); },
+    },
+  };
+  const stats = createStatsService({ store, outbox: createOutbox({ store, logger: null }) });
+  const accountId = ulid();
+  const account = await base.accounts.create({ accountId, status: 'active', emailHash: `hash:${accountId}`,
+    displayName: 'Evidence Test', displayNameFolded: 'evidence test', roles: ['player'] });
+  const matchId = ulid();
+  const terminal = result({ matchId, players: [playerRow(account, 'alpha')] });
+  delete terminal.evidenceRef;
+  const [row] = terminal.players;
+  const evidence = {
+    version: 1, matchId, rulesetVersion: terminal.rulesetVersion,
+    serverBuild: terminal.serverBuild, protocolVersion: 2,
+    authority: {
+      matchId, rulesetVersion: terminal.rulesetVersion,
+      statDefinitionVersion: terminal.statDefinitionVersion, rulesSnapshot: terminal.rulesSnapshot,
+      serverBuild: terminal.serverBuild, mapId: terminal.mapId, mapVersion: terminal.mapVersion,
+      region: terminal.region, mode: terminal.mode, startedAt: terminal.startedAt,
+    },
+    terminalSummary: {
+      status: terminal.status, endedAt: terminal.endedAt,
+      terminationReason: terminal.terminationReason, outcomeReason: terminal.outcomeReason,
+      winnerTeam: terminal.winnerTeam, invalidationReason: terminal.invalidationReason,
+      teamScores: terminal.teamScores, failureReason: null,
+    },
+    participants: [{ accountId, displayName: row.displayName, team: row.team, role: row.role }],
+    roundSummary: terminal.rounds,
+    combatSummary: [{ accountId, kills: row.kills, deaths: row.deaths, assists: row.assists,
+      suicides: row.suicides, teamKills: row.teamKills, headshots: row.headshots,
+      shotsFired: row.shotsFired, shotsHit: row.shotsHit, damageDealt: row.damageDealt,
+      plants: row.plants, defuses: row.defuses, roundsPlayed: row.roundsPlayed,
+      score: row.score, weapons: row.weapons }],
+    connectionSummary: [{ accountId, joinedAt: row.joinedAt, leftAt: row.leftAt,
+      timePlayedSec: row.timePlayedSec, disconnected: row.disconnected, abandoned: row.abandoned }],
+    objectives: [], eventTimeline: [], combatSamples: [],
+    combatSampling: { observed: 0, every: 16, retained: 0, killsAlwaysRetained: true },
+    droppedCombatSamples: 0, connectionFacts: [], droppedConnectionFacts: 0,
+    antiCheatFlags: [], droppedAntiCheatFlags: 0, droppedRows: 0,
+    roster: terminal.roster, result: structuredClone(terminal),
+  };
+  terminal.evidenceRef = `sha256:${evidenceDigest(evidence)}`;
+  const unknownNested = structuredClone(evidence); unknownNested.authority.apiToken = 'must-not-store';
+  const oversized = structuredClone(evidence); oversized.objectives = Array.from({ length: 4097 }, () => ({}));
+  const duplicate = structuredClone(evidence); duplicate.participants.push(structuredClone(duplicate.participants[0]));
+  const connectionA = { channel: 'connection', seq: 0, eventSeq: 2, kind: 'joined', tick: 0,
+    serverTimeMs: 0, accountId, entityId: 1, at: T0, reason: null };
+  const connectionB = { ...connectionA, seq: 1, eventSeq: 1 };
+  const outOfOrder = structuredClone(evidence);
+  outOfOrder.connectionFacts = [Object.fromEntries(Object.entries(connectionA).filter(([key]) => key !== 'channel')),
+    Object.fromEntries(Object.entries(connectionB).filter(([key]) => key !== 'channel'))];
+  outOfOrder.eventTimeline = [connectionA, connectionB];
+  expect(authoritativeEvidenceProblems(evidence).length === 0
+    && authoritativeEvidenceProblems(unknownNested).length > 0
+    && authoritativeEvidenceProblems(oversized).length > 0
+    && authoritativeEvidenceProblems(duplicate).length > 0
+    && authoritativeEvidenceProblems(outOfOrder).length > 0,
+  'closed evidence refuses unknown sensitive fields, oversize, duplicate accounts and out-of-order timelines');
+  let failure = null;
+  try {
+    await stats.applyMatchResult({ actor: { kind: 'service' }, result: terminal, evidence,
+      idempotencyKey: idempotencyKeyFor(matchId) });
+  } catch (error) { failure = error; }
+  const events = await base.outbox.claimUnpublished(100);
+  const career = await base.stats.listForAccount(accountId);
+  const idempotency = await base.idempotency.get(idempotencyKeyFor(matchId), 'service:match-result');
+  expect(failure?.message === 'injected evidence sink failure'
+      && await base.matches.byId(matchId) === null
+      && await base.matchEvidence.byMatchId(matchId) === null
+      && career.length === 0 && events.length === 0 && idempotency === null,
+  'an evidence insert failure rolls back match, career, evidence and both outbox events',
+  JSON.stringify({ failure: failure?.message, career: career.length, events: events.length }));
+  await base.close();
 }
 
 console.log('');

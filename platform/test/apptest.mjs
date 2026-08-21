@@ -60,7 +60,7 @@ async function withApp(fn, envOverrides = {}) {
   // pgtest was made against the memory adapter, which is the one configuration pgtest exists
   // to not test. An `envOverrides` key still wins, so a test that deliberately wants memory
   // can still ask for it explicitly.
-  const config = loadConfig({ ...process.env, PLATFORM_PORT: '0', ...envOverrides });
+  const config = loadConfig({ ...process.env, NODE_ENV: 'test', PLATFORM_PORT: '0', ...envOverrides });
   if (process.env.PLATFORM_STORAGE && !envOverrides.PLATFORM_STORAGE
       && config.storage !== process.env.PLATFORM_STORAGE) {
     throw new Error(`apptest: asked for ${process.env.PLATFORM_STORAGE}, built ${config.storage}`);
@@ -141,7 +141,7 @@ await withApp(async ({ app }) => {
 });
 
 // ── 2. the onboarding chain, end to end, over HTTP ─────────────────────────────────────
-await withApp(async ({ call }) => {
+await withApp(async ({ call, app }) => {
   section('onboarding chain over HTTP');
 
   // A CLIENT THAT HAS NEVER CONSENTED CAN CONSTRUCT A VALID PUT.
@@ -422,6 +422,69 @@ await withApp(async ({ call }) => {
     JSON.stringify(proper.body));
 });
 
+// ── 3e. sendBeacon unload ingress keeps identity and global metadata fail-closed ─────────
+await withApp(async ({ call, app }) => {
+  section('subject-bound telemetry unload ingress');
+  const sid = '01M0EFV571B7VBQCNXHAT5WTE9';
+  const { signup } = await onboard(call, { sid, email: 'unload@example.invalid' });
+  const token = signup.body?.accessToken;
+  const receipt = signup.body?.consentReceipt;
+  const credential = await call('POST', '/v1/telemetry/unload/credential', {},
+    { authorization: `Bearer ${token}` });
+  const setCookie = credential.headers.get('set-cookie') || '';
+  const cookie = setCookie.split(';')[0];
+  check(credential.status === 204 && /^os_tu=/.test(cookie) && /HttpOnly/i.test(setCookie)
+      && /SameSite=Strict/i.test(setCookie) && /Path=\/v1\/telemetry\/unload/i.test(setCookie),
+    'an authenticated call issues a narrow HttpOnly SameSite=Strict unload credential', setCookie);
+
+  const deliveryId = '01M0EFV571B7VBQCNXHAT5WTEA';
+  const body = {
+    schemaVersion: 1, deliveryId, correlationId: CORR, clientBuild: '1.0.0',
+    consentReceipt: receipt, accountId: 'forged-body-account',
+    events: [{
+      name: 'flow.step', version: 1, occurredAt: new Date().toISOString(),
+      correlationId: CORR, payload: { step: 'signup', outcome: 'completed', errorCode: null },
+    }],
+  };
+  const accepted = await call('POST', '/v1/telemetry/unload', body,
+    { cookie, 'x-client-build': '', 'x-correlation-id': '' });
+  check(accepted.status === 202 && accepted.body?.accepted === 1 && accepted.body?.duplicate === false,
+    'the unload route accepts an account-personal batch from the cookie subject without global headers',
+    accepted.text);
+  const duplicate = await call('POST', '/v1/telemetry/unload', body,
+    { cookie, 'x-client-build': '', 'x-correlation-id': '' });
+  check(duplicate.status === 202 && duplicate.body?.duplicate === true,
+    'a retried deliveryId is deduplicated before the sink', duplicate.text);
+
+  const rotated = await call('POST', '/v1/telemetry/unload/credential', {},
+    { authorization: `Bearer ${token}` });
+  const rotatedCookie = (rotated.headers.get('set-cookie') || '').split(';')[0];
+  const replaced = await call('POST', '/v1/telemetry/unload',
+    { ...body, deliveryId: '01M0EFV571B7VBQCNXHAT5WTEC' },
+    { cookie, 'x-client-build': '', 'x-correlation-id': '' });
+  check(replaced.status === 202 && replaced.body?.accepted === 0 && replaced.body?.rejected === 1,
+    'rotating the unload credential immediately invalidates the replaced cookie', replaced.text);
+
+  await app.deps.store.sessions.revoke(signup.body.session.sessionId,
+    'test-revoked', new Date().toISOString());
+  const revoked = await call('POST', '/v1/telemetry/unload',
+    { ...body, deliveryId: '01M0EFV571B7VBQCNXHAT5WTED' },
+    { cookie: rotatedCookie, 'x-client-build': '', 'x-correlation-id': '' });
+  check(revoked.status === 202 && revoked.body?.accepted === 0 && revoked.body?.rejected === 1,
+    'a still-signed unload cookie cannot outlive platform-session revocation', revoked.text);
+
+  const unbound = await call('POST', '/v1/telemetry/unload',
+    { ...body, deliveryId: '01M0EFV571B7VBQCNXHAT5WTEB' },
+    { 'x-client-build': '', 'x-correlation-id': '' });
+  check(unbound.status === 202 && unbound.body?.accepted === 0 && unbound.body?.rejected === 1,
+    'an account receipt without its subject credential fails closed', unbound.text);
+
+  const badMetadata = await call('POST', '/v1/telemetry/unload',
+    { ...body, deliveryId: 'not-a-ulid' }, { cookie, 'x-client-build': '', 'x-correlation-id': '' });
+  check(badMetadata.status === 400 && badMetadata.body?.error?.code === 'VALIDATION_FAILED',
+    'body metadata is revalidated rather than weakening the global invariant', badMetadata.text);
+});
+
 // ── 4. the relay drains the outbox ────────────────────────────────────────────────────
 await withApp(async ({ call, app }) => {
   section('outbox relay');
@@ -477,9 +540,9 @@ await withApp(async ({ call }) => {
     `${unauth.status} ${unauth.body?.error?.code}`);
 
   const real = await call('GET', '/v1/rooms');
-  check(real.status === 404,
+  check(real.status === 401 && real.body?.error?.code === 'AUTH_REQUIRED',
     'WITHOUT the header the platform behaves exactly as production does',
-    'a stub layer that answers unheadered requests is a stub layer serving real players');
+    `${real.status} ${real.body?.error?.code}; the live P2 route must answer, and auth must fail closed`);
 });
 
 // ── 4b. the address is STORED, and never projected ────────────────────────────────────
@@ -1153,8 +1216,11 @@ await withApp(async ({ call, app }) => {
     JSON.stringify(mine.body));
 
   // ── verification ──
-  check(signup.body?.profile?.emailVerifiedAt === null,
-    'control: a new account is unverified', JSON.stringify(signup.body?.profile?.emailVerifiedAt));
+  check(signup.body?.profile?.flags?.setupNextStep === 'verify'
+    && Object.keys(signup.body.profile).sort().join(',')
+      === 'accountId,consent,createdAt,displayName,flags,moderation,privacy',
+  'control: auth embeds the exact own-profile projection and routes a new account to verification',
+  JSON.stringify(signup.body?.profile));
   const anonResend = await call('POST', '/v1/onboarding/verify/resend', {});
   check(anonResend.status === 401 && anonResend.body?.error?.code === 'AUTH_REQUIRED',
     'POST /v1/onboarding/verify/resend requires a caller',
@@ -1187,6 +1253,10 @@ await withApp(async ({ call, app }) => {
   check(typeof row?.emailVerifiedAt === 'string',
     'and the account is now VERIFIED — the route changed state, not just its status code',
     JSON.stringify(row?.emailVerifiedAt));
+  const afterVerifyProfile = await call('GET', '/v1/profile/me', undefined,
+    { authorization: `Bearer ${token}` });
+  check(afterVerifyProfile.body?.flags?.setupNextStep === 'terms',
+    'the own-profile resume discriminator advances from verify to terms');
 
   // ── terms ──
   const terms = await call('GET', '/v1/onboarding/terms');
@@ -1212,6 +1282,21 @@ await withApp(async ({ call, app }) => {
   check(afterRow?.termsVersionAccepted === terms.body.version,
     'and the acceptance is recorded on the account',
     JSON.stringify(afterRow?.termsVersionAccepted));
+  const afterTermsProfile = await call('GET', '/v1/profile/me', undefined,
+    { authorization: `Bearer ${token}` });
+  check(afterTermsProfile.body?.flags?.setupNextStep === 'essential-settings',
+    'the resume discriminator advances to essential settings after terms');
+  const currentSettings = await call('GET', '/v1/profile/me/settings', undefined,
+    { authorization: `Bearer ${token}` });
+  const savedSettings = await call('PUT', '/v1/profile/me/settings', {
+    schemaVersion: currentSettings.body.schemaVersion, values: currentSettings.body.values,
+  }, { authorization: `Bearer ${token}`, 'if-match': currentSettings.headers.get('etag') });
+  const completeProfile = await call('GET', '/v1/profile/me', undefined,
+    { authorization: `Bearer ${token}` });
+  check(savedSettings.status === 200 && completeProfile.body?.flags?.setupNextStep === null,
+    'saving the essential roaming projection completes the server-owned onboarding discriminator',
+    JSON.stringify({ savedStatus: savedSettings.status, savedBody: savedSettings.body,
+      setupNextStep: completeProfile.body?.flags?.setupNextStep }));
 });
 
 // ── 8. the stub layer refuses to exist in production ──────────────────────────────────
@@ -1220,7 +1305,14 @@ await withApp(async ({ call, app }) => {
   const prodConfig = loadConfig({
     PLATFORM_PORT: '8299', NODE_ENV: 'production',
     PLATFORM_TOKEN_SECRET: 'a-sufficiently-long-production-secret-value',
+    PLATFORM_MATCH_TICKET_SECRET: 'a-separate-production-match-ticket-secret',
+    PLATFORM_MATCH_CONTROL_SECRET: 'a-separate-production-match-control-secret',
     PLATFORM_SERVICE_TOKEN: 'a-sufficiently-long-production-service-token',
+    PLATFORM_MATCH_SERVER_URL: 'wss://match.example.invalid',
+    PLATFORM_IDENTITY_PROVIDER: 'supabase', SUPABASE_URL: 'https://example.supabase.co',
+    SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+    PLATFORM_MAIL_TRANSPORT: 'resend', PLATFORM_MAIL_FROM: 'accounts@example.invalid',
+    PLATFORM_MAIL_API_KEY: 'test-resend-api-key',
   });
   const prod = await buildApp(prodConfig, { logger: silent() });
   check(!prod.mounted.includes('stubs') && prod.deps.stubs === undefined,
@@ -1229,6 +1321,8 @@ await withApp(async ({ call, app }) => {
   check(['events', 'auth', 'profile', 'telemetry'].every((m) => prod.mounted.includes(m)),
     'control: production still mounts every module it does require',
     JSON.stringify(prod.mounted));
+  check((await prod.deps.healthProbes.mail()).ok === true,
+    'production readiness includes configured recovery mail as a named dependency');
   prod.stop();
 }
 
@@ -1281,9 +1375,24 @@ await withApp(async ({ call, app }) => {
       encoding: 'utf8',
       env: {
         ...process.env,
+        // This subprocess proves module assembly, not identity migration. The outer pgtest
+        // database deliberately contains local-provider accounts created by earlier cases, so
+        // inheriting PLATFORM_STORAGE=postgres would correctly trip the production cutover
+        // guard before the copied module tree is examined.
+        PLATFORM_STORAGE: 'memory',
+        DATABASE_URL: '',
         PLATFORM_PORT: '0',
         PLATFORM_TOKEN_SECRET: 'a-sufficiently-long-production-secret-value',
+        PLATFORM_MATCH_TICKET_SECRET: 'a-separate-production-match-ticket-secret',
+        PLATFORM_MATCH_CONTROL_SECRET: 'a-separate-production-match-control-secret',
         PLATFORM_SERVICE_TOKEN: 'a-sufficiently-long-production-service-token',
+        PLATFORM_MATCH_SERVER_URL: 'wss://match.example.invalid',
+        PLATFORM_IDENTITY_PROVIDER: 'supabase',
+        SUPABASE_URL: 'https://example.supabase.co',
+        SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+        PLATFORM_MAIL_TRANSPORT: 'resend',
+        PLATFORM_MAIL_FROM: 'accounts@example.invalid',
+        PLATFORM_MAIL_API_KEY: 'test-resend-api-key',
         ...env,
       },
     });

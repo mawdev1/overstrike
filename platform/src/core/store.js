@@ -101,6 +101,7 @@ import { ApiError } from './errors.js';
  *
  * @property {object} outbox
  *   insert(event, tx) -> event         // MUST be callable inside tx
+ *   list(filter, tx) -> event[]        // read-only incident timeline lookup
  *   claimUnpublished(limit, tx) -> event[]
  *   markPublished(eventIds, at, tx) -> void
  *   recordFailure(eventId, error, tx) -> void
@@ -108,7 +109,7 @@ import { ApiError } from './errors.js';
  *
  * @property {object} audit
  *   insert(row, tx) -> row             // append-only; no update/delete exists on purpose
- *   list(filter, tx) -> row[]
+ *   list(filter, tx) -> row[]           // supports correlationId for incident reconstruction
  *
  * @property {object} idempotency
  *   acquire(key, actorId, tx) -> void   // serialise this key for the transaction
@@ -737,6 +738,37 @@ export function nestedResultProblems(result) {
         seen.add(id);
       }
     });
+  }
+  // §4.1 has two projections of the same participants: `roster` carries join/leave truth and
+  // `players` carries their terminal counters. They are not independent lists. Accepting a
+  // row in only one of them is especially dangerous because persistence derives
+  // `match_participants` from players, while the submitted roster is what the producer
+  // believes it finalised. A successful response would then read back a different roster.
+  // Compare by identity rather than array position: ordering is presentation, membership and
+  // team are authority.
+  if (Array.isArray(result.players) && Array.isArray(result.roster)) {
+    const players = new Map(result.players
+      .filter((entry) => isNonEmptyString(entry?.accountId))
+      .map((entry) => [entry.accountId, entry]));
+    const roster = new Map(result.roster
+      .filter((entry) => isNonEmptyString(entry?.accountId))
+      .map((entry) => [entry.accountId, entry]));
+    for (const [accountId, entry] of roster) {
+      const player = players.get(accountId);
+      if (!player) {
+        problems.push(at(`roster[${result.roster.indexOf(entry)}].accountId`,
+          'missing-player-row', { got: accountId }));
+      } else if (player.team !== entry.team) {
+        problems.push(at(`players[${result.players.indexOf(player)}].team`,
+          'roster-team-mismatch', { accountId, expected: entry.team, got: player.team ?? null }));
+      }
+    }
+    for (const [accountId, entry] of players) {
+      if (!roster.has(accountId)) {
+        problems.push(at(`players[${result.players.indexOf(entry)}].accountId`,
+          'missing-roster-entry', { got: accountId }));
+      }
+    }
   }
   if (Array.isArray(result.rounds)) {
     result.rounds.forEach((round, i) => roundProblems(round, `rounds[${i}]`, problems));

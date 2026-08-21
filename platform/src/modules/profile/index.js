@@ -59,7 +59,7 @@ function withHeaders(status, body, headers, correlationId) {
 }
 
 export function createProfileModule({
-  store, clock = Date, logger = console,
+  store, clock = Date, logger = console, config = null,
   // Presence has no column and sanctions have no store accessor yet (profile.js). They are
   // injected when a service for them exists rather than read from fields no schema declares.
   readPresence = null, readActiveSanctions = null,
@@ -76,7 +76,7 @@ export function createProfileModule({
   identity = null,
 }) {
   const profiles = createProfileService({
-    store, clock, readPresence, readActiveSanctions,
+    store, clock, readPresence, readActiveSanctions, termsVersion: config?.termsVersion ?? 1,
     changeDisplayName: identity?.changeDisplayName
       ? (args) => identity.changeDisplayName(args)
       : null,
@@ -101,7 +101,13 @@ export function createProfileModule({
     },
 
     async getPublicProfile(ctx) {
-      return profiles.getPublicProfile(ctx.params.accountId, actorId(ctx));
+      const projected = await profiles.getPublicProfile(ctx.params.accountId, actorId(ctx));
+      return projected.stats === null ? projected : {
+        ...projected,
+        // One exact §11.5 per-mode projection. The public profile does not invent a summary
+        // schema and does not return the definition marker as a misleading stand-in for stats.
+        stats: await stats.getCareer(ctx.params.accountId, 'tdm'),
+      };
     },
 
     async getSettings(ctx) {
@@ -208,16 +214,30 @@ export function createProfileModule({
       requireServiceCaller(ctx);
       const matchId = ctx.params.matchId;
       const body = ctx.body || {};
-      if (body.matchId !== undefined && body.matchId !== matchId) {
+      // AuthoritativeResultSubmissionV1 is an exact envelope. TerminalResult remains closed;
+      // evidence is separately digest-bound and retained in the same transaction. Historical
+      // imports call the service directly — accepting their flat shape over HTTP would leave a
+      // deployed authority path capable of committing an unresolvable evidenceRef.
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).sort().join(',') !== 'evidence,result'
+        || !body.result || typeof body.result !== 'object' || Array.isArray(body.result)
+        || !body.evidence || typeof body.evidence !== 'object' || Array.isArray(body.evidence)) {
+        throw new ApiError('VALIDATION_FAILED', 'Expected AuthoritativeResultSubmissionV1 { result, evidence }.', {
+          details: { fields: [{ key: 'body', reason: 'exact-authoritative-envelope' }] },
+        });
+      }
+      const submitted = body.result;
+      const evidence = body.evidence;
+      if (submitted.matchId !== undefined && submitted.matchId !== matchId) {
         throw new ApiError('VALIDATION_FAILED', 'The result names a different match than the path.', {
           details: { fields: [{ path: 'matchId', key: 'matchId', rule: 'path-mismatch',
-            reason: 'path-mismatch', expected: matchId, got: body.matchId }] },
+            reason: 'path-mismatch', expected: matchId, got: submitted.matchId }] },
         });
       }
       const header = ctx.headers?.['idempotency-key'];
       return stats.applyMatchResult({
         actor: { kind: 'service', id: 'match-server', role: 'service' },
-        result: { ...body, matchId },
+        result: { ...submitted, matchId }, evidence,
         idempotencyKey: typeof header === 'string' && header.trim() ? header.trim() : null,
         correlationId: ctx.correlationId,
       });

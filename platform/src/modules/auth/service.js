@@ -14,7 +14,9 @@
 import { ApiError } from '../../core/errors.js';
 import { ulid } from '../../core/ids.js';
 import { requireCapability } from '../events/rbac.js';
-import { emailHash, hashPassword, verifyPassword, opaqueToken } from './crypto.js';
+import { emailHash, opaqueToken } from './crypto.js';
+import { createLocalIdentityProvider } from './identity.js';
+import { nameChangeAvailableAt, setupNextStepForAccount } from '../profile/profile.js';
 import { normaliseDisplayName, assertCooldown } from './names.js';
 import { playerActor, correlationFor } from './events.js';
 import { internalise } from './faults.js';
@@ -44,9 +46,6 @@ export const RECOVERY_FLOOR_MS = 40;
  * account id is the other half of the lock identity and is supplied at the call site.
  */
 export const NAME_CHANGE_LOCK = 'account:display-name';
-
-/** A real hash to verify against when the account does not exist — see `signin`. */
-const DUMMY_PASSWORD_HASH = hashPassword(opaqueToken());
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -82,7 +81,7 @@ function requireString(value, path, { min = 1, max = 320 } = {}) {
 export function createAuthService(deps) {
   const {
     store, config, clock, logger, sessions, receipts, ephemeral, limiter, outbox, audit,
-    sleep = defaultSleep, mailer = null,
+    sleep = defaultSleep, mailer = null, identity = createLocalIdentityProvider(),
   } = deps;
   if (!outbox || !audit) throw new Error('auth/service: an outbox and an audit log are required');
   const iso = (ms) => new Date(ms).toISOString();
@@ -94,26 +93,31 @@ export function createAuthService(deps) {
    * half of it, which is all auth is entitled to assert. Consent is object-or-null and never
    * absent — `null` means undecided, which is not the same as a recorded "no".
    */
-  function projectProfile(account) {
+  async function projectProfile(account) {
+    const profile = await store.profiles?.byAccountId?.(account.accountId);
+    const projectedAccount = { ...account, roamingSettings: profile?.roamingSettings ?? null };
     return {
       accountId: account.accountId,
       displayName: account.displayName,
-      status: account.status,
-      roles: account.roles ?? ['player'],
       createdAt: account.createdAt,
-      emailVerifiedAt: account.emailVerifiedAt ?? null,
-      termsVersionAccepted: account.termsVersionAccepted ?? null,
-      eligibility: account.eligibilityVerdict == null ? null : {
-        verdict: account.eligibilityVerdict,
-        policyVersion: account.eligibilityPolicyVer,
-        decidedAt: account.eligibilityDecidedAt,
-      },
       consent: account.consentTelemetry == null ? null : {
         telemetryPersonal: account.consentTelemetry,
         policyVersion: account.consentPolicyVer,
         decidedAt: account.consentDecidedAt,
       },
-      privacy: account.privacy ?? {},
+      privacy: {
+        presenceVisibility: account.privacy?.presenceVisibility ?? 'everyone',
+        statsVisibility: account.privacy?.statsVisibility ?? 'everyone',
+      },
+      moderation: {
+        status: account.status === 'restricted' ? 'restricted'
+          : ['banned', 'deleted'].includes(account.status) ? 'banned' : 'clear',
+        activeSanctions: [],
+      },
+      flags: {
+        nameChangeAvailableAt: nameChangeAvailableAt(account, 30 * 24 * 3600e3),
+        setupNextStep: setupNextStepForAccount(projectedAccount, config.termsVersion),
+      },
     };
   }
 
@@ -429,16 +433,34 @@ export function createAuthService(deps) {
     const lookup = emailHash(config.tokenSecret, email);
     const now = clock.now();
 
-    // Hash BEFORE the uniqueness lookups.
+    // Ask the configured identity provider BEFORE the uniqueness lookups. For the local-test
+    // adapter this retains the KDF timing equalisation; in production Supabase is the only
+    // component that handles the password. The returned value is a provider reference, never
+    // a Supabase token. The legacy `password_hash` column stores that opaque reference when
+    // identity is delegated and a scrypt record only outside production.
     //
     // The email-collision check used to throw first, so a registered address answered in
     // 0.0 ms and a fresh one paid the 21.8 ms scrypt cost — a 21.7 ms gap that turns signup
     // into the account-enumeration oracle §8 forbids, exactly the one signin and recovery are
     // hardened against. The cost is that a refused signup still runs a KDF, which is the point.
-    const passwordHash = hashPassword(password);
     const accountId = ulid(now);
+    const credential = await identity.create({ email, password, accountId });
+    const cleanupIdentity = async () => {
+      try {
+        await identity.remove({ reference: credential.passwordHash,
+          subject: credential.identitySubject });
+      } catch (cleanupError) {
+        // Compensation is observable but never replaces the real signup outcome.
+        logger?.error?.('auth.identity.compensation_failed', {
+          accountId, provider: identity.kind, cause: String(cleanupError?.message || cleanupError),
+        });
+      }
+    };
 
-    if (await store.accounts.byNameFolded(folded)) throw new ApiError('NAME_TAKEN', 'That name is taken.');
+    if (await store.accounts.byNameFolded(folded)) {
+      await cleanupIdentity();
+      throw new ApiError('NAME_TAKEN', 'That name is taken.');
+    }
     // An existing address is reported as a name conflict would not be: signup cannot say
     // "that email is registered" without becoming the enumeration oracle §8 forbids, so it
     // returns the generic credential failure and the recovery flow is the way back in.
@@ -452,6 +474,7 @@ export function createAuthService(deps) {
     // to signup's own rules rather than to whichever adapter is mounted, and one of the two
     // must survive or §8's oracle opens.
     if (await store.accounts.byEmailHash(lookup)) {
+      await cleanupIdentity();
       throw new ApiError('AUTH_INVALID_CREDENTIALS', 'We could not complete that sign-up.');
     }
 
@@ -469,7 +492,10 @@ export function createAuthService(deps) {
     // the three columns or credentials move to the provider; both are contract decisions.
     const newActor = { ...playerActor(accountId), accountId, roles: ['player'] };
     const correlation = correlationFor(correlationId, now);
-    const { result } = await internalise(() => outbox.commit({ correlationId: correlation, actor: newActor }, async (tx, emit) => {
+    let committed = false;
+    let result;
+    try {
+      ({ result } = await internalise(() => outbox.commit({ correlationId: correlation, actor: newActor }, async (tx, emit) => {
       // §3a.1 says signup CONSUMES the receipt. It did not: the `n` nonce was minted, signed,
       // and never looked at again, so one age-gate pass created accounts without limit — three
       // on three client sessions in the reviewer's run. Recorded inside the transaction so a
@@ -484,7 +510,9 @@ export function createAuthService(deps) {
         // PERSONAL class (0019). Stored so this platform can address the mail it owes the
         // player; lookup and uniqueness still go through `emailHash`, never this.
         email,
-        passwordHash,
+        passwordHash: credential.passwordHash,
+        identityProvider: credential.identityProvider,
+        identitySubject: credential.identitySubject,
         displayName: name,
         displayNameFolded: folded,
         roles: ['player'],
@@ -534,8 +562,16 @@ export function createAuthService(deps) {
         correlationId: correlation,
       }, tx);
 
-      return { account, issued };
-    }));
+        return { account, issued };
+      })));
+      committed = true;
+    } finally {
+      // A provider user without a platform account cannot sign in and cannot be recovered.
+      // Compensate any failed database/outbox transaction instead of leaking that orphan.
+      if (!committed) {
+        await cleanupIdentity();
+      }
+    }
 
     const verificationToken = ephemeral.issue('verification', accountId, opaqueToken(), VERIFICATION_TTL_MS);
     await mailer?.sendVerification?.({ email, token: verificationToken, correlationId });
@@ -545,7 +581,7 @@ export function createAuthService(deps) {
       expiresAt: result.issued.expiresAt,
       refreshToken: result.issued.refreshToken,
       session: result.issued.session,
-      profile: projectProfile(result.account),
+      profile: await projectProfile(result.account),
       // Account-scoped, replacing the session-scoped one on subsequent telemetry batches.
       consentReceipt: accountConsentReceipt(result.account),
       verificationToken,      // returned to the caller of the service, never to the client
@@ -563,9 +599,12 @@ export function createAuthService(deps) {
     const account = await store.accounts.byEmailHash(lookup);
     // Verify against a real hash even when there is no account, so a nonexistent address does
     // not answer in a millisecond while a real one takes the full scrypt cost.
-    const ok = verifyPassword(password, account ? account.passwordHash : DUMMY_PASSWORD_HASH);
+    const ok = await identity.verify({
+      email, password, reference: account ? account.passwordHash : null,
+      subject: account?.identitySubject ?? null,
+    });
     if (!account || !ok) throw new ApiError('AUTH_INVALID_CREDENTIALS', 'That email or password is incorrect.');
-    if (account.status === 'banned' || account.status === 'restricted') {
+    if (account.status !== 'active') {
       throw new ApiError('AUTH_ACCOUNT_LOCKED', 'This account is locked.');
     }
 
@@ -595,7 +634,7 @@ export function createAuthService(deps) {
       expiresAt: issued.expiresAt,
       refreshToken: issued.refreshToken,
       session: issued.session,
-      profile: projectProfile(account),
+      profile: await projectProfile(account),
       // §3a.3: returned here too, or a returning player has no declared way to obtain one.
       consentReceipt: accountConsentReceipt(account),
     };
@@ -637,7 +676,7 @@ export function createAuthService(deps) {
     // the flow that actually changes a password was the unlimited one.
     limiter.enforceAuth({ ip, subject: null });
     requireString(newPassword, 'newPassword', { min: 10, max: 200 });
-    const claim = ephemeral.consume('recovery', token);
+    const claim = ephemeral.reserve('recovery', token);
     if (!claim.ok) {
       if (claim.reason === 'expired') {
         throw new ApiError('AUTH_RECOVERY_TOKEN_EXPIRED', 'That reset link expired. Start again.');
@@ -645,19 +684,37 @@ export function createAuthService(deps) {
       throw new ApiError('AUTH_RECOVERY_TOKEN_INVALID', 'That reset link is no longer valid. Start again.');
     }
     const account = await store.accounts.byId(claim.accountId);
-    if (!account) throw new ApiError('AUTH_RECOVERY_TOKEN_INVALID', 'That reset link is no longer valid. Start again.');
+    if (!account) {
+      claim.complete();
+      throw new ApiError('AUTH_RECOVERY_TOKEN_INVALID', 'That reset link is no longer valid. Start again.');
+    }
 
     // The account holder is the actor: proving control of the single-use token is the
     // authorization, and there is no session to derive an actor from.
     const actor = { ...playerActor(account.accountId, account.roles), accountId: account.accountId, roles: account.roles ?? ['player'] };
-    await updateAccount(actor, 'account.recovery_complete', {
-      passwordHash: hashPassword(newPassword), updatedAt: iso(clock.now()),
-    }, {
-      summaryKeys: ['status', 'updatedAt'], reasonCode: 'account_recovery', correlationId, capability: null,
-    });
-    ephemeral.invalidateAll('recovery', account.accountId);
-    await sessions.revokeAll({ accountId: account.accountId, reason: 'recovery-completed', correlationId });
-    return { accountId: account.accountId };
+    try {
+      const replacement = await identity.replace({
+        password: newPassword, reference: account.passwordHash,
+        subject: account.identitySubject, email: account.email,
+      });
+      await updateAccount(actor, 'account.recovery_complete', {
+        passwordHash: replacement.passwordHash,
+        identityProvider: replacement.identityProvider,
+        identitySubject: replacement.identitySubject,
+        updatedAt: iso(clock.now()),
+      }, {
+        summaryKeys: ['status', 'updatedAt'], reasonCode: 'account_recovery', correlationId, capability: null,
+      });
+      await sessions.revokeAll({ accountId: account.accountId, reason: 'recovery-completed', correlationId });
+      claim.complete();
+      return { accountId: account.accountId };
+    } catch (error) {
+      // Provider replacement precedes the local commit. It cannot be rolled back without the
+      // old password, so keep the exclusive token retryable: the operation is an idempotent
+      // resumable saga, not a half-completed reset with a permanently spent link.
+      claim.release();
+      throw error;
+    }
   }
 
   // ------------------------------------------------------------------------- verification

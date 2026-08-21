@@ -201,6 +201,12 @@ async function testOutboxAtomicity(store, tag) {
     (await store.accounts.byId(acct.accountId)) !== null
       && unpublished.some((e) => e.eventId === event.eventId),
     'the committed pair is not both present');
+  const byCorrelation = await store.outbox.list({ correlationId: event.correlationId });
+  const absentCorrelation = await store.outbox.list({ correlationId: ulid() });
+  check('incident lookup reads only events with the exact correlation id',
+    byCorrelation.length === 1 && byCorrelation[0].eventId === event.eventId
+      && absentCorrelation.length === 0,
+    JSON.stringify({ found: byCorrelation.map((row) => row.eventId), absent: absentCorrelation.length }));
 
   // The case the pattern exists for: the state change fails after the event was queued. If the
   // outbox were written outside the transaction, consumers would be told about an account that
@@ -261,6 +267,7 @@ async function testAuditAppendOnly(store, tag) {
     beforeSummary: { status: 'active' }, afterSummary: { status: 'restricted' },
     correlationId: ulid(),
   });
+  const exactCorrelation = row.correlationId;
 
   for (const method of ['update', 'delete', 'remove', 'patch', 'purge']) {
     check(`audit exposes no ${method}()`, typeof store.audit[method] === 'undefined',
@@ -287,6 +294,9 @@ async function testAuditAppendOnly(store, tag) {
       && reread[0].action === 'account.restrict'
       && reread[0].afterSummary.status === 'restricted',
     JSON.stringify(reread[0]));
+  check('incident lookup reads only audit rows with the exact correlation id',
+    (await store.audit.list({ correlationId: exactCorrelation })).some((item) => item.auditId === row.auditId)
+      && (await store.audit.list({ correlationId: ulid() })).length === 0);
 
   // reason_code is NOT NULL: an unexplained privileged action is a defect, not a row.
   await throwsCode('an audit row without a reason code is refused', 'VALIDATION_FAILED',
@@ -1902,8 +1912,22 @@ async function testHandles(store, tag) {
 async function testKeyCollisions(store, tag) {
   console.log(`\n[${tag}] declared keys and foreign keys`);
 
+  const readinessBefore = await store.accounts.identityReadiness();
+  const providerReady = { ...newAccount(), passwordHash: null, identityProvider: 'supabase',
+    identitySubject: `provider_${ulid()}` };
+  await store.accounts.create(providerReady);
+  const readinessAfterProvider = await store.accounts.identityReadiness();
+  check('a Supabase-bound account with no local hash is identity-ready',
+    readinessAfterProvider.unreadyAccounts === readinessBefore.unreadyAccounts,
+    JSON.stringify({ readinessBefore, readinessAfterProvider }));
+
   const acct = newAccount();
   await store.accounts.create(acct);
+  const readinessAfterLegacy = await store.accounts.identityReadiness();
+  check('control: a live account without a provider subject blocks identity readiness',
+    readinessAfterLegacy.ok === false
+      && readinessAfterLegacy.unreadyAccounts === readinessBefore.unreadyAccounts + 1,
+    JSON.stringify({ readinessBefore, readinessAfterLegacy }));
 
   await throwsCode('an account id that already exists is CONFLICT', 'CONFLICT',
     () => store.accounts.create({ ...newAccount(), accountId: acct.accountId }));
@@ -2213,6 +2237,127 @@ async function runSuite(store, tag) {
   await testKeyCollisions(store, tag);
   await testSharedRules(store, tag);
   await testConformance(store, tag);
+  await testP2Persistence(store, tag);
+  await testDurableMatchTickets(store, tag);
+  await testMatchServerRegistry(store, tag);
+}
+
+async function testDurableMatchTickets(store, tag) {
+  console.log(`\n[${tag}] durable match-ticket single use`);
+  const account = newAccount(); await store.accounts.create(account);
+  const roomId = ulid(); const matchId = ulid(); const jti = ulid();
+  await store.rooms.upsert({ roomId, ownerAccountId: account.accountId, name: 'Ticket Room', region: 'iad',
+    mapId: 'the-square', mapVersion: '1.0.0', mode: 'tdm', rulesetVersion: 'tdm-1.0.0',
+    build: '1.0.0', capacity: 2, status: 'in-progress', settings: {}, passwordHash: null,
+    destroyedAt: null, destroyedReason: null });
+  await store.matches.record({ matchId, roomId, region: 'iad', mapId: 'the-square', mapVersion: '1.0.0',
+    mode: 'tdm', status: 'allocated', rulesSnapshot: {}, players: [{ accountId: account.accountId,
+      team: 'alpha', joinedAt: iso() }] });
+  await store.matchTickets.put({ jti, accountId: account.accountId, roomId, matchId,
+    expiresAt: iso(60_000), createdAt: iso() });
+  const claims = { accountId: account.accountId, roomId, matchId };
+  const concurrent = await Promise.all([store.matchTickets.consume(jti, claims, iso()),
+    store.matchTickets.consume(jti, claims, iso())]);
+  check('concurrent ticket consume has exactly one winner', concurrent.filter(Boolean).length === 1,
+    JSON.stringify(concurrent));
+  check('a fresh verifier/process cannot replay the durably consumed jti',
+    await store.matchTickets.consume(jti, claims, iso()) === null);
+  const wrongJti = ulid(); await store.matchTickets.put({ jti: wrongJti, accountId: account.accountId,
+    roomId, matchId, expiresAt: iso(60_000), createdAt: iso() });
+  check('claim mismatch fails without consuming the ticket',
+    await store.matchTickets.consume(wrongJti, { ...claims, roomId: ulid() }, iso()) === null
+      && Boolean(await store.matchTickets.consume(wrongJti, claims, iso())));
+  const recentlyExpiredJti = ulid();
+  await store.matchTickets.put({ jti: recentlyExpiredJti, accountId: account.accountId, roomId, matchId,
+    expiresAt: iso(-23 * 60 * 60 * 1_000), createdAt: iso(-24 * 60 * 60 * 1_000) });
+  const oldUnconsumedJti = ulid();
+  await store.matchTickets.put({ jti: oldUnconsumedJti, accountId: account.accountId, roomId, matchId,
+    expiresAt: iso(-25 * 60 * 60 * 1_000), createdAt: iso(-26 * 60 * 60 * 1_000) });
+  const consumedJti = ulid();
+  await store.matchTickets.put({ jti: consumedJti, accountId: account.accountId, roomId, matchId,
+    expiresAt: iso(60 * 60 * 1_000), createdAt: iso() });
+  await store.matchTickets.consume(consumedJti, claims, iso());
+  const firstPurge = await store.matchTickets.purgeExpired(iso());
+  check('unconsumed ticket receipt is retained until expiry plus 24 hours',
+    Boolean(await store.matchTickets.byJti(recentlyExpiredJti)));
+  check('unconsumed ticket receipt is purged after expiry plus 24 hours',
+    firstPurge >= 1 && await store.matchTickets.byJti(oldUnconsumedJti) == null);
+  await store.matchTickets.purgeExpired(iso(24 * 60 * 60 * 1_000));
+  check('consumed ticket receipt is retained before expiry plus 24 hours',
+    Boolean(await store.matchTickets.byJti(consumedJti)));
+  await store.matchTickets.purgeExpired(iso(26 * 60 * 60 * 1_000));
+  check('consumed ticket receipt is purged after expiry plus 24 hours',
+    await store.matchTickets.byJti(consumedJti) == null);
+}
+
+async function testMatchServerRegistry(store, tag) {
+  console.log(`\n[${tag}] P2 match-server registry allocation parity`);
+  const stamp = iso();
+  const rows = [
+    ['iad-a', 'iad', 'wss://iad-a.example.invalid'],
+    ['iad-b', 'iad', 'wss://iad-b.example.invalid'],
+    ['ord-a', 'ord', 'wss://ord-a.example.invalid'],
+    ['yyz-a', 'yyz', 'wss://yyz-a.example.invalid'],
+  ].map(([suffix, region, address]) => ({ serverId: `${tag}-${suffix}-${ulid()}`, region,
+    address, capacity: 12, inUse: 0, status: 'healthy', build: '1.0.0', lastHeartbeatAt: stamp }));
+  for (const row of rows) await store.matchServers.register(row);
+  const [iad1, iad2] = await Promise.all([
+    store.matchServers.reserve('iad', iso(-1000)), store.matchServers.reserve('iad', iso(-1000)),
+  ]);
+  check('two same-region concurrent reservations select distinct capacity',
+    iad1 && iad2 && iad1.serverId !== iad2.serverId, JSON.stringify([iad1, iad2]));
+  check('a third reservation cannot oversubscribe two single-match authorities',
+    await store.matchServers.reserve('iad', iso(-1000)) === null, 'capacity was oversubscribed');
+  const first = rows.find((row) => row.serverId === iad1.serverId);
+  await store.matchServers.register({ ...first, inUse: 0, status: 'healthy', lastHeartbeatAt: iso() });
+  await store.matchServers.heartbeat(first.serverId,
+    { capacity: 12, inUse: 0, status: 'healthy', lastHeartbeatAt: iso() });
+  check('restart registration and a stale low heartbeat cannot erase an active reservation',
+    (await store.matchServers.byId(first.serverId)).inUse === 12, 'in_use fell below its platform lease');
+  await store.matchServers.release(first.serverId);
+  check('explicit release makes the restarted authority eligible again',
+    (await store.matchServers.reserve('iad', iso(-1000)))?.serverId === first.serverId);
+  const ord = rows[2];
+  await store.matchServers.heartbeat(ord.serverId,
+    { capacity: 12, inUse: 0, status: 'draining', lastHeartbeatAt: iso() });
+  check('draining regional capacity is excluded',
+    await store.matchServers.reserve('ord', iso(-1000)) === null);
+  await store.matchServers.heartbeat(ord.serverId,
+    { capacity: 12, inUse: 0, status: 'healthy', lastHeartbeatAt: iso() });
+  check('an undrained heartbeat restores its own region only',
+    (await store.matchServers.reserve('ord', iso(-1000)))?.serverId === ord.serverId
+      && (await store.matchServers.reserve('yyz', iso(-1000)))?.serverId === rows[3].serverId);
+  for (const row of rows) await store.matchServers.release(row.serverId);
+}
+
+async function testP2Persistence(store, tag) {
+  console.log(`\n[${tag}] P2 room/report persistence parity`);
+  const owner = newAccount(); const subject = newAccount();
+  await store.accounts.create(owner); await store.accounts.create(subject);
+  const roomId = ulid();
+  await store.rooms.upsert({
+    roomId, ownerAccountId: owner.accountId, name: 'Persisted Square', region: 'yyz',
+    mapId: 'the-square', mapVersion: '1.0.0', mode: 'bomb', rulesetVersion: 'bomb-1.0.0',
+    build: '1.0.0', capacity: 6, status: 'open', settings: { requiredReady: 2 },
+    passwordHash: null, destroyedAt: null, destroyedReason: null,
+  });
+  await store.roomMembers.upsert({ roomId, accountId: owner.accountId, displayName: owner.displayName,
+    team: 'alpha', ready: false, isOwner: true, connection: 'connected', disconnectedAt: null,
+    estimatedRttMs: null, loadout: { primaryIdx: 0, secondaryIdx: 0 }, joinedAt: iso(), leftAt: null });
+  check('control: a persisted room/member round-trips',
+    (await store.rooms.byId(roomId))?.name === 'Persisted Square'
+      && (await store.roomMembers.listForRoom(roomId)).length === 1,
+    'room or member was not persisted');
+  await store.roomMembers.remove(roomId, owner.accountId, iso());
+  check('a durable leave cannot resurrect on hydration',
+    (await store.roomMembers.listForRoom(roomId)).length === 0, 'left_at remained null');
+
+  const report = { reportId: ulid(), reporterAccountId: owner.accountId,
+    subjectAccountId: subject.accountId, matchId: null, category: 'griefing', description: null };
+  await expectOk('control: the first no-match report is stored', () => store.reports.create(report));
+  await throwsCode('a duplicate no-match report is REPORT_DUPLICATE', 'REPORT_DUPLICATE',
+    () => store.reports.create({ ...report, reportId: ulid() }));
+  await store.rooms.remove(roomId);
 }
 
 // ---------------------------------------------------------------------------------------

@@ -29,6 +29,7 @@ import { buildApp } from '../src/app.js';
 import { ulid } from '../src/core/ids.js';
 import { OUTCOME_REASONS, MATCH_STATUS_TRANSITIONS } from '../src/core/store.js';
 import { REGISTRY } from '../src/modules/telemetry/registry.js';
+import { evidenceDigest } from '../src/shared/evidenceDigest.js';
 
 let failures = 0;
 const ok = (name) => console.log(`  ok   ${name}`);
@@ -199,6 +200,39 @@ function bombResult(matchId, alpha, bravo, over = {}) {
     evidenceRef: `evidence/${matchId}`,
     ...over,
   };
+}
+
+function authoritativeEnvelope(input) {
+  const result = structuredClone(input);
+  delete result.evidenceRef;
+  const players = Array.isArray(result.players) ? result.players : [];
+  const evidence = {
+    version: 1, matchId: result.matchId, rulesetVersion: result.rulesetVersion,
+    serverBuild: result.serverBuild, protocolVersion: 2,
+    authority: { matchId: result.matchId, rulesetVersion: result.rulesetVersion,
+      statDefinitionVersion: result.statDefinitionVersion, rulesSnapshot: result.rulesSnapshot,
+      serverBuild: result.serverBuild, mapId: result.mapId, mapVersion: result.mapVersion,
+      region: result.region, mode: result.mode, startedAt: result.startedAt },
+    terminalSummary: { status: result.status, endedAt: result.endedAt,
+      terminationReason: result.terminationReason, outcomeReason: result.outcomeReason,
+      winnerTeam: result.winnerTeam, invalidationReason: result.invalidationReason,
+      teamScores: result.teamScores, failureReason: null },
+    participants: players.map(({ accountId, displayName, team, role }) => ({ accountId, displayName, team, role })),
+    roundSummary: result.rounds || [],
+    combatSummary: players.map(({ accountId, kills, deaths, assists, suicides, teamKills,
+      headshots, shotsFired, shotsHit, damageDealt, plants, defuses, roundsPlayed, score, weapons }) => ({
+      accountId, kills, deaths, assists, suicides, teamKills, headshots, shotsFired, shotsHit,
+      damageDealt, plants, defuses, roundsPlayed, score, weapons })),
+    connectionSummary: players.map(({ accountId, joinedAt, leftAt, timePlayedSec,
+      disconnected, abandoned }) => ({ accountId, joinedAt, leftAt, timePlayedSec, disconnected, abandoned })),
+    objectives: [], eventTimeline: [], combatSamples: [],
+    combatSampling: { observed: 0, every: 16, retained: 0, killsAlwaysRetained: true },
+    droppedCombatSamples: 0, connectionFacts: [], droppedConnectionFacts: 0,
+    antiCheatFlags: [], droppedAntiCheatFlags: 0, droppedRows: 0,
+    roster: result.roster || [], result: structuredClone(result),
+  };
+  result.evidenceRef = `sha256:${evidenceDigest(evidence)}`;
+  return { result, evidence };
 }
 
 const allocation = (matchId, mode = 'bomb') => ({
@@ -437,7 +471,7 @@ await withApp(async ({ call }) => {
 
   const id = ulid();
   const refused = await call('POST', `/v1/matches/${id}/result`,
-    bombResult(id, alpha, bravo, { winnerTeam: 'draw', outcomeReason: 'elimination' }),
+    authoritativeEnvelope(bombResult(id, alpha, bravo, { winnerTeam: 'draw', outcomeReason: 'elimination' })),
     { ...asService, 'idempotency-key': `match-result:${id}` });
   expect(refused.status === 400 && refused.code === 'VALIDATION_FAILED',
     'a drawn match ended by elimination is refused',
@@ -445,7 +479,7 @@ await withApp(async ({ call }) => {
 
   const id2 = ulid();
   const accepted = await call('POST', `/v1/matches/${id2}/result`,
-    bombResult(id2, alpha, bravo, { winnerTeam: 'draw', outcomeReason: 'timer' }),
+    authoritativeEnvelope(bombResult(id2, alpha, bravo, { winnerTeam: 'draw', outcomeReason: 'timer' })),
     { ...asService, 'idempotency-key': `match-result:${id2}` });
   expect(accepted.status === 200 && accepted.body?.applied === true,
     'a drawn match ended by the timer is accepted (the control)',
@@ -508,8 +542,8 @@ await withApp(async ({ call }) => {
 
   const id = ulid();
   const pending = await call('POST', `/v1/matches/${id}/result`,
-    { matchId: id, status: 'pending', mode: 'bomb', mapId: 'the-square', mapVersion: '1.0.0',
-      startedAt: T0, endedAt: null, retryAfterMs: 2000 },
+    { result: { matchId: id, status: 'pending', mode: 'bomb', mapId: 'the-square', mapVersion: '1.0.0',
+      startedAt: T0, endedAt: null, retryAfterMs: 2000 }, evidence: {} },
     { ...asService, 'idempotency-key': `match-result:${id}` });
   expect(pending.status === 400 && pending.code === 'VALIDATION_FAILED',
     'a `pending` body is refused by the submission endpoint',
@@ -519,7 +553,7 @@ await withApp(async ({ call }) => {
   const withResponseOnly = bombResult(id2, alpha, bravo);
   withResponseOnly.correlationId = ulid();
   withResponseOnly.retryAfterMs = 2000;
-  const refused = await call('POST', `/v1/matches/${id2}/result`, withResponseOnly,
+  const refused = await call('POST', `/v1/matches/${id2}/result`, authoritativeEnvelope(withResponseOnly),
     { ...asService, 'idempotency-key': `match-result:${id2}` });
   expect(refused.status === 400 && refused.code === 'VALIDATION_FAILED',
     'a submission carrying the response-only `correlationId`/`retryAfterMs` is refused',
@@ -529,7 +563,7 @@ await withApp(async ({ call }) => {
     'the refusal names both offending keys', JSON.stringify(paths));
 
   const id3 = ulid();
-  const accepted = await call('POST', `/v1/matches/${id3}/result`, bombResult(id3, alpha, bravo),
+  const accepted = await call('POST', `/v1/matches/${id3}/result`, authoritativeEnvelope(bombResult(id3, alpha, bravo)),
     { ...asService, 'idempotency-key': `match-result:${id3}` });
   expect(accepted.status === 200 && accepted.body?.applied === true,
     'the identical submission without those keys is accepted (the control)',
@@ -558,7 +592,7 @@ await withApp(async ({ call }) => {
     if (p.status !== 200) throw new Error(`could not publish career: ${p.text}`);
   }
   const id = ulid();
-  const res = await call('POST', `/v1/matches/${id}/result`, bombResult(id, alpha, bravo),
+  const res = await call('POST', `/v1/matches/${id}/result`, authoritativeEnvelope(bombResult(id, alpha, bravo)),
     { ...asService, 'idempotency-key': `match-result:${id}` });
   if (res.status !== 200) throw new Error(`submission failed: ${res.text}`);
 
@@ -659,23 +693,23 @@ await withApp(async ({ call }) => {
 
   const first = ulid();
   const submitted = await call('POST', `/v1/matches/${first}/result`,
-    bombResult(first, alpha, bravo, {
+    authoritativeEnvelope(bombResult(first, alpha, bravo, {
       status: 'invalidated', terminationReason: 'invalidated',
       outcomeReason: 'no-contest', winnerTeam: null, invalidationReason: 'cheat-detected',
-    }), { ...asService, 'idempotency-key': `match-result:${first}` });
+    })), { ...asService, 'idempotency-key': `match-result:${first}` });
   expect(submitted.status === 200 && submitted.body?.status === 'invalidated',
     'a match may be submitted as invalidated at its first and only terminal write',
     `${submitted.status} ${submitted.text}`);
 
   const second = ulid();
-  const done = await call('POST', `/v1/matches/${second}/result`, bombResult(second, alpha, bravo),
+  const done = await call('POST', `/v1/matches/${second}/result`, authoritativeEnvelope(bombResult(second, alpha, bravo)),
     { ...asService, 'idempotency-key': `match-result:${second}` });
   if (done.status !== 200) throw new Error(`setup failed: ${done.text}`);
   const after = await call('POST', `/v1/matches/${second}/result`,
-    bombResult(second, alpha, bravo, {
+    authoritativeEnvelope(bombResult(second, alpha, bravo, {
       status: 'invalidated', terminationReason: 'invalidated',
       outcomeReason: 'no-contest', winnerTeam: null, invalidationReason: 'admin-review',
-    }), { ...asService, 'idempotency-key': `match-result:${second}` });
+    })), { ...asService, 'idempotency-key': `match-result:${second}` });
   expect(after.status === 409 && after.code === 'CONFLICT',
     'a COMPLETED match cannot be invalidated afterwards — there is no append-only command yet',
     `${after.status} ${after.code} ${after.text}`);
@@ -709,9 +743,9 @@ await withApp(async ({ call }) => {
 
   const forfeitId = ulid();
   const f = await call('POST', `/v1/matches/${forfeitId}/result`,
-    bombResult(forfeitId, alpha, bravo, {
+    authoritativeEnvelope(bombResult(forfeitId, alpha, bravo, {
       status: 'aborted', terminationReason: 'aborted', outcomeReason: 'forfeit', winnerTeam: 'alpha',
-    }), { ...asService, 'idempotency-key': `match-result:${forfeitId}` });
+    })), { ...asService, 'idempotency-key': `match-result:${forfeitId}` });
   if (f.status !== 200) throw new Error(`forfeit submission failed: ${f.text}`);
   const afterForfeit = await totals(alpha);
   expect(afterForfeit.matches === before.matches + 1 && afterForfeit.wins === before.wins + 1,
@@ -720,9 +754,9 @@ await withApp(async ({ call }) => {
 
   const ncId = ulid();
   await call('POST', `/v1/matches/${ncId}/result`,
-    bombResult(ncId, alpha, bravo, {
+    authoritativeEnvelope(bombResult(ncId, alpha, bravo, {
       status: 'aborted', terminationReason: 'aborted', outcomeReason: 'no-contest', winnerTeam: null,
-    }), { ...asService, 'idempotency-key': `match-result:${ncId}` });
+    })), { ...asService, 'idempotency-key': `match-result:${ncId}` });
   const afterNc = await totals(alpha);
   expect(afterNc.matches === afterForfeit.matches && afterNc.kills === afterForfeit.kills,
     'a no-contest is recorded and does NOT aggregate',
@@ -730,10 +764,10 @@ await withApp(async ({ call }) => {
 
   const invId = ulid();
   const inv = await call('POST', `/v1/matches/${invId}/result`,
-    bombResult(invId, alpha, bravo, {
+    authoritativeEnvelope(bombResult(invId, alpha, bravo, {
       status: 'invalidated', terminationReason: 'invalidated', outcomeReason: 'no-contest',
       winnerTeam: null, invalidationReason: 'cheat-detected',
-    }), { ...asService, 'idempotency-key': `match-result:${invId}` });
+    })), { ...asService, 'idempotency-key': `match-result:${invId}` });
   const afterInv = await totals(alpha);
   expect(afterInv.matches === afterNc.matches && afterInv.kills === afterNc.kills,
     'an invalidated match is recorded and does NOT aggregate',

@@ -32,7 +32,7 @@ import * as fx from './fixtures.js';
 const T0 = EPOCH_MS;
 const TICK_MS = 50;
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /**
  * §5.1.0a: policy version 1, derived per phase and never frozen at handoff.
@@ -42,11 +42,12 @@ export const PROTOCOL_VERSION = 2;
  * team chat is the cheat the rule exists to stop.
  */
 export function spectatorPolicyFor(phase, alive) {
-  const relaxed = phase === 'roundEnd' || phase === 'matchEnd' || phase === 'warmup' || phase === 'freeze';
+  const decided = phase === 'roundEnd' || phase === 'matchEnd';
+  const chatOpen = decided || phase === 'warmup' || phase === 'freeze';
   return {
     canSpectateEnemies: false,
-    canFreeCam: relaxed,
-    canUseTeamChat: relaxed ? true : alive,
+    canFreeCam: decided,
+    canUseTeamChat: chatOpen ? true : alive,
   };
 }
 

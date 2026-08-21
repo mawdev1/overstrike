@@ -84,7 +84,7 @@ const unknownRoom = { method: 'GET', path: '/v1/rooms/01JSTUBGONEROOM00000000000
 const join = (password = null) => ({ method: 'POST', path: `/v1/rooms/${ROOM}/join`, body: { password, preferredTeam: 'auto' } });
 const setTeam = (team) => ({ method: 'POST', path: `/v1/rooms/${ROOM}/team`, body: { team } });
 const setReady = (ready) => ({ method: 'POST', path: `/v1/rooms/${ROOM}/ready`, body: { ready } });
-const setLoadout = { method: 'POST', path: `/v1/rooms/${ROOM}/loadout`, body: { primaryIdx: 2, secondaryIdx: 1 } };
+const setLoadout = { method: 'POST', path: `/v1/rooms/${ROOM}/loadout`, body: { primaryIdx: 1, secondaryIdx: 0 } };
 const lobbyTicket = { method: 'POST', path: `/v1/rooms/${ROOM}/reconnect-ticket`, body: {} };
 
 /**

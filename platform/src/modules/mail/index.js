@@ -56,7 +56,7 @@ const TEXT = {
       // auth.md §6: recovery must not confirm whether an address has an account. The MESSAGE is
       // only ever sent to a real one, so it may speak plainly — it is the HTTP response that
       // stays identical either way.
-      'This code expires in one hour. If it was not you, nothing has changed and you can ignore',
+      'This code expires in 30 minutes. If it was not you, nothing has changed and you can ignore',
       'this message.',
     ].join('\n'),
   }),
@@ -74,11 +74,9 @@ async function sendViaResend({ apiKey, apiUrl, from, to, subject, text, fetchImp
     body: JSON.stringify({ from, to: [to], subject, text }),
   });
   if (!res.ok) {
-    // The provider's body usually says WHY (unverified sending domain, bad key). Carry it into
-    // the log: "mail failed" without the reason costs an hour every time.
-    let detail = '';
-    try { detail = (await res.text()).slice(0, 300); } catch { /* body already consumed or empty */ }
-    throw new Error(`resend responded ${res.status}: ${detail}`);
+    // Never copy an upstream body into logs. Providers and proxies sometimes echo request
+    // headers in diagnostics; an error body can therefore contain the bearer API key.
+    throw new Error(`resend responded ${res.status}`);
   }
   let id = null;
   try { id = (await res.json())?.id ?? null; } catch { /* a 2xx without a JSON body is still sent */ }
@@ -97,6 +95,9 @@ export function createMailer({ config = {}, logger = null, fetchImpl = globalThi
       'PLATFORM_MAIL_TRANSPORT=log writes verification and recovery TOKENS to the log, and those '
       + 'tokens are credentials. Refusing to start in production. Use `resend` with '
       + 'PLATFORM_MAIL_API_KEY, or `none` to disable mail deliberately.');
+  }
+  if (transport === 'none' && config.env === 'production') {
+    throw new Error('PLATFORM_MAIL_TRANSPORT=resend is required in production');
   }
   if (transport === 'resend' && !config.mailApiKey) {
     throw new Error('PLATFORM_MAIL_TRANSPORT=resend requires PLATFORM_MAIL_API_KEY');
@@ -159,6 +160,13 @@ export function createMailer({ config = {}, logger = null, fetchImpl = globalThi
      * when everything except one email still works.
      */
     describe: () => ({ transport, from: config.mailFrom || null, hasKey: Boolean(config.mailApiKey) }),
+    // Configuration readiness, not deliverability. The first deployment still requires an
+    // external canary to prove the API key and sending domain; a readiness request must not
+    // send mail or call a billable provider endpoint.
+    health: async () => ({
+      ok: transport === 'resend' && Boolean(config.mailFrom) && Boolean(config.mailApiKey),
+      detail: transport === 'resend' ? 'resend-configured' : 'disabled',
+    }),
   };
 }
 

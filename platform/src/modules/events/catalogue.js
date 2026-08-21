@@ -14,7 +14,7 @@
 export const ACTOR_KINDS = ['player', 'service', 'admin', 'agent', 'system'];
 
 /** §2: the closed set of subject kinds. Ordering (§3) is keyed on (kind, id). */
-export const SUBJECT_KINDS = ['match', 'account', 'room', 'item', 'campaign', 'session'];
+export const SUBJECT_KINDS = ['match', 'account', 'room', 'item', 'campaign', 'session', 'chat-message'];
 
 export const PRIVACY_CLASSES = ['public', 'internal', 'personal', 'sensitive'];
 export const RETENTION_CLASSES = ['short', 'standard', 'audit', 'financial'];
@@ -55,6 +55,7 @@ export const CATALOGUE = new Map([
   def('objective.planted',      [1], ['service'],          ['match'],   'public',    'standard'),
   def('objective.defused',      [1], ['service'],          ['match'],   'public',    'standard'),
   def('report.submitted',       [1], ['player'],           ['account'], 'sensitive', 'audit'),
+  def('chat.removed',           [1], ['service', 'admin'], ['chat-message'], 'sensitive', 'audit'),
   def('sanction.applied',       [1], ['admin'],            ['account'], 'sensitive', 'audit'),
   def('sanction.lifted',        [1], ['admin'],            ['account'], 'sensitive', 'audit'),
   def('admin.action.executed',  [1], ['admin'],            ANY_SUBJECT, 'sensitive', 'audit'),

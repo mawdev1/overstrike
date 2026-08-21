@@ -636,7 +636,16 @@ section('core/config.js — the loader refuses what it cannot use');
   const PROD = {
     NODE_ENV: 'production',
     PLATFORM_TOKEN_SECRET: 'a-sufficiently-long-production-secret-value',
+    PLATFORM_MATCH_TICKET_SECRET: 'a-separate-production-match-ticket-secret',
+    PLATFORM_MATCH_CONTROL_SECRET: 'a-separate-production-match-control-secret',
     PLATFORM_SERVICE_TOKEN: 'a-sufficiently-long-production-service-token',
+    PLATFORM_MATCH_SERVER_URL: 'wss://match.example.invalid',
+    PLATFORM_IDENTITY_PROVIDER: 'supabase',
+    SUPABASE_URL: 'https://example.supabase.co',
+    SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+    PLATFORM_MAIL_TRANSPORT: 'resend',
+    PLATFORM_MAIL_FROM: 'accounts@example.invalid',
+    PLATFORM_MAIL_API_KEY: 'test-resend-api-key',
   };
 
   // ── :36 — the secrets are required in PRODUCTION, and only there ──
@@ -667,6 +676,16 @@ section('core/config.js — the loader refuses what it cannot use');
     && prod.serviceToken === PROD.PLATFORM_SERVICE_TOKEN,
   'CONTROL: production with both secrets loads and carries them',
   JSON.stringify({ env: prod.env, secret: typeof prod.tokenSecret }));
+  const badAlertScheme = caught(() => loadConfig({ ...PROD,
+    PLATFORM_ALERT_WEBHOOK_URL: 'http://alerts.example.invalid/route' }));
+  const badAlertUrl = caught(() => loadConfig({ ...PROD,
+    PLATFORM_ALERT_WEBHOOK_URL: 'not-a-url' }));
+  const goodAlert = loadConfig({ ...PROD,
+    PLATFORM_ALERT_WEBHOOK_URL: 'https://alerts.example.invalid/secret-route' });
+  check(/must use https/.test(badAlertScheme?.message || '')
+    && /must be an absolute URL/.test(badAlertUrl?.message || '')
+    && goodAlert.alertWebhookUrl.startsWith('https://'),
+  'production alert routing accepts only an absolute HTTPS webhook');
 
   // CONTROL 2: outside production the same absence is fine, and is filled with a value nobody
   // could mistake for a real one. Without this control the check above passes for a loader that

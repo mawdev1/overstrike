@@ -248,9 +248,21 @@ function seed(store) {
  * constructions used to omit it, which meant the suite's default configuration was the one
  * configuration the contract does not permit.
  */
-const moduleWith = (store, extra = {}) => createProfileModule({
-  store, logger: silent, outbox: createOutbox({ store, logger: null }), ...extra,
-});
+const moduleWith = (store, extra = {}) => {
+  const mod = createProfileModule({
+    store, logger: silent, outbox: createOutbox({ store, logger: null }), ...extra,
+  });
+  // Most service-level fixtures predate the HTTP header. Keep them explicit about the same
+  // derived key without obscuring the raw boundary proof below.
+  const raw = mod.stats.applyMatchResult;
+  mod.stats.applyMatchResultRaw = raw;
+  mod.stats.applyMatchResult = (args) => raw({
+    ...args,
+    idempotencyKey: args?.idempotencyKey
+      ?? (args?.result?.matchId ? idempotencyKeyFor(args.result.matchId) : null),
+  });
+  return mod;
+};
 
 const ctxFor = (accountId, extra = {}) => ({
   actor: accountId ? { kind: 'user', accountId } : null,
@@ -291,6 +303,8 @@ console.log('\nRoaming settings — If-Match, scope, and range');
   const initial = await mod.settings.read(ACCOUNT);
   expect(initial.version === 1 && initial.values.fov === 85,
     'unset settings read as version 1 at inventory defaults', JSON.stringify(initial.values.fov));
+  expect(typeof initial.updatedAt === 'string' && !Number.isNaN(Date.parse(initial.updatedAt)),
+    'unset settings still expose the contract-required stable updatedAt instant');
 
   // If-Match is required. CONFLICT (409), never 428 — http-api.md §3a.4.
   const missing = await expectCode(
@@ -1547,6 +1561,10 @@ console.log('\nmatch-result.md §5 — a retry applies once');
   expect(store._idem.size === 1 && [...store._idem.values()][0].key === idempotencyKeyFor('IDEM1'),
     '§5.2: the key is derived from the matchId, so a retry is inherently the same key',
     JSON.stringify([...store._idem.values()].map((r) => r.key)));
+  const idemRow = [...store._idem.values()][0];
+  expect(Date.parse(idemRow.expiresAt) - Date.parse(idemRow.createdAt) === 24 * 3600e3,
+    'http-api.md §8: a gameplay idempotency row is retained for exactly 24 hours',
+    `${idemRow.createdAt} -> ${idemRow.expiresAt}`);
 
   // §8.1: submit the identical payload ten times concurrently.
   await Promise.all(Array.from({ length: 10 },
@@ -1571,6 +1589,20 @@ console.log('\nmatch-result.md §5 — a retry applies once');
   await expectCode(() => mod.stats.applyMatchResult({
     actor: service, result, idempotencyKey: 'whatever-i-like',
   }), 'VALIDATION_FAILED', 'an Idempotency-Key that is not match-result:<matchId> is refused');
+
+  const missing = await expectCode(() => mod.stats.applyMatchResultRaw({ actor: service, result }),
+    'VALIDATION_FAILED', 'the service boundary refuses an omitted Idempotency-Key');
+  expect(missing?.details?.fields?.[0]?.reason === 'required',
+    'the omitted-key refusal names the required invariant', JSON.stringify(missing?.details));
+
+  await expectCode(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: { ...result, roster: result.roster.map((entry) => ({ ...entry, team: 'bravo' })) },
+  }), 'VALIDATION_FAILED', 'a roster team that contradicts its player row is refused');
+  await expectCode(() => mod.stats.applyMatchResult({
+    actor: service,
+    result: { ...result, roster: [] },
+  }), 'VALIDATION_FAILED', 'a player without a one-to-one roster entry is refused');
 
   // CONTROL: a different match still applies, so the deduplication is per match and not a
   // service that has simply stopped accepting results.
