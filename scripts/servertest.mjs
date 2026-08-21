@@ -23,14 +23,26 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 8191;
+/**
+ * Per-process port, for the same reason `wstest.mjs` derives one.
+ *
+ * This was a fixed 8191. Two of these running at once — two agents, or a `ci` chain beside an
+ * interactive run — bind the same port, and the loser fails with EADDRINUSE while the winner
+ * quietly serves BOTH sets of assertions from one process, inflating its client and health
+ * counts. It presented as an intermittent `npm run ci` exit 1 in which every step passed when
+ * run on its own, which is the worst shape a failure can take: it teaches people to re-run
+ * rather than to look.
+ *
+ * Same arithmetic as wstest, offset so the two harnesses cannot land on each other.
+ */
+const PORT = 42000 + ((process.pid * 13) % 20000);
 const ROUND = 30;                 // seconds — long enough for real combat, short enough to test
 
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const health = async () => (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+const health = async () => (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
 const debug = async () => (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
 /** Total rounds that have LANDED, across every attacker/target pair. */
 const totalHits = (d) => (d.debug?.damage ?? []).reduce((a, r) => a + (r.hits || 0), 0);

@@ -26,17 +26,47 @@
  *
  *   node scripts/mapbalance.mjs                 full report, spawn thresholds enforced
  *   node scripts/mapbalance.mjs --spawn-only    skip the geometry sections
+ *   node scripts/mapbalance.mjs --geom-only     skip the 33 headless spawn matches
  *   node scripts/mapbalance.mjs --baseline      zero the P3.A2 scoring terms, for a
  *                                               before/after delta (see BASELINE below)
  *   node scripts/mapbalance.mjs --degrade=los|death|hostile|stick
  *                                               deliberately break one part of the real
  *                                               scorer, to prove a threshold can fail
+ *   node scripts/mapbalance.mjs --degrade=cover|open|arena|sites-adjacent [--strict]
+ *                                               deliberately break the GEOMETRY, to prove
+ *                                               a sightline threshold can fail
+ *
+ * ── P3 exit criterion 4: sightlines (map-data.md §7.0/§7.1) ──────────────────────────
+ *
+ * The sightline section below is a rewrite, and it measures three things the contract
+ * names: the length distribution over close/medium/long bands read out of the weapon
+ * table, the §7.0 48 m hard ceiling, and "no single uncontested angle covering both
+ * sites" made operational. It reports both The Square and the MERIDIAN fixture (§9).
+ *
+ * A §7 envelope breach on The Square is [CX]'s geometry work and prints as PENDING, the
+ * same treatment `navtest.mjs` §7.1 gives route timings. `--strict` makes it fatal, which
+ * is how each threshold below was proven failable:
+ *
+ *   threshold                        restored      degraded
+ *   ──────────────────────────────── ───────────── ────────────────────────────────────
+ *   bands all ≥ 5% of rays           long 4.6% ✗   arena: 30.7/23.9/45.4, all pass ✓
+ *                                    meridian ✓    (the long band separates 4.6 / 9.2 /
+ *                                                   45.4 — see the section comment for
+ *                                                   what close and medium cannot do)
+ *   longest ≤ 48 m (§7.0 hard)       72.6 m ✗      arena: 117.9 m ✗
+ *   no uncontested dual-site angle   0 positions ✓ sites-adjacent: 105 positions ✗
+ *
+ * The dual-site row is the one that matters and it moves cleanly: zero on the map as
+ * authored, 105 when site B is moved onto walkable ground 8 m from site A, back to zero
+ * when the degradation is removed.
  */
 import * as THREE from 'three';
 import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
 import { SPAWN_WEIGHTS, SPAWN_POLICY } from '../src/game/spawner.js';
 import { MODES } from '../src/game/modes.js';
+import { WEAPONS } from '../src/weapons/weaponDefs.js';
+import { DEFAULTS } from '../src/core/settings.js';
 
 const ARGV = process.argv.slice(2);
 const flag = (k) => ARGV.includes(`--${k}`);
@@ -47,17 +77,182 @@ const opt = (k, d = null) => {
 const SPAWN_ONLY = flag('spawn-only');
 const BASELINE = flag('baseline');
 const DEGRADE = opt('degrade', '');
+const STRICT = flag('strict');
+const GEOM_ONLY = flag('geom-only');
+/** `navGrid.js` F_WALKABLE. Used by the sightline sampler and by the site degradation. */
+const F_WALKABLE_BIT = 1;
 
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const note = (n) => console.log(`  --   ${n}`);
+/**
+ * A §7 envelope number outside its band on The Square is [CX]'s geometry work, tracked as
+ * REQ-CX-008 — the same PENDING treatment `navtest.mjs` §7.1 and `maptest.mjs`'s §3
+ * manifest guard already give it, and for the same reason: failing here would either block
+ * every backend commit behind another lane's map edit or get the band widened until
+ * nothing could trip it. `--strict` makes them fatal, and is how each one is proven
+ * failable without leaving a live gate on somebody else's file.
+ */
+const pendingEnvelope = (n, d) => {
+  if (STRICT) { failures++; console.log(`  FAIL ${n}\n       ${d}`); return; }
+  console.log(`  PENDING  ${n}: ${d} — REQ-CX-008 (geometry, [CX]).`);
+};
+
+/**
+ * `--degrade=cover` — delete the map's cover volumes and re-run every geometry section
+ * against the result.
+ *
+ * A cover volume is identified by shape, not by a tag the level does not carry: a box
+ * standing ON the ground whose top is between waist and just over head height, with a
+ * footprint small enough to walk around. That is a crate, a planter, a barrier, a
+ * market stall counter — and not a building, a floor or a wall, which are taller, and not
+ * a kerb, which is lower.
+ *
+ * The spatial hash is rebuilt from the survivors; the nav graph is deliberately NOT
+ * re-baked. Holding the standpoint set fixed is what makes the before/after comparable —
+ * re-baking changes which positions are sampled at the same time as it changes what they
+ * can see, and the first run of this degradation moved the numbers the WRONG WAY for
+ * exactly that reason: removing crates deleted the nodes standing on top of them, taking
+ * the map's elevated long views out of the sample and making the map look tighter after
+ * its cover was removed. The cost of holding the graph fixed is that a handful of
+ * standpoints now float where a crate used to be, which lengthens sightlines slightly —
+ * in the same direction as the degradation, so it cannot manufacture a pass.
+ */
+function stripCover(g) {
+  const world = g.world;
+  const before = world.boxes.length;
+  world.boxes = world.boxes.filter((b) => {
+    const top = b.max.y - b.min.y;
+    const foot = Math.max(b.max.x - b.min.x, b.max.z - b.min.z);
+    const standsOnGround = b.min.y <= 0.6;
+    const waistToHead = b.max.y >= 0.6 && b.max.y <= 2.0;
+    return !(standsOnGround && waistToHead && foot <= 6 && top <= 2.0);
+  });
+  world.build();
+  return before - world.boxes.length;
+}
+
+/**
+ * `--degrade=open` — every collider deleted except the ones that reach above head height.
+ *
+ * The map with all of its mid-height obstruction taken away and its buildings left standing.
+ * Harsher than `cover` and aimed squarely at the band-representation floor: with nothing
+ * below 2.4 m to break a line, the close band has to collapse. Same fixed-nav-graph
+ * discipline as `stripCover`, for the same reason.
+ */
+function stripLowGeometry(g) {
+  const world = g.world;
+  const before = world.boxes.length;
+  world.boxes = world.boxes.filter((b) => b.max.y > 2.4);
+  world.build();
+  return before - world.boxes.length;
+}
+
+/**
+ * `--degrade=arena` — everything but the floor and the competitive boundary deleted.
+ *
+ * The map as an empty box. This is the degradation the band-representation floor is proven
+ * against, because `cover` and `open` cannot trip it: The Square's occlusion comes almost
+ * entirely from buildings, so deleting its 25 cover volumes or all 42 of its sub-head-height
+ * colliders moves the close band by three points and nothing crosses a threshold. That is a
+ * finding about the map, not a reason to keep quiet — a floor that only ever fires on
+ * geometry nobody would author is a weak floor, and it is recorded as such in the header.
+ *
+ * "Boundary" is identified by position, not by a tag the compiled boxes do not carry: a box
+ * that reaches the edge of the declared bounds on any axis. That is the §5 removable layer
+ * plus the outermost walls, which is exactly what has to stay for the rays to terminate.
+ */
+function stripToArena(g) {
+  const world = g.world;
+  const bounds = world.manifest?.bounds ?? world.bounds;
+  const EDGE = 2.0;
+  const before = world.boxes.length;
+  world.boxes = world.boxes.filter((b) => {
+    if (b.max.y <= 0.2) return true;                                    // the ground itself
+    return b.min.x <= bounds.min.x + EDGE || b.max.x >= bounds.max.x - EDGE
+      || b.min.z <= bounds.min.z + EDGE || b.max.z >= bounds.max.z - EDGE;
+  });
+  world.build();
+  return before - world.boxes.length;
+}
+
+/**
+ * `--degrade=sites-adjacent` — move site B's plant volume alongside site A's.
+ *
+ * The specific map defect the "no single uncontested angle covering both sites" row exists
+ * to catch: two objectives placed so close together that holding one position holds both.
+ * It edits `world.manifest.objectives`, the same normalised manifest the Bomb ruleset, the
+ * bots and the HUD read, so it is the defect a map author would actually ship.
+ */
+function sitesAdjacent(g) {
+  const objectives = g.world.manifest?.objectives;
+  if (!Array.isArray(objectives) || objectives.length === 0) return 'no objective volumes to move';
+  const a = objectives.find((o) => o.kind === 'plant' && o.site === 'A');
+  const b = objectives.find((o) => o.kind === 'plant' && o.site === 'B');
+  if (!a || !b) return 'this map does not declare a plant volume for both A and B';
+
+  // The destination is chosen from the NAV GRAPH, not by arithmetic on site A's corner. A
+  // hand-computed offset landed the volume six metres inside a wall, where it contained no
+  // standable ground — and the harness correctly refused to measure coverage against an
+  // empty target set, which meant the degradation proved nothing. A degradation has to
+  // produce a map that is wrong in the intended way, not one that is broken in another.
+  const nav = g.nav;
+  const MAXL = nav.maxLayers;
+  const cx = (a.box.min.x + a.box.max.x) / 2;
+  const cy = a.box.min.y;
+  const cz = (a.box.min.z + a.box.max.z) / 2;
+  let bestX = null, bestZ = null, bestY = 0, bestScore = Infinity;
+  for (let node = 0; node < nav.nodeCount; node++) {
+    if (!(nav.flags[node] & F_WALKABLE_BIT) || !nav.reachable[node]) continue;
+    const col = (node / MAXL) | 0;
+    const x = nav.cellCenterX(col), z = nav.cellCenterZ(col), y = nav.floorY[node];
+    if (Math.abs(y - cy) > 0.6) continue;
+    const d = Math.hypot(x - cx, z - cz);
+    if (d < 6 || d > 10) continue;
+    // Deterministic: the candidate closest to 8 m, ties broken by coordinate order.
+    const score = Math.abs(d - 8) * 1000 + x * 0.001 + z * 0.000001;
+    if (score < bestScore) { bestScore = score; bestX = x; bestZ = z; bestY = y; }
+  }
+  if (bestX === null) return 'no standable ground 6-10 m from site A — nothing to move site B onto';
+  const dx = b.box.max.x - b.box.min.x;
+  const dz = b.box.max.z - b.box.min.z;
+  const dy = b.box.max.y - b.box.min.y;
+  b.box.min.set(bestX - dx / 2, bestY, bestZ - dz / 2);
+  b.box.max.set(bestX + dx / 2, bestY + dy, bestZ + dz / 2);
+  return `site B's plant volume moved onto walkable ground at (${bestX.toFixed(1)}, ${bestY.toFixed(2)}, ${bestZ.toFixed(1)}), `
+    + `${Math.hypot(bestX - cx, bestZ - cz).toFixed(1)} m from site A`;
+}
 
 const game = new Game({ headless: true });
 await game.initHeadless({ presenter: new NullPresenter() });
 const w = game.world;
 const nav = game.nav;
 const EYE = 1.62;
+
+/**
+ * Geometry degradations, applied to the real world before a single ray is cast. Each one
+ * exists to prove one sightline threshold can fail; the header records what each measured.
+ */
+const GEOM_DEGRADES = new Set(['cover', 'open', 'arena', 'sites-adjacent']);
+function degradeGeometry(g, label) {
+  if (DEGRADE === 'cover') {
+    const removed = stripCover(g);
+    if (removed === 0) bad(`--degrade=cover removed something from ${label}`, 'no box matched the cover shape — the degradation is a no-op and would prove nothing');
+    else note(`DEGRADED ${label}: ${removed} cover volumes deleted (nav graph held fixed)`);
+  } else if (DEGRADE === 'open') {
+    const removed = stripLowGeometry(g);
+    if (removed === 0) bad(`--degrade=open removed something from ${label}`, 'no box was below head height — the degradation is a no-op');
+    else note(`DEGRADED ${label}: ${removed} colliders below 2.4 m deleted (nav graph held fixed)`);
+  } else if (DEGRADE === 'arena') {
+    const removed = stripToArena(g);
+    if (removed === 0) bad(`--degrade=arena removed something from ${label}`, 'every collider touched the bounds — the degradation is a no-op');
+    else note(`DEGRADED ${label}: ${removed} interior colliders deleted, floor and boundary kept (nav graph held fixed)`);
+  } else if (DEGRADE === 'sites-adjacent') {
+    note(`DEGRADED ${label}: ${sitesAdjacent(g)}`);
+  }
+}
+if (GEOM_DEGRADES.has(DEGRADE)) degradeGeometry(game, 'the-square');
 
 console.log(`\nmap balance (${w.boxes.length} colliders, ${w.spawnPoints.length} spawns)`);
 
@@ -231,28 +426,298 @@ if (!SPAWN_ONLY) {
   else note(`the contested centre favours one team by ${centreSecs.toFixed(2)} s (${worstName}) — target is under 0.45 s`);
 }
 
-// ── sightlines ───────────────────────────────────────────────────────────────────────
-if (!SPAWN_ONLY) {
+// ── sightlines — map-data.md §7.0 ceiling and §7.1 distribution ───────────────────────
+//
+// The version of this section that shipped first sampled a 2 m lattice at y = 1.62 and
+// cast 16 flat rays from each point. Two things were wrong with it, and both flattered
+// the map:
+//
+//   - it sampled a PLANE, not the playspace. Every point was at eye height above y = 0,
+//     so the upper walk and the signal bridge — the two levels a §7.0 "3 usable levels"
+//     map is supposed to have — contributed nothing, and points floating inside the first
+//     floor contributed rays no player could ever take. The standpoints below come from
+//     the baked nav graph: walkable, reachable, at their real floor height, on every level;
+//   - it capped rays at 90 m and compared against 55 m. §7.0's ceiling is 48 m and it is
+//     called a HARD ceiling. 55 m was not the contract's number.
+//
+// ── what counts as close, medium and long ───────────────────────────────────────────
+//
+// Not taste, and not round numbers. The bands are read out of the weapon table, because a
+// sightline is only "long" relative to what a player is holding. Two named reference
+// weapons define the edges:
+//
+//   close  ≤ smg_kestrel.falloffStart   the roster's baseline SMG ("the safe pick",
+//                                       weaponDefs.js) is still at full damage, so no
+//                                       class has a range advantage;
+//   medium ≤ ar_vector.falloffStart     the roster's baseline AR ("5.56 workhorse. No
+//                                       weakness, no gimmick") is still at full damage;
+//   long   > that                       past the workhorse AR's falloff — a marksman's
+//                                       band, and the one §7.0 caps at 48 m.
+//
+// Both ids are asserted present rather than read optimistically: if the roster is
+// re-authored and either disappears, this section fails instead of silently bucketing
+// against `undefined`.
+//
+// "All represented" is ≥ REPRESENTED_MIN of rays in each band. The floor is 5%, calibrated
+// against the retained comparison fixture rather than picked: MERIDIAN's thinnest band is
+// 9.2%, and half of the only shipped map this repository has is a defensible "this band is
+// a curiosity rather than a way the map is played".
+//
+// WHAT THIS FLOOR CAN AND CANNOT SEPARATE — stated, because two thirds of it is weak.
+//
+// Measured across every configuration tried:
+//
+//                                 close    medium    long
+//   the-square as shipped         79.9%     15.5%    4.6%   ← long breaches the floor
+//   the-square --degrade=cover    80.2%     15.3%    4.5%
+//   the-square --degrade=open     76.8%     18.4%    4.8%
+//   the-square --degrade=arena    30.7%     23.9%   45.4%
+//   meridian as shipped           74.7%     16.1%    9.2%
+//   meridian --degrade=arena      26.3%     22.4%   51.3%
+//
+// The LONG band discriminates: it separates The Square (4.6%) from MERIDIAN (9.2%) from an
+// empty arena (45.4%), and it fires on The Square as authored.
+//
+// The CLOSE and MEDIUM bands do NOT. Close never fell below 26% and medium never below
+// 14.9% — not with every cover volume deleted, not with every collider below head height
+// deleted, and not with the entire interior of the map deleted. Rays are cast from
+// standing positions that are mostly near something, so short rays are unavoidable. Those
+// two assertions are therefore tripwires against a pathological map, not guards that have
+// ever been observed to fire, and they are reported as such instead of being presented as
+// evidence the map passed something.
+//
+// One consequence of the bands worth naming: §7.0 caps sightlines at 48 m and the long
+// band starts at 34 m, so a fully compliant map has only a 14 m window in which to be
+// "long". The Square's 4.6% is 0.4 points under the floor — a real signal, but a marginal
+// one, and the two numbers should be read together rather than the verdict alone.
+//
+// ── "no single uncontested angle covering both sites" ───────────────────────────────
+//
+// Made operational, because as prose it cannot pass or fail. A standpoint p (a walkable,
+// reachable nav node, at eye height) is an UNCONTESTED DUAL-SITE ANGLE when all four hold:
+//
+//   1. p has clear line of sight (`world.losClear`, the same query a bullet uses) to a
+//      standable point inside site A's plant volume, at most SIGHT_CEILING metres away;
+//   2. the same for site B;
+//   3. p is EXPOSED to at most EXPOSURE_MAX of the playspace — the share of sampled
+//      standpoints with clear line of sight to p. This is what "uncontested" means: a spot
+//      that watches both sites and that almost nowhere can shoot back at. A spot that
+//      watches both sites from the middle of the plaza is a strong angle, not a broken
+//      one, because it can be traded.
+//
+// Threshold: zero such standpoints. The distance cap in 1–2 is §7.0's own 48 m ceiling —
+// past it the angle is already a §7.0 breach and is counted there, not laundered into
+// this row as well.
+//
+// A FOURTH condition was tried and REMOVED, and it is worth recording because it made the
+// row unfailable. It required the two view directions to be within one screen width of
+// each other (a horizontal FOV derived from `DEFAULTS.fov` at 16:9, ≈117°) on the reasoning
+// that "one angle" means both sites are visible at once. On any map whose sites are on
+// opposite sides — which is every Bomb map — a position between them sees them roughly
+// 180° apart, so the condition zeroed the count by construction and no degradation could
+// move it. It was also wrong on its own terms: turning is free in an FPS, and a spot you
+// can flick between two sites from is exactly the problem the row names. The angular
+// separation is now REPORTED as data and constrains nothing.
+//
+// A map that declares no objective volumes (MERIDIAN, retained as a fixture by §9) is
+// reported ABSENT for this row. It is NOT reported as a pass: `[].every()` is `true`, and
+// a vacuous pass on the fixture is exactly how this row would stop guarding anything.
+const SIGHT_CEILING = 48;                       // §7.0, hard
+const REPRESENTED_MIN = 0.05;
+const EXPOSURE_MAX = 0.05;
+const AZIMUTHS = 24;
+/** Horizontal FOV from the game's own default vertical FOV at 16:9. */
+const HFOV = 2 * Math.atan(Math.tan((DEFAULTS.fov * Math.PI / 180) / 2) * (16 / 9)) * 180 / Math.PI;
+
+/** Walkable, reachable standing eyes on every level of the baked graph. */
+function standEyes(nav) {
+  const MAXL = nav.maxLayers;
+  const out = [];
+  for (let node = 0; node < nav.nodeCount; node++) {
+    if (!(nav.flags[node] & F_WALKABLE_BIT) || !nav.reachable[node]) continue;
+    const col = (node / MAXL) | 0;
+    out.push(new THREE.Vector3(nav.cellCenterX(col), nav.floorY[node] + EYE, nav.cellCenterZ(col)));
+  }
+  return out;
+}
+
+function sightlines(label, world, nav, manifest) {
+  console.log(`\n  sightlines — ${label}`);
+  const eyes = standEyes(nav);
+  if (eyes.length < 200) {
+    bad(`${label}: the nav graph offers standing positions to measure from`,
+      `${eyes.length} walkable reachable nodes — every distribution below would be computed over almost nothing`);
+    return;
+  }
+
+  const kestrel = WEAPONS.smg_kestrel;
+  const vector = WEAPONS.ar_vector;
+  if (!kestrel || !vector || !Number.isFinite(kestrel.falloffStart) || !Number.isFinite(vector.falloffStart)) {
+    bad(`${label}: the sightline bands come from the weapon table`,
+      'smg_kestrel / ar_vector falloffStart is missing — the close/medium/long boundaries cannot be derived');
+    return;
+  }
+  const CLOSE_MAX = kestrel.falloffStart;
+  const MED_MAX = vector.falloffStart;
+
+  // The map diagonal, so an unobstructed ray reports its real length instead of a cap that
+  // would quietly become the maximum sightline.
+  const span = manifest.bounds.max.clone().sub(manifest.bounds.min);
+  const REACH = Math.ceil(Math.hypot(span.x, span.z)) + 1;
+
   const o = new THREE.Vector3(), d = new THREE.Vector3();
   const lens = [];
-  for (let x = -38; x <= 38; x += 2) {
-    for (let z = -38; z <= 38; z += 2) {
-      if (w.pointInSolid(x, EYE, z)) continue;
-      for (let i = 0; i < 16; i++) {
-        const a = (i / 16) * Math.PI * 2;
-        o.set(x, EYE, z);
-        d.set(Math.cos(a), 0, Math.sin(a));
-        const hit = w.raycast(o, d, 90);
-        lens.push(hit ? hit.distance : 90);
-      }
+  let escaped = 0;
+  for (const e of eyes) {
+    for (let i = 0; i < AZIMUTHS; i++) {
+      const a = (i / AZIMUTHS) * Math.PI * 2;
+      o.copy(e);
+      d.set(Math.cos(a), 0, Math.sin(a));
+      const hit = world.raycast(o, d, REACH);
+      if (!hit) { escaped++; lens.push(REACH); continue; }
+      lens.push(hit.distance);
     }
   }
   lens.sort((p, q) => p - q);
-  const pct = (f) => lens[Math.floor(lens.length * f)];
-  const over55 = lens.filter((v) => v > 55).length / lens.length * 100;
-  console.log(`\n  sightlines (${lens.length} rays): median ${pct(0.5).toFixed(1)} m, p90 ${pct(0.9).toFixed(1)}, p99 ${pct(0.99).toFixed(1)}, max ${lens[lens.length - 1].toFixed(1)}`);
-  if (over55 < 1) ok(`${(100 - over55).toFixed(2)}% of sightlines are under 55 m`);
-  else note(`${over55.toFixed(2)}% of sightlines exceed 55 m — a rifle can hold those lanes`);
+  const pct = (f) => lens[Math.min(lens.length - 1, Math.floor(lens.length * f))];
+  const close = lens.filter((v) => v <= CLOSE_MAX).length;
+  const med = lens.filter((v) => v > CLOSE_MAX && v <= MED_MAX).length;
+  const long = lens.length - close - med;
+  const share = (n) => n / lens.length;
+
+  console.log(`     ${eyes.length} standing positions × ${AZIMUTHS} azimuths = ${lens.length} rays, reach ${REACH} m`);
+  console.log(`     length: median ${pct(0.5).toFixed(1)} m · p90 ${pct(0.9).toFixed(1)} · p99 ${pct(0.99).toFixed(1)} · max ${lens[lens.length - 1].toFixed(1)}`);
+  console.log(`     bands:  close ≤${CLOSE_MAX} m ${(share(close) * 100).toFixed(1)}%`
+    + ` · medium ≤${MED_MAX} m ${(share(med) * 100).toFixed(1)}%`
+    + ` · long >${MED_MAX} m ${(share(long) * 100).toFixed(1)}%`);
+  if (escaped > 0) {
+    note(`${label}: ${escaped} rays left the map without hitting anything — they are counted at the ${REACH} m reach`);
+  }
+
+  const bands = [['close', close], ['medium', med], ['long', long]];
+  const missing = bands.filter(([, n]) => share(n) < REPRESENTED_MIN);
+  if (missing.length === 0) {
+    ok(`${label}: close, medium and long are all represented (each ≥ ${(REPRESENTED_MIN * 100).toFixed(0)}% of rays)`);
+  } else {
+    pendingEnvelope(`${label}: close, medium and long are all represented`,
+      `${missing.map(([n, c]) => `${n} ${(share(c) * 100).toFixed(1)}%`).join(', ')} — under the ${(REPRESENTED_MIN * 100).toFixed(0)}% floor`);
+  }
+
+  const longest = lens[lens.length - 1];
+  if (longest <= SIGHT_CEILING) ok(`${label}: the longest sightline is ${longest.toFixed(1)} m (§7.0 hard ceiling ${SIGHT_CEILING} m)`);
+  else {
+    const over = lens.filter((v) => v > SIGHT_CEILING).length;
+    pendingEnvelope(`${label}: the longest sightline is at or under the §7.0 ${SIGHT_CEILING} m ceiling`,
+      `${longest.toFixed(1)} m, and ${(share(over) * 100).toFixed(2)}% of rays exceed it`);
+  }
+
+  // ── the dual-site angle ────────────────────────────────────────────────────────────
+  // `Array.isArray`, not truthiness: a manifest with no `objectives` key at all and one
+  // with an empty list are different answers, and only the second is "this map declares no
+  // sites". The first is a broken manifest and has to say so.
+  if (!Array.isArray(manifest.objectives)) {
+    bad(`${label}: the manifest exposes an objectives list`, 'manifest.objectives is not an array — the dual-site row cannot be evaluated');
+    return;
+  }
+  const plants = manifest.objectives.filter((ob) => ob.kind === 'plant' && typeof ob.site === 'string' && ob.site !== '');
+  const sites = [...new Set(plants.map((ob) => ob.site))].sort();
+  if (sites.length < 2) {
+    console.log(`  ABSENT   ${label}: declares ${sites.length} bomb site${sites.length === 1 ? '' : 's'},`
+      + ' so "no single uncontested angle covering both sites" has nothing to measure.'
+      + (sites.length === 0 ? ' (map-data.md §9 fixture)' : ''));
+    return;
+  }
+
+  // Standable points inside each plant volume, from the graph — never the box centre, which
+  // can sit inside a collider and would silently make the site invisible from everywhere.
+  const targets = new Map();
+  for (const site of sites) {
+    // Non-empty by construction — `site` came out of `plants` — but asserted rather than
+    // assumed, because `[].some()` is `false` and would report the site as unseeable from
+    // anywhere, which reads as a very strong pass on the row below.
+    const boxes = plants.filter((ob) => ob.site === site).map((ob) => ob.box);
+    if (boxes.length === 0) { targets.set(site, []); continue; }
+    const inside = eyes.filter((e) => boxes.some((b) => e.x >= b.min.x && e.x <= b.max.x
+      && e.z >= b.min.z && e.z <= b.max.z
+      && e.y - EYE >= b.min.y - 0.35 && e.y - EYE <= b.max.y));
+    targets.set(site, inside);
+  }
+  const emptySite = sites.filter((s) => targets.get(s).length === 0);
+  if (emptySite.length > 0) {
+    bad(`${label}: every plant volume contains standable ground to be seen from`,
+      `${emptySite.join(', ')} contains no walkable reachable nav node — §3.3 requires standing-clear space, and a coverage test against an empty target set passes vacuously`);
+    return;
+  }
+
+  /** Nearest visible point of `site` from `e`, within the §7.0 ceiling, or null. */
+  const coverDir = (e, site) => {
+    let best = null, bestD = Infinity;
+    for (const t of targets.get(site)) {
+      const dist = e.distanceTo(t);
+      if (dist > SIGHT_CEILING || dist >= bestD) continue;
+      if (!world.losClear(e, t)) continue;
+      bestD = dist; best = t;
+    }
+    return best === null ? null : { dir: best.clone().sub(e).normalize(), dist: bestD };
+  };
+
+  const dual = [];
+  for (const e of eyes) {
+    const a = coverDir(e, sites[0]);
+    if (a === null) continue;
+    const b = coverDir(e, sites[1]);
+    if (b === null) continue;
+    dual.push({ e, a: a.dist, b: b.dist, sep: Math.acos(Math.min(1, Math.max(-1, a.dir.dot(b.dir)))) * 180 / Math.PI });
+  }
+
+  // The exposure reference set: a fixed-size, evenly strided sample of the playspace, so
+  // the fraction means the same thing on both maps and does not drift with node count.
+  const REF = 800;
+  const stride = Math.max(1, Math.floor(eyes.length / REF));
+  const ref = eyes.filter((_, i) => i % stride === 0);
+  const exposure = (e) => {
+    let seen = 0;
+    for (const r of ref) {
+      if (r === e) continue;
+      if (world.losClear(e, r)) seen++;
+    }
+    return seen / ref.length;
+  };
+
+  const uncontested = [];
+  for (const cand of dual) {
+    const x = exposure(cand.e);
+    if (x <= EXPOSURE_MAX) uncontested.push({ ...cand, exposure: x });
+  }
+  uncontested.sort((p, q) => p.exposure - q.exposure);
+
+  const seps = dual.map((c) => c.sep).sort((p, q) => p - q);
+  console.log(`     dual-site angles: ${dual.length} of ${eyes.length} standing positions see both ${sites[0]} and ${sites[1]}`
+    + ` inside ${SIGHT_CEILING} m`
+    + (seps.length ? ` (they are ${seps[0].toFixed(0)}–${seps[seps.length - 1].toFixed(0)}° apart; one screen at ${HFOV.toFixed(0)}°)` : '')
+    + ` · ${uncontested.length} of those are exposed to ≤ ${(EXPOSURE_MAX * 100).toFixed(0)}% of the playspace (${ref.length} reference points)`);
+  if (uncontested.length === 0) {
+    ok(`${label}: no single uncontested angle covers both sites`);
+  } else {
+    pendingEnvelope(`${label}: no single uncontested angle covers both sites`,
+      `${uncontested.length} position${uncontested.length === 1 ? '' : 's'}, worst at `
+      + uncontested.slice(0, 3).map((u) => `(${u.e.x.toFixed(1)}, ${(u.e.y - EYE).toFixed(2)}, ${u.e.z.toFixed(1)}) exposure ${(u.exposure * 100).toFixed(1)}%`).join(' · '));
+  }
+}
+
+if (!SPAWN_ONLY) {
+  sightlines('the-square', w, nav, w.manifest);
+
+  // §9 keeps MERIDIAN as a fixture, and the contract's sightline row is a property of a
+  // map rather than of the rotation, so the fixture is measured too — it is the only
+  // comparison baseline this repository has for what these numbers look like on geometry
+  // that was not authored against this envelope.
+  {
+    const mg = new Game({ headless: true });
+    await mg.initHeadless({ presenter: new NullPresenter(), mapId: 'meridian' });
+    if (GEOM_DEGRADES.has(DEGRADE)) degradeGeometry(mg, 'meridian');
+    sightlines('meridian (fixture)', mg.world, mg.nav, mg.world.manifest);
+  }
 }
 
 // ── is anywhere too strong ───────────────────────────────────────────────────────────
@@ -605,6 +1070,14 @@ function metrics(trials) {
   };
 }
 
+// `--geom-only` stops here. The spawn section below plays 33 headless matches and takes
+// most of this harness's runtime; when the question is a sightline number, paying for it
+// only makes the evidence harder to read.
+if (GEOM_ONLY) {
+  console.log(failures ? `\n${failures} FAILED` : '\ngeometry report complete');
+  process.exit(failures ? 1 : 0);
+}
+
 console.log('\n══ spawn quality (P3.A2) ══');
 
 /**
@@ -668,6 +1141,10 @@ if (DEGRADE === 'los') {
     'pressure', 'friendlyIdeal', 'friendlyCrowd', 'facingAway', 'jitter',
     'groupFriendly', 'groupEnemy', 'groupRecentUse']) SPAWN_WEIGHTS[k] = 0;
   note('DEGRADED: every candidate-varying term zeroed — one point now wins every contest');
+} else if (GEOM_DEGRADES.has(DEGRADE)) {
+  // Already applied to the geometry above, before a single ray was cast. Named here so the
+  // dispatcher's unknown-mode failure below still catches a typo.
+  note(`the '${DEGRADE}' degradation applies to the geometry sections, not to the spawn scorer`);
 } else if (DEGRADE) {
   bad('--degrade names a known degradation', `unknown mode '${DEGRADE}'`);
 }
