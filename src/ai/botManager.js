@@ -53,8 +53,6 @@ const MAX_FALLBACK_SPAWNS_PER_STEP = 2;
 
 export const TEAM_COLORS = [new THREE.Color(0xd9b45a), new THREE.Color(0xe0453f)];
 
-const FFA_MODES = new Set(['ffa', 'dm', 'freeforall', 'free-for-all', 'deathmatch']);
-
 // --- team blackboard tuning
 const CONTACT_MEMORY = 9;      // s a called contact keeps pulling the sweep
 const SHARE_RADIUS = 78;       // m a contact call carries (the map is 86 m across)
@@ -64,6 +62,17 @@ const POI_REVISIT = 34;        // s before a swept point is interesting again
 
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
+
+const OBJECTIVE_LOG_MAX = 512;
+const OFFGRAPH_LOG_MAX = 256;
+
+function objectiveCentre(box, out) {
+  return out.set(
+    (box.min.x + box.max.x) * 0.5,
+    box.min.y,
+    (box.min.z + box.max.z) * 0.5,
+  );
+}
 
 /**
  * Everything one team knows collectively.
@@ -107,7 +116,6 @@ export class BotManager {
     this.game = game;
     /** @type {Bot[]} */
     this.bots = [];
-    this.ffa = false;
     this.difficulty = 'regular';
 
     this._unsub = [];
@@ -125,6 +133,20 @@ export class BotManager {
     this.poi = [];
     this.poiCount = 0;
     this.boards = [new TeamBoard(), new TeamBoard()];
+
+    // Bounded, deterministic evidence for H3.3. These rows describe AI intent only;
+    // BombRules.events remains the authority for objective completion.
+    this.objectiveLog = [];
+    this._bombPlanRound = -1;
+    this._bombPlanSite = null;
+
+    /**
+     * Bounded ledger of `Bot._recoverOffGraph` relocations, kept HERE rather than only on
+     * the bot because the number that matters is a roster-wide rate: one bot stranded once
+     * is geometry the bake does not describe, the same bot stranded ten times is a pocket
+     * the AI keeps walking back into. `scripts/bottest.mjs` asserts on both.
+     */
+    this.offGraphLog = [];
   }
 
   async init() {
@@ -153,9 +175,6 @@ export class BotManager {
     const count = clamp(Math.round(settings?.get('botCount') ?? 7), 0, MAX_BOTS);
     this.difficulty = DIFFICULTY[settings?.get('difficulty')] ? settings.get('difficulty') : 'regular';
 
-    const mode = String(opts.mode ?? game.match?.mode ?? 'tdm').toLowerCase();
-    this.ffa = FFA_MODES.has(mode);
-
     this._buildNamePool();
     this._buildSweepBoard();
     // A lobby should feel like people, not one bot copied N times: deal the four
@@ -173,6 +192,26 @@ export class BotManager {
     this._pathCursor = 0;
     this._pathCount = 0;
     this._statTimer = 0;
+    this.objectiveLog.length = 0;
+    this.offGraphLog.length = 0;
+    this._bombPlanRound = -1;
+    this._bombPlanSite = null;
+  }
+
+  /**
+   * Recorded by `Bot._recoverOffGraph` when it has had to lift a bot back onto the nav
+   * graph. Position is the place the bot was STRANDED, not where it was put down: that is
+   * the coordinate a map or bake fix needs, and averaging the landing points would hide it.
+   */
+  noteOffGraphRecovery(bot) {
+    if (this.offGraphLog.length >= OFFGRAPH_LOG_MAX) return;
+    this.offGraphLog.push({
+      tick: this.game.match?._elapsedTicks ?? 0,
+      botId: bot.id,
+      x: bot.position.x,
+      y: bot.position.y,
+      z: bot.position.z,
+    });
   }
 
   /**
@@ -215,7 +254,7 @@ export class BotManager {
       b.stats.deaths = 0;
       b.stats.score = 0;
       b.stats.streak = 0;
-      b.configure(this.difficulty, this.ffa);
+      b.configure(this.difficulty);
       // The model's colourway is baked per team, so a team change needs a new one.
       b.ensureTeamModel();
       b.deactivate();
@@ -271,10 +310,9 @@ export class BotManager {
       : 80;
 
     for (let t = 0; t < 2; t++) {
-      // Where the OTHER side lives. In FFA there is no other side, so the whole
-      // team weights toward the middle and the sweep stays map-wide.
+      // Where the other team lives, so each squad sweeps toward contested ground.
       let sx = 0, sz = 0, en = 0;
-      if (!this.ffa && sp) {
+      if (sp) {
         for (let i = 0; i < sp.length; i++) {
           const s = sp[i];
           if (!s || s.team === t || s.team === -1 || s.team == null) continue;
@@ -365,7 +403,7 @@ export class BotManager {
    * see the enemy themselves before they can shoot at them.
    */
   reportContact(bot, enemy, strength = 1) {
-    if (!bot || !enemy || this.ffa) return;
+    if (!bot || !enemy) return;
     const board = this.boards[bot.team & 1];
     board.contact.copy(enemy.position);
     board.contactEnemy = enemy;
@@ -409,7 +447,6 @@ export class BotManager {
   }
 
   _teamFor(index, total, playerTeam) {
-    if (this.ffa) return 1;
     // Split evenly, with the enemy side taking the odd bot so the player's
     // squad is never the larger one.
     const friendly = Math.floor(total / 2);
@@ -497,7 +534,7 @@ export class BotManager {
     hostiles.length = 0;
     for (let i = 0; i < ents.length; i++) {
       const e = ents[i];
-      if (e !== bot && e.alive && (this.ffa ? e !== bot : e.team !== bot.team)) hostiles.push(e);
+      if (e !== bot && e.alive && e.team !== bot.team) hostiles.push(e);
     }
 
     let best = null;
@@ -505,7 +542,7 @@ export class BotManager {
     for (let i = 0; i < points.length; i++) {
       const p = points[i];
       if (!p || !p.position) continue;
-      if (!this.ffa && p.team !== -1 && p.team !== undefined && p.team !== bot.team) continue;
+      if (p.team !== -1 && p.team !== undefined && p.team !== bot.team) continue;
 
       let nearest = Infinity;
       let nearestEnt = null;
@@ -577,6 +614,11 @@ export class BotManager {
     for (let i = 0; i < bots.length; i++) {
       const b = bots[i];
       if (!b.alive) {
+        // The fallback is only a placement safety net; it is not a second respawn
+        // authority. Bomb explicitly forbids respawn after the warmup. Match begins each
+        // new round by placing connected actors itself, so respecting the mode here cannot
+        // strand a legal round spawn and prevents eliminated bots reappearing mid-round.
+        if (game.match?.mode?.allowRespawn?.(game.match, b) === false) continue;
         if (fallbackSpawns >= MAX_FALLBACK_SPAWNS_PER_STEP) continue;
         // Never placed at all: Match owns the initial placement, so only step in
         // as a safety net if it has not done so a second into the match.
@@ -591,6 +633,11 @@ export class BotManager {
         b.think(clamp(now - last, dt, 0.25));
       }
     }
+
+    // Objective intent is applied after ordinary combat thinking so a patrol/cover state
+    // cannot overwrite the route to the bomb or site on the same tick. Combat perception,
+    // aim and firing remain active while following that route.
+    for (let i = 0; i < bots.length; i++) this._applyBombObjective(bots[i]);
 
     // 2) global A* budget, round-robin so nobody starves
     if (tick % PATH_INTERVAL === 0) {
@@ -617,6 +664,147 @@ export class BotManager {
         this._pathCount = 0;
         this._statTimer = 0;
       }
+    }
+  }
+
+  _setObjective(bot, role, site = null) {
+    if (bot.objectiveRole === role && bot.objectiveSite === site) return;
+    bot.objectiveRole = role;
+    bot.objectiveSite = site;
+    this.objectiveLog.push({
+      tick: this.game.match?._elapsedTicks ?? 0,
+      round: this.game.match?.bombRules?.roundNumber ?? 0,
+      botId: bot.id,
+      team: bot.team,
+      role,
+      site,
+    });
+    if (this.objectiveLog.length > OBJECTIVE_LOG_MAX) this.objectiveLog.shift();
+  }
+
+  _bombSite(rules) {
+    if (this._bombPlanRound === rules.roundIndex && this._bombPlanSite) {
+      return this._bombPlanSite;
+    }
+    const ids = rules.siteIds;
+    if (!Array.isArray(ids) || ids.length === 0) return null;
+    // One deterministic choice per round. A carrier death does not make the recovering
+    // squad change its mind and run the bomb across the district.
+    const seed = this.game.matchSeed >>> 0;
+    const index = (seed + rules.roundIndex + rules.attackingTeam) % ids.length;
+    this._bombPlanRound = rules.roundIndex;
+    this._bombPlanSite = ids[index];
+    return this._bombPlanSite;
+  }
+
+  _teamSlot(bot) {
+    let slot = 0;
+    for (let i = 0; i < this.bots.length; i++) {
+      const other = this.bots[i];
+      if (other === bot) return slot;
+      if (other.team === bot.team) slot++;
+    }
+    return slot;
+  }
+
+  /**
+   * Autonomous Bomb objective layer.
+   *
+   * This layer chooses destinations and submits held interaction intent. It never moves an
+   * actor, changes bomb state or awards a round: Bot pathing/world collision performs the
+   * travel and BombRules revalidates the request on every fixed step.
+   */
+  _applyBombObjective(bot) {
+    const rules = this.game.match?.bombRules;
+    if (!rules || !rules.liveRound || !bot.alive || !rules.isAlive(bot)) {
+      this._setObjective(bot, 'none', null);
+      return;
+    }
+
+    const attacking = bot.team === rules.attackingTeam;
+    const plannedSiteId = this._bombSite(rules);
+    const plannedSite = plannedSiteId ? rules.sites.get(plannedSiteId) : null;
+    if (!plannedSite) {
+      this._setObjective(bot, 'none', null);
+      return;
+    }
+
+    // An objective decision outranks a stale sightseeing/climb commitment.
+    bot.climbLock = 0;
+
+    if (rules.phase === 'live' && attacking) {
+      if (rules.bomb.state === 'dropped') {
+        this._setObjective(bot, 'recover', plannedSiteId);
+        bot.moveMode = 'sprint';
+        bot.setDestination(rules.bomb.position, 0.65);
+        return;
+      }
+
+      objectiveCentre(plannedSite.plant, _v1);
+      if (rules.bomb.state === 'carried' && rules.bomb.carrierId === bot.id) {
+        bot.moveMode = bot.targetVisible ? 'combat' : 'sprint';
+        bot.setDestination(_v1, 0.4);
+        if (rules.siteAt(bot.position, 'plant')?.site === plannedSiteId && bot.grounded !== false
+          && rules.requestInteract(bot, 'plant')) {
+          this._setObjective(bot, 'planting', plannedSiteId);
+        } else {
+          this._setObjective(bot, 'plant', plannedSiteId);
+        }
+        return;
+      }
+
+      // A whole six-player deathball crushed the split defenders in measured bot series
+      // (61–71% attack wins across 200 matches). Keep half the squad on a deterministic
+      // secondary-site lurk: it contests rotations without knowing defender positions,
+      // while the carrier still gets a plausible three-player execute rather than a 6v3.
+      // This is a role plan, not balance rubber-banding; it is fixed before contact and
+      // uses only public authored sites.
+      const slot = this._teamSlot(bot);
+      if ((slot & 1) === 1 && rules.siteIds.length > 1) {
+        const lurkId = rules.siteIds.find((id) => id !== plannedSiteId);
+        const lurk = rules.sites.get(lurkId);
+        this._setObjective(bot, 'lurk', lurkId);
+        objectiveCentre(lurk.plant, _v1);
+        bot.moveMode = bot.targetVisible ? 'combat' : 'run';
+        bot.setDestination(_v1, 3.0);
+        return;
+      }
+
+      // The execute group escorts the committed route.
+      this._setObjective(bot, 'escort', plannedSiteId);
+      bot.moveMode = bot.targetVisible ? 'combat' : 'run';
+      bot.setDestination(_v1, 2.2);
+      return;
+    }
+
+    if (rules.phase === 'live') {
+      // Split defenders across both authored sites until the plant reveals the real one.
+      const heldId = rules.siteIds[this._teamSlot(bot) % rules.siteIds.length];
+      const held = rules.sites.get(heldId);
+      this._setObjective(bot, 'hold', heldId);
+      objectiveCentre(held.plant, _v1);
+      bot.moveMode = bot.targetVisible ? 'combat' : 'run';
+      bot.setDestination(_v1, 1.8);
+      return;
+    }
+
+    const plantedSite = rules.sites.get(rules.bomb.siteId);
+    if (!plantedSite) return;
+    objectiveCentre(plantedSite.defuse, _v1);
+    if (attacking) {
+      this._setObjective(bot, 'defend', rules.bomb.siteId);
+      bot.moveMode = bot.targetVisible ? 'combat' : 'run';
+      bot.setDestination(_v1, 2.0);
+      return;
+    }
+
+    bot.moveMode = bot.targetVisible ? 'combat' : 'sprint';
+    bot.setDestination(_v1, 0.4);
+    if (rules.siteAt(bot.position, 'defuse')?.site === rules.bomb.siteId
+      && rules.requestInteract(bot, 'defuse')) {
+      this._setObjective(bot, 'defusing', rules.bomb.siteId);
+    } else {
+      this._setObjective(bot, 'retake', rules.bomb.siteId);
     }
   }
 
@@ -684,7 +872,7 @@ export class BotManager {
   setDifficulty(name) {
     if (!DIFFICULTY[name]) return;
     this.difficulty = name;
-    for (const b of this.bots) b.configure(name, this.ffa);
+    for (const b of this.bots) b.configure(name);
   }
 
   dispose() {

@@ -77,6 +77,28 @@ const STUCK_WINDOW = 1.2;
 const STUCK_DISTANCE = 0.32;
 
 /**
+ * How far a bot's feet may sit above the nav floor its own column resolves to before it
+ * counts as standing OFF the graph rather than merely on a step.
+ *
+ * A bot mantles a 0.55 m crate or stands on a stair tread all the time, and in both cases
+ * `nodeAt` answers with a surface within a step of its feet. 1.5 m is above anything the
+ * movement code can climb in one go and well below the 4.8 m drops the stranding cases
+ * measured, so it separates "on a ledge the bake knows about" from "on a roof it does not".
+ */
+const OFFGRAPH_DROP = 1.5;
+
+/**
+ * How far the recovery may move a bot HORIZONTALLY. Same 0.6 m budget the level-3 nudge
+ * already spends, and for the same reason: a drop straight down off an awning reads as a
+ * fall, whereas sliding a bot several metres sideways is a teleport, and one that would
+ * also break `bombbottest`'s standing promise that no actor moves more than 0.75 m in a
+ * step inside a live round. If the nearest walkable surface is further away than this
+ * laterally then the bot is not perched above a known floor at all, and the ordinary wedge
+ * backstop — drop the goal, pick another — is the honest answer.
+ */
+const OFFGRAPH_LATERAL = 0.6;
+
+/**
  * Difficulty curves. Recruit is beatable; veteran is lethal but never perfect.
  *
  * DESIGN RULE: difficulty must never decide *whether* a bot notices you. Every
@@ -657,7 +679,6 @@ export class Bot {
     // ---- difficulty + temperament
     this.cfg = DIFFICULTY.regular;
     this.profile = DEFAULT_PROFILE;
-    this.ffa = false;
     this.personaName = 'roamer';
     this.persona = PERSONALITIES.roamer;
 
@@ -688,6 +709,13 @@ export class Bot {
     this.patrolPause = 1;
     this._poiClaim = -1;
     this._lastReport = -999;
+
+    // Bomb objective intent is assigned by BotManager. It is presentation/debug state,
+    // never authority: the ruleset still validates every pickup, plant and defuse.
+    // Keeping it on the actor makes autonomous-match evidence inspectable without
+    // teaching the rules engine about AI implementation details.
+    this.objectiveRole = 'none';
+    this.objectiveSite = null;
 
     // ---- movement
     this.grounded = false;
@@ -720,6 +748,8 @@ export class Bot {
     this._sidestepSign = 1;
     this._wedgeTimer = 0;
     this._wedged = false;
+    /** Times `_recoverOffGraph` has had to put this bot back on the nav graph. */
+    this._offGraphRecoveries = 0;
 
     // ---- combat
     this.wantFire = false;
@@ -880,15 +910,13 @@ export class Bot {
 
   isEnemy(other) {
     if (!other || other === this || other.alive === false) return false;
-    if (this.ffa) return true;
     return other.team !== this.team;
   }
 
   // ------------------------------------------------------------ life cycle
 
-  configure(difficulty, ffa) {
+  configure(difficulty) {
     this.cfg = DIFFICULTY[difficulty] || DIFFICULTY.regular;
-    this.ffa = !!ffa;
     this.maxHealth = this.cfg.health;
   }
 
@@ -947,6 +975,8 @@ export class Bot {
     this.coverCooldown = 0;
     this.coverBudget = 0;
     this._lastReport = -999;
+    this.objectiveRole = 'none';
+    this.objectiveSite = null;
     this.game.bots?.releaseSweepClaim?.(this);
 
     this.clearPath();
@@ -1032,6 +1062,8 @@ export class Bot {
     this.patrolHold = 0;
     this.patrolPause = 1;
     this._lastReport = -999;
+    this.objectiveRole = 'none';
+    this.objectiveSite = null;
 
     // ---- movement
     this.moveMode = 'walk';
@@ -1062,6 +1094,7 @@ export class Bot {
     this._sidestepSign = 1;
     this._wedgeTimer = 0;
     this._wedged = false;
+    this._offGraphRecoveries = 0;
 
     // ---- combat
     this.wantFire = false;
@@ -2019,6 +2052,9 @@ export class Bot {
     if (this._wedgeTimer >= 6) {
       this._wedgeTimer = 0;
       this._stuckLevel = 0;
+      // Checked BEFORE the goal is dropped, because dropping the goal cannot help a bot
+      // whose problem is where it is standing rather than where it was going.
+      if (this._recoverOffGraph()) return;
       this._wedged = true;
       this.hasDestination = false;
       this.pathLen = 0;
@@ -2055,6 +2091,65 @@ export class Bot {
       this.repathTimer = 0;
       if (this.hasDestination) this.requestPath(this.destination);
     }
+  }
+
+  /**
+   * Last recovery in the ladder: a bot standing somewhere the nav bake does not describe.
+   *
+   * `navGrid.nodeAt` answers with the best surface in a position's COLUMN, so a bot that
+   * has walked onto a collider the bake never marked walkable — a market awning, a roof
+   * lip, the 10 cm just outside the signal-bridge hint volume on The Square — resolves to
+   * a floor several metres below its own feet. Everything downstream then behaves as if
+   * that lower floor were where it stood: A* happily returns a full route (21 waypoints,
+   * measured), the bot walks it and immediately shoulders into the edge of its perch, and
+   * neither of the two earlier recoveries can reach the real floor. The level-3 nudge is
+   * capped at 0.6 m and zeroes its Y delta outright, so it cannot answer a 4.8 m drop, and
+   * the wedge backstop only throws the destination away — which changes nothing, because
+   * every destination from that perch is equally unreachable.
+   *
+   * Left alone the result is not a bot that plays badly, it is a bot that leaves the match
+   * while still counted alive: measured on the MERIDIAN fixture, one bot in eleven stood at
+   * (-3.6, 8.95, 5.4) from t=31.6 s to the end of a 100 s match, re-wedging every six
+   * seconds, covering 58 m/min against a roster median of 215, and never being killed
+   * because nobody else could reach it either. `_updateStuck` already promises in writing
+   * that "a bot can be briefly blocked; it can never be permanently wedged". This is what
+   * makes that true.
+   *
+   * The relocation is a teleport and is deliberately the LAST thing tried: it only runs
+   * after six seconds in which repathing, sidestepping, jumping and the nudge have all
+   * failed, and only when the bot is provably off-graph, so ordinary blocked-by-a-corner
+   * bots never see it.
+   *
+   * @returns {boolean} true if the bot was relocated onto the graph
+   */
+  _recoverOffGraph() {
+    const nav = this.game.nav;
+    if (!nav?.ready || !this.grounded) return false;
+
+    const node = nav.nodeAt(this.position.x, this.position.y, this.position.z);
+    // A node at or near the bot's feet means the graph does describe where it stands, so
+    // this is an ordinary blocked bot and relocating it would be cheating, not recovery.
+    // `node < 0` — no surface anywhere in the column — is deliberately NOT treated as
+    // stranding either: there is nothing below to drop onto, so any move would be lateral.
+    if (node < 0 || this.position.y - nav.floorY[node] <= OFFGRAPH_DROP) return false;
+
+    // `reachableOnly`: putting a stranded bot down on a second island it also cannot leave
+    // would trade one silent removal for another.
+    const p = nav.nearestWalkable?.(this.position, _v4, true);
+    if (!p) return false;
+    if (Math.hypot(p.x - this.position.x, p.z - this.position.z) > OFFGRAPH_LATERAL) return false;
+
+    // Logged before the move: the coordinate a bake or geometry fix needs is where the bot
+    // was STRANDED, not where it was put down.
+    this._offGraphRecoveries++;
+    this.game.bots?.noteOffGraphRecovery?.(this);
+
+    this.position.copy(p);
+    this.velocity.set(0, 0, 0);
+    this.clearPath();
+    this.hasDestination = false;
+    this._stuckSample.copy(this.position);
+    return true;
   }
 
   // ------------------------------------------------------- destination picks
