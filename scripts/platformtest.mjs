@@ -24,7 +24,35 @@ for (const suite of suites) {
   const ok = res.status === 0;
   checks += (res.stdout.match(/^ {2}ok/gm) || []).length;
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${suite}`);
-  if (!ok) { failed++; process.stdout.write(res.stdout.split('\n').slice(-25).join('\n')); process.stdout.write(res.stderr); }
+  if (!ok) {
+    failed++;
+    /**
+     * Print the FAILING lines, not the last 25.
+     *
+     * A tail is the wrong 25 lines: a suite that fails in the middle and then passes another
+     * hundred checks reports twenty-five `ok`s and the word FAILURE. That is exactly what CI
+     * showed for profiletest — a failure whose cause had scrolled off, reproducible nowhere
+     * because nobody could see what it was.
+     *
+     * Each failing check plus the lines under it (suites print detail on the following line),
+     * then a short tail for the summary. stderr is kept whole: a thrown error is the one case
+     * where the last lines really are the interesting ones.
+     */
+    const lines = res.stdout.split('\n');
+    const failing = [];
+    lines.forEach((line, i) => {
+      if (!/^ {2}FAIL/.test(line)) return;
+      failing.push(line);
+      for (let j = i + 1; j < Math.min(i + 3, lines.length) && !/^ {2}(ok|FAIL)/.test(lines[j]); j++) {
+        failing.push(lines[j]);
+      }
+    });
+    // No `FAIL` line at all means the suite died rather than reported — the tail is all there is.
+    process.stdout.write(failing.length
+      ? `${failing.join('\n')}\n${lines.slice(-3).join('\n')}`
+      : lines.slice(-25).join('\n'));
+    process.stdout.write(res.stderr);
+  }
 }
 
 console.log(`\n${checks} checks across ${suites.length} suites, ${failed} failing`);
