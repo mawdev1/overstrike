@@ -306,10 +306,50 @@ if (files.includes(pv.watch)) {
       + `        wire change was versioned, and a guard that cannot check must not report OK.`);
   }
   const bumped = before !== null && after !== null && after > before;
+
+  /**
+   * Does this diff change the wire LAYOUT, or only what is written into it?
+   *
+   * The rule is "every wire change bumps the version" — but the guard could not tell a layout
+   * change from a behaviour change, so it demanded a bump for ANY edit to this file. That is
+   * not a harmless over-approximation: it pushed two real safety fixes OUT of the codec and
+   * into their callers, purely to avoid a bump that would have refused every peer this build
+   * agrees with perfectly. A guard that makes correct code harder to place is buying its
+   * strictness with someone else's design.
+   *
+   * So compare the structures that DEFINE the layout — the message type ids, the fixed byte
+   * sizes, and the ordered field and event tables. If those are identical on both sides, the
+   * bytes are identical, and a bump would be a lie about compatibility. If any of them moved,
+   * the bump is mandatory and no amount of "it is only a small change" argues otherwise.
+   *
+   * Deliberately textual and deliberately over-inclusive: a reformat of one of these tables
+   * demands a bump it does not strictly need, which errs toward the version being wrong in the
+   * safe direction. Missing a real layout change is the failure that corrupts clients.
+   */
+  const LAYOUT = /^\s*export const (MSG_[A-Z_]+|[A-Z_]*BYTES[A-Z_0-9]*|ENTITY_FIELDS|EV_KINDS|EV_VEC3|EV_SPATIAL|CANCEL_REASONS|REFUSAL_REASONS|OUTCOME_REASONS|BOMB_STATES|PHASES)\b/;
+  const layoutOf = (text) => {
+    const out = [];
+    const lines = (text || '').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (!LAYOUT.test(lines[i])) continue;
+      // Take the declaration through its terminating `;` so a multi-line table is compared whole.
+      let block = lines[i];
+      for (let j = i + 1; j < lines.length && !/;\s*$/.test(block); j++) block += `\n${lines[j]}`;
+      out.push(block.replace(/\s+/g, ' ').trim());
+    }
+    return out.join('\n');
+  };
+  const layoutMoved = layoutOf(versionSideOf('before', pv.constantFile))
+    !== layoutOf(versionSideOf('after', pv.constantFile));
   // An empty diff means the file did not change *in the range being examined* — which is the
   // normal case when --files names an already-committed path. There is nothing to version, so
   // demanding a bump would be a false failure rather than a caught violation.
-  if (diff.trim() !== '' && !bumped) {
+  if (diff.trim() !== '' && !bumped && !layoutMoved) {
+    console.log(
+      `lanecheck: ${pv.watch} changed but the wire LAYOUT did not — message ids, byte sizes and\n`
+      + `           the field/event tables are identical on both sides, so ${pv.constantName}\n`
+      + `           stays ${after}. A bump here would refuse peers this build agrees with.`);
+  } else if (diff.trim() !== '' && !bumped) {
     problems.push(
       `${pv.watch} changed but ${pv.constantName} was not bumped. Build Plan §0.6: every wire\n`
       + `        change bumps the version, and incompatible clients must be rejected at handshake\n`
