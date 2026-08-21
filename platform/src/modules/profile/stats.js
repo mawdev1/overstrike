@@ -675,7 +675,15 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
         key, actorId: RESULT_ACTOR, requestHash,
         responseStatus: 200, responseBody: response,
         createdAt: resultAppliedAt,
-        expiresAt: new Date(clock.now() + IDEMPOTENCY_TTL_MS).toISOString(),
+        // Derived from `createdAt`, NOT from a second `clock.now()`.
+        //
+        // These two fields describe one instant and a fixed TTL from it, so sampling the clock
+        // twice makes them describe two. The gap is every database write in this transaction —
+        // sub-millisecond against the memory adapter and comfortably over it against real
+        // PostgreSQL, which is why `expiresAt - createdAt === 24h` passed locally and failed
+        // intermittently in CI for weeks with no reproduction. The retention window was also
+        // genuinely longer than the 24 hours §8 states, by however long the writes took.
+        expiresAt: new Date(Date.parse(resultAppliedAt) + IDEMPOTENCY_TTL_MS).toISOString(),
       }, tx);
       return response;
     });

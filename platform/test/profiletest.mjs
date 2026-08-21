@@ -1566,6 +1566,33 @@ console.log('\nmatch-result.md §5 — a retry applies once');
     'http-api.md §8: a gameplay idempotency row is retained for exactly 24 hours',
     `${idemRow.createdAt} -> ${idemRow.expiresAt}`);
 
+  /**
+   * The same rule with a clock that MOVES, which is what turned the check above into a flake.
+   *
+   * `createdAt` and `expiresAt` were each sampled from `clock.now()`, with every database write
+   * of the transaction in between. Against the memory adapter that gap is usually zero
+   * milliseconds and the check passed; against real PostgreSQL it sometimes was not, and CI
+   * failed intermittently for weeks with no local reproduction. The window was also genuinely
+   * longer than the 24 hours §8 states, by however long the writes happened to take.
+   *
+   * A clock that advances on every read makes the defect deterministic: with two samples this
+   * cannot produce exactly 24h, so the only way to pass is to derive one field from the other.
+   */
+  {
+    const movingStore = makeStore();
+    seed(movingStore);
+    let tick = Date.parse('2026-08-21T12:00:00.000Z');
+    const movingClock = { now: () => (tick += 7) };
+    const movingMod = moduleWith(movingStore, { clock: movingClock });
+    await movingMod.stats.applyMatchResult({ actor: service,
+      result: matchResult({ matchId: 'IDEMCLK', status: 'completed', winnerTeam: 'alpha',
+        outcomeReason: 'timer', players: [playerRow(ACCOUNT, 'alpha')] }) });
+    const movingRow = [...movingStore._idem.values()][0];
+    expect(Date.parse(movingRow.expiresAt) - Date.parse(movingRow.createdAt) === 24 * 3600e3,
+      'the 24-hour window holds even when the clock advances mid-transaction',
+      `${movingRow.createdAt} -> ${movingRow.expiresAt}`);
+  }
+
   // §8.1: submit the identical payload ten times concurrently.
   await Promise.all(Array.from({ length: 10 },
     () => mod.stats.applyMatchResult({ actor: service, result })));
