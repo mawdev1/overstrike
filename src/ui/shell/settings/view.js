@@ -372,6 +372,22 @@ export function createSettingsScreen(input = {}) {
     event.stopPropagation();
     controller.handleCaptureInput(event);
   }
+  /**
+   * Suppress the browser context menu WHILE CAPTURING a binding.
+   *
+   * `captureMouse` already calls `preventDefault()` on mousedown, but that does not stop the
+   * separate `contextmenu` event — so right-clicking to bind aim-down-sights recorded the
+   * binding and popped the menu over the top of the settings screen. Reported as "right-click
+   * opens the context menu, so I can't set it".
+   *
+   * Scoped to capture only. Suppressing it across the whole shell would take away copy, paste
+   * and inspect on ordinary pages to fix a problem that exists for a few seconds.
+   */
+  function captureContextMenu(event) {
+    if (!current.capture) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
   function captureWheel(event) {
     if (!current.capture) return;
     event.preventDefault();
@@ -381,6 +397,7 @@ export function createSettingsScreen(input = {}) {
   const windowRef = documentRef.defaultView;
   windowRef?.addEventListener('keydown', captureKeyboard, true);
   windowRef?.addEventListener('mousedown', captureMouse, true);
+  windowRef?.addEventListener('contextmenu', captureContextMenu, true);
   windowRef?.addEventListener('wheel', captureWheel, { capture: true, passive: false });
 
   unsubscribe = controller.subscribe((snapshot) => {
@@ -421,6 +438,7 @@ export function createSettingsScreen(input = {}) {
       unsubscribe?.();
       windowRef?.removeEventListener('keydown', captureKeyboard, true);
       windowRef?.removeEventListener('mousedown', captureMouse, true);
+      windowRef?.removeEventListener('contextmenu', captureContextMenu, true);
       windowRef?.removeEventListener('wheel', captureWheel, true);
       if (ownsController) controller.destroy();
       root.remove();

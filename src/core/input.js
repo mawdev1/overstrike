@@ -55,7 +55,19 @@ export class Input {
     window.addEventListener('mouseup', this._onMouseUp);
     window.addEventListener('wheel', this._onWheel, { passive: false });
     window.addEventListener('blur', this._onBlur);
-    canvas.addEventListener('contextmenu', this._onContext);
+    /**
+     * The whole match layer, not only the canvas.
+     *
+     * `#game-layer` contains `#hud` and `#ui` as SIBLINGS of the canvas, and the in-game menu
+     * lives in `#ui`. A canvas-only listener therefore covered the one surface where the
+     * pointer is usually locked (so the browser suppresses the menu anyway) and missed every
+     * overlay where it is not — including the rebind prompt.
+     *
+     * Falls back to the canvas when there is no such parent, so a harness that mounts a bare
+     * canvas keeps the old behaviour rather than silently losing it.
+     */
+    this.contextTarget = canvas.closest?.('#game-layer') ?? canvas;
+    this.contextTarget.addEventListener('contextmenu', this._onContext);
     canvas.addEventListener('mousedown', this._onCanvasDown);
   }
 
@@ -181,6 +193,25 @@ export class Input {
   }
 
   _onMouseDown(e) {
+    /**
+     * Rebinding accepts MOUSE buttons, not only keys.
+     *
+     * `captureBind` was consulted in `_onKeyDown` alone, so the in-game rebind prompt — which
+     * says "press a key or mouse button" — silently ignored every click. Aim-down-sights is
+     * bound to a mouse button by default, so the one action a player is most likely to want to
+     * rebind was the one they could not. Checked before the action map, and before `enabled`,
+     * because capture is a modal state that outranks both.
+     */
+    if (this.captureBind) {
+      e.preventDefault();
+      const code = mouseCode(e.button);
+      if (code) {
+        const cb = this.captureBind;
+        this.captureBind = null;
+        cb(code);
+      }
+      return;
+    }
     if (e.button >= 0 && e.button < this.buttons.length) {
       this.buttons[e.button] = true;
       this.buttonsPressed[e.button] = true;
@@ -264,7 +295,7 @@ export class Input {
     window.removeEventListener('mouseup', this._onMouseUp);
     window.removeEventListener('wheel', this._onWheel);
     window.removeEventListener('blur', this._onBlur);
-    this.canvas.removeEventListener('contextmenu', this._onContext);
+    this.contextTarget?.removeEventListener('contextmenu', this._onContext);
     this.canvas.removeEventListener('mousedown', this._onCanvasDown);
     this._settleLock();
   }

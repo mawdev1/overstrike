@@ -146,6 +146,29 @@ async function modelChecks() {
   Input.prototype._onWheel.call(input, { deltaY: -1, preventDefault() {} });
   equal(input.consumeWheel(), 1, 'wheel input must obey its rebound weapon-cycle action');
 
+  // Rebinding accepts MOUSE buttons. `captureBind` was consulted in `_onKeyDown` only, so the
+  // in-game rebind prompt — which invites "a key or mouse button" — ignored every click. Aim
+  // is bound to a mouse button by default, making the action most likely to be rebound the one
+  // that could not be.
+  {
+    input.buttons = [false, false, false, false, false];
+    input.buttonsPressed = [false, false, false, false, false];
+    let captured = null;
+    let defaultPrevented = false;
+    input.captureBind = (code) => { captured = code; };
+    Input.prototype._onMouseDown.call(input,
+      { button: 2, preventDefault() { defaultPrevented = true; } });
+    equal(captured, 'Mouse2', 'capturing a binding accepts the physical right mouse button');
+    check(defaultPrevented, 'and prevents the default so the click does not fall through');
+    check(input.captureBind === null, 'capture is one-shot — the next click is ordinary input');
+    check(!input.actions.has('aim'),
+      'a click that was consumed as a REBIND must not also fire the action it just bound');
+
+    // CONTROL: with no capture pending the same click is ordinary input again.
+    Input.prototype._onMouseDown.call(input, { button: 2, preventDefault() {} });
+    check(input.buttons[2] === true, 'CONTROL: an ordinary right click still registers');
+  }
+
   for (const route of SHELL_ROUTES) {
     const fixture = SHELL_SCREEN_FIXTURES[route.id];
     check(Boolean(fixture), `${route.id} is missing a fixture row`);
@@ -826,6 +849,25 @@ async function browserChecks() {
     equal(conflictActions.map((item) => item.trim()), ['Cancel', 'Unbind other', 'Swap'], 'binding conflict must expose only explicit outcomes');
     await page.keyboard.press('Escape');
     equal(await page.evaluate(() => document.activeElement?.dataset?.focusKey), 'binding-jump-secondary', 'binding conflict must restore capture opener');
+
+    // Right-clicking to bind popped the browser context menu over the settings screen:
+    // `captureMouse` prevents the default on mousedown, but `contextmenu` is a SEPARATE event
+    // and was never suppressed. Asserted by dispatching the real event and reading
+    // defaultPrevented, because that is the exact bit the browser consults.
+    const contextDuringCapture = await page.evaluate(() => {
+      window.__SETTINGS__.beginCapture('aim', 'primary');
+      const during = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+      window.dispatchEvent(during);
+      const suppressed = during.defaultPrevented;
+      window.__SETTINGS__.cancelCapture();
+      const after = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+      window.dispatchEvent(after);
+      return { suppressed, stillSuppressedAfterCapture: after.defaultPrevented };
+    });
+    check(contextDuringCapture.suppressed,
+      'the context menu is suppressed while capturing a binding, so right-click can be bound');
+    check(!contextDuringCapture.stillSuppressedAfterCapture,
+      'CONTROL: and is restored afterwards — the shell does not take right-click away for good');
 
     await page.evaluate(() => {
       const bind = (actionId, code) => {
