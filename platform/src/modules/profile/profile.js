@@ -182,12 +182,26 @@ export function nameChangeAvailableAt(account, cooldownMs) {
   return new Date(changedAt + cooldownMs).toISOString();
 }
 
-/** First incomplete account-policy step in the frozen onboarding order. */
-export function setupNextStepForAccount(account, termsVersion) {
+/**
+ * First incomplete account-policy step in the frozen onboarding order.
+ *
+ * `emailVerificationRequired` is `config.emailVerificationRequired`, which is derived from the
+ * mail transport rather than set by hand — see `core/config.js`. When no transport can deliver,
+ * the verify step is SKIPPED rather than failed: with nothing able to send a code, a player who
+ * completed every step they were actually offered is finished, and leaving them on step 5 would
+ * park every account in the deployment there permanently.
+ *
+ * This does not mark the address verified. `emailVerifiedAt` stays null, `profile.emailVerified`
+ * still reports false, and any capability that comes to require a verified address keeps
+ * refusing. The claim is narrow and deliberate: an unverified address does not block SETUP on a
+ * deployment that cannot verify one. It defaults to `true`, so a caller that forgets to thread
+ * the flag gets the stricter behaviour.
+ */
+export function setupNextStepForAccount(account, termsVersion, { emailVerificationRequired = true } = {}) {
   if (account?.eligibilityVerdict !== true) return 'eligibility';
   if (account.consentTelemetry === null || account.consentTelemetry === undefined) return 'consent';
   if (typeof account.displayName !== 'string' || !account.displayName.trim()) return 'display-name';
-  if (!account.emailVerifiedAt) return 'verify';
+  if (emailVerificationRequired && !account.emailVerifiedAt) return 'verify';
   if (account.termsVersionAccepted !== termsVersion) return 'terms';
   if (!account.roamingSettings) return 'essential-settings';
   return null;
@@ -196,6 +210,9 @@ export function setupNextStepForAccount(account, termsVersion) {
 export function createProfileService({
   store, clock = Date, nameChangeCooldownMs = 30 * 24 * 3600e3,
   termsVersion = 1,
+  // Defaults to the STRICTER behaviour: a composition root that forgets to thread this demands
+  // verification rather than silently waiving it. See `setupNextStepForAccount`.
+  emailVerificationRequired = true,
   // Presence is a live lobby-socket value (§5) and has no column; a reader is injected when a
   // presence service exists. Defaulting to null keeps the key present without inventing state.
   readPresence = null,
@@ -233,7 +250,8 @@ export function createProfileService({
       flags: {
         nameChangeAvailableAt: nameChangeAvailableAt(account, nameChangeCooldownMs),
         setupNextStep: setupNextStepForAccount({ ...account,
-          roamingSettings: storedProfile?.roamingSettings ?? null }, termsVersion),
+          roamingSettings: storedProfile?.roamingSettings ?? null }, termsVersion,
+        { emailVerificationRequired }),
       },
     };
   }

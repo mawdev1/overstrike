@@ -77,6 +77,7 @@ export function createProfileModule({
 }) {
   const profiles = createProfileService({
     store, clock, readPresence, readActiveSanctions, termsVersion: config?.termsVersion ?? 1,
+    emailVerificationRequired: config?.emailVerificationRequired !== false,
     changeDisplayName: identity?.changeDisplayName
       ? (args) => identity.changeDisplayName(args)
       : null,

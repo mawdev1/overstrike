@@ -1182,6 +1182,13 @@ await withApp(async ({ call, app }) => {
 });
 
 // ── 7d-iii. onboarding: GET consent, verification, terms ──────────────────────────────
+//
+// Built with a mail transport CONFIGURED, because that is the deployment this section
+// describes: every check below about the verify step presupposes that a code can be sent. It
+// used to inherit the default `none`, which after the mail work meant it was asserting the
+// verify step against a deployment with no way to pass it. `log` rather than `resend` so no
+// check here reaches the network; `mail/index.js` refuses `log` in production for its own
+// reason, and this app is `NODE_ENV=test`. The no-transport deployment is 7d-vi.
 await withApp(async ({ call, app }) => {
   section('onboarding read/verify/terms routes over a real socket');
   const tag = Date.now().toString(36).slice(-6);
@@ -1297,7 +1304,49 @@ await withApp(async ({ call, app }) => {
     'saving the essential roaming projection completes the server-owned onboarding discriminator',
     JSON.stringify({ savedStatus: savedSettings.status, savedBody: savedSettings.body,
       setupNextStep: completeProfile.body?.flags?.setupNextStep }));
-});
+}, { PLATFORM_MAIL_TRANSPORT: 'log', PLATFORM_MAIL_FROM: 'Overstrike <accounts@example.invalid>' });
+
+// ── 7d-vi. the same onboarding chain on a deployment with NO mail transport ────────────
+//
+// The live defect, over a real socket. With `PLATFORM_MAIL_TRANSPORT=none` a browser player
+// reached step 5, was asked for "the code from your verification message", and pressed a
+// "Resend code" button that answered 202 forever while nothing had ever been sent. Both halves
+// are asserted here against the ASSEMBLED app, because both were introduced by configuration
+// that every unit test had defaulted past.
+await withApp(async ({ call }) => {
+  section('onboarding on a deployment that cannot send mail');
+  const tag = `n${Date.now().toString(36).slice(-5)}`;
+  const { signup } = await onboard(call, {
+    sid: '01M0EFV571B7VBQCNXHAT5WTE1', name: `NoMl${tag}`, email: `nomail-${tag}@example.invalid`,
+  });
+  const token = signup.body?.accessToken;
+  check(signup.status === 201 && typeof token === 'string',
+    'control: signup still completes with no mail transport — verification never gated it',
+    JSON.stringify(signup.body?.error));
+
+  check(signup.body?.profile?.flags?.setupNextStep === 'terms',
+    'the chain skips verify rather than parking the account on a step nothing can complete',
+    JSON.stringify(signup.body?.profile?.flags));
+
+  const resend = await call('POST', '/v1/onboarding/verify/resend', {}, { authorization: `Bearer ${token}` });
+  check(resend.status === 503 && resend.body?.error?.code === 'SERVICE_UNAVAILABLE',
+    'and verify/resend says so instead of answering 202 for a message it will never send',
+    `${resend.status} ${resend.body?.error?.code ?? ''}`);
+  check(resend.body?.error?.retryable === true,
+    'the refusal is marked retryable — configuring a transport is what fixes it',
+    JSON.stringify(resend.body?.error));
+
+  // The rest of the chain is untouched: skipping verify must not mean skipping onboarding.
+  const terms = await call('GET', '/v1/onboarding/terms');
+  const accepted = await call('POST', '/v1/onboarding/terms/accept',
+    { version: terms.body.version }, { authorization: `Bearer ${token}` });
+  check(accepted.status === 204, 'control: terms are still demanded and still accepted',
+    `${accepted.status} ${accepted.body?.error?.code ?? ''}`);
+  const after = await call('GET', '/v1/profile/me', undefined, { authorization: `Bearer ${token}` });
+  check(after.body?.flags?.setupNextStep === 'essential-settings',
+    'and the chain continues to essential settings, not to null',
+    JSON.stringify(after.body?.flags));
+}, { PLATFORM_MAIL_TRANSPORT: 'none' });
 
 // ── 8. the stub layer refuses to exist in production ──────────────────────────────────
 {

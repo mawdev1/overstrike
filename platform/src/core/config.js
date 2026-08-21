@@ -147,6 +147,24 @@ export function loadConfig(source = process.env) {
     if (!out.matchControlSecret) out.matchControlSecret = 'DEV-ONLY-INSECURE-MATCH-CONTROL-SECRET-do-not-ship';
     if (!out.serviceToken) out.serviceToken = 'DEV-ONLY-INSECURE-SERVICE-TOKEN-do-not-ship';
   }
+  /**
+   * DERIVED, not configurable: can this deployment verify an email address at all?
+   *
+   * The onboarding chain gates step 5 on `emailVerifiedAt`, and the only way to set that column
+   * is to enter a code from a message. With `mailTransport = 'none'` no message is ever sent, so
+   * that step is not "slow" or "pending" — it is unreachable, and every account created is
+   * parked on it forever. Relaxing the transport rule above while leaving the gate in place
+   * would not have relaxed anything; it would have moved the refusal from boot to step 5, where
+   * it looks like a bug in the mailer instead of a deliberate configuration.
+   *
+   * Derived rather than given its own environment variable ON PURPOSE. Two independent switches
+   * would allow the state this cannot express: verification demanded while no transport can
+   * deliver it. That is precisely the trap the config-vs-mail-module duplication set two deploys
+   * ago, and one source of truth is the fix for it.
+   *
+   * Configure a transport and the gate returns by itself — nothing else has to be remembered.
+   */
+  out.emailVerificationRequired = out.mailTransport !== 'none';
   if (problems.length) {
     const err = new Error(`Invalid configuration:\n  - ${problems.join('\n  - ')}`);
     err.problems = problems;

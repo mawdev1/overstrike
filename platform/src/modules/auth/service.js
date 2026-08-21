@@ -20,6 +20,7 @@ import { nameChangeAvailableAt, setupNextStepForAccount } from '../profile/profi
 import { normaliseDisplayName, assertCooldown } from './names.js';
 import { playerActor, correlationFor } from './events.js';
 import { internalise } from './faults.js';
+import { mailDisabledError } from '../mail/index.js';
 
 export const RECOVERY_TTL_MS = 30 * 60 * 1000;
 export const VERIFICATION_TTL_MS = 24 * 3600 * 1000;
@@ -116,7 +117,8 @@ export function createAuthService(deps) {
       },
       flags: {
         nameChangeAvailableAt: nameChangeAvailableAt(account, 30 * 24 * 3600e3),
-        setupNextStep: setupNextStepForAccount(projectedAccount, config.termsVersion),
+        setupNextStep: setupNextStepForAccount(projectedAccount, config.termsVersion,
+          { emailVerificationRequired: config.emailVerificationRequired !== false }),
       },
     };
   }
@@ -730,9 +732,23 @@ export function createAuthService(deps) {
     // The EMAIL, not just the accountId: a mailer given only an account id has no recipient and
     // silently delivers nothing. This path is the one a player uses when the first message never
     // arrived, so it is the worst one to have quietly send nowhere.
-    await mailer?.sendVerification?.({
+    const sent = await mailer?.sendVerification?.({
       accountId: account.accountId, email: account.email, token: raw, correlationId,
     });
+    // The RETURN VALUE, not just the call.
+    //
+    // This awaited the send and discarded the result, so `accepted: true` was reported no matter
+    // what happened — including a `none` transport, where the honest answer is that nothing was
+    // sent and nothing ever will be. Live, that made "Resend code" a button reporting success
+    // forever while no message existed; `mail/index.js` exported `mailDisabledError` for this
+    // case and nothing had ever called it.
+    //
+    // Only `transport_disabled` refuses. A `transport_error` is a provider hiccup on a token
+    // that has already been minted and remains valid, so it stays 202 and is logged — the player
+    // can press the button again, which is the whole purpose of this route.
+    if (sent && sent.delivered === false && sent.reason === 'transport_disabled') {
+      throw mailDisabledError();
+    }
     return { accepted: true, verificationToken: raw };
   }
 

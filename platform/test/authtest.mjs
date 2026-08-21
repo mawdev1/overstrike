@@ -28,7 +28,8 @@
 import { createMemoryStore } from '../src/core/store/memory.js';
 import { createPostgresStore } from '../src/core/store/postgres.js';
 import { runMigrations } from '../src/core/migrate.js';
-import { createProfileService } from '../src/modules/profile/profile.js';
+import { createProfileService, setupNextStepForAccount } from '../src/modules/profile/profile.js';
+import { createMailer } from '../src/modules/mail/index.js';
 import { loadConfig } from '../src/core/config.js';
 import { ulid } from '../src/core/ids.js';
 import { ApiError } from '../src/core/errors.js';
@@ -120,21 +121,21 @@ function makeClock(now = T0) {
  * (the idempotency race) is INVISIBLE on memory by construction, because that adapter
  * serialises every transaction. A memory-only proof of a locking fix is not a proof.
  */
-function moduleOn(store, clock, { env = {}, identity = undefined } = {}) {
+function moduleOn(store, clock, { env = {}, identity = undefined, mailer = undefined } = {}) {
   const config = loadConfig({ PLATFORM_TOKEN_SECRET: 'test-secret-not-a-real-one', ...env });
   const auth = createAuthModule({
     store, config, logger: silentLogger, clock, sleep: realSleep,
     // No janitor timer in a test: §19 calls the sweep directly, and an interval that fires
     // mid-assertion would make the counts non-deterministic.
-    consentSweepIntervalMs: 0, identity,
+    consentSweepIntervalMs: 0, identity, mailer,
   });
   const h = { store, clock, config, ...auth };
   open.push(h);
   return h;
 }
 
-function mk({ now = T0, env = {}, identity = undefined } = {}) {
-  return moduleOn(recording(createMemoryStore({}, {})), makeClock(now), { env, identity });
+function mk({ now = T0, env = {}, identity = undefined, mailer = undefined } = {}) {
+  return moduleOn(recording(createMemoryStore({}, {})), makeClock(now), { env, identity, mailer });
 }
 
 /** Every §5 outbox row currently staged, and the §2 envelopes they rehydrate to. */
@@ -2088,6 +2089,91 @@ if (!databaseUrl) {
   } finally {
     await raw.end();
   }
+}
+
+// ------------------------------------------ 21. a deployment that cannot send mail
+
+/**
+ * Both halves of the same live defect, found by walking the deployed onboarding flow rather
+ * than by reading: with `PLATFORM_MAIL_TRANSPORT=none`,
+ *
+ *   1. `verify/resend` returned 202 `accepted` while sending nothing, so "Resend code" was a
+ *      button that reported success forever, and
+ *   2. `setupNextStep` stayed on `verify` for every account ever created, because the only way
+ *      out of that step is a code from a message nothing would send.
+ *
+ * The control cases matter more than the new behaviour here: this section has to show that a
+ * deployment WITH mail is unchanged, or it reads as "verification was removed".
+ */
+section('21. WITH NO MAIL TRANSPORT, VERIFICATION IS SKIPPED RATHER THAN UNPASSABLE');
+{
+  const disabled = createMailer({ config: { env: 'test', mailTransport: 'none' } });
+  const sends = [];
+  const working = {
+    transport: 'resend',
+    sendVerification: async (args) => { sends.push(args); return { delivered: true, transport: 'resend' }; },
+    sendRecovery: async () => ({ delivered: true, transport: 'resend' }),
+  };
+
+  // ── half 1: the resend route stops claiming it sent something ──────────────────────────
+  const off = mk({ mailer: disabled });
+  const offActor = await actorFor(off, await newAccount(off, { email: 'nomail@example.com', displayName: 'NoMailTen' }));
+  ok('resend refuses honestly when no transport can deliver',
+    await codeOf(() => off.service.verificationResend({ actor: offActor })) === 'SERVICE_UNAVAILABLE',
+    String(await codeOf(() => off.service.verificationResend({ actor: offActor }))));
+
+  const on = mk({ mailer: working });
+  const onActor = await actorFor(on, await newAccount(on, { email: 'hasmail@example.com', displayName: 'HasMailTen' }));
+  ok('control: with a working transport resend still succeeds',
+    await codeOf(() => on.service.verificationResend({ actor: onActor })) === null);
+  ok('control: and the message actually went to the stored address',
+    sends.some((s) => s.email === 'hasmail@example.com' && typeof s.token === 'string' && s.token));
+
+  // A provider outage is NOT the disabled case: the token is already minted and still valid,
+  // so the player must be able to press the button again.
+  const flaky = mk({ mailer: { transport: 'resend',
+    sendVerification: async () => ({ delivered: false, reason: 'transport_error', message: 'resend responded 502' }) } });
+  const flakyActor = await actorFor(flaky, await newAccount(flaky, { email: 'flaky@example.com', displayName: 'FlakyTen' }));
+  ok('a provider outage stays retryable rather than becoming a refusal',
+    await codeOf(() => flaky.service.verificationResend({ actor: flakyActor })) === null);
+
+  // ── half 2: the onboarding gate ────────────────────────────────────────────────────────
+  const unverified = {
+    eligibilityVerdict: true, consentTelemetry: true, displayName: 'Someone',
+    emailVerifiedAt: null, termsVersionAccepted: 1, roamingSettings: { a: 1 },
+  };
+  ok('control: with mail available an unverified account is held at verify',
+    setupNextStepForAccount(unverified, 1, { emailVerificationRequired: true }) === 'verify');
+  ok('with no mail transport the chain moves past verify',
+    setupNextStepForAccount(unverified, 1, { emailVerificationRequired: false }) === null,
+    String(setupNextStepForAccount(unverified, 1, { emailVerificationRequired: false })));
+  ok('the default is the STRICT one, so forgetting to thread the flag demands verification',
+    setupNextStepForAccount(unverified, 1) === 'verify');
+
+  // Skipping verify must not skip anything else, or "unblock the browser" would quietly have
+  // meant "stop enforcing onboarding".
+  ok('terms are still required when verification is skipped',
+    setupNextStepForAccount({ ...unverified, termsVersionAccepted: 0 }, 1,
+      { emailVerificationRequired: false }) === 'terms');
+  ok('a display name is still required when verification is skipped',
+    setupNextStepForAccount({ ...unverified, displayName: '   ' }, 1,
+      { emailVerificationRequired: false }) === 'display-name');
+  ok('essential settings are still required when verification is skipped',
+    setupNextStepForAccount({ ...unverified, roamingSettings: null }, 1,
+      { emailVerificationRequired: false }) === 'essential-settings');
+
+  // The address is NOT marked verified. The claim is only that it does not block setup.
+  ok('skipping the step does not claim the address is verified',
+    (await off.store.accounts.byId(offActor.accountId)).emailVerifiedAt === null);
+
+  // ── the derived config value, which is what makes the two halves agree ─────────────────
+  ok('config derives verification-required from the transport, with no separate switch',
+    loadConfig({ PLATFORM_TOKEN_SECRET: 'test-secret-not-a-real-one',
+      PLATFORM_MAIL_TRANSPORT: 'none' }).emailVerificationRequired === false);
+  ok('control: a configured transport requires verification again by itself',
+    loadConfig({ PLATFORM_TOKEN_SECRET: 'test-secret-not-a-real-one',
+      PLATFORM_MAIL_TRANSPORT: 'resend', PLATFORM_MAIL_FROM: 'a@example.invalid',
+      PLATFORM_MAIL_API_KEY: 'k' }).emailVerificationRequired === true);
 }
 
 // -------------------------------------------------------------------------------- summary

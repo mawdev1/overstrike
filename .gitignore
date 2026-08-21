@@ -3,3 +3,6 @@ dist/
 shots/
 *.log
 .DS_Store
+
+# Playwright MCP session artefacts (snapshots, console logs) — never source.
+.playwright-mcp/
