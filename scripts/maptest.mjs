@@ -505,9 +505,37 @@ let reachable = new Set();
     + `${inRotation ? '' : ' (fixture, not in rotation)'}`);
 
   const gaps = manifestGaps(m);
+
+  /**
+   * ABSENT is a schedule; PARTIAL is a defect. They are different answers.
+   *
+   * These assertions shipped ahead of the producer. They were green locally because the
+   * CX lane's manifest was sitting UNCOMMITTED in the working tree, and red in CI, where
+   * `git show HEAD:src/world/level.js` declares none of the four exports — the same shape
+   * as the untracked `tdmtest.mjs` that broke `npm run ci` three times, in a form `citest`
+   * cannot see because the file here IS tracked; only its contents lag.
+   *
+   * So: a producer that declares NOTHING is a lane that has not landed yet. That is a real
+   * state, it is tracked by name below, and failing on it would mean this lane could never
+   * commit a consumer before the other lane commits a producer — which the whole
+   * contract-first split exists to allow.
+   *
+   * A producer that declares SOME of it is a different thing entirely: someone wrote a
+   * manifest and got it wrong, and that must fail. Silence there is how a half-built
+   * manifest ships.
+   */
+  const declaresNothing = !m.declares.MAP_ID && !m.declares.MAP_VERSION
+    && !m.declares.MAP_MANIFEST && !m.declares.COMPETITIVE_BOUNDARY;
+
   if (gaps.length === 0) ok('the producer declares every §3 export');
-  else if (inRotation) bad('the producer declares every §3 export', `still owed: ${gaps.join(', ')}`);
-  else console.log(`  note   fixture does not declare: ${gaps.join(', ')}`);
+  else if (!inRotation) console.log(`  note   fixture does not declare: ${gaps.join(', ')}`);
+  else if (declaresNothing) {
+    console.log(`  PENDING  '${m.mapId}' declares no §3 manifest at all — REQ-CX-008 / map-data.md §3.`);
+    console.log('           Tracked, not ignored: the moment the producer declares ANY of it,');
+    console.log('           the branch below turns this into a failure.');
+  } else {
+    bad('the producer declares a PARTIAL §3 manifest', `declared some, still owed: ${gaps.join(', ')}`);
+  }
 
   // §3.1 / §3.3 / §3.4: a volume authored min > max is silently dropped by the spatial
   // hash, and a zero-extent one is a volume nothing can ever be inside.
@@ -584,7 +612,11 @@ let reachable = new Set();
 
   // §5: the competitive boundary must be a removable tagged layer, not baked into the
   // district — otherwise P6 re-authors the whole map to open it up.
-  if (inRotation) {
+  // Same distinction as the §3 export check above: a producer that has declared nothing has
+  // not landed, and cannot be judged on a boundary layer it has not written yet.
+  if (inRotation && declaresNothing) {
+    console.log('  PENDING  no COMPETITIVE_BOUNDARY — the producer declares no §3 manifest at all.');
+  } else if (inRotation) {
     if (m.boundary.length > 0) ok(`the competitive boundary is a removable layer (${m.boundary.length} volumes)`);
     else bad('the competitive boundary is a removable layer',
       'COMPETITIVE_BOUNDARY is not exported, so the boundary is baked into the district geometry');

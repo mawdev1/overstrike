@@ -1114,7 +1114,15 @@ export class Match {
     // `roundEnd`/`matchEnd` consumers see is the complete one.
     this.mode.decorateResult?.(this, result);
 
-    const prog = this._awardProgression(outcome);
+    // `match-result.md` §6.1: an aborted/no-contest match is "recorded and not aggregated"
+    // — counters not applied, `matches` +0, no W/L/D. The ruleset says which outcomes those
+    // are (`result.aggregate`); the referee is what makes it true, and until this line it
+    // did not: `_awardProgression` ran unconditionally, so a match nobody finished banked a
+    // completion bonus and a lifetime draw. §4.3 also fixes the per-player result at null
+    // when there is no winner — `winnerTeam: null` means *no winner*, never *draw* (§4.0).
+    if (result.aggregate === false) result.outcome = null;
+
+    const prog = result.aggregate === false ? null : this._awardProgression(result.outcome);
     result.progression = prog;
     this.lastProgression = prog;
     this.result = result;
@@ -1126,7 +1134,11 @@ export class Match {
     this.game.bus.emit('roundEnd', result);
 
     this.notice(
-      outcome === 'win' ? 'VICTORY' : outcome === 'draw' ? 'DRAW' : 'DEFEAT',
+      result.outcome === 'win' ? 'VICTORY'
+        : result.outcome === 'draw' ? 'DRAW'
+          // A no-contest is neither a defeat nor a stalemate; announcing DEFEAT for a match
+          // that paid nothing tells the player they lost something they did not.
+          : result.outcome === null ? 'NO CONTEST' : 'DEFEAT',
       result.winnerName ? `${result.winnerName} wins` : '',
       4,
     );

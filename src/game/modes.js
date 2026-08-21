@@ -124,6 +124,62 @@ export function bombAvailable(game, manifest = null) {
   }
 }
 
+/**
+ * `match-result.md` §4.0's closed `outcomeReason` enum, split by termination reason. Stated
+ * here because this file is where a series reason becomes a result field, and a value that
+ * leaves the enum is refused by the platform's shared validator AND by a database `CHECK`
+ * (`platform/migrations/0016`) — a rejected submission, not a cosmetic mismatch.
+ */
+const COMPLETED_REASONS = Object.freeze(['elimination', 'defuse', 'detonation', 'timer']);
+
+/**
+ * The §4.0 `outcomeReason` for a finished Bomb series.
+ *
+ * Three cases, and none of them is the raw series reason:
+ *
+ * - **The abort paths already name one.** `bomb.js` records `forfeit` / `no-contest`
+ *   directly (bomb-rules §9), and those are enum values; they pass through.
+ * - **`draw` → `timer`.** §4.0: "A draw is regulation expiring at 6-6 with no overtime in
+ *   Alpha… There is no other way for a `completed` match to have no winner", and §4.2:
+ *   "`winnerTeam: "draw"` requires `outcomeReason: "timer"`, and only `timer`". `draw` is
+ *   not in the enum at all; the reason a drawn series ends is that regulation ran out.
+ * - **`roundsToWin` → the deciding round's reason.** §4.0's `completed` rows offer exactly
+ *   `elimination | defuse | detonation | timer`, and every one of them names *how the match
+ *   was decided*. "Reached seven" is the series arithmetic, not a reason in that sense: the
+ *   round that took the series was itself won by an elimination, a defuse, a detonation or
+ *   the round clock, and that is the fact §4.0 is asking for — the same vocabulary §4.1
+ *   already uses for `rounds[].reason`. Picking a constant instead (say, always
+ *   `elimination`) would report a series clinched by a detonation as an elimination, which
+ *   is exactly the "two truths in one row" §4.2 refuses.
+ */
+function seriesOutcomeReason(bomb, series) {
+  if (!series) return 'timer';
+  if (series.outcomeReason) return series.outcomeReason;
+  if (series.reason === 'draw') return 'timer';
+  if (series.reason === 'roundsToWin') {
+    const last = bomb.rounds[bomb.rounds.length - 1]?.reason;
+    // Unreachable while `_endRound` is the only writer — it passes one of the four. The
+    // fallback is `timer` because it is the one reason legal beside every winnerTeam.
+    return COMPLETED_REASONS.includes(last) ? last : 'timer';
+  }
+  return COMPLETED_REASONS.includes(series.reason) ? series.reason : 'timer';
+}
+
+/**
+ * The §4.0 `winnerTeam`: `alpha` | `bravo` | `draw` | `null`.
+ *
+ * The engine's `-1` is two different facts and the contract separates them — §4.0:
+ * "`winnerTeam: null` means *no winner*, never *draw*". A drawn regulation is `draw`; a
+ * no-contest (both teams gone, bomb-rules §9) is `null`, and `draw` is legal only when the
+ * reason is `timer`, so the reason decides which `-1` this is.
+ */
+function seriesWinnerTeam(series, outcomeReason) {
+  const team = series ? series.winnerTeam : -1;
+  if (team === 0) return 'alpha';
+  if (team === 1) return 'bravo';
+  return outcomeReason === 'timer' ? 'draw' : null;
+}
+
 export const BOMB = {
   id: 'bomb',
   name: 'BOMB',
@@ -217,10 +273,17 @@ export const BOMB = {
     result.roundsToWin = BOMB_PARAMS.roundsToWin;
     result.attackingTeam = bomb.attackingTeam;
     result.winnerTeam = series ? series.winnerTeam : -1;
-    result.winnerLabel = series ? series.winnerLabel : 'draw';
-    result.outcomeReason = series?.outcomeReason ?? series?.reason ?? null;
+    // `reason` stays the raw series reason — the HUD, the round log and bombtest read it.
+    // Everything below is the §4.0 projection of that same fact, and the two are kept
+    // apart deliberately: `roundsToWin` is a true statement about the series and is not a
+    // legal `outcomeReason`, so translating in place would lose one of them.
     result.terminationReason = series?.terminationReason ?? 'completed';
-    result.aggregate = series?.aggregate ?? true;
+    result.outcomeReason = seriesOutcomeReason(bomb, series);
+    result.winnerLabel = seriesWinnerTeam(series, result.outcomeReason);
+    // §6.1: a no-contest is the ONLY Bomb outcome that records without aggregating, and
+    // that follows from the outcome reason rather than from a flag anyone can forget to
+    // set. Derived, not copied, so the two can never disagree.
+    result.aggregate = result.outcomeReason !== 'no-contest';
     result.objectiveEvents = bomb.events.map((e) => ({ ...e }));
   },
 };
