@@ -18,7 +18,40 @@ const validBox = (box) => finiteVec(box?.min) && finiteVec(box?.max)
 const contains = (box, x, y, z) => x >= box.min.x && x <= box.max.x
   && y >= box.min.y && y <= box.max.y && z >= box.min.z && z <= box.max.z;
 
-function manifestProblems(manifest, boundary = COMPETITIVE_BOUNDARY, anchors = COMMERCIAL_ANCHORS) {
+// map-data.md §3.4: the callout NAME is the one vocabulary the minimap, the HUD, canned
+// callouts, match evidence and map analytics all speak. Nothing here read `callout.name`
+// until now, so setting every name to undefined, to '', or to 'BANANA <id>' all produced
+// zero problems — the minimap would have read LOCATION UNKNOWN everywhere and both sites
+// would have fallen back to Site A/Site B while this harness printed "passed". Coverage
+// cannot substitute: The Square's `district` catch-all spans the whole map on its own, so
+// deleting thirteen of the fourteen callouts also produced zero problems.
+//
+// The vocabulary is therefore pinned. §3.4's whole argument is that these strings are
+// shared with evidence and analytics, which makes a silent rename a history rewrite, the
+// same hazard §3.3 spells out for objective ids. Changing a name must be a deliberate edit
+// here as well as in level.js.
+const SQUARE_CALLOUT_NAMES = Object.freeze({
+  district: 'District',
+  'alpha-court': 'South Court',
+  'bravo-court': 'North Court',
+  'plaza-fountain': 'Fountain',
+  'plaza-east': 'Plaza East',
+  'plaza-west': 'Plaza West',
+  'civic-archive': 'Civic Archive',
+  'civic-court': 'Archive Court',
+  'market-arcade': 'Market Arcade',
+  'market-alley': 'Delivery Alley',
+  'transit-control': 'Transit Control',
+  'transit-platform': 'Platform',
+  'service-tunnel': 'Service Tunnel',
+  'upper-walk': 'Upper Walk',
+});
+// Sampling coverage at a hardcoded y = 0 meant the `upper-walk` band (y 3.5–8) — the whole
+// second storey of the vocabulary — was exercised by nothing.
+const COVERAGE_Y = [0, 4, 6];
+
+function manifestProblems(manifest, boundary = COMPETITIVE_BOUNDARY, anchors = COMMERCIAL_ANCHORS,
+  vocabulary = SQUARE_CALLOUT_NAMES) {
   const out = [];
   if (!validBox(manifest?.bounds)) out.push('bounds');
   const spawns = Array.isArray(manifest?.spawns) ? manifest.spawns : [];
@@ -42,21 +75,54 @@ function manifestProblems(manifest, boundary = COMPETITIVE_BOUNDARY, anchors = C
       out.push(`site-${site}`);
     }
   }
-  if (!unique((manifest.callouts || []).map((callout) => callout.id))) out.push('callout-ids');
-  for (let x = -42; x <= 42; x += 3) {
-    for (let z = -42; z <= 42; z += 3) {
-      const candidates = (manifest.callouts || []).filter((callout) => contains(callout.box, x, 0, z));
-      if (candidates.length === 0) out.push(`callout-gap:${x},${z}`);
-      const priorities = candidates.map((callout) => callout.priority);
-      const max = Math.max(...priorities);
-      if (priorities.filter((priority) => priority === max).length > 1) out.push(`callout-tie:${x},${z}`);
+  const callouts = Array.isArray(manifest?.callouts) ? manifest.callouts : [];
+  if (!unique(callouts.map((callout) => callout.id))) out.push('callout-ids');
+  // Every region must be named, with a name a human can say, and no two regions may share
+  // a name — two regions called the same thing is the second vocabulary §3.4 forbids.
+  for (const callout of callouts) {
+    if (typeof callout?.name !== 'string' || callout.name.trim().length < 2
+      || callout.name.trim() !== callout.name) out.push(`callout-name:${callout?.id ?? '?'}`);
+    if (!Number.isFinite(callout?.priority)) out.push(`callout-priority:${callout?.id ?? '?'}`);
+    if (!validBox(callout?.box)) out.push(`callout-box:${callout?.id ?? '?'}`);
+  }
+  const names = callouts.map((callout) => callout?.name);
+  if (!unique(names)) out.push('callout-name-collision');
+  const expected = Object.entries(vocabulary || {});
+  if (callouts.length !== expected.length) out.push(`callout-count:${callouts.length}/${expected.length}`);
+  for (const [id, name] of expected) {
+    const callout = callouts.find((item) => item?.id === id);
+    if (!callout) out.push(`callout-missing:${id}`);
+    else if (callout.name !== name) out.push(`callout-renamed:${id}`);
+  }
+  for (const y of COVERAGE_Y) {
+    for (let x = -42; x <= 42; x += 3) {
+      for (let z = -42; z <= 42; z += 3) {
+        const candidates = callouts.filter((callout) => validBox(callout?.box)
+          && contains(callout.box, x, y, z));
+        if (candidates.length === 0) { out.push(`callout-gap:${x},${y},${z}`); continue; }
+        const priorities = candidates.map((callout) => callout.priority);
+        const max = Math.max(...priorities);
+        if (priorities.filter((priority) => priority === max).length > 1) out.push(`callout-tie:${x},${y},${z}`);
+      }
     }
   }
   if (!Array.isArray(boundary) || boundary.length !== 4 || boundary.some((box) => !validBox(box))) out.push('boundary');
-  const budgets = manifest.budgets || {};
-  if (budgets.profileId !== 'ref-integrated-1080p' || budgets.drawCalls > 140
-    || budgets.triangles > 300000 || budgets.materials > 48
-    || budgets.lights > 6 || budgets.colliders > 1200) out.push('budgets');
+  // `undefined > 140` is false, so this whole clause used to hold with every numeric budget
+  // field absent — only the profileId string equality was doing any work. §3.6 calls a
+  // budget without its counting conditions unfalsifiable; a budget without its numbers is
+  // worse. Each field must be present and finite before its ceiling means anything.
+  const budgets = manifest?.budgets;
+  const CEILINGS = { drawCalls: 140, triangles: 300000, materials: 48, lights: 6, colliders: 1200 };
+  if (!budgets || typeof budgets !== 'object') out.push('budgets-absent');
+  else {
+    if (budgets.profileId !== 'ref-integrated-1080p') out.push('budgets-profile');
+    for (const [field, ceiling] of Object.entries(CEILINGS)) {
+      const value = budgets[field];
+      if (!Number.isFinite(value)) out.push(`budgets-missing:${field}`);
+      else if (value > ceiling) out.push(`budgets-over:${field}`);
+      else if (value <= 0) out.push(`budgets-nonpositive:${field}`);
+    }
+  }
   const anchorIds = (anchors || []).map((anchor) => anchor.id);
   for (const id of ['sponsor.event.plaza-east', 'sponsor.rooftop.transit',
     'sponsor.billboard.market-north', 'storefront.market.01', 'storefront.civic.01']) {
@@ -83,14 +149,97 @@ check(MERIDIAN_FIXTURE.MAP_ID === 'meridian' && typeof MERIDIAN_FIXTURE.buildLev
 assert.deepEqual(manifestProblems(MAP_MANIFEST), []);
 checks++;
 
-// A guard that cannot fail is decoration. Exercise three independent defect classes.
-const duplicateSpawn = { ...MAP_MANIFEST, spawns: [...MAP_MANIFEST.spawns, MAP_MANIFEST.spawns[0]] };
+// A guard that cannot fail is decoration. Every clause above is degraded here against a
+// real manifest — a shallow clone of MAP_MANIFEST with one field spoiled — and must be
+// seen to reject it. The repo file is never touched.
+const degrade = (patch) => ({ ...MAP_MANIFEST, ...patch });
+const renameAll = (name) => degrade({
+  callouts: MAP_MANIFEST.callouts.map((callout) => ({ ...callout, name })),
+});
+
+const duplicateSpawn = degrade({ spawns: [...MAP_MANIFEST.spawns, MAP_MANIFEST.spawns[0]] });
 check(manifestProblems(duplicateSpawn).includes('spawn-ids'), 'duplicate spawn mutation is rejected');
-const noCallouts = { ...MAP_MANIFEST, callouts: [] };
+const noCallouts = degrade({ callouts: [] });
 check(manifestProblems(noCallouts).some((problem) => problem.startsWith('callout-gap:')),
   'callout coverage mutation is rejected');
-const excessiveBudget = { ...MAP_MANIFEST, budgets: { ...MAP_MANIFEST.budgets, drawCalls: 141 } };
-check(manifestProblems(excessiveBudget).includes('budgets'), 'budget mutation is rejected');
+
+// The four degradations the audit drove straight through: every name undefined, every name
+// empty, every name replaced wholesale, and thirteen of fourteen regions deleted.
+check(manifestProblems(renameAll(undefined)).includes('callout-name:district'),
+  'callouts with no name at all are rejected');
+check(manifestProblems(renameAll('')).includes('callout-name:plaza-fountain'),
+  'callouts with a blank name are rejected');
+const banana = degrade({
+  callouts: MAP_MANIFEST.callouts.map((callout) => ({ ...callout, name: `BANANA ${callout.id}` })),
+});
+check(manifestProblems(banana).includes('callout-renamed:upper-walk')
+  && manifestProblems(banana).filter((problem) => problem.startsWith('callout-renamed:')).length === 14,
+  'wholesale renaming of the callout vocabulary is rejected');
+const oneRenamed = degrade({
+  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'plaza-fountain'
+    ? { ...callout, name: 'Water Feature' } : callout)),
+});
+check(manifestProblems(oneRenamed).includes('callout-renamed:plaza-fountain'),
+  'renaming a single callout is rejected');
+const thirteenDeleted = degrade({
+  callouts: MAP_MANIFEST.callouts.filter((callout) => callout.id === 'district'),
+});
+check(manifestProblems(thirteenDeleted).includes('callout-missing:upper-walk')
+  && manifestProblems(thirteenDeleted).includes('callout-count:1/14'),
+  'deleting thirteen of fourteen callouts is rejected despite the district catch-all covering them');
+const nameCollision = degrade({
+  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'plaza-east'
+    ? { ...callout, name: 'Plaza West' } : callout)),
+});
+check(manifestProblems(nameCollision).includes('callout-name-collision'),
+  'two regions sharing one name is rejected');
+// `upper-walk` is the only region above y = 3.5, so sampling coverage at a hardcoded y = 0
+// left the entire second storey of the vocabulary exercised by nothing. Drop its priority
+// onto the district catch-all's and the upper band becomes ambiguous — two names for one
+// standing point, which §3.4 says nobody can talk about. Nothing at y = 0 changes, which
+// is exactly why the old single-band sampling could not see it.
+const ambiguousUpper = degrade({
+  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'upper-walk'
+    ? { ...callout, priority: -100 } : callout)),
+});
+const upperProblems = manifestProblems(ambiguousUpper);
+check(upperProblems.some((problem) => /^callout-tie:-?\d+,(4|6),/.test(problem))
+  && !upperProblems.some((problem) => /^callout-tie:-?\d+,0,/.test(problem)),
+  'an ambiguous upper band is caught by the y 4 / y 6 samples and is invisible at y 0');
+
+// `node scripts/uimap.mjs --degraded` prints what each degradation produces, so the claim
+// "this guard can fail" is inspectable rather than asserted.
+if (process.argv.includes('--degraded')) {
+  const summarise = (problems) => (problems.length
+    ? `${problems.length} problems -> ${problems.slice(0, 4).join(', ')}${problems.length > 4 ? ', …' : ''}`
+    : 'problems: []');
+  console.log('\nDEGRADED MANIFESTS (scratch clones; the repo file is untouched)');
+  for (const [label, degraded] of [
+    ['every name -> undefined   ', renameAll(undefined)],
+    ["every name -> ''          ", renameAll('')],
+    ['every name -> BANANA <id> ', banana],
+    ['one name -> Water Feature ', oneRenamed],
+    ['13 of 14 callouts deleted ', thirteenDeleted],
+    ['two regions, one name     ', nameCollision],
+    ['upper band made ambiguous ', ambiguousUpper],
+    ['budgets.drawCalls deleted ', degrade({ budgets: (() => { const b = { ...MAP_MANIFEST.budgets }; delete b.drawCalls; return b; })() })],
+    ['budgets block deleted     ', degrade({ budgets: undefined })],
+    ['AS AUTHORED               ', MAP_MANIFEST],
+  ]) console.log(`  ${label} ${summarise(manifestProblems(degraded))}`);
+  console.log('');
+}
+
+const excessiveBudget = degrade({ budgets: { ...MAP_MANIFEST.budgets, drawCalls: 141 } });
+check(manifestProblems(excessiveBudget).includes('budgets-over:drawCalls'), 'budget mutation is rejected');
+// Each numeric ceiling used to be satisfied by the field being absent.
+for (const field of ['drawCalls', 'triangles', 'materials', 'lights', 'colliders']) {
+  const stripped = { ...MAP_MANIFEST.budgets };
+  delete stripped[field];
+  check(manifestProblems(degrade({ budgets: stripped })).includes(`budgets-missing:${field}`),
+    `an absent ${field} budget is rejected rather than passing as under its ceiling`);
+}
+check(manifestProblems(degrade({ budgets: undefined })).includes('budgets-absent'),
+  'a manifest with no budgets block at all is rejected');
 
 // The legacy mapbalance report predates The Square and still names MERIDIAN landmarks.
 // Keep the frozen P0.3 envelope load-bearing here as well: real shipping World/NavGrid,
@@ -104,13 +253,33 @@ buildLevel(game, boundaryFreeWorld, { competitiveBoundary: false });
 check(!boundaryFreeWorld.boxes.some((box) => box.surface === 'boundary'),
   'competitive boundary can be omitted without changing the architectural producer');
 const boundaryFreeManifest = squareManifest({ competitiveBoundary: false });
+// §5 declares four boundary boxes. The two assertions below used to compare
+// COMPETITIVE_BOUNDARY.length against itself and to run .every() over an array that, if it
+// were ever emptied, would make both of them vacuously true — `[].every()` is `true`, and
+// after that `0 === 0` holds. The expected count is the literal 4, asserted first, so the
+// array can never shrink its own expectation.
+const BOUNDARY_LAYER_BOXES = 4;
+check(COMPETITIVE_BOUNDARY.length === BOUNDARY_LAYER_BOXES,
+  `the declared competitive boundary is ${BOUNDARY_LAYER_BOXES} boxes (§5)`);
+const blockedWithBoundary = COMPETITIVE_BOUNDARY
+  .filter((box) => MAP_MANIFEST.navHints.blocked.includes(box)).length;
+const blockedWithoutBoundary = COMPETITIVE_BOUNDARY
+  .filter((box) => boundaryFreeManifest.navHints.blocked.includes(box)).length;
 check(boundaryFreeWorld.manifest?.navHints?.blocked === boundaryFreeManifest.navHints.blocked
-  && COMPETITIVE_BOUNDARY.every((box) => !boundaryFreeManifest.navHints.blocked.includes(box))
-  && COMPETITIVE_BOUNDARY.every((box) => MAP_MANIFEST.navHints.blocked.includes(box)),
-  'boundary-free projection removes the same layer from navigation without cloning authority');
-check(world.boxes.filter((box) => box.surface === 'boundary').length === COMPETITIVE_BOUNDARY.length
-  && world.boxes.length - boundaryFreeWorld.boxes.length === COMPETITIVE_BOUNDARY.length,
-  'boundary-free build removes exactly the complete declared boundary layer');
+  && blockedWithBoundary === BOUNDARY_LAYER_BOXES && blockedWithoutBoundary === 0,
+  `boundary-free projection removes the same layer from navigation without cloning authority `
+  + `(${blockedWithBoundary} blocked with, ${blockedWithoutBoundary} without)`);
+
+// Same defect, same fix: count the tagged layer in a real build against the literal, and
+// prove the count is load-bearing by running it against a real world built without the
+// layer, where it must come out at 0 rather than 4.
+const boundaryLayerCount = (target) => target.boxes.filter((box) => box.surface === 'boundary').length;
+check(boundaryLayerCount(world) === BOUNDARY_LAYER_BOXES
+  && world.boxes.length - boundaryFreeWorld.boxes.length === BOUNDARY_LAYER_BOXES,
+  `boundary-free build removes exactly the complete declared boundary layer `
+  + `(${boundaryLayerCount(world)} tagged, ${world.boxes.length - boundaryFreeWorld.boxes.length} removed)`);
+check(boundaryLayerCount(boundaryFreeWorld) === 0,
+  'the same count run against a real boundary-free build reads 0, so 4 is a measurement');
 boundaryFreeWorld.dispose();
 const nav = game.nav;
 nav.nodeBudget = 100_000;
