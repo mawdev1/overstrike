@@ -35,7 +35,7 @@ try {
   page.on('console', (m) => { if (m.type() === 'error') errs.push('console: ' + m.text()); });
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => window.__GAME__?.state === 'menu', null, { timeout: 180000, polling: 200 });
-  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'ffa', botCount: 2, seed: 5 }));
+  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'tdm', botCount: 2, seed: 5 }));
   const waitFrames = (n = 3) => page.evaluate(async (want) => {
     const g = window.__GAME__; const t = g.frame + want; const t0 = Date.now();
     while (g.frame < t && Date.now() - t0 < 60000) await new Promise((r) => requestAnimationFrame(r));

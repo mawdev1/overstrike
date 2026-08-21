@@ -44,6 +44,11 @@ const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const health = async () => (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
 const debug = async () => (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
+const CONTROL_SECRET = 'DEV-ONLY-INSECURE-MATCH-CONTROL-SECRET-do-not-ship';
+const control = (path, body, secret = CONTROL_SECRET) => fetch(`http://127.0.0.1:${PORT}${path}`, {
+  method: 'POST', headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+  body: JSON.stringify(body),
+});
 /** Total rounds that have LANDED, across every attacker/target pair. */
 const totalHits = (d) => (d.debug?.damage ?? []).reduce((a, r) => a + (r.hits || 0), 0);
 
@@ -98,6 +103,30 @@ try {
   }
   if (!up) { bad('the server starts', log.slice(-800)); throw new Error('no server'); }
   ok('the server starts and simulates');
+
+  const unauthDrain = await control('/control/drain', { draining: true }, 'wrong');
+  const malformedDrain = await control('/control/drain', { draining: true, extra: true });
+  const drain = await control('/control/drain', { draining: true });
+  const drainedStatus = await fetch(`http://127.0.0.1:${PORT}/control/status`, {
+    headers: { authorization: `Bearer ${CONTROL_SECRET}` },
+  }).then((response) => response.json());
+  const refusedAllocation = await control('/control/allocate', {});
+  if (unauthDrain.status === 401 && malformedDrain.status === 422 && drain.status === 200
+    && drainedStatus.draining === true && refusedAllocation.status === 503) {
+    ok('authenticated drain fails closed and excludes every new allocation');
+  } else bad('authenticated drain excludes allocation', JSON.stringify({ unauth: unauthDrain.status,
+    malformed: malformedDrain.status, drain: drain.status, drainedStatus, allocation: refusedAllocation.status }));
+  const undrain = await control('/control/drain', { draining: false });
+  const activeStatus = await fetch(`http://127.0.0.1:${PORT}/control/status`, {
+    headers: { authorization: `Bearer ${CONTROL_SECRET}` },
+  }).then((response) => response.json());
+  if (undrain.status === 200 && activeStatus.draining === false) ok('explicit undrain restores allocation eligibility');
+  else bad('explicit undrain restores allocation eligibility', JSON.stringify(activeStatus));
+  const idleMatchId = '01M0H000000000000000000000';
+  const idleRelease = await control('/control/release', { matchId: idleMatchId });
+  const idleReplay = await control('/control/release', { matchId: idleMatchId });
+  if (idleRelease.status === 204 && idleReplay.status === 204) ok('idle release is idempotent for terminal recovery after authority restart');
+  else bad('idle release is idempotent after authority restart', `${idleRelease.status}/${idleReplay.status}`);
 
   const first = await health();
   if (first.phase === 'live') ok(`the first match is live (${first.bots} bots)`);

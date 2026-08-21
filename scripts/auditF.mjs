@@ -152,7 +152,7 @@ const ok = (name, pass, detail) => {
       out.settingWrite = true;
     } catch (e) { out.settingWriteError = e.message; }
     try {
-      g.startMatch({ mode: 'ffa', botCount: 5, difficulty: 'regular', seed: 4 });
+      g.startMatch({ mode: 'tdm', botCount: 5, difficulty: 'regular', seed: 4 });
       for (let i = 0; i < 1200; i++) g._fixedUpdate(1 / 120);
       // Drive a match end so progression tries to write.
       g.match.timeLimit = g.match.elapsed + 1;

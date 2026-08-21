@@ -183,7 +183,7 @@ if (aSeenByBEnd) {
 if (aRes.worstLiving >= 0 && aRes.worstLiving < 1) ok(`worst live reconciliation error in-browser: ${aRes.worstLiving.toFixed(3)} m`);
 else if (aRes.worstLiving >= 1) bad('in-browser reconciliation stays tight', `worst ${aRes.worstLiving.toFixed(2)} m`);
 
-const health = await (await fetch(`http://127.0.0.1:${GS_PORT}/health`)).json();
+const health = await (await fetch(`http://127.0.0.1:${GS_PORT}/health?debug=1`)).json();
 if (health.clients === 2) ok('the server sees exactly two clients');
 else bad('the server sees both clients', `clients=${health.clients}`);
 const drops = (health.sessions ?? []).reduce((a, s) => a + s.dropped, 0);

@@ -188,7 +188,7 @@ const out = await page.evaluate(async () => {
   // ───────────────────────────────────────────── 10. the last enemy bot dying
   guard('lastBotDies', () => {
     g.settings.set('botCount', 2);
-    g.startMatch({ mode: 'ffa', botCount: 2, difficulty: 'regular', seed: 9 });
+    g.startMatch({ mode: 'tdm', botCount: 2, difficulty: 'regular', seed: 9 });
     sim(600);
     for (const b of g.bots.bots) if (b.alive) b.die({ attacker: g.player, weaponId: 'ar_vector' });
     sim(2);

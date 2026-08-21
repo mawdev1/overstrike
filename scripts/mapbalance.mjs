@@ -94,6 +94,7 @@ const BASELINE = flag('baseline');
 const DEGRADE = opt('degrade', '');
 const STRICT = flag('strict');
 const GEOM_ONLY = flag('geom-only');
+const TOP_RAYS = flag('top-rays');
 /** `navGrid.js` F_WALKABLE. Used by the sightline sampler and by the site degradation. */
 const F_WALKABLE_BIT = 1;
 
@@ -636,6 +637,7 @@ function sightlines(label, world, nav, manifest) {
   const o = new THREE.Vector3(), d = new THREE.Vector3(), march = new THREE.Vector3();
   const lens = [];            // to the first OPAQUE hit — the sightline
   const ballistic = [];       // to the first hit of ANY kind — what a bullet meets
+  const rayRows = TOP_RAYS ? [] : null;
   let escaped = 0, throughGlass = 0, glassMetres = 0, exhausted = 0;
   for (const e of eyes) {
     for (let i = 0; i < AZIMUTHS; i++) {
@@ -658,8 +660,18 @@ function sightlines(label, world, nav, manifest) {
         march.copy(e).addScaledVector(d, travelled);
       }
       ballistic.push(first < 0 ? REACH : Math.min(first, REACH));
-      if (travelled < 0) { escaped++; lens.push(REACH); }
-      else lens.push(travelled);
+      const sightLength = travelled < 0 ? REACH : travelled;
+      if (travelled < 0) escaped++;
+      lens.push(sightLength);
+      if (rayRows) rayRows.push({
+        length: sightLength,
+        x: e.x,
+        y: e.y,
+        z: e.z,
+        dx: d.x,
+        dz: d.z,
+        azimuth: i,
+      });
       if (panes > 0) {
         throughGlass++;
         glassMetres += (travelled < 0 ? REACH : travelled) - (first < 0 ? REACH : first);
@@ -684,6 +696,31 @@ function sightlines(label, world, nav, manifest) {
   console.log(`     bands:  close ≤${CLOSE_MAX} m ${(share(close) * 100).toFixed(1)}%`
     + ` · medium ≤${MED_MAX} m ${(share(med) * 100).toFixed(1)}%`
     + ` · long >${MED_MAX} m ${(share(long) * 100).toFixed(1)}%`);
+  if (rayRows) {
+    rayRows.sort((a, b) => b.length - a.length);
+    console.log('     longest ray origins/directions:');
+    for (const r of rayRows.slice(0, 24)) {
+      console.log(`       ${r.length.toFixed(2)}m from (${r.x.toFixed(2)},${r.y.toFixed(2)},${r.z.toFixed(2)})`
+        + ` dir (${r.dx.toFixed(3)},${r.dz.toFixed(3)}) azimuth ${r.azimuth}/${AZIMUTHS}`);
+    }
+    const overRows = rayRows.filter((r) => r.length > SIGHT_CEILING);
+    const origins = new Map();
+    const directions = new Map();
+    const elevations = new Map();
+    for (const r of overRows) {
+      const originKey = `${r.x.toFixed(2)},${r.y.toFixed(2)},${r.z.toFixed(2)}`;
+      origins.set(originKey, (origins.get(originKey) ?? 0) + 1);
+      directions.set(r.azimuth, (directions.get(r.azimuth) ?? 0) + 1);
+      const elevationKey = r.y.toFixed(2);
+      elevations.set(elevationKey, (elevations.get(elevationKey) ?? 0) + 1);
+    }
+    console.log(`     >${SIGHT_CEILING}m offender origins: `
+      + [...origins.entries()].sort((a, b) => b[1] - a[1]).slice(0, 24).map(([k, n]) => `${k} ×${n}`).join(' | '));
+    console.log(`     >${SIGHT_CEILING}m offender directions: `
+      + [...directions.entries()].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}/${AZIMUTHS} ×${n}`).join(' | '));
+    console.log(`     >${SIGHT_CEILING}m offender eye elevations: `
+      + [...elevations.entries()].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}m ×${n}`).join(' | '));
+  }
   // What the choice of ray is worth, on this map, on this run — so "glass is transparent to
   // LOS" is a measured difference here rather than a claim in a comment. Zero on a map with
   // no glass, and then the two rows are the same measurement and say so.

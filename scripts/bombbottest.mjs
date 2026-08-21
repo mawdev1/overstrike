@@ -10,6 +10,11 @@ import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
 import { BOMB_PARAMS } from '../src/game/bomb.js';
+import { GameServer, ObjectiveEvidence } from '../src/net/server.js';
+import { buildCanonicalTerminalResult, evidenceDigest, reconstructEvidenceResult } from '../server/result.js';
+import { expireUnjoinedSeats } from '../server/tickets.js';
+import { submittableResultProblems } from '../platform/src/core/store.js';
+import { ulid } from '../platform/src/core/ids.js';
 
 let checks = 0;
 const failures = [];
@@ -26,6 +31,9 @@ const REQUIRED_ROLES = Object.freeze([
 
 const game = new Game({ headless: true });
 await game.initHeadless({ presenter: new NullPresenter() });
+const authority = new GameServer(game);
+const matchId = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+authority.evidence.identify({ matchId, rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0' });
 game.startMatch({ mode: 'bomb', botCount: 11, difficulty: 'regular', seed: SEED });
 
 // Skip only the legacy three-second presentation countdown. The Bomb freeze, round clocks,
@@ -117,6 +125,128 @@ const [alpha, bravo] = bomb.series?.roundWins ?? [-1, -1];
 check(Math.max(alpha, bravo) === BOMB_PARAMS.roundsToWin
   || (rounds.length === BOMB_PARAMS.maxRounds && alpha === 6 && bravo === 6),
   'series ends only at seven wins or the legal 6-6 draw', `${alpha}-${bravo}`);
+
+// Feed the actual Game.matchEnd payload and GameServer objective evidence into the shipping
+// dedicated-server result builder. This is the real autonomous series above, not a fabricated
+// status response, and the platform's own closed validator is the consumer.
+const startedAt = Date.parse('2026-08-20T00:00:00.000Z');
+const roster = new Map();
+const entitiesByAccount = new Map();
+const accountByEntity = new Map();
+for (const [index, bot] of game.bots.bots.entries()) {
+  const accountId = ulid(startedAt + index);
+  roster.set(accountId, { displayName: `Bot ${index + 1}`, team: bot.team === 1 ? 'bravo' : 'alpha',
+    joined: true, joinedAt: startedAt, connected: true, connectedAt: startedAt, connectedMs: 0 });
+  entitiesByAccount.set(accountId, bot);
+  accountByEntity.set(bot.id, accountId);
+  authority.evidence.recordConnection({ kind: 'connected', accountId, entityId: bot.id,
+    at: new Date(startedAt).toISOString() });
+}
+const terminalWithEvidence = buildCanonicalTerminalResult({
+  allocation: { matchId, roomId: '01BX5ZZKBKACTAV9WEVGEMMVS0', mode: 'bomb', mapId: 'the-square',
+    mapVersion: '1.0.0', rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0',
+    region: 'iad', startedAt, roster },
+  matchResult: game.match.result, match: game.match, entitiesByAccount,
+  evidence: authority.evidence, endedAt: startedAt + Math.round(ticks * FIXED_DT * 1000),
+});
+const { evidence: terminalEvidence, ...terminal } = terminalWithEvidence;
+const resultProblems = submittableResultProblems(terminal);
+check(resultProblems.length === 0, 'real matchEnd builds one exact submittable TerminalResult',
+  JSON.stringify(resultProblems.slice(0, 3)));
+check(terminal.rounds.length === rounds.length && terminal.players.length === roster.size,
+  'terminal result contains the complete authoritative round and roster projections');
+check(terminal.rounds.some((round) => round.plant?.accountId)
+  && terminal.rounds.some((round) => round.defuse?.accountId),
+  'objective evidence resolves plant and defuse actors to authoritative accounts');
+const objectiveRows = terminalEvidence.objectives;
+check(terminal.rounds.every((round) => {
+  const plant = objectiveRows.find((row) => row.kind === 'plantComplete' && row.roundIndex === round.index);
+  const defuse = objectiveRows.find((row) => row.kind === 'defuseComplete' && row.roundIndex === round.index);
+  return (plant ? round.plant?.accountId === accountByEntity.get(plant.actorId) : round.plant === null)
+    && (defuse ? round.defuse?.accountId === accountByEntity.get(defuse.actorId) : round.defuse === null);
+}), 'planted/unplanted and defused/non-defused rounds keep exact zero-based evidence attribution');
+check(terminalEvidence.result.matchId === terminal.matchId
+  && terminalEvidence.objectives.some((row) => row.kind === 'matchOutcome'),
+  'evidence retains the reconstructable result and terminal match outcome');
+check(terminalEvidence.combatSamples.length > 0 && terminalEvidence.combatSummary.length === roster.size
+  && terminalEvidence.connectionSummary.length === roster.size
+  && Array.isArray(terminalEvidence.antiCheatFlags),
+  'evidence contains combat/position samples, full counter summaries, connection facts, and anti-cheat flags');
+check(terminalEvidence.combatSummary.every((summary) => {
+  const player = terminal.players.find((row) => row.accountId === summary.accountId);
+  return player && ['kills', 'deaths', 'assists', 'suicides', 'teamKills', 'headshots',
+    'shotsFired', 'shotsHit', 'damageDealt', 'plants', 'defuses', 'roundsPlayed', 'score']
+    .every((key) => player[key] === summary[key])
+    && JSON.stringify(player.weapons) === JSON.stringify(summary.weapons);
+}), 'discarding the embedded result still reconstructs every canonical player counter');
+const { evidenceRef: _terminalEvidenceRef, ...terminalCore } = terminal;
+check(evidenceDigest(reconstructEvidenceResult({ ...terminalEvidence, result: undefined }))
+  === evidenceDigest(terminalCore),
+  'discarding the embedded result independently reconstructs the exact TerminalResult');
+check(terminalEvidence.eventTimeline.length > terminalEvidence.objectives.length
+  && terminalEvidence.eventTimeline.every((row, index, all) => index === 0
+    || row.eventSeq > all[index - 1].eventSeq),
+  'evidence provides one strictly ordered objective/combat/connection event timeline');
+const rosterWithNeverConnected = new Map(roster);
+rosterWithNeverConnected.set('never-connected-account', {
+  displayName: 'Never Connected', team: 'bravo', joined: false, released: false,
+  connectBy: startedAt + 60_000, joinedAt: null, connected: false, connectedAt: null, connectedMs: 0,
+});
+const expiredNeverConnected = expireUnjoinedSeats(rosterWithNeverConnected, startedAt + 60_001);
+const omittedNeverConnected = buildCanonicalTerminalResult({
+  allocation: { matchId, roomId: '01BX5ZZKBKACTAV9WEVGEMMVS0', mode: 'bomb', mapId: 'the-square',
+    mapVersion: '1.0.0', rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0',
+    region: 'iad', startedAt, roster: rosterWithNeverConnected },
+  matchResult: game.match.result, match: game.match, entitiesByAccount,
+  evidence: authority.evidence, endedAt: startedAt + Math.round(ticks * FIXED_DT * 1000),
+});
+const { evidence: _neverEvidence, ...omittedNeverConnectedResult } = omittedNeverConnected;
+check(expiredNeverConnected === 1 && rosterWithNeverConnected.get('never-connected-account').released
+  && !omittedNeverConnected.roster.some((row) => row.accountId === 'never-connected-account')
+  && !omittedNeverConnected.players.some((row) => row.accountId === 'never-connected-account')
+  && !omittedNeverConnected.evidence.participants.some((row) => row.accountId === 'never-connected-account')
+  && !omittedNeverConnected.evidence.connectionSummary.some((row) => row.accountId === 'never-connected-account')
+  && submittableResultProblems(omittedNeverConnectedResult).length === 0,
+'ticket-TTL expiry releases never-connected seats from result roster/players/evidence and remains valid');
+const reverseKeys = (value) => Array.isArray(value) ? value.map(reverseKeys)
+  : value && typeof value === 'object'
+    ? Object.fromEntries(Object.keys(value).reverse().map((key) => [key, reverseKeys(value[key])])) : value;
+const reordered = reverseKeys(terminalEvidence);
+const changed = structuredClone(reordered);
+changed.result.teamScores.alpha++;
+check(evidenceDigest(reordered) === terminal.evidenceRef.slice('sha256:'.length)
+  && evidenceDigest(changed) !== terminal.evidenceRef.slice('sha256:'.length),
+  'evidence digest is recursively key-order invariant and changes with semantic content');
+const overflow = new ObjectiveEvidence({ limit: 1 }).identify({ matchId,
+  rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0' });
+overflow.record({ kind: 'roundStart', roundIndex: 0 });
+overflow.record({ kind: 'roundOutcome', roundIndex: 0 });
+let overflowCode = null;
+try {
+  buildCanonicalTerminalResult({ allocation: { matchId, roomId: '01BX5ZZKBKACTAV9WEVGEMMVS0',
+    mode: 'bomb', mapId: 'the-square', mapVersion: '1.0.0',
+    rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0', region: 'iad', startedAt, roster },
+  matchResult: game.match.result, match: game.match, entitiesByAccount, evidence: overflow,
+  endedAt: startedAt + 1_000 });
+} catch (error) { overflowCode = error?.code; }
+check(overflowCode === 'EVIDENCE_INCOMPLETE',
+  'evidence overflow fails closed instead of certifying incomplete completed stats');
+const sampleOverflow = new ObjectiveEvidence({ limit: 1 }).identify({ matchId,
+  rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0' });
+sampleOverflow.recordCombat({ kind: 'kill' });
+sampleOverflow.recordCombat({ kind: 'kill' });
+sampleOverflow.recordConnection({ kind: 'allocated' });
+sampleOverflow.recordConnection({ kind: 'connected' });
+let sampleOverflowCode = null;
+try {
+  buildCanonicalTerminalResult({ allocation: { matchId, roomId: '01BX5ZZKBKACTAV9WEVGEMMVS0',
+    mode: 'bomb', mapId: 'the-square', mapVersion: '1.0.0',
+    rulesetVersion: 'bomb-1.0.0', serverBuild: '1.0.0', region: 'iad', startedAt, roster },
+  matchResult: game.match.result, match: game.match, entitiesByAccount, evidence: sampleOverflow,
+  endedAt: startedAt + 1_000 });
+} catch (error) { sampleOverflowCode = error?.code; }
+check(sampleOverflowCode === 'EVIDENCE_INCOMPLETE',
+  'combat or connection truncation also fails closed');
 
 stopSpawnWatch();
 game.dispose();

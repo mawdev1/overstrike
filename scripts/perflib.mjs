@@ -726,7 +726,7 @@ export const PAGE_SRC = `
       // A benchmark must never end early. 24 veteran bots reach the TDM score limit of
       // 75 inside the sample window, and a match that ends stops simulating.
       g.match.timeLimit = 1e9;
-      if (g.match.mode) g.match.mode.scoreLimit = 1e9;
+      if (g.match) g.match.killLimit = 500;
     }
     if (sc.view) PIN.set(sc.view);
     FIRE = !!sc.fire;

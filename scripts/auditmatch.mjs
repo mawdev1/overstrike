@@ -1,8 +1,7 @@
 /**
- * AUDIT PROBE 2 — match lifecycle, mode coverage and cross-match state.
+ * AUDIT PROBE 2 — TDM lifecycle and cross-match state.
  *
- * A) Every mode (tdm, ffa, gungame, domination, killconfirmed) is started with a
- *    temporarily lowered score limit and simulated until it ends. We assert the
+ * A) TDM is started with a temporarily lowered kill limit and simulated until it ends. We assert the
  *    phase progression idle -> countdown -> live -> ended, a well-formed result,
  *    and that game.state becomes 'gameover'.
  * B) Two identical matches (same seed) are run back to back through
@@ -45,13 +44,7 @@ const out = await page.evaluate(async () => {
   const sim = (sec) => { const n = Math.round(sec * 120); for (let i = 0; i < n; i++) step(); };
 
   // ---------------------------------------------------------------- A) modes
-  const MODE_SETUP = {
-    tdm: { scoreLimit: 6 },
-    ffa: { scoreLimit: 3 },
-    gungame: { scoreLimit: null },   // derived from the ladder; leave alone
-    domination: { scoreLimit: 25 },
-    killconfirmed: { scoreLimit: 6 },
-  };
+  const MODE_SETUP = { tdm: { killLimit: 6 } };
 
   for (const id of Object.keys(MODE_SETUP)) {
     const rec = { id };
@@ -63,8 +56,8 @@ const out = await page.evaluate(async () => {
       rec.botCount = g.bots.bots.length;
       rec.teams = g.bots.bots.map((b) => b.team).join(',');
 
-      const origLimit = g.match.mode.scoreLimit;
-      if (MODE_SETUP[id].scoreLimit != null) g.match.mode.scoreLimit = MODE_SETUP[id].scoreLimit;
+      const origLimit = g.match.killLimit;
+      g.match.killLimit = MODE_SETUP[id].killLimit;
       g.match.timeLimit = 100000;   // force the score path, not the clock
 
       sim(4);
@@ -87,7 +80,7 @@ const out = await page.evaluate(async () => {
       } : null;
       rec.totalKills = [...g.match._book.values()].reduce((a, s) => a + s.kills, 0);
 
-      g.match.mode.scoreLimit = origLimit;
+      g.match.killLimit = origLimit;
 
       ok(`${id}:reachesLive`, rec.phaseAfterCountdown === 'live', `phase=${rec.phaseAfterCountdown}`);
       ok(`${id}:reachesWinCondition`, rec.phaseAtEnd === 'ended', `phase=${rec.phaseAtEnd} after ${elapsed}s sim`);

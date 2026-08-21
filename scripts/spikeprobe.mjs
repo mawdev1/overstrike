@@ -146,7 +146,7 @@ const out = await page.evaluate(async ({ BOTS, RUNS, KILLS }) => {
     };
   }
 
-  const MODES = ['tdm', 'ffa', 'gungame', 'domination', 'killconfirmed'];
+  const MODES = ['tdm'];
   for (const mode of MODES) {
     const runs = [];
     for (let i = 0; i < RUNS; i++) {
@@ -171,7 +171,7 @@ const out = await page.evaluate(async ({ BOTS, RUNS, KILLS }) => {
   // ------------------------------- A2 isolated: one pickSpawn against a full live lobby
   // The worst case for the spawn scorer is a live match with every bot alive, which is
   // exactly the mid-match respawn case; `begin()` only ever sees the lobby half-spawned.
-  for (const mode of ['tdm', 'ffa']) {
+  for (const mode of ['tdm']) {
     g.startMatch({ mode, botCount: BOTS, difficulty: 'regular', seed: 21 });
     sim(4);
     const alive = g.bots.bots.filter((b) => b.alive).length;
@@ -274,7 +274,7 @@ const out = await page.evaluate(async ({ BOTS, RUNS, KILLS }) => {
 
   // Repeat the whole scenario: a single worst-step reading is dominated by whichever
   // step the GC happened to land on.
-  for (const mode of ['tdm', 'ffa']) {
+  for (const mode of ['tdm']) {
     const trials = [];
     for (let t = 0; t < 5; t++) trials.push(cluster(mode, KILLS));
     R.clusters[mode] = {

@@ -135,10 +135,22 @@ try {
   const migrate = sh(process.execPath, ['platform/src/core/migrate.js'], { env, stdio: 'inherit' });
   if (migrate.status !== 0) { console.error('pgtest: migrations failed'); failed++; }
 
-  if (!failed) {
+  if (!failed && !flag('lobby-only')) {
     console.log('pgtest: running the platform suite against Postgres');
     const suite = sh(process.execPath, ['scripts/platformtest.mjs'], { env, stdio: 'inherit' });
     if (suite.status !== 0) failed++;
+  }
+
+  if (!failed) {
+    console.log('pgtest: running six-client live lobby/handoff against Postgres');
+    const lobby = sh(process.execPath, ['scripts/lobbytest.mjs'], { env, stdio: 'inherit' });
+    if (lobby.status !== 0) failed++;
+  }
+
+  if (!failed) {
+    console.log('pgtest: injecting countdown, partial-handoff and live authority death against Postgres');
+    const faults = sh(process.execPath, ['scripts/lifecyclefaulttest.mjs'], { env, stdio: 'inherit' });
+    if (faults.status !== 0) failed++;
   }
 
   if (!failed) {

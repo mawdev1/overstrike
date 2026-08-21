@@ -21,12 +21,19 @@ import {
 } from '../src/net/protocol.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 8123;
+// Per-process base: concurrent agents must never join each other's child server and inflate
+// health/client counts. Keep four contiguous ports for the sub-harnesses.
+const PORT = 12000 + ((process.pid * 7) % 30000);
 let failures = 0;
 const ok = (n) => console.log(`  ok   ${n}`);
 const note = (n) => console.log(`  --   ${n}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// These legacy socket vectors intentionally exercise the unauthenticated local-dev entrypoint;
+// allocation/ticket authority is covered by lobbytest. Never inherit a developer's production
+// secrets into this child or fake `st_*` tickets become invalid depending on the shell.
+const localServerEnv = { ...process.env, NODE_ENV: 'test', OVERSTRIKE_MATCH_TICKET_SECRET: '',
+  OVERSTRIKE_MATCH_CONTROL_SECRET: '' };
 
 console.log('\ndedicated server over a real WebSocket');
 
@@ -65,7 +72,7 @@ if (!await waitForFreePort(PORT)) {
 }
 
 const child = spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${PORT}`, '--bots=0'], {
-  cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+  cwd: ROOT, env: localServerEnv, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverLog = '';
 child.stdout.on('data', (d) => { serverLog += d; });
@@ -86,9 +93,18 @@ if (!up) {
 }
 ok('the server starts and serves /health');
 
-const health = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+const health = await (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
 if (health.tick > 0) ok(`the match is ticking without any client (tick ${health.tick})`);
 else bad('the match ticks with no client', 'tick is still 0 — a lobby that never simulates');
+
+const idleHello = new WebSocket(`ws://127.0.0.1:${PORT}`);
+await new Promise((resolve, reject) => { idleHello.once('open', resolve); idleHello.once('error', reject); });
+const idleClosed = await Promise.race([
+  new Promise((resolve) => idleHello.once('close', () => resolve(true))),
+  sleep(7_000).then(() => false),
+]);
+if (idleClosed) ok('a socket that never sends HELLO is closed by the handshake deadline');
+else { bad('pre-HELLO sockets cannot occupy capacity forever', 'still open after 7 s'); idleHello.terminate(); }
 
 // ── play a client ────────────────────────────────────────────────────────────────────
 //
@@ -188,7 +204,7 @@ if (!client.welcome) {
   if (closed) ok('and the server closed the socket rather than leaving it half-alive');
   else { bad('a rejected socket is closed', 'still open after 2 s'); try { old.close(); } catch { /* gone */ } }
 
-  const h = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+  const h = await (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json();
   if (h.clients === 1) ok('the rejected connection left no session behind');
   else bad('a rejected connection is not counted as a client', `clients=${h.clients}`);
 }
@@ -222,7 +238,7 @@ for (let i = 0; i < 240; i++) {
 await sleep(300);
 
 const getHealth = async () => {
-  try { return await (await fetch(`http://127.0.0.1:${PORT}/health`)).json(); } catch (e) {
+  try { return await (await fetch(`http://127.0.0.1:${PORT}/health?debug=1`)).json(); } catch (e) {
     bad('the server is still alive', `${e.message}\n       last server output:\n${serverLog.slice(-900)}`);
     return null;
   }
@@ -344,7 +360,7 @@ else ok('the server logged no errors');
 console.log('\ntwo clients in one match');
 
 const child2 = spawn(process.execPath, [path.join(ROOT, 'server/index.js'), `--port=${PORT + 1}`, '--bots=0'], {
-  cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
+  cwd: ROOT, env: localServerEnv, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let log2 = '';
 child2.stdout.on('data', (d) => { log2 += d; });
@@ -489,7 +505,7 @@ if (bEndFromA && bEndFromB) {
   else bad('both clients agree on entity positions', `${agree.toFixed(3)} m apart — they are not sharing a world`);
 }
 
-const h4 = await (await fetch(`http://127.0.0.1:${PORT + 1}/health`)).json();
+const h4 = await (await fetch(`http://127.0.0.1:${PORT + 1}/health?debug=1`)).json();
 if (h4.clients === 2) ok('the server reports both clients');
 else bad('the server reports both clients', `clients=${h4.clients}`);
 if (h4.entities >= 2) ok(`the match holds ${h4.entities} entities with no bots`);
@@ -513,7 +529,7 @@ child2.kill('SIGKILL');
 // A real `WebSocketServer`, a real `GameServer` over a real Bomb match, and the real
 // `NetClient`. Bomb rather than TDM because `MSG_MATCHSTATE` and `MSG_OUTCOME` do not exist on
 // a TDM stream, and the dedicated entrypoint is exercised in bomb mode below as well.
-console.log('\nprotocol v2 message types over a real socket');
+console.log('\ncurrent protocol message types over a real socket');
 
 {
   const { WebSocketServer } = await import('ws');
@@ -782,7 +798,7 @@ console.log('\nprotocol v2 message types over a real socket');
   if (!await waitForFreePort(BOMB_PORT)) bad(`port ${BOMB_PORT} is free`, 'still held');
   const bombChild = spawn(process.execPath,
     [path.join(ROOT, 'server/index.js'), `--port=${BOMB_PORT}`, '--bots=6', '--mode=bomb'],
-    { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    { cwd: ROOT, env: localServerEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   let bombLog = '';
   bombChild.stdout.on('data', (d) => { bombLog += d; });
   bombChild.stderr.on('data', (d) => { bombLog += d; });

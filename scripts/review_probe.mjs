@@ -67,7 +67,7 @@ try {
   log('[api] ' + JSON.stringify(api));
 
   /* ---------------- start a match ---------------- */
-  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'ffa', botCount: 4, seed: 1234 }));
+  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'tdm', botCount: 4, seed: 1234 }));
   await waitFrames(8);
   log('[state] ' + await page.evaluate(() => window.__GAME__.state));
 
@@ -128,7 +128,7 @@ try {
   log('[cache] ' + JSON.stringify(cache));
 
   /* ---------------- MINIMAP: per-frame draw + alloc + ctx stack ---------------- */
-  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'ffa', botCount: 4, seed: 99 }));
+  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'tdm', botCount: 4, seed: 99 }));
   await waitFrames(10);
 
   const mm = await page.evaluate(async () => {
@@ -221,7 +221,7 @@ try {
   log('[minimap-resize] ' + JSON.stringify(rz));
 
   /* ---------------- scoreboard TAB ---------------- */
-  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'ffa', botCount: 4, seed: 7 }));
+  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'tdm', botCount: 4, seed: 7 }));
   await waitFrames(6);
   const sb = await page.evaluate(async () => {
     const g = window.__GAME__;
@@ -339,7 +339,7 @@ try {
   await page.evaluate(() => { const w = window.__GAME__.player.weapon; if (w) { w.adsAmount = w.adsRaw = 1; w.wantAds = true; } });
   await waitFrames(4);
   await page.screenshot({ path: path.join(ROOT, 'shots', 'review-hud-scoped.png'), timeout: 120000 });
-  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'ffa', botCount: 4, seed: 3 }));
+  await page.evaluate(() => window.__GAME__.startMatch({ mode: 'tdm', botCount: 4, seed: 3 }));
   await waitFrames(10);
   await page.screenshot({ path: path.join(ROOT, 'shots', 'review-hud.png'), timeout: 120000 });
 } catch (e) {

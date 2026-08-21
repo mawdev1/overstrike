@@ -1,7 +1,7 @@
 /**
- * AUDIT B — every mode runs, every mode ends, and state resets between matches.
+ * AUDIT B — TDM runs, ends on its kill limit/clock, and resets between rounds.
  *
- * For each of tdm / ffa / gungame / domination / killconfirmed:
+ * For Team Deathmatch:
  *   1. start it, let it play naturally for 45 simulated seconds and record whether the
  *      mode's own machinery actually moved (team score, kills, tiers, zones, tags),
  *   2. force it to its SCORE win condition and assert `matchEnd` fires with a sane result,
@@ -19,7 +19,7 @@ const out = await page.evaluate(async () => {
   const ok = (name, cond, detail) => R.checks.push({ name, pass: !!cond, detail: String(detail) });
   const sim = (n) => { for (let i = 0; i < n; i++) g._fixedUpdate(1 / 120); };
 
-  const MODES = ['tdm', 'ffa', 'gungame', 'domination', 'killconfirmed'];
+  const MODES = ['tdm'];
 
   /** A snapshot of everything that MUST be clean at the start of a match. */
   const cleanSnapshot = () => {
@@ -82,21 +82,10 @@ const out = await page.evaluate(async () => {
     rec.scoreMoved = g.match.scores[0] !== beforeScores[0] || g.match.scores[1] !== beforeScores[1];
     rec.stillPlaying = g.state === 'playing';
     rec.modeStateKeys = Object.keys(g.match.modeState);
-    if (mode === 'gungame') {
-      rec.ladderLen = g.match.modeState.ladder?.length ?? 0;
-      rec.tiers = [...(g.match.modeState.tiers?.values() ?? [])];
-      rec.maxTier = Math.max(0, ...rec.tiers);
-    }
-    if (mode === 'domination') {
-      rec.zones = (g.match.modeState.zones || []).map((z) => ({ l: z.letter, owner: z.owner, prog: +z.progress.toFixed(2) }));
-    }
-    if (mode === 'killconfirmed') {
-      rec.tagsActive = (g.match.modeState.tags || []).filter((t) => t.active).length;
-      rec.confirms = [...g.match._book.values()].reduce((a, s) => a + (s.confirms || 0), 0);
-    }
 
     // ---- 2. force the SCORE win condition
     // Drive kills directly through the canonical death path until the mode ends.
+    g.match.killLimit = Math.max(g.match.scores[0], g.match.scores[1]) + 3;
     let guard = 0;
     while (g.match.phase === 'live' && guard < 400) {
       guard++;
@@ -109,22 +98,6 @@ const out = await page.evaluate(async () => {
         sim(60);
       }
       sim(12);
-      if (mode === 'domination' || mode === 'killconfirmed') {
-        // These modes do not end on kills; push their own objective instead.
-        if (mode === 'domination') {
-          const zs = g.match.modeState.zones || [];
-          for (const z of zs) { z.owner = 0; }
-          sim(360);
-        } else {
-          // Walk the player over every live tag.
-          for (const t of (g.match.modeState.tags || [])) {
-            if (!t.active) continue;
-            g.player.position.set(t.position.x, t.position.y - 0.4, t.position.z);
-            sim(2);
-          }
-          sim(30);
-        }
-      }
     }
     rec.forcedScoreIterations = guard;
     rec.endedOnScore = g.match.phase === 'ended';
@@ -172,7 +145,7 @@ const out = await page.evaluate(async () => {
 
   // -------------------------------------------------- repeated restart cleanliness
   for (let i = 0; i < 5; i++) {
-    g.startMatch({ mode: i % 2 ? 'ffa' : 'tdm', botCount: 7, difficulty: 'regular', seed: 7 });
+    g.startMatch({ mode: 'tdm', botCount: 7, difficulty: 'regular', seed: 7 });
     const atStart = cleanSnapshot();
     sim(600 + 120 * 20);
     // Kill a few things so there is state to clean up.

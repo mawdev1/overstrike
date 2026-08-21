@@ -153,7 +153,7 @@ const out = await page.evaluate(async () => {
   // ══════════════════════════════════════ 5. FFA scoreboard renders
   {
     g.settings.set('botCount', 7);
-    g.startMatch({ mode: 'ffa', botCount: 7, difficulty: 'regular', seed: 25 });
+    g.startMatch({ mode: 'tdm', botCount: 7, difficulty: 'regular', seed: 25 });
     sim(600 + 120 * 10);
     const sb = g.hud.scoreboard;
     sb.setVisible(true);
