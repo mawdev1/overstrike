@@ -35,9 +35,24 @@
 import * as THREE from 'three';
 import { Game } from '../src/core/game.js';
 import { NullPresenter } from '../src/core/presenter.js';
+import { PLAYER_TUNE } from '../src/player/player.js';
 import { manifestGaps, mapRotation, listMaps, selectMap, getMapEntry } from '../src/world/world.js';
+import { artifactPath, bakeMap, drift, readCommitted } from './navbake.mjs';
 
 const VERBOSE = process.argv.includes('--verbose');
+/**
+ * Deliberate breakage, for proving the gates below can fail. Every mode damages a REAL
+ * input to the thing under test — the geometry the bake reads, the graph the route walk
+ * reads, the tuning constant the seconds come from — rather than stubbing the check out.
+ *
+ *   --degrade=stale     move a wall before the fresh bake        (§4 staleness)
+ *   --degrade=sever     cut every nav edge across z = 0          (route connectivity)
+ *   --degrade=shortcut  bill every edge at 40% of its length     (route geodesic sanity)
+ *   --degrade=speed     read the movement speed as 0 m/s         (speed provenance)
+ *   --degrade=slowsite  bill edges near site A at 3x             (§7.1 spawn-to-site band)
+ */
+const DEGRADE = (process.argv.slice(2).find((a) => a.startsWith('--degrade=')) ?? '').slice('--degrade='.length);
+const DEGRADE_MODES = ['', 'stale', 'sever', 'shortcut', 'speed', 'slowsite'];
 const MAP_ARG = process.argv.slice(2).find((a) => a.startsWith('--map='));
 if (MAP_ARG) {
   const id = MAP_ARG.slice('--map='.length);
@@ -49,6 +64,10 @@ if (MAP_ARG) {
 }
 
 let failures = 0;
+if (!DEGRADE_MODES.includes(DEGRADE)) {
+  console.error(`navtest: --degrade='${DEGRADE}' is not one of ${DEGRADE_MODES.slice(1).join(', ')}`);
+  process.exit(2);
+}
 const ok = (n, d = '') => console.log(`  ok   ${n}${d ? `  (${d})` : ''}`);
 const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const fmt = (v) => (typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : String(v));
@@ -347,6 +366,290 @@ const spawnNodes = [];
     100 * stranded / shipped.walkable, 30, '%');
 }
 
+// ══════════════════════════════════ B2. the committed bake matches the current geometry
+//
+// map-data.md §4 and Build Plan §3.3: the bake is a [CC] tool whose output is committed by
+// whoever moved the geometry. That was unenforceable while the bake existed only in memory
+// — there was no artifact to go stale. Here the map is re-baked from the geometry on disk
+// and compared BYTE FOR BYTE against `src/world/navdata/<map>.json`.
+//
+// A mismatch is not a subtle defect. It means the committed navigation graph is not the
+// graph this geometry produces, so every downstream guard, every bot route and every
+// analytic ran against a map that does not exist.
+
+console.log(`\nmap-data.md §4 — committed nav artifact (${artifactPath(manifest.mapId)})`);
+{
+  // Determinism first. A staleness check on a non-deterministic bake is a random failure
+  // generator, and the first person it wakes up at 2am will delete it — so the property it
+  // rests on is asserted here rather than assumed, on every run, for the map under test.
+  const first = await bakeMap(manifest.mapId);
+  const second = await bakeMap(manifest.mapId);
+  if (first.text === second.text) {
+    ok('two bakes of the same geometry are byte-identical', `${first.text.length} bytes, ${first.artifact.fingerprint.combined.slice(7, 19)}`);
+  } else {
+    let at = 'length only';
+    for (let i = 0; i < Math.min(first.text.length, second.text.length); i++) {
+      if (first.text[i] !== second.text[i]) { at = `byte ${i}`; break; }
+    }
+    bad('the bake is deterministic', `two bakes of identical geometry differ at ${at} — the artifact cannot be a guard until this is fixed`);
+  }
+
+  // The staleness check itself. `--degrade=stale` moves a wall first: a producer's geometry
+  // edit, through `world.build()` and `nav.bake()`, with no committed re-bake.
+  const fresh = DEGRADE === 'stale'
+    ? await bakeMap(manifest.mapId, {
+      perturb: (w, g) => {
+        const b = w.bounds;
+        w.addBox(new THREE.Vector3(b.min.x + 4, 0, b.min.z + 4), new THREE.Vector3(b.min.x + 8, 3, b.min.z + 8), 'concrete');
+        w.build();
+        g.bake();
+      },
+    })
+    : first;
+  if (DEGRADE === 'stale') console.log('  DEGRADED: one 4x4 m collider added before the bake — the committed artifact must now read as stale');
+
+  const problems = drift(fresh, readCommitted(manifest.mapId), manifest.mapId);
+  if (problems.length === 0) {
+    ok(`'${manifest.mapId}' — the committed artifact is the bake of the current geometry`,
+      `${fresh.artifact.grid.nodes} nodes, ${fresh.artifact.totals.walkable} walkable`);
+  } else {
+    bad(`'${manifest.mapId}' — the committed nav bake matches the current geometry`,
+      `${problems.length} difference(s):\n       ${problems.slice(0, 8).join('\n       ')}\n`
+      + `       Build Plan §3.3: re-run \`npm run navbake\` and commit ${artifactPath(manifest.mapId)}\n`
+      + '       in the same change as the geometry.');
+  }
+
+  // The artifact must describe THIS grid, not merely parse. A file that is byte-identical
+  // to a fresh bake and disagrees with the live grid would mean the bake and the running
+  // game read different geometry, which is the failure the artifact exists to rule out.
+  const a = fresh.artifact;
+  exactly('the artifact describes the running grid — columns', a.grid.cols * a.grid.rows, nav.cols * nav.rows);
+  exactly('the artifact describes the running grid — walkable nodes', a.totals.walkable, shipped.walkable);
+  exactly('the artifact describes the running grid — reachable nodes', a.totals.reachable, shipped.reachable);
+
+  // Every OTHER registered map, too. `--map` selects which map gets the full audit, but a
+  // stale artifact for a map this run did not select is exactly as stale — and the fixture
+  // (map-data.md §9) is the one nobody would otherwise re-run, which is how it would rot.
+  for (const other of listMaps()) {
+    if (other.id === manifest.mapId) continue;
+    const bake = await bakeMap(other.id);
+    const p = drift(bake, readCommitted(other.id), other.id);
+    if (p.length === 0) ok(`'${other.id}' — its committed artifact matches too`, `${bake.artifact.totals.walkable} walkable`);
+    else {
+      bad(`'${other.id}' — the committed nav bake matches the current geometry`,
+        `${p.length} difference(s):\n       ${p.slice(0, 6).join('\n       ')}\n`
+        + `       Re-run \`npm run navbake\` and commit ${artifactPath(other.id)}.`);
+    }
+  }
+}
+
+// ══════════════════════════════ B3. §7.1 route timing — spawn-to-site and A↔B rotation
+//
+// map-data.md §7.0/§7.1 state two timing requirements and nothing measured either of them:
+//
+//   spawn → nearest site   12–16 s, the two sites within 15% of each other
+//   A ↔ B rotation          16–22 s, the two rotations within 15% of each other
+//
+// Both are in SECONDS, so both are a DISTANCE ALONG THE NAV GRAPH divided by a movement
+// speed. A straight-line metre count is the wrong instrument in both directions: it walks
+// through walls (inventing a fast route that does not exist) and it ignores the stairs and
+// detours that make a real route long. On this map the two answers disagree completely —
+// straight lines put alpha-main's two sites 90% apart and bravo-main's 2.6% apart, and the
+// nav graph says the reverse: alpha-main 2.6%, bravo-main 19.9%. One of those is a fact
+// about the map and the other is a fact about the ruler.
+//
+// SPEED. `PLAYER_TUNE.WALK_SPEED` from `src/player/player.js` — the sim's own base ground
+// speed, 4.6 m/s, and the number map-data.md §7.0 itself cites when it grounds the envelope
+// ("the player walks 4.6 m/s and sprints 7.2 m/s", from P0-decisions.md §D3). It is also the
+// only reading under which the contract's bands are satisfiable: at the 7.2 m/s sprint the
+// A↔B rotation on an 88 m map is ~11 s, so a 16–22 s requirement would declare every map
+// ever built out of contract — a fact about the chosen speed, not about the geometry. The
+// sprint figure is reported alongside so the choice is visible rather than buried.
+const WALK_SPEED = PLAYER_TUNE.WALK_SPEED;
+const SPRINT_SPEED = PLAYER_TUNE.SPRINT_SPEED;
+
+console.log('\nmap-data.md §7.1 — route timing');
+{
+  // The one hard gate on the speed itself: these seconds are only as good as the constant
+  // they divide by, and a missing or zero constant would turn every route below into
+  // Infinity or NaN and every band check into a silent pass.
+  const speed = DEGRADE === 'speed' ? 0 : WALK_SPEED;
+  if (DEGRADE === 'speed') console.log('  DEGRADED: the movement speed is read as 0 m/s');
+  const speedOk = Number.isFinite(speed) && speed > 0.5;
+  if (speedOk) {
+    ok('the movement speed comes from the sim', `PLAYER_TUNE.WALK_SPEED = ${speed} m/s (sprint ${SPRINT_SPEED} m/s)`);
+  } else {
+    // Reported and then STOPPED. Every line below divides by this number, so continuing
+    // would print a page of Infinity and NaN dressed up as measurements — the shape of
+    // output somebody eventually learns to scroll past.
+    bad('the movement speed comes from the sim',
+      `PLAYER_TUNE.WALK_SPEED read as ${speed} — every timing below it would be meaningless, so none was taken`);
+  }
+
+  const secs = (metres) => metres / speed;
+  const spread = (a, b) => (Math.min(a, b) > 0 ? Math.abs(a - b) / Math.min(a, b) : Infinity);
+  const SITE_LO = 12, SITE_HI = 16, ROT_LO = 16, ROT_HI = 22, SPREAD_MAX = 0.15;
+
+  /**
+   * PENDING, not FAIL, for a breach of the §7 envelope — and the reason is the same one
+   * `maptest.mjs` gives for a producer that has declared nothing (§3 manifest guard).
+   *
+   * The geometry is Codex's file. A number outside the envelope is that lane's open work,
+   * tracked as REQ-CX-008 item 5, and failing this harness on it would either block every
+   * backend change behind another lane's map edit or get the threshold quietly widened
+   * until nothing could trip it. So a breach is printed loudly, by name, with the measured
+   * number and the target — and every assertion about OUR OWN code (the graph is connected,
+   * the route is a real walk, the speed is real) stays a hard failure directly above and
+   * below it.
+   */
+  const envelope = (name, got, lo, hi, unit = ' s') => {
+    if (got >= lo && got <= hi) { ok(name, `${fmt(got)}${unit} in ${lo}–${hi}${unit}`); return true; }
+    console.log(`  PENDING  ${name}: ${fmt(got)}${unit}, target ${lo}–${hi}${unit} — REQ-CX-008 item 5 (geometry, [CX]).`);
+    return false;
+  };
+  const within = (name, a, b, labelA, labelB) => {
+    const s = spread(a, b);
+    if (s <= SPREAD_MAX) { ok(name, `${labelA} ${fmt(a)} s vs ${labelB} ${fmt(b)} s — ${(s * 100).toFixed(1)}% apart`); return true; }
+    console.log(`  PENDING  ${name}: ${labelA} ${fmt(a)} s vs ${labelB} ${fmt(b)} s — ${(s * 100).toFixed(1)}% apart, `
+      + `allowed ${SPREAD_MAX * 100}% — REQ-CX-008 item 5 (geometry, [CX]).`);
+    return false;
+  };
+
+  const sites = [];
+  for (const o of manifest.objectives) {
+    if (o.site === null || o.site === undefined) continue;
+    if (sites.some((s) => s.site === o.site) && o.kind !== 'plant') continue;
+    const nodes = reachableNodesIn(o.box);
+    sites.push({ id: o.id, site: o.site, nodes, box: o.box });
+  }
+  sites.sort((p, q) => (p.site < q.site ? -1 : p.site > q.site ? 1 : 0));
+
+  // Bomb spawn groups: per team, the largest group whose points declare the `bomb` mode —
+  // the same selection `mapbalance.mjs` makes when it drives the spawner's FIXED policy,
+  // and the group §3.2 calls "1 protected group of >= 5 adjacent points".
+  const bombGroups = [];
+  for (const team of [0, 1]) {
+    const byGroup = new Map();
+    for (const sp of manifest.spawns) {
+      if (sp.team !== team) continue;
+      if (!(sp.modes ?? []).includes('bomb')) continue;
+      if (!byGroup.has(sp.group)) byGroup.set(sp.group, []);
+      byGroup.get(sp.group).push(sp);
+    }
+    const ordered = [...byGroup.entries()].sort((p, q) => q[1].length - p[1].length || (p[0] < q[0] ? -1 : 1));
+    if (ordered.length) bombGroups.push({ team, id: ordered[0][0], spawns: ordered[0][1] });
+  }
+
+  if (!speedOk) {
+    // nothing measurable; the failure above says why.
+  } else if (sites.length < 2 || bombGroups.length < 2) {
+    // ABSENT is a schedule, not a defect — the same distinction maptest.mjs draws. MERIDIAN
+    // is a retained fixture (§9) that declares no §3.3 objective volumes at all, so there is
+    // no site to time and no Bomb group to time it from. Reporting a number here would mean
+    // inventing the sites, which is worse than saying so.
+    console.log(`  ABSENT   '${manifest.mapId}' declares ${sites.length} sited objective volume(s) and `
+      + `${bombGroups.length} Bomb spawn group(s) — §7.1 needs 2 of each, so there is nothing to time.`);
+    if (IN_ROTATION) {
+      bad('a rotation map declares the two sites §7.1 times routes between',
+        `${sites.length} sited objectives, ${bombGroups.length} Bomb spawn groups`);
+    }
+    // The fixture is still worth a number, so report the thing it CAN answer: how long the
+    // map takes to cross between the two teams' spawn areas.
+    if (bombGroups.length === 2 || manifest.spawns.length > 0) {
+      const byTeam = [0, 1].map((t) => manifest.spawns.filter((s) => s.team === t));
+      if (byTeam[0].length && byTeam[1].length) {
+        const d = routeDistance(spawnSources(byTeam[0]), spawnSources(byTeam[1]));
+        console.log(`  note     spawn-area to spawn-area: ${Number.isFinite(d) ? `${d.toFixed(1)} m = ${secs(d).toFixed(1)} s at ${speed} m/s` : 'no route'}`);
+      }
+    }
+  } else {
+    for (const s of sites) atLeast(`${s.id} offers a reachable node to route to`, s.nodes.length, 1);
+
+    // -- spawn to site
+    const rows = [];
+    for (const g of bombGroups) {
+      const dist = routeField(spawnSources(g.spawns));
+      const per = sites.map((s) => ({ site: s.site, id: s.id, m: minOver(dist, s.nodes) }));
+      rows.push({ group: g, per });
+    }
+    console.log(`  spawn-to-site, from each team's protected Bomb group, along the nav graph at ${speed} m/s:`);
+    for (const r of rows) {
+      console.log(`     ${r.group.id.padEnd(14)} team ${r.group.team}  `
+        + r.per.map((p) => `${p.id} ${p.m === Infinity ? '  unreachable' : `${p.m.toFixed(1).padStart(6)} m = ${secs(p.m).toFixed(1).padStart(5)} s`}`).join('   ')
+        + (r.per.every((p) => Number.isFinite(p.m))
+          ? `   spread ${(spread(secs(r.per[0].m), secs(r.per[1].m)) * 100).toFixed(1)}%`
+          : ''));
+    }
+    for (const r of rows) {
+      for (const p of r.per) {
+        // HARD: a protected Bomb group that cannot walk to a site is not a §7 timing
+        // problem, it is a broken map or a broken graph, and Bomb cannot be played on it.
+        if (Number.isFinite(p.m)) continue;
+        bad(`${r.group.id} can walk to ${p.id}`, 'no route exists along the nav graph');
+      }
+    }
+    // HARD, and this is the one that catches a broken route walk rather than a broken map:
+    // no path over the graph can be shorter than the straight line between its endpoints.
+    // A traversal that has started taking shortcuts reports smaller numbers, which looks
+    // like a better map instead of like a bug.
+    for (const r of rows) {
+      for (let i = 0; i < sites.length; i++) {
+        const m = r.per[i].m;
+        if (!Number.isFinite(m)) continue;
+        const straight = minStraightLine(r.group.spawns.map((s) => s.position), sites[i].nodes);
+        atLeast(`${r.group.id} -> ${r.per[i].id} is at least the straight-line distance`,
+          m + 1e-6, straight - nav.cell, ' m');
+      }
+    }
+    for (const r of rows) {
+      if (!r.per.every((p) => Number.isFinite(p.m))) continue;
+      const t = r.per.map((p) => secs(p.m));
+      for (let i = 0; i < t.length; i++) envelope(`${r.group.id} -> ${r.per[i].id}`, t[i], SITE_LO, SITE_HI);
+      within(`${r.group.id} reaches both sites in comparable time`, t[0], t[1], r.per[0].id, r.per[1].id);
+      console.log(`     (at the ${SPRINT_SPEED} m/s sprint: ${r.per.map((p) => `${p.id} ${(p.m / SPRINT_SPEED).toFixed(1)} s`).join(', ')})`);
+    }
+
+    // -- rotation
+    //
+    // The nav graph has no notion of a team, and on Bomb BOTH defending sides rotate
+    // between the same two volumes — so the two measurable rotations are the two
+    // DIRECTIONS, not two teams. They are measured separately rather than assumed equal
+    // because one-way drops make the graph directed: a route that falls off a ledge on the
+    // way to B cannot be climbed on the way back, and that asymmetry is exactly the kind of
+    // thing a defender discovers in a match and a harness should have said first.
+    const rot = [];
+    for (let i = 0; i < 2; i++) {
+      const from = sites[i], to = sites[1 - i];
+      const dist = routeField(from.nodes);
+      rot.push({ label: `${from.id} -> ${to.id}`, m: minOver(dist, to.nodes) });
+    }
+    console.log('  A↔B rotation, both directions:');
+    for (const r of rot) {
+      console.log(`     ${r.label.padEnd(24)} ${r.m === Infinity ? 'unreachable' : `${r.m.toFixed(1).padStart(6)} m = ${secs(r.m).toFixed(1).padStart(5)} s`}`);
+    }
+    let rotOk = true;
+    for (const r of rot) {
+      if (Number.isFinite(r.m)) continue;
+      rotOk = false;
+      bad(`the ${r.label} rotation exists`, 'no route between the two sites along the nav graph');
+    }
+    if (rotOk) {
+      const straight = minStraightLine(sites[0].nodes.map(nodeVec), sites[1].nodes);
+      for (const r of rot) {
+        atLeast(`${r.label} is at least the straight-line distance`, r.m + 1e-6, straight - nav.cell, ' m');
+      }
+      const t = rot.map((r) => secs(r.m));
+      for (let i = 0; i < rot.length; i++) envelope(`rotation ${rot[i].label}`, t[i], ROT_LO, ROT_HI);
+      within('both A↔B rotations take comparable time', t[0], t[1], rot[0].label, rot[1].label);
+      console.log(`     (at the ${SPRINT_SPEED} m/s sprint: ${rot.map((r) => `${r.label} ${(r.m / SPRINT_SPEED).toFixed(1)} s`).join(', ')})`);
+      // bomb-rules.md §2.1 arithmetic, restated against the measured number rather than
+      // against the 22 s worst case the contract assumed.
+      console.log(`     worst rotation ${Math.max(...t).toFixed(1)} s + 7 s defuse = ${(Math.max(...t) + 7).toFixed(1)} s `
+        + `against the 40 s Bomb timer (bomb-rules.md §2.1)`);
+    }
+  }
+}
+
 // ════════════════════════════════════════════ C. the §3.5 hint path, on real geometry
 
 console.log('\nmap-data.md §3.5 nav hints');
@@ -581,6 +884,174 @@ const restore = () => { world.manifest.navHints = { ...declared }; nav.bake(); }
 
 console.log(failures ? `\n${failures} FAILED` : '\nthe nav graph and the §3.5 hint path both hold up');
 process.exit(failures ? 1 : 0);
+
+// ───────────────────────────────────────────────── route measurement (§7.1 timing)
+//
+// Distances are measured with a multi-source Dijkstra over the SHIPPING graph rather than
+// with `findPath`, and the difference matters twice over.
+//
+//   1. `findPath` is budgeted (NODE_BUDGET expansions) and returns its best PARTIAL when a
+//      route is long — which is correct for a bot and useless for a measurement, because a
+//      75 m rotation and a budget exhaustion produce the same short answer. Every §7.1
+//      route on an 88 m map is exactly the length that triggers it.
+//   2. A* costs are not metres. `_search` adds a 1.6 m penalty per drop, a 0.06 m cover
+//      bonus, 0.9x on vertical rise and a danger term — deliberate steering weights that
+//      make bots prefer stairs, and nonsense as a distance. Seconds must divide TRUE path
+//      length by speed, so the weight here is the plain 3-D distance between node centres.
+//
+// Traversability is the graph's own: `linkMask` (which already encodes one-way drops as an
+// edge that exists in one direction only) plus the §3.5 hinted links.
+
+/** The centre of a node, as a vector. */
+function nodeVec(node) {
+  const col = (node / MAXL) | 0;
+  return new THREE.Vector3(nav.cellCenterX(col), nav.floorY[node], nav.cellCenterZ(col));
+}
+
+function cellX(node) { return nav.cellCenterX((node / MAXL) | 0); }
+function cellZ(node) { return nav.cellCenterZ((node / MAXL) | 0); }
+
+/**
+ * The metres billed for stepping from `a` to `b`: their true separation, unless a
+ * `--degrade` mode is deliberately lying about it.
+ */
+function edgeMetres(a, b) {
+  const d = Math.hypot(cellX(b) - cellX(a), nav.floorY[b] - nav.floorY[a], cellZ(b) - cellZ(a));
+  if (DEGRADE === 'shortcut') return d * 0.4;
+  if (DEGRADE === 'slowsite') {
+    // Bill the approach to the first sited objective at 3x — a route that got longer
+    // without the map changing shape, which is what a §7.1 band breach looks like.
+    const o = manifest.objectives.find((x) => x.site !== null && x.site !== undefined);
+    if (o !== undefined) {
+      const cx = (o.box.min.x + o.box.max.x) / 2, cz = (o.box.min.z + o.box.max.z) / 2;
+      if (Math.hypot(cellX(b) - cx, cellZ(b) - cz) < 25) return d * 3;
+    }
+  }
+  return d;
+}
+
+/** True when this edge is traversable. `--degrade=sever` cuts the map in half at z = 0. */
+function edgeAllowed(a, b) {
+  if (DEGRADE !== 'sever') return true;
+  return (cellZ(a) < 0) === (cellZ(b) < 0);
+}
+
+/**
+ * Shortest walking distance in metres from any of `sources` to every node, as a
+ * Float64Array indexed by node. Unreachable nodes hold Infinity.
+ */
+function routeField(sources) {
+  const dist = new Float64Array(nav.nodeCount).fill(Infinity);
+  // Binary heap over (distance, node). Pairs live in two parallel arrays so a 55k-node
+  // grid does not allocate 200k tuples.
+  const hd = [], hn = [];
+  const push = (d, n) => {
+    hd.push(d); hn.push(n);
+    let i = hd.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (hd[p] <= hd[i]) break;
+      [hd[p], hd[i]] = [hd[i], hd[p]]; [hn[p], hn[i]] = [hn[i], hn[p]];
+      i = p;
+    }
+  };
+  const pop = () => {
+    const topD = hd[0], topN = hn[0];
+    const lastD = hd.pop(), lastN = hn.pop();
+    if (hd.length) {
+      hd[0] = lastD; hn[0] = lastN;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let s = i;
+        if (l < hd.length && hd[l] < hd[s]) s = l;
+        if (r < hd.length && hd[r] < hd[s]) s = r;
+        if (s === i) break;
+        [hd[s], hd[i]] = [hd[i], hd[s]]; [hn[s], hn[i]] = [hn[i], hn[s]];
+        i = s;
+      }
+    }
+    return [topD, topN];
+  };
+
+  for (const s of sources) {
+    if (s < 0 || !(nav.flags[s] & F_WALKABLE) || dist[s] === 0) continue;
+    dist[s] = 0;
+    push(0, s);
+  }
+  const DX = [1, -1, 0, 0, 1, 1, -1, -1];
+  const DZ = [0, 0, 1, -1, 1, -1, 1, -1];
+  while (hd.length) {
+    const [d, cur] = pop();
+    if (d > dist[cur]) continue;
+    const relax = (to) => {
+      if (!(nav.flags[to] & F_WALKABLE) || !edgeAllowed(cur, to)) return;
+      const nd = d + edgeMetres(cur, to);
+      if (nd < dist[to]) { dist[to] = nd; push(nd, to); }
+    };
+    const extra = nav.hintLinks.get(cur);
+    if (extra !== undefined) for (const e of extra) relax(e.to);
+    const mask = nav.linkMask[cur];
+    if (mask === 0) continue;
+    const col = (cur / MAXL) | 0;
+    const cx = col % nav.cols, cz = (col / nav.cols) | 0;
+    for (let d2 = 0; d2 < 8; d2++) {
+      if (!(mask & (1 << d2))) continue;
+      const nx = cx + DX[d2], nz = cz + DZ[d2];
+      if (nx < 0 || nz < 0 || nx >= nav.cols || nz >= nav.rows) continue;
+      relax((nz * nav.cols + nx) * MAXL + nav.linkLayer[cur * 8 + d2]);
+    }
+  }
+  return dist;
+}
+
+/** Shortest walking distance between two node sets, in metres, or Infinity. */
+function routeDistance(fromNodes, toNodes) {
+  if (fromNodes.length === 0 || toNodes.length === 0) return Infinity;
+  return minOver(routeField(fromNodes), toNodes);
+}
+
+function minOver(dist, nodes) {
+  let best = Infinity;
+  for (const n of nodes) if (dist[n] < best) best = dist[n];
+  return best;
+}
+
+/** Walkable, reachable nodes standing inside a manifest volume. */
+function reachableNodesIn(box) {
+  const out = [];
+  for (let node = 0; node < nav.nodeCount; node++) {
+    if (!(nav.flags[node] & F_WALKABLE) || !nav.reachable[node]) continue;
+    const col = (node / MAXL) | 0;
+    const x = nav.cellCenterX(col), z = nav.cellCenterZ(col), y = nav.floorY[node];
+    if (x < box.min.x || x > box.max.x || z < box.min.z || z > box.max.z) continue;
+    if (y < box.min.y - 0.05 || y > box.max.y) continue;
+    out.push(node);
+  }
+  return out;
+}
+
+/** The graph nodes a list of §3.2 spawn markers stands on. */
+function spawnSources(spawns) {
+  const out = [];
+  for (const sp of spawns) {
+    const node = nav.nodeAt(sp.position.x, sp.position.y + 0.2, sp.position.z);
+    if (node >= 0 && (nav.flags[node] & F_WALKABLE)) out.push(node);
+  }
+  return out;
+}
+
+/** The shortest straight line between a set of points and a set of nodes. */
+function minStraightLine(points, nodes) {
+  let best = Infinity;
+  for (const p of points) {
+    for (const n of nodes) {
+      const d = Math.hypot(cellX(n) - p.x, nav.floorY[n] - p.y, cellZ(n) - p.z);
+      if (d < best) best = d;
+    }
+  }
+  return best;
+}
 
 // ───────────────────────────────────────────────────── fixture finders (probe, never guess)
 

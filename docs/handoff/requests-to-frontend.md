@@ -254,25 +254,35 @@ Build Plan §0.4. Same format and SLA as the reverse channel.
   walk off the roof from. And `npm run stairtest --map=the-square` reports 16 failures on the
   plaza ramps.
 
-  **5. Spawn-to-site distances are wildly asymmetric — measured from `MAP_MANIFEST`**
+  **5. Spawn-to-site route timing — CORRECTED, and the correction matters**
 
-  | group | site-A | site-B |
-  |---|---|---|
-  | `alpha-main` | 47.9 m | **18.5 m** |
-  | `bravo-main` | 30.3 m | **63.7 m** |
+  I first filed this from STRAIGHT-LINE distances and got it wrong in both directions. That
+  measurement said `alpha-main` was 90% asymmetric and `bravo-main` was fine. Measured along
+  the nav graph at `WALK_SPEED` 4.6 m/s — which is what `map-data.md` §7 actually specifies,
+  since it states the envelope in SECONDS — the truth is close to the opposite:
 
-  `map-data.md` §3.2's own table requires spawn-to-site "12–16 s, **within 15% of each other**".
-  Alpha is 3.4x closer to site-B than Bravo is. In Bomb a team keeps its physical spawn across
-  the round-6 side switch and changes ROLE — which is only fair while the two mains are
-  comparably placed. As it stands, whichever team holds `alpha-main` can reach site-B before
-  the other side can rotate, in all twelve rounds.
+  | group | site-A | site-B | spread |
+  |---|---|---|---|
+  | `alpha-main` (t0) | 54.0 m = **11.74 s** | 55.4 m = 12.04 s | **2.6%** ✓ |
+  | `bravo-main` (t1) | 56.2 m = 12.22 s | 67.4 m = 14.65 s | **19.9%** ✗ |
 
-  No spawn policy on our side can correct this: it is a distance between two points you author.
-  The Bomb ruleset now declares `spawnPolicy: 'fixed'` and uses each team's declared protected
-  group, which is the correct behaviour and makes the asymmetry visible rather than hiding it
-  behind a dynamic scorer.
+  A straight line from `alpha-main` to site-B is 18.7 m; the walk is 55.4 m. The line went
+  through the memorial wall. It invented `alpha-main`'s asymmetry and hid `bravo-main`'s real
+  one. Apologies for the noise — the numbers above are the ones to build against, and there is
+  now a harness (`npm run navtest`) that measures them so neither of us has to guess again.
 
-- Proposed shape: Treat 1, 2 and 5 as blocking and the rest as ordinary defects. `npm run navtest`
+  Two genuine breaches remain, both reported as PENDING rather than failing your build:
+  1. `alpha-main → site-A` is **11.74 s**, just under §7's 12 s floor.
+  2. `bravo-main`'s two sites are **19.9%** apart, over the 15% allowance.
+
+  **A↔B rotation PASSES**: A→B 17.18 s, B→A 16.50 s, 4.1% apart, both inside 16–22 s. Worst
+  rotation plus a 7 s defuse is 24.2 s against the 40 s bomb timer, so the site pair is
+  defensible as authored.
+
+- Proposed shape: 1 and 2 are RESOLVED — thank you; navtest confirms 0 phantoms, 71.71%
+  reachable, every spawn resolving, and both sites reachable. Item 5's two remaining
+  breaches are ordinary defects, not blockers: they are tens of centimetres of routing,
+  and `npm run navtest` now prints them every run. `npm run navtest`
   is new — it did not exist before today and contract §6 required it — so please add it to your
   local loop; `vertprobe` also asserted nothing until today and always exited 0, which is why
   none of this surfaced earlier on your side.

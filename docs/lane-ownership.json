@@ -13,6 +13,7 @@
 
     { "pattern": "src/world/level.js", "lane": "CX" },
     { "pattern": "src/world/props.js", "lane": "CX" },
+    { "$comment": "The committed nav bake (map-data.md §4). The TOOL is [CC] (scripts/navbake.mjs); the OUTPUT is committed by whoever moved the geometry, which is [CX] for a level.js change and [CC] when the baker itself changes. Neither lane can own it: a CX rule would block CC from re-baking after a baker change, and a CC rule would make every CX geometry PR span both lanes and be rejected by the split guard - which would make §4's arrangement impossible to obey. SHARED is safe here for a reason that does not apply to hand-written files: nobody authors this, and `npm run navtest` fails unless its bytes are exactly what the tool produces from the geometry in the same tree, so a bad write cannot survive.", "pattern": "src/world/navdata/**", "lane": "SHARED" },
 
     { "pattern": "src/fx/**", "lane": "CX" },
     { "pattern": "src/audio/**", "lane": "CX" },
@@ -73,10 +74,12 @@
     "constantName": "PROTOCOL_VERSION"
   },
   "mapGuard": {
-    "$comment": "Build Plan §3.3: geometry changes must ship a fresh nav bake and pass the map guards.",
+    "$comment": "Build Plan §3.3: geometry changes must ship a fresh nav bake and pass the map guards. `npm run navbake` writes src/world/navdata/<map>.json and `npm run navtest` FAILS when the committed artifact is not the bake of the current geometry — that pair is what makes \"commit the bake with the change\" a rule rather than a request (map-data.md §4).",
     "watch": ["src/world/level.js", "src/world/props.js"],
     "requiredHarnesses": [
+      "npm run navbake",
       "npm run maptest",
+      "npm run navtest",
       "node scripts/collisiontest.mjs --quick",
       "npm run stairtest",
       "npm run vertprobe"
