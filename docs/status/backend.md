@@ -157,6 +157,67 @@ the entire multiplayer phase history. That is well outside P0's scope and is a h
 
 ---
 
+## 2026-08-21 — P3.A findings that cross into the net lane
+
+**Two open defects live in `src/net/**`, which another CC session is editing right now.**
+Recorded here rather than fixed, because editing those files under an in-flight session is how
+two lanes produce a tree neither one tested. Both were found by adversarial re-review and both
+reproduce at HEAD.
+
+### D1 — nothing in the shipping game can plant or defuse
+
+`git grep requestInteract -- src/ server/` finds the definition (`bomb.js:570`), the passthrough
+(`match.js:716`), and **no production caller**. `player.js:1928` routes the interact edge to
+`_interact()`, which raycasts the world and emits a bus `interact` event nothing subscribes to
+the bomb, and `src/net/server.js` never reads `cmd.interact`.
+
+So bomb-rules §6/§7, the `interact` wire byte, `plantComplete`/`defuseComplete`,
+`MSG_OUTCOME.actorId` and every `REFUSAL_REASONS` value are proved **only against
+harness-invented calls**. `bombtest.mjs` and `wstest.mjs` call `rules.requestInteract` directly.
+That is the same failure `server.js`'s own `normaliseObjective` comment already documents: the
+test hand-fed the shape the test invented, so producer and consumer were never connected.
+
+544 passing checks describe a ruleset the game cannot reach.
+
+**A STRUCTURAL BLOCKER sits behind it.** §6.4 requires the plant key **held continuously**, and
+the wire has nowhere to say so. `HELD_BITS` (`protocol.js:284`) is exactly 8 entries written with
+`setUint8` — full — and `interact` lives in `EDGE_BITS`, a press. A continuously-held plant needs
+a 9th held bit, which is a LAYOUT change and therefore `PROTOCOL_VERSION` → 3. It cannot be
+routed correctly without that.
+
+The in-flight net work routes `cmd.interact` as `if (cmd.interact) requestInteract else
+releaseInteract`. That treats an edge as a hold: a held key produces one `true` and then `false`
+on every later command, so `_resetProgress` fires every tick and a plant can never complete. It
+is the right instinct against a wire that cannot express the requirement.
+
+### D3 — the wire and the result record disagree on every `roundsToWin` series
+
+`src/net/server.js:1356` maps `roundsToWin` to the constant `'elimination'`. `modes.js:155`
+maps the same fact to the **deciding round's own** reason. On `bombresult`'s own timer-decided
+control: result record `timer`, wire `elimination`.
+
+`wire-protocol.md` §8.9: "`reason` (`outcomeReason` everywhere else — one name, one enum)."
+`match-result.md` §4.2: "a record where they disagree carries two truths and is refused."
+
+This is the earlier fix MOVING the defect rather than removing it. The `modes.js` comment argues
+at length that a constant "would report a series clinched by a detonation as an elimination,
+which is exactly the two-truths-in-one-row §4.2 refuses" — and the server's independent table
+then does precisely that. Invisible to the suites because `bombresult` asserts only result
+records and never a decoded frame.
+
+### Also open, from the same review
+- `bombDetonated` is in `EV_VEC3`/`EV_SPATIAL` but `bomb.js:800` emits no `x/y/z`, so it encodes
+  as the origin AND is distance-culled against the origin — clients more than 90 m from world
+  (0,0,0) never receive it.
+- A malformed hello is refused with `PROTOCOL_VERSION_MISMATCH`; §8.11 calls this a framing
+  error, so the client shows an upgrade prompt for a length bug.
+- Once D1's routing lands, `interactRefused` shares the 4096-row evidence budget with objective
+  facts and drops the NEWEST on overflow. One client holding an invalid interact key fills it in
+  ~34 s, after which every later plant, defuse and outcome is lost — against §7's "the result
+  must be reconstructable from evidence alone".
+
+---
+
 ## 2026-08-20 — P1 backend, and what the green suite was not measuring
 
 ### Where it stands
@@ -237,6 +298,78 @@ one source file — had never been written at all.
 **Contracts stay in `REVIEW` until it lands.** This lane deliberately did not freeze them:
 that gate exists to catch backend APIs the frontend cannot actually use, and self-certifying
 it would remove the only check on that failure mode.
+
+---
+
+## 2026-08-20 — P0/P1 closure audit after REQ-CC-045–061
+
+This entry supersedes the old “Open” lists above as current executable status; the historical
+findings remain because they explain why the proofs exist.
+
+### Executable closure
+
+- `REQ-CC-045`, `046`, `048`, `050`–`053`, and `058`–`061` are `DONE` with exact responses in
+  `requests-to-backend.md`. The result boundary, profile/store parity, mounted stateful stubs,
+  deployed auth/telemetry assembly, telemetry subject/privacy rules, unload transport, Vite
+  reachability and client transport codes all have executable negative and positive controls.
+- D1 now matches the recorded decision. Production has only the Supabase REST adapter and refuses
+  the local scrypt provider. Provider identity uses the constrained `identity_provider` /
+  `identity_subject` pair from migration 0021; provider tokens are never platform sessions.
+  `email_confirm:true` is deliberate because Overstrike owns the separate verification/setup
+  gate. Unknown local-test accounts still pay dummy-KDF work. Signup compensation preserves the
+  original failure, and recovery is a reserved-token resumable saga rather than an uncompensated
+  provider-first update with a spent link.
+- Telemetry unload has one design, not the prior contradictory pair: same-origin Beacon to
+  `/v1/telemetry/unload`. Its cookie is endpoint-scoped/httpOnly/Strict, current-nonce rotated,
+  expires at 15 minutes, and revalidates the live unrevoked platform session on every use.
+  Build/correlation/delivery metadata is body-validated, `deliveryId` is transactionally reserved,
+  client body identity is ignored, signed-out personal remains receipt/session-bound, and internal
+  remains identity-free. Normal delivery still waits for `202`; unload explicitly uses the
+  response-independent at-most-once trade recorded in telemetry 2.0.
+
+### Evidence run on this tree
+
+- `node scripts/platformtest.mjs`: **2,454 checks, 12 suites, zero failures** on memory.
+- `node scripts/pgtest.mjs`: migration 0001–0021 applied, **2,865 checks, 12 suites, zero
+  failures** on PostgreSQL 16, then migration replay reported `nothing to do (20 already applied)`.
+- `node scripts/viteproxytest.mjs`: Chromium drove the Vite `/v1` proxy through a stateful
+  scenario across navigation, exact correlation echo, scoped Secure/httpOnly cookie carriage and
+  reload refresh.
+- `identitytest.mjs`: Supabase admin-create/password-grant/update/delete shapes,
+  `email_confirm:true`, provider-subject binding, generic 5xx mapping, no service-role material in
+  errors, production local-provider refusal, and dummy-KDF unknown-user work.
+
+One initial aggregate run hit the existing wall-clock-sensitive two-second stub delay assertion;
+the isolated suite immediately passed and the complete clean rerun above passed. This is recorded
+as a test flake rather than erased or counted as a product failure.
+
+### P0 and P1 gates — exact remaining evidence
+
+| Gate | Current truth |
+|---|---|
+| P0 contracts/design/guard | 13 contract headers are frozen, six CX design documents exist, and the lane guard has deliberate-failure evidence. |
+| P0 contract sufficiency | The CX status file contains historical blocker tables but no new explicit final sufficiency attestation after REQ-CC-045–061. Do not infer a human/CX sign-off from backend green tests. |
+| P0 decisions | D1–D5 are recorded working decisions. D6 remains a working engineering default and still requires professional legal review before P8/P11; this entry does not declare that review complete. |
+| H1.1 | Backend/browser proof is executable and green through Vite. A current CX acceptance statement is still separate review evidence. |
+| H1.2 | Local and PostgreSQL auth/profile/telemetry switching is executable. A live production Supabase switch is externally blocked because the deployed platform has no provider URL/service-role secret. |
+| H1.3 | Browser→platform correlation, HTTP→outbox/audit correlation, and match/platform component tests are green. The phase-review artifact tracing one actual CX action across client → match server → platform → audit has not been produced here, so H1.3 is not self-certified complete. |
+| P1 observability exit | Structured logs and correlation are implemented. This audit has no evidence of deployed distributed traces, service metrics, alert routing, or an incident timeline view; that checklist row remains open. |
+| P1 migration exit | PostgreSQL 16 scratch rehearsal and forward replay are green. Production rollout remains a deployment action. |
+
+### Required production identity configuration
+
+The platform must receive all three values; none may be replaced with the local provider:
+
+```text
+PLATFORM_IDENTITY_PROVIDER=supabase
+SUPABASE_URL=https://<project>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<secret>
+```
+
+Fail-closed boot was rechecked twice: production without the provider selector reports
+`PLATFORM_IDENTITY_PROVIDER=supabase is required in production`; selecting Supabase without its
+two credentials reports `SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for the Supabase
+identity provider`. No fallback is installed or permitted.
 
 ### Open requests
 
