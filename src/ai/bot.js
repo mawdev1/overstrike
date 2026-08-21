@@ -88,15 +88,37 @@ const STUCK_DISTANCE = 0.32;
 const OFFGRAPH_DROP = 1.5;
 
 /**
- * How far the recovery may move a bot HORIZONTALLY. Same 0.6 m budget the level-3 nudge
- * already spends, and for the same reason: a drop straight down off an awning reads as a
- * fall, whereas sliding a bot several metres sideways is a teleport, and one that would
- * also break `bombbottest`'s standing promise that no actor moves more than 0.75 m in a
- * step inside a live round. If the nearest walkable surface is further away than this
- * laterally then the bot is not perched above a known floor at all, and the ordinary wedge
- * backstop — drop the goal, pick another — is the honest answer.
+ * How far from its perch the recovery will look for an edge to step off.
+ *
+ * The recovery does NOT move the bot; it walks it (see `_updateOffGraphEscape`), so this
+ * is a search radius rather than a teleport budget and can afford to be generous. 6 m
+ * covers every awning, roof lip and stair landing the strandings have been measured on
+ * while staying local enough that the bot is plainly stepping off the thing it is standing
+ * on rather than crossing the map.
  */
-const OFFGRAPH_LATERAL = 0.6;
+const OFFGRAPH_EXIT_RADIUS = 6;
+
+/**
+ * The deepest drop the recovery will aim a bot at.
+ *
+ * Measured strandings drop 4.0–8.0 m (the-square probe: min 4.02, median 4.02, max 8.02),
+ * so 12 m clears them all with room. It refuses the 15 m skyline blocks, where a "landing"
+ * that far below is more likely a different part of the map than the floor the bot fell off
+ * — and where a bot has no business standing in the first place. Deliberately not tied to
+ * `TUNE.FALL_SAFE`: bots take no fall damage, so the bound is about whether the surface
+ * underneath is plausibly the same place, not about survival.
+ */
+const OFFGRAPH_MAX_DROP = 12;
+
+/** Seconds the escape walk may run before the ordinary wedge backstop takes over again. */
+const OFFGRAPH_ESCAPE_TIME = 4;
+
+/**
+ * How far ABOVE its feet a landing may sit and still be walked onto — `world`'s own
+ * `MAX_STEP_HEIGHT`, because that is precisely the lip the movement code will carry a bot
+ * over without a jump. Anything higher is a mantle the escape has no way to guarantee.
+ */
+const OFFGRAPH_STEP_UP = 0.55;
 
 /**
  * Difficulty curves. Recruit is beatable; veteran is lethal but never perfect.
@@ -748,8 +770,11 @@ export class Bot {
     this._sidestepSign = 1;
     this._wedgeTimer = 0;
     this._wedged = false;
-    /** Times `_recoverOffGraph` has had to put this bot back on the nav graph. */
+    /** Times `_recoverOffGraph` has had to walk this bot back onto the nav graph. */
     this._offGraphRecoveries = 0;
+    /** Edge `_updateOffGraphEscape` is walking to, and how long it may keep trying. */
+    this._escapeTo = new THREE.Vector3();
+    this._escapeTimer = 0;
 
     // ---- combat
     this.wantFire = false;
@@ -1095,6 +1120,8 @@ export class Bot {
     this._wedgeTimer = 0;
     this._wedged = false;
     this._offGraphRecoveries = 0;
+    this._escapeTo.set(0, 0, 0);
+    this._escapeTimer = 0;
 
     // ---- combat
     this.wantFire = false;
@@ -1931,6 +1958,10 @@ export class Bot {
   }
 
   _updateMovement(dt) {
+    // A bot walking itself off a perch the nav bake does not describe cannot be steered by
+    // a path, because there is no path from a node that does not exist. See `_recoverOffGraph`.
+    if (this._updateOffGraphEscape(dt)) return;
+
     this._advancePath();
 
     let dirX = 0, dirZ = 0;
@@ -2033,6 +2064,13 @@ export class Bot {
   }
 
   _updateStuck(dt) {
+    // An escape walk is itself a recovery in progress. Letting the ladder escalate on top
+    // of it would sidestep and nudge the bot away from the edge it is heading for.
+    if (this._escapeTimer > 0) {
+      this._stuckTimer = 0; this._stuckLevel = 0;
+      this._stuckSample.copy(this.position);
+      return;
+    }
     if (!this.hasDestination && this.strafeDir === 0) {
       this._stuckTimer = 0; this._stuckLevel = 0; this._wedgeTimer = 0; return;
     }
@@ -2115,12 +2153,31 @@ export class Bot {
    * that "a bot can be briefly blocked; it can never be permanently wedged". This is what
    * makes that true.
    *
-   * The relocation is a teleport and is deliberately the LAST thing tried: it only runs
-   * after six seconds in which repathing, sidestepping, jumping and the nudge have all
-   * failed, and only when the bot is provably off-graph, so ordinary blocked-by-a-corner
-   * bots never see it.
+   * It is deliberately the LAST thing tried: it only runs after six seconds in which
+   * repathing, sidestepping, jumping and the nudge have all failed, and only when the bot
+   * is provably off-graph, so ordinary blocked-by-a-corner bots never see it.
    *
-   * @returns {boolean} true if the bot was relocated onto the graph
+   * WHAT THIS IS NOT, ANY MORE: until today the recovery asked `nearestWalkable` for a
+   * floor and assigned it to `position`. That could not work and was measured not working.
+   * `nearestWalkable` returns `nodeAt(pos)` FIRST — the very node the guard above has just
+   * proved sits >1.5 m BELOW the bot's feet — and that node's cell centre is at most 0.53 m
+   * from the query point (0.75 m cells), so the 0.6 m lateral guard could never bite. Every
+   * relocation was therefore "drop straight down through whatever you are standing on":
+   * 643 of 643 probed relocations on the-square crossed solid geometry, dropping 4–8 m.
+   *
+   * So the bot is no longer moved at all. The recovery instead finds a place it could WALK
+   * to and fall from — a column within `OFFGRAPH_EXIT_RADIUS` whose drop is open air all
+   * the way down to a walkable, reachable floor, reached by a body-height corridor that is
+   * clear from here — and hands it to `_updateOffGraphEscape`, which steers there with
+   * ordinary locomotion. The fall is then integrated by `world.move` like anyone else's.
+   * Phasing is impossible by construction: no code path writes `position` directly, so
+   * every metre the bot travels has been swept against the collision world.
+   *
+   * When no such edge exists the answer is false, and the wedge backstop below runs as it
+   * did before. A bot sealed inside geometry is a MAP defect; the recovery's job is to log
+   * the coordinate (`noteOffGraphRecovery`), not to invent a way out through a wall.
+   *
+   * @returns {boolean} true if an escape walk was started
    */
   _recoverOffGraph() {
     const nav = this.game.nav;
@@ -2133,22 +2190,155 @@ export class Bot {
     // stranding either: there is nothing below to drop onto, so any move would be lateral.
     if (node < 0 || this.position.y - nav.floorY[node] <= OFFGRAPH_DROP) return false;
 
-    // `reachableOnly`: putting a stranded bot down on a second island it also cannot leave
-    // would trade one silent removal for another.
-    const p = nav.nearestWalkable?.(this.position, _v4, true);
-    if (!p) return false;
-    if (Math.hypot(p.x - this.position.x, p.z - this.position.z) > OFFGRAPH_LATERAL) return false;
+    if (!this._findOffGraphExit(_v4)) return false;
 
-    // Logged before the move: the coordinate a bake or geometry fix needs is where the bot
-    // was STRANDED, not where it was put down.
+    // Logged before the walk starts: the coordinate a bake or geometry fix needs is where
+    // the bot was STRANDED, not where it got down.
     this._offGraphRecoveries++;
     this.game.bots?.noteOffGraphRecovery?.(this);
 
-    this.position.copy(p);
-    this.velocity.set(0, 0, 0);
+    this._escapeTo.copy(_v4);
+    this._escapeTimer = OFFGRAPH_ESCAPE_TIME;
     this.clearPath();
     this.hasDestination = false;
     this._stuckSample.copy(this.position);
+    return true;
+  }
+
+  /**
+   * The nearest spot a stranded bot could step off its perch and land on the graph.
+   *
+   * Two legs, and both are tested against the collision world rather than against the nav
+   * bake — the bake is the thing that has already been shown not to describe where the bot
+   * is standing, so it cannot also be the authority on how to get down:
+   *
+   *   1. the WALK: a straight corridor from here to the candidate column at the bot's own
+   *      feet height AND at its head height, so its whole body fits;
+   *   2. the FALL: open air straight down that column, from the bot's feet to the floor it
+   *      would land on.
+   *
+   * A player does exactly this — walks to the edge and steps off — which is the standard
+   * the fix is held to. The straight-line walk is stricter than a player's freedom to
+   * route around obstacles, and that is the right way to be wrong: it refuses rescues it
+   * could have made, never invents one that passes through a wall.
+   *
+   * Landing candidates are `reachable` as well as walkable: putting a stranded bot down on
+   * a second island it also cannot leave would trade one silent removal for another. That
+   * check is made HERE, against the flag, and not left to `nearestWalkable(…, true)` —
+   * whose own fallback recurses with `reachableOnly = false` when its ten rings come up
+   * empty, quietly returning the island the caller asked it to avoid.
+   *
+   * @param {THREE.Vector3} out  receives the escape point (x/z of the column, y = feet)
+   * @returns {boolean} whether one was found
+   */
+  _findOffGraphExit(out) {
+    const nav = this.game.nav;
+    const world = this.game.world;
+    if (!nav?.ready || typeof world?.losClear !== 'function') return false;
+
+    const col0 = nav.colOf(this.position.x, this.position.z);
+    if (col0 < 0) return false;
+    const cx0 = col0 % nav.cols;
+    const cz0 = (col0 / nav.cols) | 0;
+    const feetY = this.position.y;
+    const headY = feetY + Math.max(0.9, this.height - 0.15);
+    const rings = Math.max(1, Math.ceil(OFFGRAPH_EXIT_RADIUS / nav.cell));
+
+    let bestD = Infinity;
+    for (let r = 1; r <= rings; r++) {
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+          const cx = cx0 + dx, cz = cz0 + dz;
+          if (cx < 0 || cz < 0 || cx >= nav.cols || cz >= nav.rows) continue;
+          const col = cz * nav.cols + cx;
+          const wx = nav.cellCenterX(col), wz = nav.cellCenterZ(col);
+          const d = Math.hypot(wx - this.position.x, wz - this.position.z);
+          if (d > OFFGRAPH_EXIT_RADIUS || d >= bestD) continue;
+
+          // The floor this column would actually catch the bot on: the HIGHEST walkable
+          // surface it could arrive at — anything lower is behind that one. Candidates at
+          // or near the bot's own height are deliberately IN: the strandings measured on
+          // MERIDIAN are all a bot standing on an upper floor whose own column the bake
+          // left empty, well under a metre from a walkable node at the SAME height (bot14
+          // at y=4.15, node at 4.15, d=0.57). Those are cured by a step sideways, and a
+          // search that only accepted floors 1.5 m below refused every one of them.
+          const layers = nav.layerCount[col];
+          let floorY = -Infinity;
+          for (let l = 0; l < layers; l++) {
+            const n = col * nav.maxLayers + l;
+            if (!nav.isWalkable(n) || !nav.reachable[n]) continue;
+            const fy = nav.floorY[n];
+            if (fy > feetY + OFFGRAPH_STEP_UP || feetY - fy > OFFGRAPH_MAX_DROP) continue;
+            if (fy > floorY) floorY = fy;
+          }
+          if (floorY === -Infinity) continue;
+
+          // 1. the walk, at both ends of the body.
+          _v5.set(this.position.x, feetY + 0.15, this.position.z);
+          _v6.set(wx, feetY + 0.15, wz);
+          if (!world.losClear(_v5, _v6)) continue;
+          _v5.y = headY; _v6.y = headY;
+          if (!world.losClear(_v5, _v6)) continue;
+
+          // 2. the fall — only when there is one. A landing at the bot's own height is
+          //    walked onto, and the world's step-up and ground-snap handle the centimetres.
+          if (feetY - floorY > 0.05) {
+            _v5.set(wx, feetY + 0.1, wz);
+            _v6.set(wx, floorY + 0.05, wz);
+            if (!world.losClear(_v5, _v6)) continue;
+          }
+
+          bestD = d;
+          out.set(wx, feetY, wz);
+        }
+      }
+      if (bestD < Infinity) return true;   // rings are searched nearest-first
+    }
+    return false;
+  }
+
+  /**
+   * Walk a stranded bot to the edge found by `_findOffGraphExit` and let it fall off.
+   *
+   * Runs in place of ordinary movement, because ordinary movement is driven by a path the
+   * nav graph cannot produce from a position it does not describe. Everything else about
+   * the bot — aim, fire, stance — carries on: this is a bot walking, not a bot suspended.
+   *
+   * Ends the moment the graph describes the bot's feet again (the rescue worked), when it
+   * reaches the edge (the fall is now the world's business, and air control should not keep
+   * driving it), or on the timeout, which hands the bot back to the wedge backstop.
+   *
+   * @returns {boolean} true if the escape consumed this tick's movement
+   */
+  _updateOffGraphEscape(dt) {
+    if (this._escapeTimer <= 0) return false;
+    this._escapeTimer -= dt;
+
+    const nav = this.game.nav;
+    if (this.grounded && nav?.ready) {
+      const node = nav.nodeAt(this.position.x, this.position.y, this.position.z);
+      if (node >= 0 && this.position.y - nav.floorY[node] <= OFFGRAPH_DROP) {
+        this._escapeTimer = 0;
+        return false;
+      }
+    }
+
+    let dirX = this._escapeTo.x - this.position.x;
+    let dirZ = this._escapeTo.z - this.position.z;
+    const len = Math.hypot(dirX, dirZ);
+    if (len < 0.2 || this._escapeTimer <= 0) {
+      // At the lip — or out of time. Either way stop steering and let gravity finish.
+      this._escapeTimer = 0;
+      return false;
+    }
+    dirX /= len; dirZ /= len;
+
+    const speed = this._desiredSpeed();
+    const accel = this.grounded ? 26 : 6;
+    this.velocity.x = damp(this.velocity.x, dirX * speed, accel, dt);
+    this.velocity.z = damp(this.velocity.z, dirZ * speed, accel, dt);
+    this._integrate(dt, this.velocity.x, this.velocity.z, 0);
     return true;
   }
 

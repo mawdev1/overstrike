@@ -121,7 +121,7 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
   for (const bot of game.bots.bots) {
     rows.set(bot.id, {
       id: bot.id, team: bot.team, distance: 0, aliveTicks: 0, oobTicks: 0,
-      cells: new Set(), maxStep: 0, teleports: 0, immobileRun: 0, worstImmobileRun: 0,
+      cells: new Set(), maxStep: 0, maxStepY: 0, teleports: 0, immobileRun: 0, worstImmobileRun: 0,
       deadMoveTicks: 0, deadShots: 0, offGraphRun: 0, worstOffGraphRun: 0,
     });
   }
@@ -158,7 +158,7 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
         // returns early when `alive` is false today, and this is what notices if it stops.
         const last = previous.get(bot.id);
         if (last && last.dead && Math.hypot(p.x - last.x, p.z - last.z) > 1e-6) row.deadMoveTicks++;
-        previous.set(bot.id, { x: p.x, z: p.z, dead: true });
+        previous.set(bot.id, { x: p.x, y: p.y, z: p.z, dead: true });
         row.immobileRun = 0;
         continue;
       }
@@ -170,10 +170,22 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
       const last = previous.get(bot.id);
       if (last && !last.dead && sameSegment) {
         const step = Math.hypot(p.x - last.x, p.z - last.z);
-        if (step > 0.75) row.teleports++;
+        // Vertical is measured SEPARATELY and asserted, not folded into a horizontal
+        // hypotenuse and not ignored. Folding it in would be worse than useless — a
+        // relocation straight down scores zero on a horizontal metric, which is exactly
+        // how `Bot._recoverOffGraph` dropped bots 4–8 m through solid roofs while this
+        // harness printed "0 steps over 0.75 m" beside "recoveries 1". See MAX_STEP_Y.
+        const stepY = Math.abs(p.y - last.y);
+        // Negated `<=` rather than `>`, so a NaN counts as a discontinuity instead of
+        // passing. This is not hypothetical: the first cut of this metric read `last.y`
+        // from a sample that only carried x and z, every comparison was NaN, and the
+        // harness reported "0 m vertical" and PASS against the very relocation it was
+        // written to catch. A measurement that cannot be wrong out loud is not one.
+        if (!(step <= MAX_STEP_XZ) || !(stepY <= MAX_STEP_Y)) row.teleports++;
         else {
           row.distance += step;
           if (step > row.maxStep) row.maxStep = step;
+          if (stepY > row.maxStepY) row.maxStepY = stepY;
         }
         if (bot.hasDestination && step < IMMOBILE_STEP) {
           row.immobileRun++;
@@ -192,7 +204,7 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
         row.offGraphRun++;
         if (row.offGraphRun > row.worstOffGraphRun) row.worstOffGraphRun = row.offGraphRun;
       } else row.offGraphRun = 0;
-      previous.set(bot.id, { x: p.x, z: p.z, dead: false });
+      previous.set(bot.id, { x: p.x, y: p.y, z: p.z, dead: false });
     }
 
     if (bomb?.series) break;
@@ -215,6 +227,7 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
     }
     : { scores: [...game.match.scores] };
 
+  const digestGaps = new Set();
   const result = {
     mapId, mode, seed, ticks,
     seconds: ticks * FIXED_DT,
@@ -222,10 +235,34 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
     offGraph: game.bots.offGraphLog.map((r) => ({ ...r })),
     botIds: new Set(game.bots.bots.map((b) => b.id)),
     objective,
-    digest: matchDigest(game, bomb),
+    digest: matchDigest(game, bomb, digestGaps),
+    digestGaps: [...digestGaps],
   };
   game.dispose();
   return result;
+}
+
+/**
+ * The round-record fields the digest fingerprints, in order.
+ *
+ * `winnerTeam`, NOT `winner`: `BombRules._endRound` writes `winnerTeam`, and the digest
+ * asked for `winner` — a key no Bomb round record has ever had — so every round in every
+ * digest this harness has produced contributed the literal string "undefined". The
+ * component was not weak, it asserted nothing. `planted` and `site` were absent entirely,
+ * which is how a series that planted at A and one that planted at B could digest alike.
+ */
+const ROUND_DIGEST_FIELDS = ['round', 'winnerTeam', 'reason', 'attackingTeam', 'planted', 'site'];
+
+/**
+ * One digest field of one record — or a loud marker, recorded in `gaps`, if the record has
+ * no such key. `record[key] ?? ''` would be the natural-looking thing to write here and is
+ * the whole reason the bug survived: it turns "this field was renamed out from under me"
+ * into a value that fingerprints perfectly consistently across every run.
+ */
+function digestField(record, key, gaps) {
+  if (!Object.hasOwn(record, key)) { gaps.add(key); return `<no-${key}>`; }
+  const v = record[key];
+  return v === null ? 'null' : String(v);
 }
 
 /**
@@ -234,8 +271,10 @@ async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
  * Positions alone are a weak digest: two runs can converge on the same resting places after
  * different fights. Scores, round records and objective events are folded in so a divergence
  * anywhere in the mode logic shows up, not only one that moves someone.
+ *
+ * @param {Set<string>} gaps  receives the name of any digested field the record lacked
  */
-function matchDigest(game, bomb) {
+function matchDigest(game, bomb, gaps) {
   const parts = [];
   for (const bot of game.bots.bots) {
     parts.push(`${bot.id}:${bot.team}:${bot.alive ? 1 : 0}:${bot.position.x.toFixed(4)},`
@@ -243,7 +282,9 @@ function matchDigest(game, bomb) {
   }
   parts.push(`scores=${game.match.scores.join('-')}`);
   if (bomb) {
-    for (const r of bomb.rounds) parts.push(`r${r.round}:${r.winner}:${r.reason}:${r.attackingTeam}`);
+    for (const r of bomb.rounds) {
+      parts.push(`r${ROUND_DIGEST_FIELDS.map((k) => digestField(r, k, gaps)).join(':')}`);
+    }
     for (const e of bomb.events) parts.push(`e${e.tick}:${e.kind}:${e.entityId ?? ''}:${e.site ?? ''}`);
   }
   return parts.join('|');
@@ -279,6 +320,28 @@ const MAX_IMMOBILE_SECONDS = 12;
 const MAX_OFFGRAPH_SECONDS = 12;
 
 /**
+ * How far an actor may move in ONE 1/120 s tick, laterally and vertically.
+ *
+ * Both numbers are what the movement code can physically produce, not round figures:
+ *
+ *   lateral  — sprint tops out well under 90 m/s; 0.75 m/tick is the long-standing budget
+ *              and the one `bombbottest` also promises inside a live round.
+ *   vertical — `world.move` can shift a bot's feet in one tick by a step-up or ground-snap
+ *              (`MAX_STEP_HEIGHT` / `GROUND_SNAP`, 0.55 m, taken instantly) plus a fall at
+ *              terminal velocity (`TERMINAL_FALL` = -60 m/s → 0.50 m/tick); a jump adds
+ *              7.6 m/s → 0.063 m. 1.05 m is that ceiling, so the bound is the physics
+ *              rather than an observation of it — the worst this suite actually measures is
+ *              0.67 m, printed beside the budget on every run so drift is visible.
+ *
+ * So a bot falling off a ledge, jumping a rail or mantling a crate passes, and the 4.0–8.0 m
+ * relocations `_recoverOffGraph` used to perform — 4 to 16 times a tick of terminal velocity
+ * — cannot. Proven red, not assumed: against the previous `_recoverOffGraph` this check
+ * fails on meridian/tdm and on both MERIDIAN Bomb series that recover a bot.
+ */
+const MAX_STEP_XZ = 0.75;
+const MAX_STEP_Y = 1.05;
+
+/**
  * Assert the navigation contract over one measured match.
  *
  * @param {object} run  a `runMatch` result
@@ -296,6 +359,7 @@ function assertNavigation(run, label) {
   const oob = rows.reduce((a, r) => a + r.oobTicks, 0);
   const teleports = rows.reduce((a, r) => a + r.teleports, 0);
   const maxStep = Math.max(...rows.map((r) => r.maxStep));
+  const maxStepY = Math.max(...rows.map((r) => r.maxStepY));
   const aliveTicks = rows.reduce((a, r) => a + r.aliveTicks, 0);
   const worstOffGraph = Math.max(...rows.map((r) => r.worstOffGraphRun)) * FIXED_DT;
   const deadMove = rows.reduce((a, r) => a + r.deadMoveTicks, 0);
@@ -305,6 +369,8 @@ function assertNavigation(run, label) {
   note(`${label}: cells/bot min ${worstCells}, roster ${roster.size} | worst immobile-while-seeking `
     + `${fixed(worstImmobile, 2)} s | worst off-graph ${fixed(worstOffGraph, 2)} s `
     + `| recoveries ${run.offGraph.length}`);
+  note(`${label}: largest single-tick step ${fixed(maxStep, 3)} m lateral / ${fixed(maxStepY, 3)} m vertical `
+    + `(budgets ${MAX_STEP_XZ} / ${MAX_STEP_Y})`);
   if (run.offGraph.length > 0) {
     note(`${label}: stranded at ${run.offGraph.map((r) => `bot${r.botId}@${fixed(r.x)},${fixed(r.y)},${fixed(r.z)}`).join('  ')}`);
   }
@@ -320,9 +386,10 @@ function assertNavigation(run, label) {
     `${label}: no bot spends more than ${MAX_IMMOBILE_SECONDS} s trying to reach somewhere without moving`,
     `worst ${fixed(worstImmobile, 2)} s`);
   check(oob === 0, `${label}: no bot leaves the world bounds`, `${oob} out-of-bounds ticks`);
-  check(teleports === 0 && maxStep < 0.75,
-    `${label}: no bot moves discontinuously inside a round segment`,
-    `${teleports} steps over 0.75 m, largest legal step ${fixed(maxStep, 3)} m`);
+  check(teleports === 0 && maxStep < MAX_STEP_XZ && maxStepY < MAX_STEP_Y,
+    `${label}: no bot moves discontinuously inside a round segment, in any direction`,
+    `${teleports} steps over ${MAX_STEP_XZ} m lateral / ${MAX_STEP_Y} m vertical, `
+    + `largest legal step ${fixed(maxStep, 3)} m lateral, ${fixed(maxStepY, 3)} m vertical`);
   // Horizontal only, on purpose: `Bot.fixedUpdate` deliberately keeps integrating a dead
   // actor so the body falls to the floor, and that is presentation, not play. What must stop
   // is locomotion — a bot eliminated in a Bomb round with no respawns is out of the round.
@@ -414,6 +481,13 @@ for (const seed of SQUARE_BOMB_SEEDS) {
     `at least ${SQUARE_BOMB_SEEDS.length - 1} of ${SQUARE_BOMB_SEEDS.length} Bomb series contain a defuse`,
     objs.map((o) => o.defuses.length).join(','));
   check(sites.size === 2, 'bots plant at both authored sites, not just the nearer one', [...sites].join(','));
+  // The digest is only a regression net if it reads fields that exist. It read `r.winner`
+  // for months; Bomb round records carry `winnerTeam`, so the round component of every
+  // digest was the constant string "undefined".
+  const gaps = new Set(squareBomb.flatMap((r) => r.digestGaps));
+  check(gaps.size === 0,
+    'every round field the determinism digest fingerprints exists on the record it reads',
+    `missing: ${[...gaps].join(',')}`);
   check(allOf(allPlants, (p) => ids.has(p.entityId)), 'every planter is an autonomous bot');
   check(allOf(allDefuses, (d) => ids.has(d.entityId)), 'every defuser is an autonomous bot');
   check(allOf(objs, (o) => o.liveRespawns === 0),
@@ -477,7 +551,21 @@ heading('4. MERIDIAN — Bomb');
   game.dispose();
 }
 
-const MERIDIAN_BOMB_SEEDS = [20260101, 20260202];
+/**
+ * Six seeds, not two — and the reason is a hole in this harness, not a convenience.
+ *
+ * The defuse-rate assertion below aggregates over these series, so the sample size IS the
+ * threshold's calibration. `MIN_DEFUSES_PER_ROUND` is 0.10, calibrated on a SIX-seed sweep
+ * (0.17), but was being applied to a two-seed sample whose spread is far wider: measured on
+ * the unmodified simulation, the six seeds give 4, 0, 2, 2, 2 and 3 defuses, so the pair
+ * (20260202, 20260303) scores 0.087 and (20260202, 20260404) 0.083 — both RED. The check
+ * was passing on the pair it happened to be given, which is luck rather than evidence.
+ *
+ * A MERIDIAN Bomb series costs ~2.3 s, so the honest sample is nearly free. Aggregated the
+ * six seeds give 0.206 on the unmodified simulation and 0.156 with today's off-graph
+ * recovery change — the same behaviour, sampled widely enough to say so.
+ */
+const MERIDIAN_BOMB_SEEDS = [20260101, 20260202, 20260303, 20260404, 20260505, 20260606];
 const meridianBomb = [];
 for (const seed of MERIDIAN_BOMB_SEEDS) {
   meridianBomb.push(await runMatch({
@@ -499,12 +587,17 @@ for (const seed of MERIDIAN_BOMB_SEEDS) {
     'the bot objective layer plants at fixture site coordinates it has never seen',
     `${plants}/${rounds}`);
   // Aggregated over the fixture's series rather than required of each, unlike The Square:
-  // two series is too small a sample to demand a defuse from both, and inventing a third
-  // just to keep a per-series form would buy nothing but runtime.
+  // a single series can legitimately contain no defuse at all, and demanding one from each
+  // would fail on behaviour that is correct. See MERIDIAN_BOMB_SEEDS for why aggregating
+  // over two of them was not a sample at all.
   check(rounds > 0 && defuses / rounds >= MIN_DEFUSES_PER_ROUND,
     'and defuses there too, so neither behaviour is fitted to The Square',
     `${defuses}/${rounds} = ${fixed(defuses / Math.max(rounds, 1), 3)}`);
   check(sites.size === 2, 'both fixture sites are used', [...sites].join(','));
+  const gaps = new Set(meridianBomb.flatMap((r) => r.digestGaps));
+  check(gaps.size === 0,
+    'every round field the digest fingerprints exists on the fixture\'s records too',
+    `missing: ${[...gaps].join(',')}`);
   for (const run of meridianBomb) assertNavigation(run, `meridian/bomb#${run.seed}`);
 }
 
