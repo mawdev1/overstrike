@@ -96,7 +96,7 @@ export function keyLabel(code) {
  * these are now: posts 2.2 u (~8 px) and hairlines 0.7 u (~2.5 px, sub-pixel-antialiased,
  * hence the halo pass in CSS).
  */
-function reticleShapes() {
+function reticleMildot() {
   let s = '';
   // Heavy outer posts, stopping at 42 % of the radius.
   s += '<rect x="-1.1" y="-100" width="2.2" height="58"/>';
@@ -125,6 +125,37 @@ function reticleShapes() {
   return s;
 }
 
+/**
+ * The MERIDIAN's ranging reticle — a fine open chevron over a drop ladder.
+ *
+ * A 3.5x semi-auto is aimed differently from a 6x bolt gun: fast follow-up shots at
+ * torsos, not one held breath at a head. So no mil-dot field — a chevron whose apex is
+ * the aiming point (nothing covers the target above it) and a single BDC ladder under
+ * it for the second shot. The same unit weights as the mil-dot apply: posts 2.2 u,
+ * hairlines 0.7 u, because those are what rasterise correctly (see the note above).
+ */
+function reticleRanging() {
+  let s = '';
+  // Horizontal posts only — the vertical field stays open above the chevron.
+  s += '<rect x="-100" y="-1.1" width="62" height="2.2"/>';
+  s += '<rect x="38" y="-1.1" width="62" height="2.2"/>';
+  s += '<rect x="-1.1" y="46" width="2.2" height="54"/>';
+  // Hairline stadia running in from the posts.
+  s += '<rect x="-38" y="-0.35" width="34" height="0.7"/>';
+  s += '<rect x="4" y="-0.35" width="34" height="0.7"/>';
+  // Open chevron, apex exactly on the aiming point (0,0), legs 7 units at 45 degrees.
+  s += '<rect x="0" y="0" width="9.9" height="0.9" transform="rotate(45)"/>';
+  s += '<rect x="-9.9" y="0" width="9.9" height="0.9" transform="rotate(-45)"/>';
+  // BDC drop ladder: fine centre line with widening rungs.
+  s += '<rect x="-0.35" y="7" width="0.7" height="39"/>';
+  for (let i = 1; i <= 3; i++) {
+    const y = 7 + i * 10;
+    const w = 4.5 + i * 2.2;
+    s += `<rect x="${(-w / 2).toFixed(2)}" y="${(y - 0.35).toFixed(2)}" width="${w}" height="0.7"/>`;
+  }
+  return s;
+}
+
 export class HUD {
   constructor(game) {
     this.game = game;
@@ -144,7 +175,7 @@ export class HUD {
       scoreA: -1, scoreB: -1, timer: -1, urgent: false, modeTxt: '',
       tagA: '', tagB: '', metric: '', phase: '',
       spread: -1, xhStyle: '', xhColor: '', xhHidden: null,
-      scopeAmt: -1, scopeSize: -1, scopeBreath: -1, scopeHold: null,
+      scopeAmt: -1, scopeSize: -1, scopeBreath: -1, scopeHold: null, scopeRet: '',
       vignette: -1, crit: false, flash: -1, blind: -1,
       perf: '', live: null, secondary: '', nades: -1, hmKind: '',
       deathKiller: '', deathCount: -1, deathReady: null, deathHp: -1, deathHow: '',
@@ -343,9 +374,12 @@ export class HUD {
     // the bullet goes (see `_pollScope`).
     const scope = mk('scope', `
       <svg viewBox="-120 -120 240 240" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-        <defs><g id="os-reticle">${reticleShapes()}</g></defs>
-        <use href="#os-reticle" class="ret-halo"></use>
-        <use href="#os-reticle" class="ret-ink"></use>
+        <defs>
+          <g id="os-ret-mildot">${reticleMildot()}</g>
+          <g id="os-ret-ranging">${reticleRanging()}</g>
+        </defs>
+        <use href="#os-ret-mildot" class="ret-halo"></use>
+        <use href="#os-ret-mildot" class="ret-ink"></use>
         <g class="scope-breath">
           <rect class="trk" x="-23" y="103.4" width="46" height="1.9" rx="0.95"></rect>
           <rect class="fil" x="-23" y="103.4" width="46" height="1.9" rx="0.95"></rect>
@@ -442,6 +476,7 @@ export class HUD {
       notice, streak, death, center, streaks, uav, scope,
       scopeBreath: scope.querySelector('.scope-breath'),
       scopeBreathFill: scope.querySelector('.scope-breath .fil'),
+      scopeUses: scope.querySelectorAll('use'),
       scoreA: top.querySelector('.score-team.a .val'),
       scoreB: top.querySelector('.score-team.b .val'),
       tagA: top.querySelector('.score-team.a .tag'),
@@ -1185,6 +1220,16 @@ export class HUD {
         el.style.visibility = 'hidden';
       }
       return;
+    }
+
+    // Per-weapon reticle. `scopeReticle` is authored on the optic in weaponDefs; the
+    // href swap is cached like every other write here, so it costs nothing per frame
+    // and exactly two attribute writes on a weapon change.
+    const ret = this.game.player?.weapon?.def?.viewmodel?.optic?.scopeReticle || 'mildot';
+    if (ret !== this._c.scopeRet) {
+      this._c.scopeRet = ret;
+      const href = ret === 'ranging' ? '#os-ret-ranging' : '#os-ret-mildot';
+      for (const u of this.el.scopeUses) u.setAttribute('href', href);
     }
 
     const size = Math.round(s.apertureR * this._vh * 1.2);
