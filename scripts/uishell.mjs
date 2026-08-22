@@ -29,7 +29,7 @@ import {
   validateSettingValue,
 } from '../src/ui/shell/settings/index.js';
 import { SHELL_ROUTES, matchShellRoute } from '../src/ui/shell/router.js';
-import { SHELL_SCREEN_FIXTURES, SHELL_VARIANT_MATRIX } from '../src/ui/shell/fixtures.js';
+import { SETTLEMENT_RESULT_FIXTURES, SHELL_SCREEN_FIXTURES, SHELL_VARIANT_MATRIX } from '../src/ui/shell/fixtures.js';
 import { Input } from '../src/core/input.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -41,7 +41,8 @@ const REQUIRED_VARIANTS = Object.freeze(['loading', 'error', 'offline', 'ready']
 const EMPTY_NA = new Set([
   'welcome', 'auth.signIn', 'auth.create', 'auth.recover', 'onboarding.eligibility',
   'onboarding.displayName', 'onboarding.verify', 'onboarding.terms', 'room.loadout',
-  'room.chat', 'career.matchDetail', 'match.loading', 'results', 'system',
+  'room.chat', 'career.matchDetail', 'inventory.item', 'loadouts', 'match.loading',
+  'results', 'system',
 ]);
 const TERMINAL_NA = new Set(['onboarding.essentialSettings']);
 
@@ -96,6 +97,7 @@ function routePath(route) {
   return route.pattern
     .replace(':roomId', 'fixture-room-alpha')
     .replace(':matchId', 'fixture-match-1')
+    .replace(':instanceId', 'fixture-instance-helmet')
     .replace(':category', 'accessibility')
     .replace(':condition', 'maintenance');
 }
@@ -105,7 +107,7 @@ async function modelChecks() {
   equal(Object.keys(SETTINGS_SCOPES), EXPECTED_SCOPES, 'settings scope vocabulary must be exact');
   equal(LOCAL_SETTINGS_SCHEMA_VERSION, 2, 'local repair schema must remain independently versioned');
   equal(ROAMING_SETTINGS_SCHEMA_VERSION, 1, 'HTTP roaming schema must match RoamingSettingsV1');
-  equal(SHELL_ROUTES.length, 27, 'the shell route inventory must contain 27 addressable routes');
+  equal(SHELL_ROUTES.length, 30, 'the shell route inventory must contain 30 addressable routes');
 
   const keys = SETTINGS_INVENTORY.map((item) => item.key);
   equal(new Set(keys).size, keys.length, 'setting keys must be unique');
@@ -559,8 +561,23 @@ const connection = {
   set(value) { this.value = value; this.listener?.(value); },
 };
 window.__SOLO_SUBMISSIONS__ = [];
+window.__LOADOUT_SUBMISSIONS__ = [];
 const client = {
   connection,
+  // Records what the loadout editor actually SENDS, like createRoom below: a select that
+  // renders but never reaches the payload is the same defect one layer in. A reserved name
+  // triggers the contract's closed error enumeration so the mapped copy can be asserted.
+  async createLoadout(payload) {
+    window.__LOADOUT_SUBMISSIONS__.push(['create', payload]);
+    if (payload.name === 'Not Owned Probe') {
+      throw Object.assign(new Error('Referenced instance is not owned.'), { code: 'LOADOUT_ITEM_NOT_OWNED' });
+    }
+    return { loadoutId: 'harness-loadout', name: payload.name, slots: payload.slots, isDefault: false };
+  },
+  async updateLoadout(payload) {
+    window.__LOADOUT_SUBMISSIONS__.push(['update', payload]);
+    return { loadoutId: payload.loadoutId, name: payload.name, slots: payload.slots, isDefault: false };
+  },
   // Records what the create-room form actually SENDS. A checkbox that renders and submits
   // nothing is the same defect one layer in, so the assertion is on the payload, not the DOM.
   async createRoom(payload) {
@@ -787,6 +804,176 @@ async function browserChecks() {
     });
     equal(await page.locator('#shell-loadout-primary').count(), 1, 'lobby loadout must render supplied authoritative primary choices');
     equal(await page.locator('#shell-loadout-secondary').count(), 1, 'lobby loadout must render supplied authoritative secondary choices');
+
+    // ── P3-08: persistent inventory and loadout preparation ─────────────────────────────
+    //
+    // Every state items-inventory.md names, asserted as visible text a player can act on:
+    // locked-by-deployment, run vs permanent, stackable quantities, the durability placeholder,
+    // the honest capacity statement, and the closed validation error vocabulary.
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/inventory');
+      window.__SHELL__.injectFixture('inventory', 'ready');
+    });
+    check((await page.getByText('Locked — reserved for deployment', { exact: true }).count()) === 1,
+      'a deployment-locked item must carry a non-color locked label');
+    check((await page.getByText('90 of 120', { exact: true }).count()) === 1,
+      'a stackable item must show its quantity against its max stack');
+    check((await page.getByText('1 (serialized item)', { exact: true }).count()) === 4,
+      'serialized items must be explicit about not stacking');
+    check((await page.getByText('Not tracked yet — wear and repair arrive in a later phase (max 100)', { exact: true }).count()) === 1,
+      'the durability placeholder must be labeled as untracked, never rendered as a zero');
+    check((await page.getByText('Not equippable — carried as raid loot only', { exact: true }).count()) === 1,
+      'a slot-less definition must say it can never be equipped');
+    check((await page.locator('main').innerText()).includes('no capacity limit in this phase'),
+      'capacity must be stated honestly: no limit exists yet, so no invented meter');
+    check((await page.locator('main').innerText()).includes('Items you are carrying in an active raid are not listed here'),
+      'run vs permanent must be explained on the permanent list');
+    check((await page.locator('a[href="/inventory/fixture-instance-helmet"]').count()) === 1,
+      'every listed item must offer an inspect link');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/inventory/fixture-instance-helmet');
+      window.__SHELL__.injectFixture('inventory.item', 'ready');
+    });
+    check((await page.getByText('This item is reserved by deployment fixture-deployment-1. Until that deployment resolves, it cannot be modified or equipped into another deployment.', { exact: true }).count()) === 1,
+      'inspecting a locked item must name the deployment holding the lock (§6.4 made visible)');
+
+    await page.evaluate(() => window.__SHELL__.injectFixture('inventory.item', {
+      variant: 'ready',
+      data: {
+        instanceId: 'fixture-instance-run', itemId: 'rifle_fixture', quantity: 1,
+        durability: null, location: 'run', runId: 'fixture-run-1', locked: false,
+        lockedByDeploymentId: null, status: 'active',
+        definition: { itemId: 'rifle_fixture', name: 'Fixture rifle', class: 'weapon', slot: 'primary', rarityTier: 'rare', stackable: false, maxStack: null, durabilityMax: 100 },
+      },
+    }));
+    check((await page.getByText('This item is inside an active raid. It returns to your permanent inventory if you extract, and is lost if you die or abort. It cannot be equipped into a loadout while the raid is live.', { exact: true }).count()) === 1,
+      'a run item must explain both exits and why it cannot be equipped (§4 made visible)');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/loadouts');
+      window.__SHELL__.injectFixture('loadouts', 'ready');
+    });
+    check((await page.getByText('No item is protected. Everything you equip deploys with you, and is lost if you die or abort instead of extracting. Item protection does not exist in this phase.', { exact: true }).count()) === 1,
+      'protection is stated honestly: the contracts define exactly two run exits and no protected flag');
+    equal(await page.locator('#shell-loadout-slot-primary option').allTextContents(),
+      ['Empty', 'Fixture rifle'],
+      'a slot select must offer only that slot\'s items — slot mismatch is prevented by construction');
+    equal(await page.locator('#shell-loadout-slot-helmet option').allTextContents(),
+      ['Empty'],
+      'a deployment-locked item must not be offered for equipping (§3.1 rule 1)');
+    check((await page.getByText('Fixture helmet (reserved by an active deployment)', { exact: true }).count()) === 1,
+      'a saved loadout referencing a locked item must say so on its card');
+    check((await page.getByText('Default', { exact: true }).count()) === 1,
+      'the default loadout must be labeled');
+
+    // The chosen instances must reach the REQUEST, and empty slots must be omitted, not sent
+    // as empty strings the server would reject.
+    await page.fill('input[name="loadout-name"]', 'Harness Kit');
+    await page.locator('#shell-loadout-slot-primary').selectOption('fixture-instance-rifle');
+    await page.locator('#shell-loadout-slot-consumable').selectOption('fixture-instance-medkit');
+    await page.evaluate(() => document.querySelector('input[name="loadout-name"]').form.requestSubmit());
+    await page.waitForFunction(() => window.__LOADOUT_SUBMISSIONS__.length === 1);
+    const createdLoadout = await page.evaluate(() => window.__LOADOUT_SUBMISSIONS__[0]);
+    equal(createdLoadout[0], 'create', 'saving a new loadout must create, not patch');
+    equal(createdLoadout[1].slots,
+      { primary: 'fixture-instance-rifle', consumable: 'fixture-instance-medkit' },
+      'the editor must send exactly the chosen instance ids and omit empty slots');
+
+    // The contract's closed error enumeration (§8) maps to copy a player can act on.
+    await page.evaluate(() => {
+      window.__LOADOUT_SUBMISSIONS__ = [];
+      window.__SHELL__.navigate('/loadouts');
+      window.__SHELL__.injectFixture('loadouts', 'ready');
+    });
+    await page.fill('input[name="loadout-name"]', 'Not Owned Probe');
+    await page.evaluate(() => document.querySelector('input[name="loadout-name"]').form.requestSubmit());
+    await page.waitForFunction(() => document.body.innerText.includes('no longer in your permanent inventory'));
+    check((await page.getByText('An item in this loadout is no longer in your permanent inventory — it may have been lost, consumed, or taken into a raid. Replace it and save again.', { exact: true }).count()) === 1,
+      'LOADOUT_ITEM_NOT_OWNED must map to actionable copy, not a raw code');
+
+    // Editing a loadout whose saved slot is locked must demand a replacement, prefill the
+    // eligible slots, and PATCH the same loadout rather than creating a sibling.
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/loadouts');
+      window.__SHELL__.injectFixture('loadouts', 'ready');
+    });
+    await page.getByRole('button', { name: 'Edit Fixture raid kit', exact: true }).click();
+    check((await page.getByText('The saved helmet is reserved by an active deployment. Choose a replacement or wait for that deployment to resolve.', { exact: true }).count()) === 1,
+      'editing a loadout with a locked item explains the replacement requirement');
+    equal(await page.locator('#shell-loadout-slot-primary').inputValue(), 'fixture-instance-rifle',
+      'editing must prefill saved slots that are still eligible');
+    await page.evaluate(() => {
+      window.__LOADOUT_SUBMISSIONS__ = [];
+      document.querySelector('input[name="loadout-name"]').form.requestSubmit();
+    });
+    await page.waitForFunction(() => window.__LOADOUT_SUBMISSIONS__.length === 1);
+    const editedLoadout = await page.evaluate(() => window.__LOADOUT_SUBMISSIONS__[0]);
+    equal(editedLoadout[0], 'update', 'saving an edit must patch the existing loadout');
+    equal(editedLoadout[1].loadoutId, 'fixture-loadout-1', 'the patch must target the edited loadout id');
+    check(editedLoadout[1].slots.helmet === undefined,
+      'the ineligible locked slot must be dropped from the saved slots, never silently resent');
+
+    // ── P3-10: post-run settlement presentation ─────────────────────────────────────────
+    //
+    // settlement.md §5.3's per-participant statuses as a player must be able to tell them
+    // apart: extracted, lost, held-for-review (exception-open), and the two retry-safe
+    // windows (run pending, participant `ended`). Each is asserted as visible text plus a
+    // non-color data attribute, and "protected" is asserted as the honest statement that no
+    // protection exists — the contracts define two dispositions and no protected flag.
+    const showSettlement = (fixture) => page.evaluate((data) => {
+      window.__SHELL__.navigate('/results/run-fixture-1');
+      window.__SHELL__.injectFixture('results', { variant: 'ready', data });
+    }, fixture);
+
+    await showSettlement(SETTLEMENT_RESULT_FIXTURES.extracted);
+    check((await page.locator('[data-local-settlement="extracted"]').count()) === 1,
+      'an extracted local player gets the extracted headline state');
+    check((await page.locator('main').innerText()).includes('returned to the permanent inventory'),
+      'extracted copy states where the items went');
+    check((await page.getByText('Protected items: none. Item protection does not exist in this phase — extraction keeps everything, any other outcome loses everything.', { exact: true }).count()) === 1,
+      'protection is stated honestly: none exists, said in words rather than implied');
+    check((await page.locator('.os-settlement-card[data-settlement="lost"]').count()) === 1,
+      'a squadmate who died is presented as lost on the same screen — outcomes are per-participant');
+
+    await showSettlement(SETTLEMENT_RESULT_FIXTURES.lost);
+    check((await page.locator('[data-local-settlement="lost"]').count()) === 1,
+      'a killed local player gets the lost headline state');
+    check((await page.locator('main').innerText()).includes('Every item carried was lost'),
+      'lost copy states the full-loss disposition without euphemism');
+
+    await showSettlement(SETTLEMENT_RESULT_FIXTURES.pendingReview);
+    check((await page.locator('[data-local-settlement="pending-review"]').count()) === 1,
+      'an exception-open participant is presented as held for review, not as lost or settled');
+    const reviewText = await page.locator('main').innerText();
+    check(reviewText.includes('neither returned nor lost until the review resolves'),
+      'pending-review copy states that no disposition has been applied yet');
+    check(reviewText.includes('exc-fixture-01'),
+      'the review reference is shown so support can find the exception');
+
+    await showSettlement(SETTLEMENT_RESULT_FIXTURES.retrySafe);
+    check((await page.locator('[data-local-settlement="retry-safe"]').count()) === 1,
+      'a received-but-unsettled participant is presented as retry-safe settling');
+    check((await page.locator('main').innerText()).includes('a retry can never settle the same items twice'),
+      'retry-safe copy states the §5 idempotency guarantee that makes leaving safe');
+    check((await page.locator('.os-settlement-card[data-settlement="extracted"]').count()) === 1,
+      'a squadmate already settled renders alongside the still-settling one');
+
+    await showSettlement(SETTLEMENT_RESULT_FIXTURES.runPending);
+    const pendingText = await page.locator('main').innerText();
+    check(pendingText.includes('This run is still finalising'),
+      'a pending extraction run says run, not match');
+    check(pendingText.includes('It is safe to leave this screen'),
+      'the pending window states that waiting is optional — the server queues and retries');
+
+    await showSettlement(SETTLEMENT_RESULT_FIXTURES.mixedSquad);
+    const mixedKinds = await page.locator('.os-settlement-card').evaluateAll(
+      (nodes) => nodes.map((node) => node.dataset.settlement));
+    equal(mixedKinds, ['extracted', 'lost', 'pending-review'],
+      'a mixed squad renders every participant in its own state — one exception never blocks a settled squadmate');
+    check((await page.locator('main').innerText()).includes('An abort settles exactly like a death'),
+      'abort copy states settlement.md §4\'s died/aborted equivalence');
+    await page.evaluate(() => window.__SHELL__.clearFixture('results'));
 
     await page.evaluate(() => {
       window.__SHELL__.navigate('/room/fixture-room-alpha/chat');

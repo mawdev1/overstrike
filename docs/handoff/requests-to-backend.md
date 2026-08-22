@@ -834,3 +834,110 @@ backend-owned module.
   service-role credential is configured for `overstrike-platform`. Deployment remains blocked
   until Resend is configured and verification/recovery canaries deliver, then dry-run, apply, and
   the post-apply zero-candidate report are captured.
+
+### REQ-CC-071 — Wire `scripts/uiraid.mjs` (P3-09 raid HUD acceptance) into package scripts and CI
+- Phase: P3
+- Blocking: no
+- Needed by: continuous P3-09 acceptance
+- Contract affected: Build Plan §0.7/P3; package/CI ownership
+- Ask: `scripts/uiraid.mjs` is the CX-owned acceptance suite for the new `src/ui/raid/`
+  presentation package (fixtures, projection, markup, mount adapter; 131 assertions, direct Node
+  execution, no browser). `package.json` and CI are CC-owned, so it currently runs only by direct
+  invocation.
+- Proposed shape: Add `"uiraid": "node scripts/uiraid.mjs"` and run it in the `ci` chain next to
+  `uibomb`, same as REQ-CC-069 did for the earlier harnesses.
+- Requester's workaround until then: run `node scripts/uiraid.mjs` directly.
+- Status: OPEN
+
+### REQ-CC-072 — Browser-readable extraction run result projection for the results screen
+- Phase: P3
+- Blocking: yes (for P3-10 against live data; fixture-driven presentation is done)
+- Needed by: P3-10 post-run settlement presentation against the real platform
+- Contract affected: `contracts/settlement.md` §3/§5.3 (statuses), `contracts/http-api.md` /
+  `contracts/match-result.md` (the `GET /v1/matches/:matchId` wire projection), stub routes
+- Ask: The shell fetches results via `GET /v1/matches/:matchId` and its typed client
+  (`src/ui/platform/shell-api.js` `validMatch`) accepts `mode ∈ {tdm, bomb}` only — no wire
+  projection exists for a `mode='extraction'` run, and the platform stubs serve none. The results
+  screen now renders every settlement.md §3/§5.3 per-participant state from a documented
+  view-model (`SETTLEMENT_RESULT_FIXTURES` in `src/ui/shell/fixtures.js`): `mode: 'extraction'`,
+  run `status`, and `settlement.participants[]` carrying `settlementStatus`
+  (`ended|settled|exception-open|exception-resolved`), `outcome`
+  (`extracted|died|aborted|server-failure|null`), `exitId`, `deathCause`, `exceptionId`,
+  `trigger`, plus `settlement.runLevelException`. Define the authoritative wire shape (or a
+  dedicated run-result read endpoint) and extend the stub fixtures; the shell client will then
+  add the matching validator.
+- Requester's workaround until then: presentation is fixture-driven and asserted in
+  `scripts/uishell.mjs`; `getResult` remains PvP-only.
+- Status: OPEN
+
+### REQ-CC-073 — Client raid runtime: `match.raidView()` sample and `raid` bus topic for the in-match HUD
+- Phase: P3
+- Blocking: no (mount is inert until it exists)
+- Needed by: P3-09 raid HUD against a live run (P3-05/P3-07 client runtime)
+- Contract affected: `contracts/extraction-match.md` §1–§5 (facts already maintained by
+  `src/game/extraction.js`); client runtime surface
+- Ask: `src/ui/raid/local.js` (`createRaidHud`, hosted by `src/ui/hud.js` exactly like the Bomb
+  HUD) activates only when `game.match.modeId === 'extraction'` and `game.match.raidView()`
+  returns the documented v1 sample (see `src/ui/raid/model.js` header): run phase/timeout,
+  local participant phase + server-driven channel progress, run-inventory rows, exits with
+  declared conditions, nearby container/world loot. Loot/channel outcomes should be reported on
+  one `game.bus` topic `raid` using the projection's typed-event vocabulary (`lootRefused` with
+  extraction.js's literal refusal reasons, `pickedUp`/`dropped`/`containerOpened`/
+  `exitCompleted`/`channelInterrupted`). Sealed-container contents must never appear in the
+  sample (the projection also drops them, §3.1).
+- Requester's workaround until then: fixture-driven package acceptance (`scripts/uiraid.mjs`),
+  which includes a control proving the refusal vocabulary matches the real `ExtractionRun`.
+- Status: OPEN
+
+### REQ-CC-074 — Land the map-data.md `sectors` amendment that sector-interest.md §3.1 specifies
+- Phase: P3
+- Blocking: yes
+- Needed by: P3-06 acceptance (the amendment is named as P3-06's deliverable)
+- Contract affected: `contracts/map-data.md` §3 (currently 1.2.0), `contracts/CHANGELOG.md`,
+  per `contracts/sector-interest.md` §3.1
+- Ask: `sector-interest.md` §3.1 defines the exact additive amendment P3-06 must produce:
+  `MAP_MANIFEST` gains one top-level `sectors` key (array of `{ id, box, neighbours,
+  populationCap, baseThinkStride }`), documented in `map-data.md` with a minor version bump
+  (1.2.0 → 1.3.0, additive, no CCR) and a `CHANGELOG.md` line. The producer side is shipped:
+  `src/world/level.js` exports `EXTRACTION_SECTORS` in exactly that shape on the
+  'square-extraction' manifest, and `src/world/world.js` already parses the key (its own
+  comment notes "P3-06 is the landing of that amendment"). But `docs/contracts/**` is
+  CC-owned, so the contract text and changelog entry cannot be landed from the CX lane —
+  `map-data.md` is still 1.2.0 with no `sectors` key documented.
+- Proposed shape: Add `sectors` to `map-data.md` §3's manifest key list with the §3.1 shape
+  above, state that it is optional for pre-P3-06 maps (absent ≠ partial manifest — matching
+  `world.js`'s provenance handling) and required for raid maps, note that `MAP_VERSION`
+  bumps on any `sectors` change (sector-interest.md §3.2's `sectorVersion` rule), bump the
+  contract to 1.3.0, and add the CHANGELOG entry.
+- Requester's workaround until then: the manifest shape is authored verbatim to
+  sector-interest.md §3.1 and validated by `sectortest`; nothing is blocked at runtime, but
+  the frozen contract and the shipped producer disagree until the text lands.
+- Status: OPEN
+
+### REQ-CC-075 — One authoritative exit/container set for map 'square-extraction'
+- Phase: P3
+- Blocking: yes
+- Needed by: first live `ExtractionRun` on 'square-extraction'
+- Contract affected: `contracts/extraction-match.md` §3.1/§4 (data authoring split);
+  `src/game/extractionContent.js` (P3-11, CC-owned); `src/world/level.js` (P3-06, CX-owned)
+- Ask: P3-06 and P3-11 landed concurrently and each authored an exit/container set. The map
+  entry (`SQUARE_EXTRACTION` in `level.js`) now references ONLY the shipped P3-11 vocabulary —
+  containers carry `tier: 1|2` and `lootTableId: 'lt.tier1.cache' | 'lt.tier2.cache'`, and the
+  ferry exit requires `keycard_transit` — so every roll and condition resolves against the
+  P3-11 catalog. But `extractionContent.js` still exports its own district-only
+  `STATIC_CONTAINERS` (6) and `EXTRACTION_EXITS` (`exit-transit-gate` / `exit-market-van`)
+  authored before the three-sector map existed. A run wired from one set will disagree with
+  tooling wired from the other.
+- Proposed shape: Placements are map data anchored to geometry: make run wiring (and
+  `extractiontest`'s consumed-set assertions) take `opts.exits` / `opts.containers` from the
+  map registry entry (`SQUARE_EXTRACTION.EXTRACTION_EXITS` / `.LOOT_CONTAINERS` — 2 exits,
+  9 containers across all three sectors), and retire or re-derive the content module's
+  placement arrays, keeping item definitions, loot tables, run rules, and AI profiles as the
+  P3-11 catalog the map references. If CC prefers the content module as the placement owner
+  instead, say so and the map entry will re-export it — either way exactly one set exists.
+  Note the map's rail-gate window is `[0, 100800]` (closes at RUN_RULES' collapse warning,
+  840 s), preserving P3-11's "an item-less player is never stranded" invariant.
+- Requester's workaround until then: the map exports remain the authoritative set for
+  'square-extraction'; both sets validate against the same P3-11 catalog so no reference
+  dangles whichever is consumed.
+- Status: OPEN

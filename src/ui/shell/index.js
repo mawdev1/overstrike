@@ -35,6 +35,9 @@ const ROUTE_LOADERS = Object.freeze({
   'career.weapons': 'getCareerWeapons',
   'career.matches': 'listMatches',
   'career.matchDetail': 'getMatch',
+  inventory: 'listInventory',
+  'inventory.item': 'getInventoryItem',
+  loadouts: 'listLoadouts',
   'settings.category': 'getSettings',
   sessions: 'listSessions',
   'match.loading': 'getActiveMatch',
@@ -52,18 +55,21 @@ function loaderForRoute(route) {
 
 function isAuthenticatedRoute(route) {
   return route.id.startsWith('play.') || route.id.startsWith('room.')
-    || route.id.startsWith('career.') || route.id === 'settings.category'
+    || route.id.startsWith('career.') || route.id.startsWith('inventory')
+    || route.id === 'loadouts' || route.id === 'settings.category'
     || route.id === 'sessions' || route.id.startsWith('match.') || route.id === 'results';
 }
 
 function canPreserveDeepLink(route) {
   return route.id.startsWith('play.') || route.id.startsWith('career.')
-    || route.id.startsWith('room.') || route.id === 'settings.category'
+    || route.id.startsWith('room.') || route.id.startsWith('inventory')
+    || route.id === 'loadouts' || route.id === 'settings.category'
     || route.id === 'sessions' || route.id === 'results';
 }
 
 function canPreserveWhileInRoom(route) {
-  return route.id.startsWith('career.') || route.id === 'settings.category'
+  return route.id.startsWith('career.') || route.id.startsWith('inventory')
+    || route.id === 'loadouts' || route.id === 'settings.category'
     || route.id === 'sessions' || route.id === 'results';
 }
 
@@ -199,7 +205,8 @@ function createNavigation(snapshot, route, isFeatureEnabled) {
     const links = [
       ['Play', '/play/rooms', () => route.id.startsWith('play.') || (route.id.startsWith('room.') && route.id !== 'room.loadout'), 'shell.serverbrowser.enabled'],
       ['Career', '/career/overview', () => route.id.startsWith('career.'), 'shell.career.enabled'],
-      ['Loadout', '/settings/loadout', () => route.id === 'room.loadout'
+      ['Inventory', '/inventory', () => route.id.startsWith('inventory')],
+      ['Loadout', '/loadouts', () => route.id === 'loadouts' || route.id === 'room.loadout'
         || (route.id === 'settings.category' && route.params.category === 'loadout')],
       ['Settings', '/settings/accessibility', () => route.id === 'settings.category'
         && !['profile', 'privacy', 'loadout'].includes(route.params.category)],
@@ -597,7 +604,11 @@ export function mountAppShell({
     }
   }
 
-  async function submit(operation, payload, { onSuccess, onError, secretInputs = [] } = {}) {
+  // NOT async: an async wrapper would return a NEW promise that adopts `task`'s rejection,
+  // and the `task.catch(() => {})` below only marks the inner promise handled — so every
+  // onError path fired an unhandled rejection at callers that fire-and-forget the submission.
+  // Returning `task` itself returns the promise the catch was actually attached to.
+  function submit(operation, payload, { onSuccess, onError, secretInputs = [] } = {}) {
     if (pending.has(operation)) return pending.get(operation);
     const buttons = [...screenHost.querySelectorAll('button[type="submit"], button[data-operation]')]
       .map((button) => ({ button, wasDisabled: button.disabled }));

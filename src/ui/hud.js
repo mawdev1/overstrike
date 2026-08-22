@@ -5,6 +5,7 @@ import { Killfeed, weaponGlyph } from './killfeed.js';
 import { Minimap } from './minimap.js';
 import { Scoreboard, modeLabel, formatClock } from './scoreboard.js';
 import { createLocalBombHud } from './bomb/index.js';
+import { createRaidHud } from './raid/index.js';
 
 /**
  * HUD — DOM overlay mounted under `#hud`, per ARCHITECTURE §10.
@@ -229,6 +230,7 @@ export class HUD {
     this.scoreboard = new Scoreboard(game, this.root);
     this.root?.appendChild(this.el.death);
     this.bombHud = createLocalBombHud({ game, root: this.root });
+    this.raidHud = createRaidHud({ game, root: this.root });
 
     this._onResize = this._onResize.bind(this);
     window.addEventListener('resize', this._onResize);
@@ -1021,6 +1023,7 @@ export class HUD {
     this.minimap.reset();
     this.scoreboard.reset();
     this.bombHud.reset();
+    this.raidHud.reset();
     this.scoreboard.setVisible(false);
     this._hideDeath();
     this.el.notice.classList.remove('on', 'anim', 'fade');
@@ -1104,11 +1107,14 @@ export class HUD {
       this.scoreboard.update(dt);
       this.minimap.draw(dt);
       this.bombHud.update(dt);
+      this.raidHud.update(dt);
     } else if (this.scoreboard.visible) {
       this.scoreboard.setVisible(false);
       this.bombHud.update(dt);
+      this.raidHud.update(dt);
     } else {
       this.bombHud.update(dt);
+      this.raidHud.update(dt);
     }
 
     this._tickPerf(dt);
@@ -1123,6 +1129,7 @@ export class HUD {
     this.minimap.dispose();
     this.scoreboard.dispose();
     this.bombHud.destroy();
+    this.raidHud.destroy();
     if (this.root) this.root.innerHTML = '';
   }
 

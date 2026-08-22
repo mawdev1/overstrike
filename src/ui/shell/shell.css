@@ -402,6 +402,15 @@
   color: var(--os-accent);
 }
 
+/* P3-10 settlement cards — each per-participant state is border-coded AND labeled in text,
+   so the distinction never rests on color alone. */
+.os-settlement-card { border-left: 3px solid var(--os-muted); }
+.os-settlement-card[data-settlement='extracted'] { border-left-color: var(--os-accent); }
+.os-settlement-card[data-settlement='lost'] { border-left-color: var(--os-danger); }
+.os-settlement-card[data-settlement='pending-review'] { border-left-color: var(--os-warning); }
+.os-settlement-card[data-settlement='retry-safe'] { border-left-color: var(--os-accent-deep); }
+.os-settlement-card h2 { display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
+
 .os-error-code {
   color: var(--os-muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

@@ -18,6 +18,128 @@ function screen(readyData = {}, { empty = true, terminal = true } = {}) {
   return Object.freeze(variants);
 }
 
+const inventoryInstance = ({ instanceId, itemId, name, slot, rarityTier = 'common',
+  className = 'weapon', stackable = false, maxStack = null, quantity = 1, durability = null,
+  durabilityMax = null, location = 'permanent', runId = null, locked = false,
+  lockedByDeploymentId = null, status = 'active' }) => Object.freeze({
+  instanceId,
+  itemId,
+  quantity,
+  durability,
+  location,
+  runId,
+  locked,
+  lockedByDeploymentId,
+  status,
+  definition: Object.freeze({ itemId, name, class: className, slot, rarityTier, stackable, maxStack, durabilityMax }),
+});
+
+const FIXTURE_LOCKED_ITEM = inventoryInstance({
+  instanceId: 'fixture-instance-helmet', itemId: 'helmet_fixture', name: 'Fixture helmet',
+  className: 'gear', slot: 'helmet', rarityTier: 'epic',
+  locked: true, lockedByDeploymentId: 'fixture-deployment-1',
+});
+
+const FIXTURE_INVENTORY_ITEMS = Object.freeze([
+  inventoryInstance({
+    instanceId: 'fixture-instance-rifle', itemId: 'rifle_fixture', name: 'Fixture rifle',
+    slot: 'primary', rarityTier: 'rare', durabilityMax: 100,
+  }),
+  inventoryInstance({
+    instanceId: 'fixture-instance-sidearm', itemId: 'sidearm_fixture', name: 'Fixture sidearm',
+    slot: 'secondary', rarityTier: 'uncommon',
+  }),
+  FIXTURE_LOCKED_ITEM,
+  inventoryInstance({
+    instanceId: 'fixture-instance-ammo', itemId: 'ammo_fixture', name: 'Fixture ammunition',
+    className: 'material', slot: null, stackable: true, maxStack: 120, quantity: 90,
+  }),
+  inventoryInstance({
+    instanceId: 'fixture-instance-medkit', itemId: 'medkit_fixture', name: 'Fixture med-kit',
+    className: 'consumable', slot: 'consumable', rarityTier: 'uncommon',
+  }),
+]);
+
+/**
+ * P3-10 post-run settlement presentations for the results screen, one per state the raid
+ * player must be able to tell apart (settlement.md §3/§5.3): extracted, lost, held for
+ * review (`exception-open`), and the retry-safe windows (run still `pending`, participant
+ * still `ended`). Injected inline by the acceptance harness rather than registered as
+ * screen-variant keys — these are data states of the `ready` variant, not view variants.
+ */
+const settlementResult = (participants, overrides = {}) => Object.freeze({
+  result: Object.freeze({
+    matchId: 'run-fixture-1',
+    mode: 'extraction',
+    mapId: 'the-square',
+    status: 'completed',
+    roomId: null,
+    settlement: Object.freeze({
+      runLevelException: null,
+      participants: Object.freeze(participants),
+      ...overrides.settlement,
+    }),
+    ...overrides.result,
+  }),
+});
+
+const settlementParticipant = (overrides = {}) => Object.freeze({
+  accountId: 'acct-squad-lead',
+  displayName: 'Squad Lead',
+  isLocal: true,
+  settlementStatus: 'settled',
+  outcome: 'extracted',
+  exitId: null,
+  deathCause: null,
+  exceptionId: null,
+  trigger: null,
+  ...overrides,
+});
+
+export const SETTLEMENT_RESULT_FIXTURES = Object.freeze({
+  extracted: settlementResult([
+    settlementParticipant({ outcome: 'extracted', exitId: 'exit-market-van' }),
+    settlementParticipant({
+      accountId: 'acct-squad-second', displayName: 'Squad Second', isLocal: false,
+      outcome: 'died', deathCause: 'ai',
+    }),
+  ]),
+  lost: settlementResult([
+    settlementParticipant({ outcome: 'died', deathCause: 'player' }),
+  ]),
+  pendingReview: settlementResult([
+    settlementParticipant({
+      settlementStatus: 'exception-open', outcome: null,
+      exceptionId: 'exc-fixture-01', trigger: 'evidence-mismatch',
+    }),
+  ]),
+  retrySafe: settlementResult([
+    settlementParticipant({ settlementStatus: 'ended', outcome: null }),
+    settlementParticipant({
+      accountId: 'acct-squad-second', displayName: 'Squad Second', isLocal: false,
+      outcome: 'extracted', exitId: 'exit-transit-gate',
+    }),
+  ]),
+  runPending: Object.freeze({
+    result: Object.freeze({
+      matchId: 'run-fixture-1', mode: 'extraction', mapId: 'the-square',
+      status: 'pending', retryAfterMs: 3000, roomId: null,
+    }),
+  }),
+  mixedSquad: settlementResult([
+    settlementParticipant({ outcome: 'extracted', exitId: 'exit-market-van' }),
+    settlementParticipant({
+      accountId: 'acct-squad-second', displayName: 'Squad Second', isLocal: false,
+      outcome: 'aborted',
+    }),
+    settlementParticipant({
+      accountId: 'acct-squad-third', displayName: 'Squad Third', isLocal: false,
+      settlementStatus: 'exception-open', outcome: null,
+      exceptionId: 'exc-fixture-02', trigger: 'server-failure-without-state',
+    }),
+  ]),
+});
+
 export const SHELL_SCREEN_FIXTURES = Object.freeze({
   welcome: screen({}, { empty: false }),
   'auth.signIn': screen({}, { empty: false }),
@@ -85,6 +207,23 @@ export const SHELL_SCREEN_FIXTURES = Object.freeze({
   'career.weapons': screen({ weapons: [{ id: 'fixture-weapon', name: 'Fixture weapon', eliminations: 7 }] }),
   'career.matches': screen({ matches: [{ id: 'fixture-match-1', mode: 'Fixture mode', outcome: 'Fixture result', endedAt: FIXTURE_TIME }] }),
   'career.matchDetail': screen({ match: { id: 'fixture-match-1', mode: 'Fixture mode', status: 'final', endedAt: FIXTURE_TIME } }, { empty: false }),
+  // items-inventory.md coverage in one list: an equippable serialized weapon, a second slot's
+  // weapon, an instance LOCKED by an active deployment, a stackable quantity against its max
+  // stack, a definition with a durability model (placeholder — durability itself is null in P3),
+  // and a slot=null material that can never be equipped (§3.1 rule 5).
+  inventory: screen({
+    items: FIXTURE_INVENTORY_ITEMS,
+    nextCursor: null,
+  }),
+  'inventory.item': screen(FIXTURE_LOCKED_ITEM, { empty: false }),
+  loadouts: screen({
+    loadouts: [
+      { loadoutId: 'fixture-loadout-1', name: 'Fixture raid kit', slots: { primary: 'fixture-instance-rifle', helmet: 'fixture-instance-helmet', consumable: 'fixture-instance-medkit' }, isDefault: true },
+      { loadoutId: 'fixture-loadout-2', name: 'Fixture backup kit', slots: { secondary: 'fixture-instance-sidearm' }, isDefault: false },
+    ],
+    items: FIXTURE_INVENTORY_ITEMS,
+    inventoryUnavailable: false,
+  }, { empty: false }),
   'settings.category': screen(),
   sessions: screen({ sessions: [{ id: 'fixture-session-current', device: 'Fixture browser', current: true, lastSeenAt: FIXTURE_TIME }] }),
   'match.loading': screen({ stage: 'Awaiting fixture handoff', handoff: { fixture: true, matchId: 'fixture-match-1' }, retryAllowed: true }, { empty: false }),

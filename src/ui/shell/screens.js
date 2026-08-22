@@ -25,6 +25,9 @@ const COPY = Object.freeze({
   'career.weapons': { empty: 'No weapon statistics are available.' },
   'career.matches': { empty: 'No match history is available.' },
   'career.matchDetail': { empty: 'This match is not available.' },
+  inventory: { empty: 'You do not own any items yet. Items you extract from a raid appear here.' },
+  'inventory.item': { empty: 'This item is not available.' },
+  loadouts: { empty: 'No loadout data is available.' },
   sessions: { empty: 'Only the current session is active.' },
   results: { empty: 'The result is still being prepared.' },
 });
@@ -1532,6 +1535,323 @@ function renderMatchDetail({ view }) {
   ]);
 }
 
+/**
+ * items-inventory.md §2's closed slot vocabulary, mirrored from the FROZEN contract (the typed
+ * client validates it independently; this copy only orders and labels the same eight keys).
+ */
+const EQUIP_SLOT_LABELS = Object.freeze({
+  primary: 'Primary weapon',
+  secondary: 'Secondary weapon',
+  melee: 'Melee',
+  helmet: 'Helmet',
+  vest: 'Vest',
+  backpack: 'Backpack',
+  rig: 'Rig',
+  consumable: 'Quick item',
+});
+const EQUIP_SLOT_ORDER = Object.freeze(Object.keys(EQUIP_SLOT_LABELS));
+
+/**
+ * items-inventory.md §8's closed error enumeration, translated into instructions a player can
+ * act on. Unknown codes fall back to the server message rather than a guess.
+ */
+const LOADOUT_ERROR_COPY = Object.freeze({
+  LOADOUT_INVALID_SLOT: 'An item is placed in a slot its type cannot occupy. Check each slot and save again.',
+  LOADOUT_ITEM_NOT_OWNED: 'An item in this loadout is no longer in your permanent inventory — it may have been lost, consumed, or taken into a raid. Replace it and save again.',
+  LOADOUT_DUPLICATE_INSTANCE: 'The same physical item is equipped in two slots. One item can fill only one slot.',
+  ITEM_LOCKED: 'An item in this loadout is reserved by an active deployment and cannot change until that deployment resolves.',
+  ITEM_ALREADY_DEPLOYED: 'An item in this loadout is already deployed in another match.',
+});
+
+const LOCKED_CHIP = 'Locked — reserved for deployment';
+
+function itemName(item) {
+  const definition = item?.definition || {};
+  if (definition.name) return definition.name;
+  const id = definition.itemId || item?.itemId;
+  return id ? String(id).replaceAll('_', ' ') : 'Unknown item';
+}
+
+function itemRarityLabel(item) {
+  const tier = item?.definition?.rarityTier;
+  return tier ? tier.charAt(0).toUpperCase() + tier.slice(1) : 'Unknown';
+}
+
+function itemSlotLabel(item) {
+  const slot = item?.definition?.slot;
+  return slot ? EQUIP_SLOT_LABELS[slot] || slot : 'Not equippable — carried as raid loot only';
+}
+
+function itemQuantityLabel(item) {
+  if (item?.definition?.stackable !== true) return '1 (serialized item)';
+  return Number.isFinite(item?.definition?.maxStack)
+    ? `${item.quantity} of ${item.definition.maxStack}`
+    : String(item.quantity);
+}
+
+// P4-04 placeholder made visible instead of invented: the schema reserves durability now, but
+// no P3 code path writes it, so a null value is labeled as "not tracked yet" rather than 0%.
+function itemDurabilityLabel(item) {
+  const max = item?.definition?.durabilityMax;
+  if (max === null || max === undefined) return 'No durability model';
+  return Number.isFinite(item?.durability)
+    ? `${item.durability} of ${max}`
+    : `Not tracked yet — wear and repair arrive in a later phase (max ${max})`;
+}
+
+function itemLocationLabel(item) {
+  if (item?.location === 'permanent') return 'Permanent — kept between raids';
+  if (item?.location === 'run') return 'In an active raid — returns on extraction, lost otherwise';
+  return 'Not in your possession';
+}
+
+function renderInventory({ view, actions }) {
+  const items = Array.isArray(view.data?.items) ? view.data.items : [];
+  const grid = element('section', { className: 'os-card-grid', 'aria-label': 'Permanent inventory' });
+  for (const item of items) {
+    grid.append(element('article', {
+      className: 'os-card os-inventory-card',
+      dataset: { instanceId: item.instanceId || '', locked: String(item.locked === true) },
+    }, [
+      element('h2', {}, itemName(item)),
+      item.locked ? statusBadge(LOCKED_CHIP) : null,
+      definitionList([
+        ['Rarity', itemRarityLabel(item)],
+        ['Slot', itemSlotLabel(item)],
+        ['Quantity', itemQuantityLabel(item)],
+        ['Durability', itemDurabilityLabel(item)],
+        ['Location', itemLocationLabel(item)],
+      ]),
+      item.instanceId
+        ? shellLink('Inspect', `/inventory/${encodeURIComponent(item.instanceId)}`, {
+          className: 'os-button os-button--quiet',
+          'aria-label': `Inspect ${itemName(item)}`,
+        })
+        : null,
+    ]));
+  }
+  return element('section', {}, [
+    element('p', { className: 'os-lede' }, 'Everything you own between raids. Equip items into a loadout to take them into a deployment.'),
+    // "Capacity" made understandable by being honest: permanent inventory has no capacity
+    // limit in this phase (settlement.md §8 names one as a possible later amendment), so the
+    // count is shown and no invented meter is.
+    element('p', { className: 'os-hint' }, `${items.length} item${items.length === 1 ? '' : 's'} shown. Permanent inventory has no capacity limit in this phase.`),
+    element('p', { className: 'os-notice', role: 'note' }, 'Items you are carrying in an active raid are not listed here. They return to this inventory when you extract, and are lost if you do not.'),
+    actionsRow([
+      shellLink('Prepare a loadout', '/loadouts', { className: 'os-button os-button--primary' }),
+      actionButton('Refresh inventory', actions.refresh, { className: 'os-button os-button--quiet' }),
+      view.data?.nextCursor
+        ? actionButton('Load more items', () => actions.loadMore('items', view.data.nextCursor), { className: 'os-button os-button--quiet' })
+        : null,
+    ]),
+    view.data?.paginationError
+      ? element('p', { className: 'os-state os-state--error', role: 'alert' }, `More items could not be loaded: ${safeError(view.data.paginationError).message}`)
+      : null,
+    grid,
+  ]);
+}
+
+function renderInventoryItem({ view }) {
+  const item = view.data?.instanceId ? view.data : view.data?.item || {};
+  if (!item.instanceId) {
+    return element('section', { className: 'os-state', role: 'status' }, [
+      element('p', {}, 'This item is not available.'),
+      actionsRow([shellLink('Back to inventory', '/inventory', { className: 'os-button os-button--quiet' })]),
+    ]);
+  }
+  return element('section', { className: 'os-inventory-detail' }, [
+    element('h2', {}, itemName(item)),
+    item.locked ? statusBadge(LOCKED_CHIP) : null,
+    definitionList([
+      ['Item type', item.itemId],
+      ['Instance', item.instanceId],
+      ['Class', item.definition?.class],
+      ['Rarity', itemRarityLabel(item)],
+      ['Slot', itemSlotLabel(item)],
+      ['Quantity', itemQuantityLabel(item)],
+      ['Durability', itemDurabilityLabel(item)],
+      ['Location', itemLocationLabel(item)],
+      ['Status', item.status],
+    ]),
+    item.locked
+      ? element('p', { className: 'os-notice', role: 'status' }, `This item is reserved by deployment ${item.lockedByDeploymentId}. Until that deployment resolves, it cannot be modified or equipped into another deployment.`)
+      : null,
+    item.location === 'run'
+      ? element('p', { className: 'os-notice', role: 'status' }, 'This item is inside an active raid. It returns to your permanent inventory if you extract, and is lost if you die or abort. It cannot be equipped into a loadout while the raid is live.')
+      : null,
+    item.definition?.slot === null || item.definition?.slot === undefined
+      ? element('p', { className: 'os-hint' }, 'This item has no equipment slot, so it can never appear in a loadout. You will find and carry items like this as loot inside a raid.')
+      : null,
+    actionsRow([
+      shellLink('Back to inventory', '/inventory', { className: 'os-button os-button--quiet' }),
+      shellLink('Prepare a loadout', '/loadouts', { className: 'os-button os-button--quiet' }),
+    ]),
+  ]);
+}
+
+function renderLoadouts({ view, actions }) {
+  const data = view.data || {};
+  const loadouts = Array.isArray(data.loadouts) ? data.loadouts : [];
+  const items = Array.isArray(data.items) ? data.items : [];
+  const byInstanceId = new Map(items.map((item) => [item.instanceId, item]));
+  // §3.1 rule 1: only owned, permanent, active, UNLOCKED instances are equippable; rule 2's
+  // slot match is enforced by construction — each select only ever offers its own slot's items.
+  const equippable = (slot) => items.filter((item) => item.definition?.slot === slot
+    && item.location === 'permanent' && item.status === 'active' && item.locked !== true);
+
+  const feedback = element('p', { className: 'os-field-status', role: 'status', 'aria-live': 'polite', tabIndex: -1 });
+  const surfaceError = (error) => {
+    const safe = safeError(error);
+    feedback.textContent = (safe.code && LOADOUT_ERROR_COPY[safe.code]) || safe.message;
+    feedback.focus();
+  };
+
+  const nameField = field({ label: 'Loadout name', name: 'loadout-name', required: true });
+  const editorHeading = element('h2', {}, 'Create a loadout');
+  const slotSelects = new Map();
+  const slotRows = [];
+  for (const slot of EQUIP_SLOT_ORDER) {
+    const options = equippable(slot);
+    const select = element('select', { id: `shell-loadout-slot-${slot}`, name: `loadout-slot-${slot}` }, [
+      element('option', { value: '' }, 'Empty'),
+      ...options.map((item) => element('option', { value: item.instanceId }, itemName(item))),
+    ]);
+    slotSelects.set(slot, select);
+    slotRows.push(element('div', { className: 'os-field' }, [
+      element('label', { htmlFor: select.id }, EQUIP_SLOT_LABELS[slot]),
+      select,
+      options.length ? null : element('p', { className: 'os-hint' }, 'No eligible item. Only unlocked items in your permanent inventory can be equipped.'),
+    ]));
+  }
+
+  let editingLoadoutId = null;
+  const cancelEdit = actionButton('Cancel edit', () => setEditing(null), {
+    className: 'os-button os-button--quiet', dataset: { operation: 'cancel-edit-loadout' },
+  });
+  cancelEdit.hidden = true;
+
+  function setEditing(loadout) {
+    editingLoadoutId = loadout?.loadoutId || null;
+    editorHeading.textContent = loadout ? `Edit ${loadout.name}` : 'Create a loadout';
+    nameField.input.value = loadout?.name || '';
+    feedback.textContent = '';
+    for (const [slot, select] of slotSelects) {
+      const wanted = loadout?.slots?.[slot] || '';
+      select.value = wanted;
+      // A saved reference that is no longer eligible (locked by a deployment, lost, or in a
+      // raid) is not among the options; the browser silently keeps the old selection, so the
+      // miss is made explicit instead.
+      if (wanted && select.value !== wanted) {
+        select.value = '';
+        const referenced = byInstanceId.get(wanted);
+        feedback.textContent = referenced?.locked
+          ? `The saved ${EQUIP_SLOT_LABELS[slot].toLowerCase()} is reserved by an active deployment. Choose a replacement or wait for that deployment to resolve.`
+          : `The saved ${EQUIP_SLOT_LABELS[slot].toLowerCase()} is no longer equippable — it may have been lost or taken into a raid. Choose a replacement before saving.`;
+      }
+    }
+    cancelEdit.hidden = !loadout;
+    if (loadout) nameField.input.focus();
+  }
+
+  const form = element('form', { className: 'os-form' }, [
+    nameField.wrapper,
+    ...slotRows,
+    actionsRow([submitButton('Save loadout'), cancelEdit]),
+  ]);
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const slots = {};
+    const used = new Map();
+    for (const [slot, select] of slotSelects) {
+      if (!select.value) continue;
+      // §3.1 rule 3, checked before the request so the failure names both slots. Slot-filtered
+      // selects make this unreachable today (one definition, one slot), but the guard keeps the
+      // rule enforced here rather than remembered.
+      if (used.has(select.value)) {
+        feedback.textContent = `${LOADOUT_ERROR_COPY.LOADOUT_DUPLICATE_INSTANCE} (${EQUIP_SLOT_LABELS[used.get(select.value)]} and ${EQUIP_SLOT_LABELS[slot]}.)`;
+        feedback.focus();
+        return;
+      }
+      used.set(select.value, slot);
+      slots[slot] = select.value;
+    }
+    const name = nameField.input.value.trim();
+    actions.submit(editingLoadoutId ? 'updateLoadout' : 'createLoadout', {
+      ...(editingLoadoutId ? { loadoutId: editingLoadoutId } : {}),
+      name,
+      slots,
+    }, {
+      onSuccess: (result) => {
+        actions.announce(`Loadout ${result?.name || name} saved.`);
+        actions.refresh();
+      },
+      onError: surfaceError,
+    });
+  });
+
+  const list = element('section', { className: 'os-card-grid', 'aria-label': 'Saved loadouts' });
+  for (const loadout of loadouts) {
+    const slotFacts = EQUIP_SLOT_ORDER
+      .filter((slot) => loadout.slots?.[slot])
+      .map((slot) => {
+        const item = byInstanceId.get(loadout.slots[slot]);
+        if (!item) return [EQUIP_SLOT_LABELS[slot], 'Item unavailable — replace before deploying'];
+        return [EQUIP_SLOT_LABELS[slot], item.locked
+          ? `${itemName(item)} (reserved by an active deployment)`
+          : itemName(item)];
+      });
+    list.append(element('article', { className: 'os-card os-loadout-card', dataset: { loadoutId: loadout.loadoutId || '' } }, [
+      element('h2', {}, loadout.name),
+      loadout.isDefault ? statusBadge('Default') : null,
+      slotFacts.length ? definitionList(slotFacts) : element('p', {}, 'No items equipped.'),
+      actionsRow([
+        data.inventoryUnavailable ? null : actionButton(`Edit ${loadout.name}`, () => setEditing(loadout), {
+          className: 'os-button os-button--quiet', dataset: { operation: 'edit-loadout' },
+        }),
+        loadout.isDefault ? null : actionButton(`Make ${loadout.name} default`, () => actions.submit('setDefaultLoadout', { loadoutId: loadout.loadoutId }, {
+          onSuccess: () => {
+            actions.announce(`${loadout.name} is now the default loadout.`);
+            actions.refresh();
+          },
+          onError: surfaceError,
+        }), { className: 'os-button os-button--quiet', dataset: { operation: 'default-loadout' } }),
+        actionButton(`Delete ${loadout.name}`, (event) => actions.openModal({
+          title: `Delete ${loadout.name}?`,
+          message: 'Deleting a loadout does not delete or unlock any item in it.',
+          confirmLabel: 'Delete loadout',
+          opener: event.currentTarget,
+          onConfirm: () => actions.submit('deleteLoadout', { loadoutId: loadout.loadoutId }, {
+            onSuccess: () => {
+              actions.announce(`${loadout.name} deleted.`);
+              actions.refresh();
+            },
+            onError: surfaceError,
+          }),
+        }), { className: 'os-button os-button--danger', dataset: { operation: 'delete-loadout' } }),
+      ]),
+    ]));
+  }
+
+  return element('section', {}, [
+    element('p', { className: 'os-lede' }, 'Prepare named loadouts from your permanent inventory. Deploying locks every equipped item to that deployment.'),
+    // "Protect" made understandable by being honest: the contracts define exactly two run
+    // exits (extract or lost) and no protected-item flag, so the screen says that plainly
+    // instead of hinting at a mechanic that does not exist.
+    element('p', { className: 'os-warning', role: 'note' }, 'No item is protected. Everything you equip deploys with you, and is lost if you die or abort instead of extracting. Item protection does not exist in this phase.'),
+    feedback,
+    loadouts.length
+      ? list
+      : element('p', { role: 'status' }, 'You have no saved loadouts yet. Create one below to prepare for deployment.'),
+    data.inventoryUnavailable
+      ? element('section', { className: 'os-state os-state--offline', role: 'status' }, [
+        element('p', {}, 'Your inventory could not be loaded, so equipping is unavailable. Saved loadouts are shown read-only.'),
+        actionsRow([actionButton('Try again', actions.refresh, { className: 'os-button os-button--primary' })]),
+      ])
+      : element('section', { className: 'os-loadout-editor' }, [editorHeading, form]),
+    actionsRow([shellLink('View inventory', '/inventory', { className: 'os-button os-button--quiet' })]),
+  ]);
+}
+
 function renderSessions({ view, actions }) {
   const list = element('ul', { className: 'os-list' });
   for (const session of view.data?.sessions || view.data?.items || []) {
@@ -1618,8 +1938,153 @@ function renderReconnect({ view, actions, isFeatureEnabled }) {
   ]);
 }
 
+/**
+ * settlement.md §5.3's per-participant statuses, presented so each is visibly a different
+ * fact. `settlementStatus` is the platform's own vocabulary (§3): `ended` (received, not yet
+ * settled — the §5 rule 5 retry-safe window), `settled`, `exception-open`, and
+ * `exception-resolved` (whose `outcome: null` branch is a §6.1 void). `outcome` is §4's
+ * closed enum. Nothing here invents a fifth status or a third item disposition.
+ */
+const SETTLEMENT_STATUS_PRESENTATION = Object.freeze({
+  extracted: {
+    kind: 'extracted',
+    label: 'Extracted',
+    detail: 'Every item carried out has been returned to the permanent inventory.',
+  },
+  died: {
+    kind: 'lost',
+    label: 'Lost — killed in the raid',
+    detail: 'Every item carried was lost.',
+  },
+  aborted: {
+    kind: 'lost',
+    label: 'Lost — run aborted',
+    detail: 'Every item carried was lost. An abort settles exactly like a death — quitting or disconnecting past grace never protects a run.',
+  },
+  'server-failure': {
+    kind: 'server-failure',
+    label: 'Server fault — settled from last known state',
+    detail: 'The raid server reported its own fault. Settlement ruled this run from the last trustworthy state it recorded, not from a guess.',
+  },
+});
+
+function settlementPresentation(participant) {
+  const status = participant?.settlementStatus;
+  if (status === 'ended' || status === undefined || status === null) {
+    return {
+      kind: 'retry-safe',
+      label: 'Result received — settling',
+      detail: 'The run result has been accepted and settlement is in progress. It is safe to leave this screen: settlement applies exactly once, and a retry can never settle the same items twice.',
+    };
+  }
+  if (status === 'exception-open') {
+    return {
+      kind: 'pending-review',
+      label: 'Held for review',
+      detail: 'This outcome could not be settled automatically and is queued for a reviewer. Items are neither returned nor lost until the review resolves — no action is needed, and nothing is settled twice.',
+    };
+  }
+  if (status === 'exception-resolved' && (participant.outcome === null || participant.outcome === undefined)) {
+    return {
+      kind: 'reviewed-void',
+      label: 'Reviewed — no settlement applied',
+      detail: 'A reviewer closed this run without applying an item outcome. No items were moved or lost by this run.',
+    };
+  }
+  const base = SETTLEMENT_STATUS_PRESENTATION[participant.outcome] || {
+    kind: 'unknown',
+    label: 'Outcome unavailable',
+    detail: 'The platform reported a settlement state this client does not recognise. The recorded outcome is authoritative.',
+  };
+  if (status === 'exception-resolved') {
+    return { ...base, label: `${base.label} (after review)`, detail: `${base.detail} A reviewer confirmed this outcome.` };
+  }
+  return base;
+}
+
+function settlementParticipantCard(participant) {
+  const presentation = settlementPresentation(participant);
+  const facts = [
+    ['Result', presentation.label],
+    participant.outcome === 'extracted' && participant.exitId ? ['Exit used', participant.exitId] : null,
+    participant.outcome === 'died' && participant.deathCause ? ['Cause', participant.deathCause] : null,
+    presentation.kind === 'pending-review' && participant.exceptionId ? ['Review reference', participant.exceptionId] : null,
+    presentation.kind === 'pending-review' && participant.trigger ? ['Held because', String(participant.trigger).replaceAll('-', ' ')] : null,
+  ].filter(Boolean);
+  return element('article', {
+    className: 'os-card os-settlement-card',
+    dataset: { settlement: presentation.kind, accountId: participant.accountId || '' },
+  }, [
+    element('h2', {}, [
+      element('span', {}, participant.displayName || participant.accountId || 'Participant'),
+      participant.isLocal ? statusBadge('You') : null,
+    ]),
+    statusBadge(presentation.label),
+    definitionList(facts),
+    element('p', { className: 'os-hint' }, presentation.detail),
+  ]);
+}
+
+function renderExtractionResults({ view, actions, isFeatureEnabled }, result) {
+  const settlement = result.settlement || {};
+  const participants = Array.isArray(settlement.participants) ? settlement.participants : [];
+  const local = participants.find((participant) => participant.isLocal) || null;
+  const localPresentation = local ? settlementPresentation(local) : null;
+  const anyUnsettled = participants.some((participant) => {
+    const kind = settlementPresentation(participant).kind;
+    return kind === 'retry-safe' || kind === 'pending-review';
+  });
+  if (anyUnsettled && typeof actions?.registerCleanup === 'function' && typeof actions?.refresh === 'function') {
+    const retryAfterMs = Number.isFinite(result.retryAfterMs) ? result.retryAfterMs : 5000;
+    const timer = setTimeout(() => actions.refresh(), retryAfterMs);
+    actions.registerCleanup(() => clearTimeout(timer));
+  }
+  return element('section', { className: 'os-settlement' }, [
+    localPresentation
+      ? element('p', {
+        className: localPresentation.kind === 'extracted' ? 'os-positive' : localPresentation.kind === 'lost' ? 'os-warning' : 'os-lede',
+        role: 'status',
+        dataset: { localSettlement: localPresentation.kind },
+      }, `${localPresentation.label}. ${localPresentation.detail}`)
+      : null,
+    // "Protected" stated honestly rather than implied: the contracts define exactly two run
+    // dispositions (extract-convert, lose-everything) and no protected-item flag
+    // (settlement.md §4; items-inventory.md has no protection field), so this screen says
+    // which items were protected — none — instead of leaving the question open.
+    element('p', { className: 'os-notice', role: 'note' }, 'Protected items: none. Item protection does not exist in this phase — extraction keeps everything, any other outcome loses everything.'),
+    settlement.runLevelException
+      ? element('p', { className: 'os-state os-state--error', role: 'alert' },
+        `A run-level exception is open for this raid (reference ${settlement.runLevelException.exceptionId}). A participant was missing from the submitted result; a reviewer will resolve it. Individual outcomes below are unaffected.`)
+      : null,
+    definitionList([
+      ['Run', result.matchId],
+      ['Mode', 'Extraction'],
+      ['Map', result.mapId],
+      ['Run status', result.status],
+    ]),
+    participants.length
+      ? element('section', { className: 'os-card-grid', 'aria-label': 'Squad settlement' },
+        participants.map((participant) => settlementParticipantCard(participant)))
+      : element('p', { role: 'status' }, 'No participant settlement has been reported for this run yet.'),
+    actionsRow([
+      shellLink('View inventory', '/inventory', { className: 'os-button os-button--primary' }),
+      anyUnsettled ? actionButton('Refresh settlement', () => actions.refresh(), { className: 'os-button os-button--quiet' }) : null,
+      result.roomId
+        ? shellLink('Return to lobby', `/room/${encodeURIComponent(result.roomId)}`, { className: 'os-button os-button--quiet' })
+        : shellLink(
+          isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? 'Return to welcome' : 'Browse rooms',
+          homePath(isFeatureEnabled),
+          { className: 'os-button os-button--quiet' },
+        ),
+    ]),
+  ]);
+}
+
 function renderResults({ view, actions, isFeatureEnabled }) {
   const result = view.data?.result || view.data || {};
+  if (result.mode === 'extraction' && result.status !== 'pending') {
+    return renderExtractionResults({ view, actions, isFeatureEnabled }, result);
+  }
   if (result.status === 'pending') {
     const retryAfterMs = Number.isFinite(result.retryAfterMs) ? result.retryAfterMs : 3000;
     if (typeof actions?.registerCleanup === 'function' && typeof actions?.refresh === 'function') {
@@ -1627,7 +2092,15 @@ function renderResults({ view, actions, isFeatureEnabled }) {
       actions.registerCleanup(() => clearTimeout(timer));
     }
     return element('section', { className: 'os-state', role: 'status' }, [
-      element('p', {}, 'This match is still finalising. Results will appear automatically once they are ready.'),
+      element('p', {}, result.mode === 'extraction'
+        ? 'This run is still finalising. Results will appear automatically once they are ready.'
+        : 'This match is still finalising. Results will appear automatically once they are ready.'),
+      // settlement.md §5 rule 5: the raid server durably queues and retries the result, and
+      // idempotency guarantees a retry never settles items twice — so waiting here is
+      // optional, not required, and the screen says so.
+      result.mode === 'extraction'
+        ? element('p', { className: 'os-hint' }, 'It is safe to leave this screen. Your run result is queued and retried by the server, and settlement applies exactly once — a retry can never settle your items twice.')
+        : null,
       definitionList([
         ['Status', result.status],
         ['Mode', result.mode],
@@ -1723,6 +2196,9 @@ export function renderShellScreen(context) {
       break;
     }
     case 'career.matchDetail': content = renderMatchDetail(context); break;
+    case 'inventory': content = renderInventory(context); break;
+    case 'inventory.item': content = renderInventoryItem(context); break;
+    case 'loadouts': content = renderLoadouts(context); break;
     case 'settings.category': content = renderSettingsHook(context); break;
     case 'sessions': content = renderSessions(context); break;
     case 'match.loading': content = renderMatchLoading(context); break;

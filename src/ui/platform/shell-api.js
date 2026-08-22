@@ -148,6 +148,59 @@ const validHistoryPage = (value) => closed(value, ['items', 'nextCursor', 'corre
   && (value.items === null || (Array.isArray(value.items) && value.items.every(validHistoryItem)))
   && nullableText(value.nextCursor) && text(value.correlationId);
 
+// items-inventory.md §2 (definitions vs instances) and §7 (API surface). The wire projection
+// camelCases the contract's columns the way every other endpoint here does. `definition` is
+// inlined on every instance — §7 only promises it inlined on the single-item endpoint, but a
+// list of bare instance rows cannot render a name, slot, or rarity at all, so the stub fixtures
+// and the routes stream carry it on both (noted as a cross-stream dependency, not invented
+// silently). `name` is optional: the catalog schema has no display-name column yet, so the UI
+// falls back to humanizing `itemId` when it is absent.
+const ITEM_CLASSES = ['weapon', 'gear', 'consumable', 'material', 'cosmetic'];
+const RARITY_TIERS = ['common', 'uncommon', 'rare', 'epic', 'legendary'];
+export const EQUIP_SLOTS = Object.freeze(['primary', 'secondary', 'melee', 'helmet', 'vest',
+  'backpack', 'rig', 'consumable']);
+const validItemDefinition = (value) => closed(value,
+  ['itemId', 'class', 'slot', 'rarityTier', 'stackable', 'maxStack', 'durabilityMax'], ['name'])
+  && text(value.itemId) && (value.name === undefined || text(value.name))
+  && ITEM_CLASSES.includes(value.class)
+  && (value.slot === null || EQUIP_SLOTS.includes(value.slot))
+  && RARITY_TIERS.includes(value.rarityTier) && bool(value.stackable)
+  && (value.stackable ? count(value.maxStack) : value.maxStack === null)
+  && (value.durabilityMax === null || count(value.durabilityMax));
+const validItemInstance = (value, { correlation = false } = {}) => closed(value,
+  ['instanceId', 'itemId', 'quantity', 'durability', 'location', 'runId', 'locked',
+    'lockedByDeploymentId', 'status', 'definition',
+    ...(correlation ? ['correlationId'] : [])])
+  && text(value.instanceId) && text(value.itemId)
+  && integer(value.quantity) && value.quantity >= 1
+  && (value.durability === null || count(value.durability))
+  && ['permanent', 'run', 'world', 'container'].includes(value.location)
+  // §2's CHECK pair: run_id non-null iff location='run'.
+  && (value.location === 'run' ? text(value.runId) : value.runId === null)
+  && bool(value.locked)
+  // §2's CHECK: locked iff locked_by_deployment_id is set.
+  && (value.locked ? text(value.lockedByDeploymentId) : value.lockedByDeploymentId === null)
+  && ['active', 'consumed', 'destroyed', 'lost', 'merged'].includes(value.status)
+  && validItemDefinition(value.definition) && value.definition.itemId === value.itemId
+  && (!correlation || text(value.correlationId));
+const validInventoryPage = (value) => closed(value, ['items', 'nextCursor', 'correlationId'])
+  && Array.isArray(value.items) && value.items.every((item) => validItemInstance(item))
+  && nullableText(value.nextCursor) && text(value.correlationId);
+
+// items-inventory.md §3. `slots` keys are the closed slot vocabulary; values are instance ids.
+const validLoadoutSlots = (value) => record(value)
+  && Object.keys(value).every((key) => EQUIP_SLOTS.includes(key))
+  && Object.values(value).every(text);
+const validLoadout = (value, { correlation = false } = {}) => closed(value,
+  ['loadoutId', 'name', 'slots', 'isDefault', ...(correlation ? ['correlationId'] : [])])
+  && text(value.loadoutId) && text(value.name) && validLoadoutSlots(value.slots)
+  && bool(value.isDefault) && (!correlation || text(value.correlationId));
+const validLoadoutList = (value) => closed(value, ['loadouts', 'correlationId'])
+  && Array.isArray(value.loadouts) && value.loadouts.every((loadout) => validLoadout(loadout))
+  // loadouts_one_default: at most one default per account (§3).
+  && value.loadouts.filter((loadout) => loadout.isDefault).length <= 1
+  && text(value.correlationId);
+
 const ROOM_CORE_KEYS = ['roomId', 'name', 'region', 'mapId', 'mapVersion', 'mode',
   'rulesetVersion', 'build', 'status', 'capacity', 'playerCount', 'joinable',
   'joinBlockedReason', 'hasPassword', 'ownerAccountId', 'estimatedRttMs', 'settings'];
@@ -841,6 +894,59 @@ export function createShellApi({ client, telemetry = null, settings = null, ulid
       const result = await client.signOut({ all: false, validateSuccess: empty204 });
       telemetry?.setConsent({ telemetryPersonal: null });
       return result;
+    },
+
+    // items-inventory.md §7. Persistent inventory is location='permanent' only by contract;
+    // run items are not listed here and the screens say so instead of implying they vanished.
+    listInventory(payload = {}) {
+      return data(query('/v1/inventory', payload, ['limit', 'cursor']), undefined,
+        validInventoryPage);
+    },
+
+    getInventoryItem(payload = {}) {
+      return data(`/v1/inventory/${encode(payload.instanceId)}`, undefined,
+        (value) => validItemInstance(value, { correlation: true }));
+    },
+
+    // Sideloads the permanent inventory the same way listRooms sideloads regions, and degrades
+    // the same way: the loadout list is CONTENT and a protocol violation there stays loud, but
+    // an unavailable inventory only removes the editor's options, so it sets a flag the screen
+    // renders as an explicit read-only notice instead of taking the whole page down.
+    async listLoadouts() {
+      const result = await data('/v1/loadouts', undefined, validLoadoutList);
+      const response = { ...result, items: [], inventoryUnavailable: false };
+      try {
+        const inventory = await data('/v1/inventory', undefined, validInventoryPage);
+        response.items = inventory.items;
+      } catch (error) {
+        if (error?.code === 'CLIENT_PROTOCOL') throw error;
+        response.inventoryUnavailable = true;
+      }
+      return response;
+    },
+
+    createLoadout(payload = {}) {
+      return data('/v1/loadouts', {
+        method: 'POST', body: bodyWith(payload, ['name', 'slots']),
+        idempotencyKey: payload.idempotencyKey || key('loadout'),
+      }, (value) => validLoadout(value, { correlation: true }));
+    },
+
+    updateLoadout(payload = {}) {
+      return data(`/v1/loadouts/${encode(payload.loadoutId)}`, {
+        method: 'PATCH', body: bodyWith(payload, ['name', 'slots']),
+        idempotencyKey: payload.idempotencyKey || key('loadout'),
+      }, (value) => validLoadout(value, { correlation: true }));
+    },
+
+    deleteLoadout(payload = {}) {
+      return data(`/v1/loadouts/${encode(payload.loadoutId)}`, { method: 'DELETE' }, empty204);
+    },
+
+    setDefaultLoadout(payload = {}) {
+      return data(`/v1/loadouts/${encode(payload.loadoutId)}/set-default`, {
+        method: 'POST', body: {}, maxAttempts: 1,
+      }, (value) => correlationOnly(value) || validLoadout(value, { correlation: true }));
     },
 
     async getSettings() {
