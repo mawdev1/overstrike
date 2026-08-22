@@ -54,6 +54,15 @@ const SPEC = {
   matchServerUrl: { env: 'PLATFORM_MATCH_SERVER_URL', type: 'string', default: 'ws://127.0.0.1:8080', requiredInProd: true },
   matchServerAllowedHosts: { env: 'PLATFORM_MATCH_SERVER_ALLOWED_HOSTS', type: 'string', default: '' },
   matchServerRegion: { env: 'PLATFORM_MATCH_SERVER_REGION', type: 'enum', values: [...REGION_IDS], default: 'iad' },
+  // deployment.md §4.1: the HMAC key under the signed inventory snapshot. Its own secret, not a
+  // reuse of tokenSecret — a snapshot forged with a leaked session-token key would seed a run
+  // with items the player does not hold, and rotating one credential must not invalidate the
+  // other's artefacts.
+  deploymentSnapshotSecret: { env: 'PLATFORM_DEPLOYMENT_SNAPSHOT_SECRET', type: 'string', default: null, requiredInProd: true },
+  // settlement.md §7.2: SETTLEMENT_STALL_MS, "platform config, not hardcoded". A run whose
+  // participants still lack any settlementStatus this long after ending gets an exception
+  // opened rather than staying silently unresolved.
+  settlementStallMs: { env: 'SETTLEMENT_STALL_MS', type: 'int', default: 15 * 60 * 1000, min: 1000, max: 7 * 24 * 3600 * 1000 },
   termsVersion:    { env: 'PLATFORM_TERMS_VERSION', type: 'int', default: 1, min: 1, max: 1e6 },
   env:             { env: 'NODE_ENV', type: 'string', default: 'development' },
 };
@@ -147,6 +156,7 @@ export function loadConfig(source = process.env) {
     if (!out.matchTicketSecret) out.matchTicketSecret = 'DEV-ONLY-INSECURE-MATCH-TICKET-SECRET-do-not-ship';
     if (!out.matchControlSecret) out.matchControlSecret = 'DEV-ONLY-INSECURE-MATCH-CONTROL-SECRET-do-not-ship';
     if (!out.serviceToken) out.serviceToken = 'DEV-ONLY-INSECURE-SERVICE-TOKEN-do-not-ship';
+    if (!out.deploymentSnapshotSecret) out.deploymentSnapshotSecret = 'DEV-ONLY-INSECURE-DEPLOYMENT-SNAPSHOT-SECRET-do-not-ship';
   }
   /**
    * DERIVED, not configurable: can this deployment verify an email address at all?

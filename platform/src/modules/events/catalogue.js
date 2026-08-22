@@ -68,6 +68,23 @@ export const CATALOGUE = new Map([
   def('run.settled',            [1], ['service'],          ['match'],   'internal',  'audit'),
   def('run.exception.opened',   [1], ['system', 'service'], ['match'],  'internal',  'audit'),
   def('run.exception.resolved', [1], ['admin'],             ['match'],  'internal',  'audit'),
+
+  // items-inventory.md §6.3 (P3-01, additive; event-envelope.md is FROZEN, so that contract's
+  // own table is the authoritative shape until an amendment promotes the row). Never `player` —
+  // no player-initiated call creates an instance directly; a purchase or craft is the service
+  // completing a player's request, and the player's action is what `correlationId` carries.
+  def('item.created',           [1], ['service', 'admin', 'system'], ['item'], 'internal', 'audit'),
+
+  // deployment.md §6 (P3-02, additive, same pending-amendment posture). `deployment.released`
+  // additionally admits `service`: §5.2's timeout release and §5.3's expiry sweep are reported
+  // by a named service actor (`match-server`, `deployment-sweep`) — the contract's `system`
+  // column describes the same non-player originator, and a named service is the stronger
+  // attribution of the two (event-envelope.md §2).
+  def('deployment.reserved',          [1], ['player'],                       ['account'], 'internal', 'standard'),
+  def('deployment.released',          [1], ['player', 'system', 'service'],  ['account'], 'internal', 'standard'),
+  def('deployment.snapshot.issued',   [1], ['service'],                      ['match'],   'internal', 'standard'),
+  def('deployment.snapshot.consumed', [1], ['service'],                      ['match'],   'internal', 'audit'),
+  def('deployment.snapshot.rejected', [1], ['service'],                      ['match'],   'internal', 'audit'),
 ]);
 
 /** §5: `<domain>.<entity>.<past-tense-verb>`, lowercase, dot-separated, two or three parts. */

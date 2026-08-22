@@ -18,6 +18,8 @@
  */
 import { ApiError } from '../../core/errors.js';
 import { validateRoamingSettings, defaultRoamingValues, SCHEMA_VERSION } from '../profile/settings.js';
+// The platform's own slot vocabulary, not a copy: two lists is two places for a slot to drift.
+import { EQUIPPABLE_SLOTS } from '../inventory/index.js';
 import * as fx from './fixtures.js';
 import * as rooms from './rooms.js';
 import * as accounts from './accounts.js';
@@ -138,6 +140,64 @@ function requireMembership(r) {
   const me = rooms.localMember(r);
   if (!me) throw new ApiError('NOT_IN_ROOM', 'You are not in that room.');
   return me;
+}
+
+// ── P3 item helpers ─────────────────────────────────────────────────────────────────────────
+
+/** The per-session item state, seeded lazily so scenarios that never touch items pay nothing. */
+function itemsStateOf(ctx) {
+  if (!ctx.state.items) ctx.state.items = fx.itemsState();
+  return ctx.state.items;
+}
+
+/** §8: Idempotency-Key is REQUIRED on the P3 writes — same refusal shape as the real routes. */
+function requireIdempotencyKey(ctx) {
+  const raw = ctx.headers['idempotency-key'];
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new ApiError('VALIDATION_FAILED', 'Idempotency-Key is required on this request.', {
+      details: { fields: [{ key: 'Idempotency-Key', reason: 'required' }] },
+    });
+  }
+  return raw.trim();
+}
+
+function requireLoadoutName(name) {
+  if (typeof name !== 'string' || !name.trim() || name.length > 100) {
+    throw new ApiError('VALIDATION_FAILED', 'A loadout needs a name (1–100 characters).', {
+      details: { fields: [{ key: 'name', reason: name ? 'too-long' : 'required' }] },
+    });
+  }
+  return name.trim();
+}
+
+/** items-inventory.md §3.1 rules 1/2/3/5, over the session's own instances. */
+function validateLoadoutSlots(st, slots) {
+  if (slots === null || typeof slots !== 'object' || Array.isArray(slots)) {
+    throw validationFailed([{ path: 'slots', rule: 'object', message: 'slots is slot -> instanceId.' }]);
+  }
+  const seen = new Set();
+  for (const [slotKey, instanceId] of Object.entries(slots)) {
+    if (instanceId == null) continue;
+    if (!EQUIPPABLE_SLOTS.includes(slotKey)) {
+      throw new ApiError('LOADOUT_INVALID_SLOT', `${slotKey} is not an equippable slot.`,
+        { details: { slot: slotKey } });
+    }
+    if (seen.has(instanceId)) {
+      throw new ApiError('LOADOUT_DUPLICATE_INSTANCE', `Instance ${instanceId} used twice in one loadout.`,
+        { details: { instanceId } });
+    }
+    seen.add(instanceId);
+    const row = st.instances[instanceId];
+    if (!row || row.location !== 'permanent' || row.status !== 'active' || row.locked) {
+      throw new ApiError('LOADOUT_ITEM_NOT_OWNED', `Instance ${instanceId} is not owned and idle.`,
+        { details: { instanceId } });
+    }
+    if (fx.itemDefinition(row.itemId).slot !== slotKey) {
+      throw new ApiError('LOADOUT_INVALID_SLOT', `Instance ${instanceId} does not fit slot ${slotKey}.`,
+        { details: { instanceId, slot: slotKey } });
+    }
+  }
+  return { ...slots };
 }
 
 export const ROUTES = [
@@ -672,6 +732,162 @@ export const ROUTES = [
   } },
 
   { method: 'GET', path: '/v1/config/regions', auth: 'P', handler: () => okBody({ regions: fx.REGIONS }) },
+
+  // ── P3: inventory, loadouts, deployments ────────────────────────────────────────────────
+  // items-inventory.md §7 and deployment.md §7, stateful like the rooms above: a reservation
+  // locks the instances it names and an abort unlocks them, so the loadout editor and the
+  // deploy flow can be exercised end to end against fixtures. The S-marked rows
+  // (verify-snapshot, timeout release, run-result, the exception queue) are deliberately
+  // ABSENT for the same reason POST /v1/matches/:matchId/result is: their entire security
+  // property is that the shell cannot reach them.
+
+  { method: 'GET', path: '/v1/inventory', auth: 'A', handler(ctx) {
+    const st = itemsStateOf(ctx);
+    const rows = Object.values(st.instances)
+      .filter((r) => r.location === 'permanent' && r.status === 'active')
+      .sort((a, b) => a.instanceId.localeCompare(b.instanceId));
+    const page = paginate(rows, ctx.query);
+    return okBody({ items: page.items.map(fx.itemInstanceBody), nextCursor: page.nextCursor });
+  } },
+
+  { method: 'GET', path: '/v1/inventory/:instanceId', auth: 'A', handler(ctx) {
+    const row = itemsStateOf(ctx).instances[ctx.params.instanceId];
+    if (!row) throw new ApiError('NOT_FOUND', 'No such instance.');
+    return okBody(fx.itemInstanceBody(row));
+  } },
+
+  { method: 'GET', path: '/v1/loadouts', auth: 'A', handler(ctx) {
+    return okBody({ loadouts: itemsStateOf(ctx).loadouts.map(fx.loadoutBody) });
+  } },
+
+  { method: 'POST', path: '/v1/loadouts', auth: 'A', handler(ctx) {
+    requireIdempotencyKey(ctx);
+    const st = itemsStateOf(ctx);
+    const name = requireLoadoutName(ctx.body.name);
+    const slots = validateLoadoutSlots(st, ctx.body.slots ?? {});
+    const row = {
+      loadoutId: stubUlid(`loadout:new:${ctx.scenario}:${st.loadouts.length}`, ctx.clock.nowMs()),
+      name, slots, isDefault: false,
+    };
+    st.loadouts.push(row);
+    return okBody(fx.loadoutBody(row));
+  } },
+
+  { method: 'PATCH', path: '/v1/loadouts/:loadoutId', auth: 'A', handler(ctx) {
+    requireIdempotencyKey(ctx);
+    const st = itemsStateOf(ctx);
+    const row = st.loadouts.find((l) => l.loadoutId === ctx.params.loadoutId);
+    if (!row) throw new ApiError('NOT_FOUND', 'No such loadout.');
+    if ('name' in ctx.body) row.name = requireLoadoutName(ctx.body.name);
+    if ('slots' in ctx.body) row.slots = validateLoadoutSlots(st, ctx.body.slots ?? {});
+    if (ctx.body.isDefault === true) {
+      for (const other of st.loadouts) other.isDefault = other === row;
+    }
+    return okBody(fx.loadoutBody(row));
+  } },
+
+  { method: 'DELETE', path: '/v1/loadouts/:loadoutId', auth: 'A', handler(ctx) {
+    const st = itemsStateOf(ctx);
+    const at = st.loadouts.findIndex((l) => l.loadoutId === ctx.params.loadoutId);
+    if (at === -1) throw new ApiError('NOT_FOUND', 'No such loadout.');
+    st.loadouts.splice(at, 1);
+    return noContent();
+  } },
+
+  { method: 'POST', path: '/v1/loadouts/:loadoutId/set-default', auth: 'A', handler(ctx) {
+    const st = itemsStateOf(ctx);
+    const row = st.loadouts.find((l) => l.loadoutId === ctx.params.loadoutId);
+    if (!row) throw new ApiError('NOT_FOUND', 'No such loadout.');
+    for (const other of st.loadouts) other.isDefault = other === row;
+    return okBody(fx.loadoutBody(row));
+  } },
+
+  // deployment.md §7: exactly one of loadoutId / non-empty instanceIds. Locks what it reserves,
+  // so a second reservation naming the same instance answers the §3 409 with the per-instance
+  // breakdown, and an abort genuinely frees it.
+  { method: 'POST', path: '/v1/deployments', auth: 'A', handler(ctx) {
+    requireIdempotencyKey(ctx);
+    const st = itemsStateOf(ctx);
+    const { loadoutId = null, instanceIds = null, roomId = null } = ctx.body;
+    const hasLoadout = loadoutId !== null && loadoutId !== undefined;
+    const hasInstances = instanceIds !== null && instanceIds !== undefined;
+    if (hasLoadout === hasInstances || (hasInstances && (!Array.isArray(instanceIds) || instanceIds.length === 0))) {
+      throw new ApiError('DEPLOYMENT_REQUEST_INVALID',
+        'Exactly one of loadoutId or a non-empty instanceIds is required.',
+        { details: { fields: ['loadoutId', 'instanceIds'] } });
+    }
+    let candidateIds;
+    if (hasLoadout) {
+      const loadout = st.loadouts.find((l) => l.loadoutId === loadoutId);
+      if (!loadout) throw new ApiError('NOT_FOUND', 'No such loadout.');
+      candidateIds = EQUIPPABLE_SLOTS.map((slot) => loadout.slots[slot]).filter((v) => v != null);
+      if (candidateIds.length === 0) {
+        throw new ApiError('DEPLOYMENT_REQUEST_INVALID', 'That loadout has no equipped slots.',
+          { details: { fields: ['loadoutId'] } });
+      }
+    } else {
+      candidateIds = instanceIds;
+      const seenSlot = new Map();
+      for (const id of candidateIds) {
+        const row = st.instances[id];
+        if (!row) continue;   // rule 1 catches it at lock time, as the real module does
+        const slot = fx.itemDefinition(row.itemId).slot;
+        if (slot == null) {
+          throw new ApiError('LOADOUT_INVALID_SLOT', `Instance ${id} has no equippable slot.`,
+            { details: { instanceId: id } });
+        }
+        if (seenSlot.has(slot)) {
+          throw new ApiError('LOADOUT_DUPLICATE_INSTANCE',
+            `Instances ${seenSlot.get(slot)} and ${id} both target slot ${slot}.`,
+            { details: { instanceId: id, slot, conflictsWith: seenSlot.get(slot) } });
+        }
+        seenSlot.set(slot, id);
+      }
+    }
+    const conflicting = candidateIds
+      .filter((id) => {
+        const row = st.instances[id];
+        return !row || row.location !== 'permanent' || row.status !== 'active' || row.locked;
+      })
+      .map((id) => ({ instanceId: id,
+        reason: st.instances[id]?.locked ? 'ITEM_ALREADY_DEPLOYED' : 'LOADOUT_ITEM_NOT_OWNED' }));
+    if (conflicting.length > 0) {
+      throw new ApiError('DEPLOYMENT_RESERVATION_CONFLICT', 'One or more instances could not be locked.',
+        { details: { conflictingInstances: conflicting } });
+    }
+    st.reservationsIssued += 1;
+    const reservationId = stubUlid(`deployment:new:${ctx.scenario}:${st.reservationsIssued}`, ctx.clock.nowMs());
+    for (const id of candidateIds) {
+      st.instances[id].locked = true;
+      st.instances[id].lockedByDeploymentId = reservationId;
+    }
+    const expiresAt = ctx.clock.plus(90 * 1000);   // §2.2's TTL
+    st.reservations[reservationId] = { instanceIds: candidateIds, roomId, expiresAt, status: 'reserved' };
+    return okBody({ reservationId, instanceIds: candidateIds, expiresAt });
+  } },
+
+  { method: 'DELETE', path: '/v1/deployments/:reservationId', auth: 'A', handler(ctx) {
+    const st = itemsStateOf(ctx);
+    const reservationId = ctx.params.reservationId;
+    // The pre-seeded raid's reservation is already consumed (§5.4): aborting it now would
+    // desync a match server that already spawned the entity.
+    if (reservationId === fx.ACTIVE_DEPLOYMENT_ID) {
+      throw new ApiError('DEPLOYMENT_ALREADY_CONSUMED', 'This deployment already started a run.');
+    }
+    const reservation = st.reservations[reservationId];
+    if (!reservation) throw new ApiError('NOT_FOUND', 'No such reservation.');
+    if (reservation.status === 'reserved') {
+      reservation.status = 'released';
+      for (const id of reservation.instanceIds) {
+        const row = st.instances[id];
+        if (row && row.lockedByDeploymentId === reservationId) {
+          row.locked = false;
+          row.lockedByDeploymentId = null;
+        }
+      }
+    }
+    return noContent();   // idempotent: already-released is success, same as rooms/:id/leave
+  } },
 
   // Build-exempt exactly as core/http.js exempts them: a liveness probe is not a game client
   // and has no build to compare against a floor.

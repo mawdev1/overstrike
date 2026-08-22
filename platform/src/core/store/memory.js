@@ -1174,6 +1174,17 @@ export function createMemoryStore(config = {}, deps = {}) {
         .map(clone));
     },
 
+    /** settlement.md §7.4 step 2 — the queryable queue. Every filter optional, oldest first. */
+    list({ status = null, runId = null, accountId = null, trigger = null } = {}, txh) {
+      return read(txh, (st) => [...st.settlementExceptions.values()]
+        .filter((e) => (status === null || e.status === status)
+          && (runId === null || e.runId === runId)
+          && (accountId === null || e.accountId === accountId)
+          && (trigger === null || e.trigger === trigger))
+        .sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.exceptionId.localeCompare(b.exceptionId))
+        .map(clone));
+    },
+
     /** §7.4 step 3 — optimistic-locked claim. Zero-row (returns null) means claimed/resolved since read. */
     claim({ exceptionId, operatorId, expectedUpdatedAt }, txh) {
       return write(txh, (st) => {

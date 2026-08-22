@@ -557,3 +557,5 @@ export function createSettlementService({ store, inventoryService, outbox, clock
 
   return { submitRunResult, checkStalls, claimException, resolveException };
 }
+
+export { registerSettlementRoutes } from './routes.js';

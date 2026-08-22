@@ -20,13 +20,15 @@ import { createStore } from './core/store.js';
 import { createHealth } from './core/health.js';
 import { createRateLimiter } from './core/ratelimit.js';
 import { ApiError } from './core/errors.js';
-import { isUlid } from './core/ids.js';
+import { isUlid, ulid } from './core/ids.js';
+import { pgConnectionConfig } from './core/pgurl.js';
 import { createObservability } from './core/observability.js';
 import { timingSafeEqual, createHash } from 'node:crypto';
 
 // The modules a production process MUST have. `stubs` is deliberately absent: in production
 // it is not mounted at all, which is a stronger guarantee than mounting it disabled.
-const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'regions', 'mail', 'lobby'];
+const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'regions', 'mail', 'lobby',
+  'inventory', 'deployment', 'settlement'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
@@ -203,6 +205,11 @@ export async function buildApp(config, overrides = {}) {
     try { deps.auth?.stop?.(); } catch { /* nothing useful to do while shutting down */ }
     try { deps.events?.relay?.stop?.(); } catch { /* same */ }
     try { deps.lobby?.stop?.(); } catch { /* same */ }
+    try { deps.deployment?.stop?.(); } catch { /* same */ }
+    // The P3 module stores hold their own pools; on postgres an unclosed pool keeps the
+    // process (or a test runner) waiting on sockets nobody will use again.
+    try { void deps.inventory?.store?.close?.(); } catch { /* shutting down */ }
+    try { void deps.deployment?.store?.close?.(); } catch { /* same */ }
   };
 
   return {
@@ -469,6 +476,111 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     });
     deps.lobby.routes(router);
     mounted.push('lobby');
+  }
+
+  // ── P3: items/inventory, deployment reservation, run settlement ──────────────────────
+  //
+  // Wired here rather than left as constructible-but-unmounted services, because that is the
+  // exact gap this file keeps finding: a module whose suite passes and whose endpoints 404.
+  //
+  // One event path for all three. The inventory and deployment services return/emit envelope
+  // shapes (their contracts' §6 tables) and take an `emit` dependency; that dependency is the
+  // REAL transactional outbox — `outbox.commit` around the single insert — so `item.created`
+  // and `deployment.*` land in `events_outbox` for the relay like every other platform event.
+  // The emit and the module's own row commit in two stores, which is the two-store limitation
+  // both module headers already document; the emit runs last inside the module's own
+  // transaction, so an outbox refusal still rolls the domain write back.
+  const emitDomainEvent = deps.events
+    ? async (spec) => {
+      const { correlationId = null, ...event } = spec ?? {};
+      await deps.events.outbox.commit(
+        // A sweep has no request to inherit an id from; a fresh ULID keeps the event traceable.
+        { correlationId: correlationId || ulid(), actor: event.actor },
+        async (tx, emit) => { await emit(event); });
+    }
+    : null;
+
+  /** The P3 module stores are self-contained slices over the same database (their migrations
+   * 0027/0028); `pg` is handed in explicitly so the memory path never imports the driver. */
+  const moduleStorePg = async () => (await import('pg')).default;
+
+  const inventory = await load('inventory', './modules/inventory/index.js');
+  if (inventory) {
+    const inventoryStore = overrides.inventoryStore
+      || (config.storage === 'postgres'
+        ? inventory.createPostgresInventoryStore(
+          { pool: { ...pgConnectionConfig(config.databaseUrl), max: 5 } },
+          { pg: await moduleStorePg() })
+        : inventory.createMemoryInventoryStore());
+    deps.inventory = {
+      store: inventoryStore,
+      service: inventory.createInventoryService({ store: inventoryStore, emit: emitDomainEvent }),
+    };
+    inventory.registerInventoryRoutes(router, {
+      service: deps.inventory.service,
+      coreStore: deps.store,
+      auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth,
+    });
+    mounted.push('inventory');
+  }
+
+  const deployment = await load('deployment', './modules/deployment/index.js');
+  if (deployment && deps.inventory) {
+    const deploymentStore = overrides.deploymentStore
+      || (config.storage === 'postgres'
+        ? deployment.createPostgresDeploymentStore(
+          { pool: { ...pgConnectionConfig(config.databaseUrl), max: 5 } },
+          { pg: await moduleStorePg() })
+        : deployment.createMemoryDeploymentStore());
+    const service = deployment.createDeploymentService({
+      inventoryService: deps.inventory.service,
+      store: deploymentStore,
+      emit: emitDomainEvent,
+      clock: { now: deps.clock },
+      signingSecret: config.deploymentSnapshotSecret,
+    });
+    // §5.3's expiry sweep — the backstop that makes the TTL a policy rather than a column,
+    // exactly the failure mode the idempotency janitor below was added for. Unref'd, failures
+    // logged and swallowed: a retention timer must never hold a process open or take it down.
+    const sweepMs = overrides.deploymentSweepIntervalMs ?? 15_000;
+    const sweepTimer = config.env !== 'test' && sweepMs > 0
+      ? setInterval(() => {
+        service.sweepExpired()
+          .then((swept) => { if (swept.length) logger.info('deployment.sweep', { released: swept.length }); })
+          .catch((err) => logger.warn('deployment.sweep.failed', { message: err?.message ?? String(err) }));
+      }, sweepMs)
+      : null;
+    sweepTimer?.unref?.();
+    deps.deployment = {
+      store: deploymentStore, service,
+      stop: () => { if (sweepTimer) clearInterval(sweepTimer); },
+    };
+    deployment.registerDeploymentRoutes(router, {
+      service,
+      coreStore: deps.store,
+      auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth,
+    });
+    mounted.push('deployment');
+  }
+
+  const settlement = await load('settlement', './modules/settlement/index.js');
+  // Requires the outbox outright (its constructor refuses to build without one): a settlement
+  // applied with no event can duplicate or destroy an item, which is the state §4 of the event
+  // contract exists to make impossible.
+  if (settlement && deps.inventory && deps.events) {
+    deps.settlement = {
+      service: settlement.createSettlementService({
+        store: deps.store,
+        inventoryService: deps.inventory.service,
+        outbox: deps.events.outbox,
+        clock: { now: deps.clock },
+      }),
+    };
+    settlement.registerSettlementRoutes(router, {
+      service: deps.settlement.service,
+      store: deps.store,
+    });
+    mounted.push('settlement');
   }
 
   // ── stubs: the fixture layer that unblocks the frontend lane ─────────────────────────

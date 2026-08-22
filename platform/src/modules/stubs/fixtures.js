@@ -780,4 +780,96 @@ export function roamingSettings() {
   };
 }
 
+// ── P3: inventory, loadouts, deployments (items-inventory.md §7, deployment.md §7) ──────────
+
+/**
+ * The wire projection agreed with the shell stream (src/ui/platform/shell-api.js validates
+ * every key, closed): instances carry their `definition` inlined on the list AND the single-
+ * item endpoint, and none of the server-side columns (`ownerAccountId`, `attachments`,
+ * `containerId`, timestamps) travel. Deterministic ids, no wall clock, same rules as every
+ * other builder in this file.
+ */
+export const INSTANCE_IDS = {
+  rifle: stubUlid('item:rifle', EPOCH_MS - 30 * DAY),
+  sidearm: stubUlid('item:sidearm', EPOCH_MS - 28 * DAY),
+  helmet: stubUlid('item:helmet', EPOCH_MS - 21 * DAY),
+  medkit: stubUlid('item:medkit', EPOCH_MS - 14 * DAY),
+  ammo: stubUlid('item:ammo', EPOCH_MS - 7 * DAY),
+  vestInRaid: stubUlid('item:vest-in-raid', EPOCH_MS - 2 * DAY),
+};
+
+export const LOADOUT_IDS = {
+  raidKit: stubUlid('loadout:raid-kit', EPOCH_MS - 20 * DAY),
+  backupKit: stubUlid('loadout:backup-kit', EPOCH_MS - 10 * DAY),
+};
+
+/** The reservation that holds `vestInRaid`'s lock — a raid already in flight when the session starts. */
+export const ACTIVE_DEPLOYMENT_ID = stubUlid('deployment:active', EPOCH_MS - 900 * 1000);
+
+const ITEM_DEFINITIONS = {
+  rifle_ak74: { itemId: 'rifle_ak74', name: 'AK-74', class: 'weapon', slot: 'primary',
+    rarityTier: 'rare', stackable: false, maxStack: null, durabilityMax: 100 },
+  sidearm_p226: { itemId: 'sidearm_p226', name: 'P226', class: 'weapon', slot: 'secondary',
+    rarityTier: 'uncommon', stackable: false, maxStack: null, durabilityMax: 60 },
+  helmet_halfshell: { itemId: 'helmet_halfshell', name: 'Half-shell helmet', class: 'gear',
+    slot: 'helmet', rarityTier: 'epic', stackable: false, maxStack: null, durabilityMax: 40 },
+  vest_carrier: { itemId: 'vest_carrier', name: 'Plate carrier', class: 'gear', slot: 'vest',
+    rarityTier: 'rare', stackable: false, maxStack: null, durabilityMax: 80 },
+  medkit_field: { itemId: 'medkit_field', name: 'Field med-kit', class: 'consumable',
+    slot: 'consumable', rarityTier: 'uncommon', stackable: true, maxStack: 3, durabilityMax: null },
+  // `slot: null` — a material can be owned and listed but never deployed (items-inventory.md
+  // §2), which is exactly the state a loadout editor has to grey out rather than hide.
+  ammo_545: { itemId: 'ammo_545', name: '5.45×39 rounds', class: 'material', slot: null,
+    rarityTier: 'common', stackable: true, maxStack: 60, durabilityMax: null },
+};
+
+export const itemDefinition = (itemId) => ({ ...ITEM_DEFINITIONS[itemId] });
+
+const instanceSeed = (instanceId, itemId, overrides = {}) => ({
+  instanceId, itemId, quantity: 1, durability: null,
+  location: 'permanent', runId: null, locked: false, lockedByDeploymentId: null,
+  status: 'active', ...overrides,
+});
+
+/**
+ * The mutable per-session item state the stub routes advance: reserve locks rows, abort
+ * unlocks them, loadout writes append. Built fresh per session so a replay is byte-identical.
+ */
+export function itemsState() {
+  return {
+    instances: {
+      [INSTANCE_IDS.rifle]: instanceSeed(INSTANCE_IDS.rifle, 'rifle_ak74', { durability: 87 }),
+      [INSTANCE_IDS.sidearm]: instanceSeed(INSTANCE_IDS.sidearm, 'sidearm_p226', { durability: 52 }),
+      [INSTANCE_IDS.helmet]: instanceSeed(INSTANCE_IDS.helmet, 'helmet_halfshell', { durability: 33 }),
+      [INSTANCE_IDS.medkit]: instanceSeed(INSTANCE_IDS.medkit, 'medkit_field', { quantity: 2 }),
+      [INSTANCE_IDS.ammo]: instanceSeed(INSTANCE_IDS.ammo, 'ammo_545', { quantity: 45 }),
+      // Inside the active raid: run-located and still lock-held, per items-inventory.md §4 —
+      // the state the item-detail screen explains ("returns if you extract, lost if you die").
+      [INSTANCE_IDS.vestInRaid]: instanceSeed(INSTANCE_IDS.vestInRaid, 'vest_carrier', {
+        durability: 71, location: 'run', runId: MATCH_ID,
+        locked: true, lockedByDeploymentId: ACTIVE_DEPLOYMENT_ID,
+      }),
+    },
+    loadouts: [
+      { loadoutId: LOADOUT_IDS.raidKit, name: 'Raid kit A', isDefault: true,
+        slots: { primary: INSTANCE_IDS.rifle, helmet: INSTANCE_IDS.helmet, consumable: INSTANCE_IDS.medkit } },
+      { loadoutId: LOADOUT_IDS.backupKit, name: 'Backup kit', isDefault: false,
+        slots: { secondary: INSTANCE_IDS.sidearm } },
+    ],
+    reservations: {},          // reservationId -> { instanceIds, expiresAt, status }
+    reservationsIssued: 0,
+  };
+}
+
+export const itemInstanceBody = (row) => ({
+  instanceId: row.instanceId, itemId: row.itemId, quantity: row.quantity,
+  durability: row.durability, location: row.location, runId: row.runId,
+  locked: row.locked, lockedByDeploymentId: row.lockedByDeploymentId, status: row.status,
+  definition: itemDefinition(row.itemId),
+});
+
+export const loadoutBody = (row) => ({
+  loadoutId: row.loadoutId, name: row.name, slots: { ...row.slots }, isDefault: row.isDefault,
+});
+
 export { iso };

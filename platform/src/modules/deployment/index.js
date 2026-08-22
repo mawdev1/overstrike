@@ -362,3 +362,4 @@ export function createDeploymentService({
 }
 
 export { createMemoryDeploymentStore, createPostgresDeploymentStore } from './store.js';
+export { registerDeploymentRoutes } from './routes.js';

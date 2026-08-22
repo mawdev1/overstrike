@@ -121,6 +121,7 @@ try {
     PLATFORM_MATCH_TICKET_SECRET: 'a-separate-production-match-ticket-secret',
     PLATFORM_MATCH_CONTROL_SECRET: 'a-separate-production-match-control-secret',
     PLATFORM_SERVICE_TOKEN: 'a-sufficiently-long-production-service-token',
+    PLATFORM_DEPLOYMENT_SNAPSHOT_SECRET: 'a-separate-production-deployment-snapshot-secret',
     PLATFORM_MATCH_SERVER_URL: 'wss://match.example.invalid',
     PLATFORM_IDENTITY_PROVIDER: 'supabase', SUPABASE_URL: 'https://example.supabase.co',
     SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',

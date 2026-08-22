@@ -304,3 +304,4 @@ export function createInventoryService({ store, emit = null }) {
 }
 
 export { createMemoryInventoryStore, createPostgresInventoryStore } from './store.js';
+export { registerInventoryRoutes } from './routes.js';

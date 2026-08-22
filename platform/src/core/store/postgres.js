@@ -1018,6 +1018,19 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return rows.map((r) => mapRow(r));
     },
 
+    /** settlement.md §7.4 step 2 — the queryable queue. Every filter optional, oldest first. */
+    async list({ status = null, runId = null, accountId = null, trigger = null } = {}, txh) {
+      const { rows } = await q(txh,
+        `select * from settlement_exceptions
+          where ($1::text is null or status = $1)
+            and ($2::text is null or run_id = $2)
+            and ($3::text is null or account_id = $3)
+            and ($4::text is null or trigger = $4)
+          order by opened_at, exception_id`,
+        [status, runId, accountId, trigger]);
+      return rows.map((r) => mapRow(r));
+    },
+
     /** §7.4 step 3 — optimistic-locked claim. Zero rows (returns null) means claimed/resolved since read. */
     async claim({ exceptionId, operatorId, expectedUpdatedAt }, txh) {
       const { rows } = await q(txh,
