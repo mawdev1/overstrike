@@ -1618,8 +1618,34 @@ function renderReconnect({ view, actions, isFeatureEnabled }) {
   ]);
 }
 
-function renderResults({ view, isFeatureEnabled }) {
+function renderResults({ view, actions, isFeatureEnabled }) {
   const result = view.data?.result || view.data || {};
+  if (result.status === 'pending') {
+    const retryAfterMs = Number.isFinite(result.retryAfterMs) ? result.retryAfterMs : 3000;
+    if (typeof actions?.registerCleanup === 'function' && typeof actions?.refresh === 'function') {
+      const timer = setTimeout(() => actions.refresh(), retryAfterMs);
+      actions.registerCleanup(() => clearTimeout(timer));
+    }
+    return element('section', { className: 'os-state', role: 'status' }, [
+      element('p', {}, 'This match is still finalising. Results will appear automatically once they are ready.'),
+      definitionList([
+        ['Status', result.status],
+        ['Mode', result.mode],
+        ['Map', result.mapId],
+        ['Match', result.matchId],
+      ]),
+      actionsRow([
+        actionButton('Retry', () => actions.refresh(), { className: 'os-button os-button--primary' }),
+        result.roomId
+          ? shellLink('Return to lobby', `/room/${encodeURIComponent(result.roomId)}`, { className: 'os-button os-button--quiet' })
+          : shellLink(
+            isFeatureEnabled?.('shell.serverbrowser.enabled') === false ? 'Return to welcome' : 'Browse rooms',
+            homePath(isFeatureEnabled),
+            { className: 'os-button os-button--quiet' },
+          ),
+      ]),
+    ]);
+  }
   return element('section', {}, [
     definitionList([
       ['Status', result.status],

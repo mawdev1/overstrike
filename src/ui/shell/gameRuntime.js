@@ -109,9 +109,48 @@ export function createGameRuntime({
   let activeProgression = null;
   let stopTerminalListener = null;
   let stopDiagnosticsListener = null;
+  let stopDisconnectedListener = null;
+  let stopStateChangeListener = null;
+  let stopReconnectUpdateListener = null;
+  let stopVersionMismatchListener = null;
   let spectatorKeyHandler = null;
   let tacticalMouseHandler = null;
   let terminalExitTimer = null;
+  let reconnectOverlay = null;
+  let reconnectCountdownTimer = null;
+
+  function buildReconnectOverlay() {
+    const el = document.createElement('div');
+    el.className = 'runtime-reconnect-overlay';
+    el.setAttribute('role', 'alertdialog');
+    el.setAttribute('aria-live', 'assertive');
+    el.hidden = true;
+    el.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;'
+      + 'justify-content:center;flex-direction:column;gap:12px;background:rgba(6,8,12,0.82);'
+      + 'color:#f4f6fb;font:600 16px/1.4 system-ui,sans-serif;text-align:center;z-index:50;';
+    const title = document.createElement('div');
+    title.className = 'runtime-reconnect-overlay__title';
+    title.style.cssText = 'font-size:20px;letter-spacing:0.02em;';
+    const sub = document.createElement('div');
+    sub.className = 'runtime-reconnect-overlay__sub';
+    sub.style.cssText = 'font-weight:400;opacity:0.85;font-size:14px;';
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'runtime-reconnect-overlay__action';
+    action.style.cssText = 'margin-top:8px;padding:8px 18px;border-radius:6px;'
+      + 'border:1px solid rgba(255,255,255,0.35);background:transparent;color:inherit;'
+      + 'font:inherit;cursor:pointer;';
+    el.append(title, sub, action);
+    gameLayer.appendChild(el);
+    return { el, title, sub, action };
+  }
+
+  function clearReconnectOverlay() {
+    clearInterval(reconnectCountdownTimer);
+    reconnectCountdownTimer = null;
+    reconnectOverlay?.el?.remove();
+    reconnectOverlay = null;
+  }
 
   function setProgress(value, label = 'Loading match') {
     const amount = Math.max(0, Math.min(1, Number(value) || 0));
@@ -225,6 +264,81 @@ export function createGameRuntime({
           });
           const publishDiagnostics = () => onNetworkDiagnostics?.(facade.netStats);
           stopDiagnosticsListener = facade.on('matchState', publishDiagnostics);
+
+          // Mid-match connection loss: the facade runs a real, silent reconnect loop on socket
+          // drop (net-facade.md §3.2). Without this, a dropped player sees a frozen match with
+          // no countdown, no cancel, and — on grace expiry or version mismatch — no way back to
+          // the shell, because no `matchEnded` is ever emitted for those outcomes.
+          const finishWithConnectionFailure = (reason) => {
+            clearReconnectOverlay();
+            if (authoritativeTerminal) return;
+            authoritativeTerminal = Object.freeze({
+              matchId: handoff.matchId,
+              winner: null,
+              outcomeReason: reason ?? null,
+              terminationReason: 'aborted',
+            });
+            candidate.hud?.notice?.('CONNECTION LOST', 'Returning to menu', 1.2);
+            clearTimeout(terminalExitTimer);
+            terminalExitTimer = setTimeout(() => {
+              terminalExitTimer = null;
+              candidate.bus?.emit?.('toMenu', { authoritative: true });
+            }, 1200);
+          };
+          const showReconnectOverlay = (title, sub, { action = null } = {}) => {
+            if (!reconnectOverlay) reconnectOverlay = buildReconnectOverlay();
+            reconnectOverlay.title.textContent = title;
+            reconnectOverlay.sub.textContent = sub;
+            reconnectOverlay.el.hidden = false;
+            reconnectOverlay.action.onclick = null;
+            if (action) {
+              reconnectOverlay.action.hidden = false;
+              reconnectOverlay.action.textContent = action.label;
+              reconnectOverlay.action.onclick = action.onClick;
+            } else {
+              reconnectOverlay.action.hidden = true;
+            }
+          };
+          const tickReconnectCountdown = () => {
+            const info = facade.reconnect;
+            if (!info || !reconnectOverlay) return;
+            const remainingMs = Math.max(0, info.graceEndsAt - performance.now());
+            showReconnectOverlay('Connection lost', `Reconnecting… attempt ${info.attempt}/`
+              + `${info.maxAttempts} · ${Math.ceil(remainingMs / 1000)}s left`, {
+              action: {
+                label: 'Cancel',
+                onClick: () => { facade.disconnect?.('client-cancelled'); },
+              },
+            });
+          };
+          stopDisconnectedListener = facade.on('disconnected', () => {
+            if (authoritativeTerminal) return;
+            showReconnectOverlay('Connection lost', 'Reconnecting…', {
+              action: { label: 'Cancel', onClick: () => { facade.disconnect?.('client-cancelled'); } },
+            });
+          });
+          stopReconnectUpdateListener = facade.on('reconnectUpdate', () => {
+            if (authoritativeTerminal) return;
+            clearInterval(reconnectCountdownTimer);
+            tickReconnectCountdown();
+            reconnectCountdownTimer = setInterval(tickReconnectCountdown, 250);
+          });
+          stopVersionMismatchListener = facade.on('versionMismatch', () => {
+            if (authoritativeTerminal) return;
+            clearInterval(reconnectCountdownTimer);
+            reconnectCountdownTimer = null;
+            showReconnectOverlay('Update required', 'Your client no longer matches the server '
+              + 'version. Reload to update — this match cannot be resumed.', {
+              action: { label: 'Leave match', onClick: () => finishWithConnectionFailure('version-mismatch') },
+            });
+          });
+          stopStateChangeListener = facade.on('stateChange', ({ to, reason } = {}) => {
+            if (to === 'live') {
+              clearReconnectOverlay();
+            } else if (to === 'closed') {
+              finishWithConnectionFailure(reason);
+            }
+          });
           spectatorKeyHandler = (event) => {
             if (event.repeat) return;
             const action = candidate?.settings?.actionFor?.(event.code);
@@ -289,6 +403,15 @@ export function createGameRuntime({
         stopTerminalListener = null;
         stopDiagnosticsListener?.();
         stopDiagnosticsListener = null;
+        stopDisconnectedListener?.();
+        stopDisconnectedListener = null;
+        stopStateChangeListener?.();
+        stopStateChangeListener = null;
+        stopReconnectUpdateListener?.();
+        stopReconnectUpdateListener = null;
+        stopVersionMismatchListener?.();
+        stopVersionMismatchListener = null;
+        clearReconnectOverlay();
         if (spectatorKeyHandler) window.removeEventListener('keydown', spectatorKeyHandler);
         spectatorKeyHandler = null;
         if (tacticalMouseHandler) window.removeEventListener('mousedown', tacticalMouseHandler);
@@ -315,6 +438,15 @@ export function createGameRuntime({
     stopTerminalListener = null;
     stopDiagnosticsListener?.();
     stopDiagnosticsListener = null;
+    stopDisconnectedListener?.();
+    stopDisconnectedListener = null;
+    stopStateChangeListener?.();
+    stopStateChangeListener = null;
+    stopReconnectUpdateListener?.();
+    stopReconnectUpdateListener = null;
+    stopVersionMismatchListener?.();
+    stopVersionMismatchListener = null;
+    clearReconnectOverlay();
     onNetworkDiagnostics?.(null);
     if (spectatorKeyHandler) window.removeEventListener('keydown', spectatorKeyHandler);
     spectatorKeyHandler = null;
