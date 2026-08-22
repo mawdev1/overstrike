@@ -1127,7 +1127,11 @@ export const PROPS = {
     t.box(0.5, 6.16, 0, 1.1, 0.1, 0.1, 'metal', { rz: 0.18 });
     t.box(1.02, 6.26, 0, 0.66, 0.16, 0.34, 'metal');
     t.box(1.02, 6.15, 0, 0.5, 0.06, 0.24, 'glassOptic', { cast: false });
-    t.col(-0.28, 0, -0.28, 0.28, 6.3, 0.28, 'metal');
+    // Collider only needs to block the base of the mast at a normal standing height —
+    // the full 6.3 m visual pole made its flat top standable and fed a mantle route onto
+    // nearby rooftops (project_map_open_items item 4). 2.2 m still blocks the pole solidly
+    // without offering a climbable surface near roof height.
+    t.col(-0.28, 0, -0.28, 0.28, 2.2, 0.28, 'metal');
     return t.finish();
   },
 

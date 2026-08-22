@@ -762,10 +762,14 @@ function buildMarketHall(B) {
   B.stairs({ x0: -13.6, z0: 4.4, x1: -11.2, z1: 11.2, y0: 0, y1: L1, dir: '-z', matName: 'concreteDark', surface: 'concrete', rail: true });
 
   // Arcade colonnade down the east flank — cover, and it breaks the flanking sightline.
+  // These lintels sit directly on top of the pillars' flat, standable tops (pillar()
+  // collider height == visual height, props.js:1247-1249). A non-colliding `deco` beam
+  // there let a mantled player clip up into/through it onto an unintended perch — the
+  // beam must collide so it caps the pillar tops instead of opening into them.
   for (const z of [-9, -5.4, -1.8, 1.8, 5.4, 9]) B.prop('pillar', 11.7, 0, z, 0, { variant: '3.9' });
-  B.deco(10.9, 3.9, -9.6, 12.5, 4.35, 9.6, 'concreteDark');
+  B.box(10.9, 3.9, -9.6, 12.5, 4.35, 9.6, 'concreteDark', 'concrete');
   for (const z of [-9.5, -6]) B.prop('pillar', -11.7, 0, z, 0, { variant: '3.9' });
-  B.deco(-12.5, 3.9, -10.2, -10.9, 4.35, -5.4, 'concreteDark');
+  B.box(-12.5, 3.9, -10.2, -10.9, 4.35, -5.4, 'concreteDark', 'concrete');
 
   // Awnings and signage on the ground-floor faces.
   B.prop('awning', -4.9, 2.62, 11.9, 0);
