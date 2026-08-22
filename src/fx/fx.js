@@ -766,6 +766,13 @@ export class FX {
   // ================================================================ update
 
   update(dtFrame) {
+    // P3-07 sector streaming (level.js `createSectorStreaming`). Lives on the world
+    // group's userData so no CC-owned object grows a property; driven from the FX
+    // facade because this is the CX-owned once-per-frame hook. The local player's feet
+    // are the §5.1 viewpoint; a dead player's last position stands in for the
+    // last-alive-sector rule, and a missing player fails open inside the controller.
+    const streaming = this.game.world?.group?.userData?.sectorStreaming;
+    if (streaming) streaming.update(dtFrame, this.game.player?.position ?? null);
     if (!this.particles.groups) return;
     const dt = dtFrame > 0.1 ? 0.1 : dtFrame;
 

@@ -244,7 +244,7 @@ export class Builder {
     this._inst = new Map();        // key -> { geo, mat, cast, receive, items: [] }
     this._templates = new Map();   // per-build template cache
     this._singles = [];            // non-merged meshes (ground zones)
-    this.stats = { meshes: 0, instanced: 0, triangles: 0, colliders: 0 };
+    this.stats = { meshes: 0, instanced: 0, triangles: 0, colliders: 0 }; this._sector = null; this.sectorGroups = new Map(); // P3-07: see setSector()
   }
 
   // ── raw plumbing ────────────────────────────────────────────────────────────────
@@ -258,9 +258,9 @@ export class Builder {
   addGeo(geo, matName, cast = true, receive = true, colored = false) {
     // THE skip point. See COLLIDERS_ONLY above before moving this anywhere else.
     if (COLLIDERS_ONLY) { geo?.dispose?.(); return; }
-    const key = `${matName}|${cast ? 1 : 0}${receive ? 1 : 0}`;
+    const key = `${this._sector ?? ''}~${matName}|${cast ? 1 : 0}${receive ? 1 : 0}`;
     let b = this._static.get(key);
-    if (!b) { b = { mat: matName, cast, receive, colored: false, geos: [] }; this._static.set(key, b); }
+    if (!b) { b = { mat: matName, sector: this._sector, cast, receive, colored: false, geos: [] }; this._static.set(key, b); }
     if (colored) b.colored = true;
     b.geos.push(geo);
   }
@@ -352,7 +352,7 @@ export class Builder {
     mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();
-    this.group.add(mesh);
+    this._attach(mesh);
     this._singles.push(mesh);
     if (opts.collide !== false) this.collider(x0, y - 1, z0, x1, y, z1, surface);
   }
@@ -797,10 +797,10 @@ export class Builder {
     const sy = (opts.scaleY ?? 1) * s;
     for (let i = 0; i < tpl.parts.length; i++) {
       const part = tpl.parts[i];
-      const key = `${vkey}#${i}`;
+      const key = `${this._sector ?? ''}~${vkey}#${i}`;
       let b = this._inst.get(key);
       if (!b) {
-        b = { key, geo: part.geo, mat: part.mat, tint: part.tint, cast: part.cast, receive: part.receive, items: [] };
+        b = { key: `${vkey}#${i}`, sector: this._sector, geo: part.geo, mat: part.mat, tint: part.tint, cast: part.cast, receive: part.receive, items: [] };
         this._inst.set(key, b);
       }
       b.items.push(x, y, z, yaw, s, sy, (part.plain || opts.color == null) ? -1 : opts.color);
@@ -820,6 +820,40 @@ export class Builder {
       this.collider(x + minX, y + c.y0 * sy, z + minZ, x + maxX, y + c.y1 * sy, z + maxZ, c.surface);
     }
   }
+
+  // ── P3-07 sector streaming: per-sector visual bucketing ─────────────────────────
+  //
+  // Purely a RENDER concern. Between `setSector('north-yard')` and the next
+  // `setSector(...)`, every visual this Builder emits lands in its own merge/instance
+  // buckets (the sector id is folded into the bucket key above) and, at finish() time,
+  // in a THREE.Group named `sector:north-yard` under `world.group` instead of directly
+  // under it. Client streaming (level.js `createSectorStreaming`) then gates whole
+  // sectors with one `visible` flag per group. Colliders are NEVER sector-tagged —
+  // collision, nav and the server's own sector membership record (sector-interest.md §3)
+  // are untouched by any of this, so hiding a sector can never change gameplay truth.
+  //
+  // NOTE for maintainers: `scripts/geomtest.mjs` used to classify colliders by props.js
+  // LINE NUMBER ranges, which froze the numbering of everything above this comment. It
+  // now wraps the emitter methods and records the method NAME at emit time, so lines in
+  // this file may move freely — but if an emitter method is RENAMED or a new one is
+  // added, update geomtest's KINDS list (it fails loudly on a missing method).
+  setSector(id) { this._sector = id || null; }
+
+  _sectorGroup(id) {
+    if (!id) return this.group;
+    let g = this.sectorGroups.get(id);
+    if (!g) {
+      g = new THREE.Group();
+      g.name = `sector:${id}`;
+      g.userData.sectorId = id;
+      g.matrixAutoUpdate = false;
+      this.group.add(g);
+      this.sectorGroups.set(id, g);
+    }
+    return g;
+  }
+
+  _attach(mesh, sector = this._sector) { this._sectorGroup(sector).add(mesh); }
 
   // ── output ──────────────────────────────────────────────────────────────────────
 
@@ -842,6 +876,10 @@ export class Builder {
       if (n > maxCount) continue;
       const tris = (b.geo.index ? b.geo.index.count : b.geo.attributes.position.count) / 3;
       if (tris * n > maxTris) continue;
+      // Folding happens at finish() time, long after the last setSector() call — the
+      // fold must land in the BUCKET's sector, not whatever sector was set last.
+      const prevSector = this._sector;
+      this._sector = b.sector ?? null;
       for (let i = 0; i < n; i++) {
         const o = i * 7;
         _pos.set(b.items[o], b.items[o + 1], b.items[o + 2]);
@@ -859,6 +897,7 @@ export class Builder {
         }
         this.addGeo(g, b.mat, b.cast, b.receive, colored);
       }
+      this._sector = prevSector;
       this._inst.delete(key);
     }
   }
@@ -890,7 +929,7 @@ export class Builder {
       mesh.receiveShadow = b.receive;
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
-      this.group.add(mesh);
+      this._attach(mesh, b.sector);
       this.stats.meshes++;
       this.stats.triangles += (geo.index ? geo.index.count : geo.attributes.position.count) / 3;
       b.geos.length = 0;
@@ -925,7 +964,7 @@ export class Builder {
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       mesh.computeBoundingSphere();
-      this.group.add(mesh);
+      this._attach(mesh, b.sector);
       this.stats.instanced++;
       const tris = (b.geo.index ? b.geo.index.count : b.geo.attributes.position.count) / 3;
       this.stats.triangles += tris * n;

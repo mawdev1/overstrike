@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { Builder } from './props.js';
+// Client sector streaming (P3-07) deliberately answers "which sectors are near this
+// viewer" with the SAME geometry module the simulation's activation gating uses
+// (sector-interest.md §5.1's "one relevant sector set" rule) — never a second,
+// renderer-local notion of nearby. The module is CC-owned; importing it is the point.
+import { SectorInterest, SECTOR_COOLDOWN_S } from '../game/sectorInterest.js';
 
 /**
  * MERIDIAN — a Mediterranean coastal military compound.
@@ -719,22 +724,50 @@ export const EXTRACTION_MANIFEST = Object.freeze({
   }),
 });
 
-/** Build the extraction raid map: the district POI plus the two graybox sectors. */
-export function buildExtractionLevel(game, world) {
+/**
+ * Build the extraction raid map: the district POI plus the two graybox sectors.
+ *
+ * P3-07: every sector's visuals are built inside `B.setSector(...)` so the Builder lands
+ * them in one `sector:<id>` group per EXTRACTION_SECTORS entry (colliders are never
+ * sector-tagged — see the Builder's own note). `opts.dressing === false` skips the
+ * signage and sponsor-slot dressing layers; the P3-07 harness (`scripts/uistream.mjs`)
+ * builds the map both ways in colliders-only mode and asserts the collider sets are
+ * BYTE-IDENTICAL — the proof that dressing changes neither collision nor any
+ * server-checked sightline.
+ */
+export function buildExtractionLevel(game, world, opts = {}) {
+  const dressing = opts.dressing !== false;
   const B = new Builder(game, world);
   world.setBounds(XM_BOUNDS.min, XM_BOUNDS.max);
   // The Square district, verbatim, WITHOUT its removable competitive boundary layer.
+  B.setSector('square');
   buildSquareGround(B);
   buildSquareDistrict(B);
-  buildExtractionGround(B);
+  buildExtractionGround(B);          // sets its own per-tile sectors
+  B.setSector('north-yard');
   buildRailYard(B);
+  B.setSector('east-docks');
   buildEastDocks(B);
+  // The raid perimeter spans all three sectors: shared, never streamed out.
+  B.setSector(null);
   buildExtractionPerimeter(B);
   buildLootMarkers(B);
+  if (dressing) {
+    buildExtractionSignage(B);
+    buildSponsorSlots(B);
+  }
+  B.setSector(null);
   const stats = B.finish();
   world.buildStats.drawCalls = stats.meshes + stats.instanced;
   world.buildStats.triangles = Math.round(stats.triangles);
   world.buildStats.colliders = world.boxes.length;
+  // Client-side streaming controller, driven per-frame from the FX facade (CX-owned
+  // frame hook). Hangs off the THREE group's userData so no CC-owned object grows a
+  // new property. Inert headlessly: colliders-only builds produce no sector groups.
+  world.group.userData.sectorStreaming = createSectorStreaming({
+    sectors: EXTRACTION_SECTORS,
+    groups: B.sectorGroups,
+  });
 }
 
 /** Registry entry, same shape as MERIDIAN_FIXTURE. Out of rotation: extraction runs
@@ -753,14 +786,20 @@ export const SQUARE_EXTRACTION = Object.freeze({
 });
 
 function buildExtractionGround(B) {
-  // Non-overlapping tiles around the district's own −42…42 ground.
+  // Non-overlapping tiles around the district's own −42…42 ground, each tagged with the
+  // sector its area lies in so streaming can gate whole ground zones.
+  B.setSector('north-yard');
   B.groundPlane(-43, -99, 44, -42, 0, 'concreteDark', 'concrete');   // rail yard + north rim
+  B.setSector('square');
   B.groundPlane(-43, -42, -42, 43, 0, 'concreteDark', 'concrete');   // west rim
   B.groundPlane(-42, 42, 42, 43, 0, 'concreteDark', 'concrete');     // south rim
+  B.setSector('east-docks');
   B.groundPlane(44, -99, 99, -42, 0, 'asphalt', 'concrete');         // dock quay north
   B.groundPlane(42, -42, 99, 43, 0, 'asphalt', 'concrete');          // dock quay east
   // Rail-gate and ferry pads read as landmarks from across their sectors.
+  B.setSector('north-yard');
   B.floorFinish(-40, -98, -32, -92, 0.03, 'tile', { cast: false });
+  B.setSector('east-docks');
   B.floorFinish(88, 32, 98, 40, 0.03, 'tile', { cast: false });
 }
 
@@ -878,11 +917,258 @@ function buildExtractionPerimeter(B) {
 
 function buildLootMarkers(B) {
   // Graybox stand-ins at every static container spawn point, so the placement is visible
-  // in-world and in screenshots. LOOT_CONTAINERS is the authoritative list.
+  // in-world and in screenshots. LOOT_CONTAINERS is the authoritative list. Each marker
+  // is tagged with the sector its placement point resolves to (sector-interest.md §3's
+  // placement-point rule), so streaming gates it with the sector it belongs to.
   for (const c of LOOT_CONTAINERS) {
     const p = c.position;
+    B.setSector(extractionSectorAt(p.x, p.y, p.z));
     B.box(p.x - 0.6, p.y, p.z - 0.6, p.x + 0.6, p.y + 0.9, p.z + 0.6, 'wood', 'wood');
   }
+  B.setSector(null);
+}
+
+/** Sector id containing a point, from the authored EXTRACTION_SECTORS boxes (or null). */
+function extractionSectorAt(x, y, z) {
+  for (const s of EXTRACTION_SECTORS) {
+    const b = s.box;
+    if (x >= b.min.x && x <= b.max.x && y >= b.min.y && y <= b.max.y
+      && z >= b.min.z && z <= b.max.z) return s.id;
+  }
+  return null;
+}
+
+// ── P3-07: POI/extraction signage language + sponsor-slot placeholders ───────────────
+//
+// Every surface below is FLUSH-MOUNTED dressing on an existing opaque, colliding wall:
+// board/paint props collide:false by contract ("signage must never snag a player"), and
+// because each panel is backed by solid architecture it can never occlude anything the
+// wall behind it did not already occlude — no collision change, no sightline change.
+// `scripts/uistream.mjs` proves both: byte-identical collider sets with dressing
+// on/off, and a backing-collider containment check for every declared panel.
+
+/** One colour per sector — the raid's wayfinding vocabulary. Sign boards, and later the
+ *  minimap/compass language, all read from this single table. */
+export const SECTOR_SIGN_COLORS = Object.freeze({
+  square: 0xd7a05a,        // The Square keeps its ochre signwriting colour (OT_PAINT)
+  'north-yard': 0xa4643a,  // rail yard: red-oxide primer (HB_RUST)
+  'east-docks': 0x5f9a86,  // docks: marine-green ironwork (HB_PAINT)
+});
+
+/** Neutral placeholder grey — deliberately NOT a sector or hazard colour. */
+const SPONSOR_GREY = 0x9aa0a6;
+
+/**
+ * Declared signage surfaces — graybox wayfinding language for the raid map.
+ * `normal` is the axis direction the panel faces ('+z'|'-z'|'+x'|'-x'; every mounting
+ * wall on this map is axis-aligned); (x, z) is the panel centre ON the wall plane
+ * (already nudged proud, same ±0.03 m convention the district's paintBands use),
+ * `y` the bottom edge. kind: 'exit' surfaces mark extraction-match.md exits (refId =
+ * exit id, hazard yellow); 'sector' surfaces carry sector-name/wayfinding colour
+ * (refId = the sector they NAME, sectorId = the sector they are physically in).
+ */
+export const EXTRACTION_SIGNAGE = Object.freeze([
+  // Rail-gate exit (exit-rail-gate volume x −40…−32, z −98…−92).
+  { id: 'sg-exit-rail-wall', kind: 'exit', refId: 'exit-rail-gate', sectorId: 'north-yard',
+    normal: '+z', x: -36, z: -98.97, y: 3.2, w: 8, h: 1.2, color: HAZARD },
+  { id: 'sg-exit-rail-post-w', kind: 'exit', refId: 'exit-rail-gate', sectorId: 'north-yard',
+    normal: '+z', x: -40.6, z: -91.77, y: 0.9, w: 0.72, h: 2.4, color: HAZARD },
+  { id: 'sg-exit-rail-post-e', kind: 'exit', refId: 'exit-rail-gate', sectorId: 'north-yard',
+    normal: '+z', x: -31.4, z: -91.77, y: 0.9, w: 0.72, h: 2.4, color: HAZARD },
+  // Ferry-landing exit (exit-ferry-landing volume x 88…98, z 32…40).
+  { id: 'sg-exit-ferry-wall', kind: 'exit', refId: 'exit-ferry-landing', sectorId: 'east-docks',
+    normal: '-x', x: 98.97, z: 36, y: 3.2, w: 6, h: 1.2, color: HAZARD },
+  { id: 'sg-exit-ferry-post-s', kind: 'exit', refId: 'exit-ferry-landing', sectorId: 'east-docks',
+    normal: '-z', x: 87.8, z: 35.17, y: 0.9, w: 0.72, h: 2.4, color: HAZARD },
+  { id: 'sg-exit-ferry-post-n', kind: 'exit', refId: 'exit-ferry-landing', sectorId: 'east-docks',
+    normal: '-z', x: 98.2, z: 35.17, y: 0.9, w: 0.72, h: 2.4, color: HAZARD },
+  // Sector-name callout surfaces on the perimeter walls, one per sector.
+  { id: 'sg-name-square', kind: 'sector', refId: 'square', sectorId: 'square',
+    normal: '+x', x: -42.97, z: -14, y: 4.6, w: 9, h: 1.1, color: SECTOR_SIGN_COLORS.square },
+  { id: 'sg-name-north-yard', kind: 'sector', refId: 'north-yard', sectorId: 'north-yard',
+    normal: '+z', x: 10, z: -98.97, y: 4.6, w: 9, h: 1.1, color: SECTOR_SIGN_COLORS['north-yard'] },
+  { id: 'sg-name-east-docks', kind: 'sector', refId: 'east-docks', sectorId: 'east-docks',
+    normal: '-x', x: 98.97, z: -54, y: 4.6, w: 9, h: 1.1, color: SECTOR_SIGN_COLORS['east-docks'] },
+  // Boundary wayfinding: what lies THROUGH this face, in that sector's colour.
+  { id: 'sg-way-north-yard', kind: 'sector', refId: 'north-yard', sectorId: 'north-yard',
+    normal: '+z', x: -20, z: -63.97, y: 4.9, w: 8, h: 1.0, color: SECTOR_SIGN_COLORS['north-yard'] },
+  { id: 'sg-way-east-docks', kind: 'sector', refId: 'east-docks', sectorId: 'east-docks',
+    normal: '-x', x: 59.97, z: -8, y: 4.9, w: 6, h: 1.0, color: SECTOR_SIGN_COLORS['east-docks'] },
+  { id: 'sg-way-square', kind: 'sector', refId: 'square', sectorId: 'north-yard',
+    normal: '+x', x: -7.97, z: -77, y: 4.9, w: 6, h: 1.0, color: SECTOR_SIGN_COLORS.square },
+  { id: 'sg-way-square-docks', kind: 'sector', refId: 'square', sectorId: 'east-docks',
+    normal: '-z', x: 72, z: -20.03, y: 4.9, w: 6, h: 1.0, color: SECTOR_SIGN_COLORS.square },
+]);
+
+/**
+ * Inert sponsor-slot placeholder surfaces (Build Plan P3-07). Same flush-mounted,
+ * never-colliding contract as the signage above — a placeholder that changed collision
+ * or hid a player would be a map defect, and `scripts/uistream.mjs` asserts it can't.
+ * Neutral grey on purpose: nothing here may read as gameplay language.
+ */
+export const SPONSOR_SLOTS = Object.freeze([
+  { id: 'sp-square-west', sectorId: 'square', normal: '+x', x: -42.97, z: 8, y: 1.6, w: 6, h: 3, color: SPONSOR_GREY },
+  { id: 'sp-yard-north', sectorId: 'north-yard', normal: '+z', x: 26, z: -98.97, y: 1.6, w: 6, h: 3, color: SPONSOR_GREY },
+  { id: 'sp-docks-east', sectorId: 'east-docks', normal: '-x', x: 98.97, z: -34, y: 1.6, w: 6, h: 3, color: SPONSOR_GREY },
+  { id: 'sp-docks-shed', sectorId: 'east-docks', normal: '+z', x: 71.5, z: 4.03, y: 3.4, w: 5, h: 2.4, color: SPONSOR_GREY },
+]);
+
+const NORMAL_YAW = Object.freeze({ '+z': 0, '-z': Math.PI, '+x': Math.PI / 2, '-x': -Math.PI / 2 });
+
+/**
+ * Stamp one declared panel as chopped ≤3 m sign boards (the same "no absurdly thick
+ * instance" rule paintBand applies — the sign prop's depth scales with its width).
+ */
+function panelBoards(B, spec) {
+  B.setSector(spec.sectorId);
+  const yaw = NORMAL_YAW[spec.normal];
+  const alongX = spec.normal === '+z' || spec.normal === '-z';
+  const a = alongX ? spec.x : spec.z;
+  const n = Math.max(1, Math.round(spec.w / 3.0));
+  const w = spec.w / n;
+  for (let i = 0; i < n; i++) {
+    const c = a + (i - (n - 1) / 2) * w;
+    if (alongX) board(B, c, spec.y, spec.z, yaw, w, spec.h, spec.color);
+    else board(B, spec.x, spec.y, c, yaw, w, spec.h, spec.color);
+  }
+}
+
+function buildExtractionSignage(B) {
+  for (const spec of EXTRACTION_SIGNAGE) panelBoards(B, spec);
+  B.setSector(null);
+}
+
+function buildSponsorSlots(B) {
+  for (const spec of SPONSOR_SLOTS) panelBoards(B, spec);
+  B.setSector(null);
+}
+
+// ── P3-07: client sector streaming controller ────────────────────────────────────────
+
+/** Render tiers. FULL = as authored; NEAR = visible but shadow-casting stripped (a
+ *  neighbour sector the viewer has not entered); HIDDEN = not rendered at all. */
+export const STREAM_TIER = Object.freeze({ FULL: 'full', NEAR: 'near', HIDDEN: 'hidden' });
+
+/**
+ * Client-side sector streaming (sector-interest.md §5.1 mirrored for rendering).
+ *
+ * Tier rule, per frame, from the viewer's feet position:
+ *   - every sector in `occupiedSectorsFor(viewer)` (own sector + any neighbour whose
+ *     boundary the viewer is inside the 6 m transition zone of) renders FULL;
+ *   - every other sector in `relevantSetFor(viewer)` (direct neighbours) renders NEAR —
+ *     still fully visible (a client IS shown its neighbour sectors, §5.1; hiding one
+ *     would desync what the player sees from what the server sends), but its meshes stop
+ *     casting shadows, which is pure cost with zero gameplay information;
+ *   - FULL→NEAR is hysteretic: a sector that reached FULL holds FULL for the same
+ *     SECTOR_COOLDOWN_S grace after it leaves the occupied set, as long as it stays
+ *     relevant. Without this, pacing the 6 m transition-zone edge would flip every
+ *     mesh's castShadow in the neighbour sector once per crossing — on the shipped
+ *     three-sector map (complete graph, nothing ever HIDDEN) that whole-sector shadow
+ *     pop is the ONLY artifact this feature can produce, so it gets the same cooldown
+ *     shape the HIDDEN edge already had. NEAR→FULL stays instant (restoring detail
+ *     must never lag);
+ *   - a sector outside the relevant set renders NOT AT ALL, after the same
+ *     SECTOR_COOLDOWN_S grace the server applies to activation (§4.1), so pacing a
+ *     boundary never thrashes visibility.
+ *
+ * On today's three-sector map the graph is complete, so nothing ever reaches HIDDEN —
+ * that is contract-correct (§5.1 shows a client every adjacent sector), and the HIDDEN
+ * path is exercised against P4-01-shaped deeper graphs by `scripts/uistream.mjs`.
+ *
+ * COST, measured (`scripts/uistreamperf.mjs`, real renderer): on the shipped map this
+ * is NOT a net draw-call win. The per-sector bucket split costs ~+20 draw calls over
+ * the pre-P3-07 merged build and NEAR shadow-stripping earns back ~10, so sector gating
+ * runs at a net ~+10 draw calls (bounded by that harness, well inside the manifest
+ * budget). The mechanism's real return — whole sectors HIDDEN — arrives with P4-01's
+ * deeper sector graphs; today's price buys the machinery, not a saving.
+ *
+ * Fail-open by design: no viewer position, or a viewer outside every sector, renders
+ * everything FULL. A rendering optimisation must never be able to blank the world.
+ *
+ * `groups` is a Map<sectorId, groupLike> where groupLike is a THREE.Group (or any
+ * `{ visible, children: [{ castShadow, userData }] }` — the harness drives plain
+ * objects). Memory is untouched by tiering: geometry stays resident, only `visible`
+ * and `castShadow` flip, so the map's memory budget is exactly the built map's.
+ */
+export function createSectorStreaming({ sectors = [], groups = new Map(), cooldownS = SECTOR_COOLDOWN_S } = {}) {
+  const interest = new SectorInterest(sectors);
+  const lastRelevant = new Map();
+  const lastOccupied = new Map();
+  const tiers = new Map();
+  let clock = 0;
+
+  function apply(id, tier) {
+    tiers.set(id, tier);
+    const group = groups.get(id);
+    if (!group) return;
+    group.visible = tier !== STREAM_TIER.HIDDEN;
+    for (const mesh of group.children || []) {
+      if (!mesh || typeof mesh.castShadow !== 'boolean') continue;
+      if (mesh.userData && mesh.userData.p307Cast === undefined) mesh.userData.p307Cast = mesh.castShadow;
+      mesh.castShadow = tier === STREAM_TIER.FULL
+        ? (mesh.userData?.p307Cast ?? mesh.castShadow)
+        : false;
+    }
+  }
+
+  return {
+    interest,
+    tiers,
+    tierOf(id) { return tiers.get(id) ?? STREAM_TIER.FULL; },
+
+    /**
+     * @param {number} dt seconds since last frame
+     * @param {{x,y,z}|null} viewerPos the LOCAL viewer's feet (player position; a dead
+     *   player's last position stands in for §5.1's last-alive-sector rule)
+     */
+    update(dt, viewerPos) {
+      clock += Math.max(0, dt || 0);
+      if (!interest.hasSectors()) return;
+      const own = viewerPos ? interest.sectorOf(viewerPos) : null;
+      if (!own) {
+        for (const s of interest.sectors) apply(s.id, STREAM_TIER.FULL);
+        return;
+      }
+      const occupied = interest.occupiedSectorsFor(viewerPos);
+      const relevant = interest.relevantSetFor(viewerPos);
+      for (const s of interest.sectors) {
+        const id = s.id;
+        if (occupied.has(id)) {
+          lastRelevant.set(id, clock);
+          lastOccupied.set(id, clock);
+          apply(id, STREAM_TIER.FULL);
+        } else if (relevant.has(id)) {
+          lastRelevant.set(id, clock);
+          // FULL→NEAR hysteresis: hold FULL through the cooldown after the sector was
+          // last occupied, so pacing the transition-zone edge never toggles castShadow
+          // per crossing (whole-sector shadow pop). A never-occupied neighbour goes
+          // straight to NEAR — this is a decay grace, not a warm-up delay.
+          const occ = lastOccupied.get(id);
+          apply(id, occ !== undefined && clock - occ < cooldownS
+            ? STREAM_TIER.FULL : STREAM_TIER.NEAR);
+        } else {
+          const last = lastRelevant.get(id);
+          // Grace period: recently-relevant sectors decay through NEAR, never snap off.
+          if (last !== undefined && clock - last < cooldownS) apply(id, STREAM_TIER.NEAR);
+          else apply(id, STREAM_TIER.HIDDEN);
+        }
+      }
+    },
+
+    /** Render-cost accounting for harnesses: mesh/draw-shaped counts per tier. */
+    stats() {
+      let visibleMeshes = 0;
+      let castingMeshes = 0;
+      let hiddenMeshes = 0;
+      for (const [id, group] of groups) {
+        const n = (group.children || []).length;
+        if (tiers.get(id) === STREAM_TIER.HIDDEN) { hiddenMeshes += n; continue; }
+        visibleMeshes += n;
+        for (const mesh of group.children || []) if (mesh?.castShadow) castingMeshes++;
+      }
+      return { visibleMeshes, castingMeshes, hiddenMeshes, tiers: Object.fromEntries(tiers) };
+    },
+  };
 }
 
 /**
