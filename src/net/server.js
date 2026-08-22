@@ -1390,7 +1390,12 @@ export class GameServer {
   _broadcastSnapshot() {
     const g = this.game;
     const ents = g.entities;
+    // sector-interest.md §5.2 — the coarse filter applied BEFORE the existing per-recipient
+    // distance/authorisation checks below. Inert (`sectors === null`) on every map today,
+    // since P3-06 has not landed `MAP_MANIFEST.sectors` yet — see `SectorInterest`'s header.
+    const sectors = g.sectorInterest?.hasSectors() ? g.sectorInterest : null;
     const wire = [];
+    const wireSectorId = sectors ? [] : null;
     for (let i = 0; i < ents.length; i++) {
       const e = ents[i];
       const lo = g.weapons?.getLoadout?.(e);
@@ -1409,6 +1414,7 @@ export class GameServer {
         w.interact = packInteract(obj.kind, Math.round((obj.progress ?? 0) * INTERACT_PROGRESS_MAX));
       }
       wire.push(w);
+      if (sectors) wireSectorId.push(sectors.sectorOf(e.position));
     }
 
     // The unfiltered bomb, read once per snapshot rather than once per recipient.
@@ -1422,8 +1428,29 @@ export class GameServer {
       const mine = session.entity?.id;
       const at = session.entity?.position;
       const role = bomb ? roleOf(session.entity, bomb.attackingTeam) : 'none';
+      // sector-interest.md §5.1 — a dead/spectating client's relevant set is the sector of
+      // whoever it is spectating, never map-wide. This server has no spectate assignment
+      // defined yet (§4.1's own caveat: neither `extraction-match.md` nor `net-facade.md`
+      // pins post-death connection state down), so the safe default per that caveat is a
+      // client with no entity gets no sector-relevant entities/events at all, same as a
+      // fully wiped squad — never map-wide vision by omission.
+      const relevantSectors = sectors ? (at ? sectors.relevantSetFor(at) : new Set()) : null;
+      const entities = relevantSectors
+        ? wire.filter((w, idx) => {
+          const sid = wireSectorId[idx];
+          return sid == null || relevantSectors.has(sid);
+        })
+        : wire;
       const events = this._pendingEvents.filter((ev) => {
         if (ev.to != null) return ev.to === mine;        // private: routing decides it
+        // §5.2 — sector relevance is checked before the distance cull below, specifically
+        // for the case a flat distance cull cannot catch: two sectors close in raw distance
+        // but not neighbours (across a wall/floor/chasm). Non-spatial events carry no
+        // origin position and are not gated here.
+        if (relevantSectors && EV_SPATIAL.has(ev.kind)) {
+          const evSector = sectors.sectorOf({ x: ev.x, y: ev.y, z: ev.z });
+          if (evSector != null && !relevantSectors.has(evSector)) return false;
+        }
         // §8.8, on the EVENT path. `bombDropped` is in `EV_VEC3` and `EV_SPATIAL`, so it
         // carries the true coordinates in the snapshot's event block — and the only filter
         // there was the 90 m distance cull, on a map 88 m across. Measured: a blind defender
@@ -1457,7 +1484,7 @@ export class GameServer {
         tick: g.tick,
         baseTick: session.baseTick,
         lastCommandSeq: session.lastCommandSeq,
-        entities: wire,
+        entities,
         events,
       };
       const buf = encodeSnapshot(snap, session.baseline);

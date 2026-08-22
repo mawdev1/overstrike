@@ -50,8 +50,15 @@
  * v2 also lands the Bomb wire (`bomb-rules.md` §11, spelled out in `wire-protocol.md` §8): the
  * appended `interact` entity field, eleven appended event kinds, `MSG_MATCHSTATE` with its
  * per-recipient bomb-position filter, and `MSG_OUTCOME`.
+ *
+ * Version 4 appends `'off-sector'` to `REFUSAL_REASONS` (index 5), for `sector-interest.md`
+ * §6's off-sector combat/loot refusal gate. `REFUSAL_REASONS` is decoded positionally
+ * (`reasonIndex`/`EV_REFUSED`), so appending an entry is a wire-shape change even though the
+ * array is otherwise additive — an older client that has not learned index 5 would decode a
+ * refusal it cannot name, which is exactly what the version negotiation in v2 exists to catch
+ * before any state is decoded.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 // ── message types ─────────────────────────────────────────────────────────────────────
 export const MSG_COMMANDS = 1;
@@ -683,9 +690,17 @@ export const EV_SPATIAL = new Set(['fire', 'explosion', 'blood', 'bombDropped', 
  * all — a different fact, which is why `interactRefused` is a separate kind.
  */
 export const CANCEL_REASONS = ['released', 'left-volume', 'died', 'round-ended'];
-/** `interactRefused` reasons, carried in `amount` (§8.7). */
+/**
+ * `interactRefused` reasons, carried in `amount` (§8.7).
+ *
+ * Positional / append-only: `reasonIndex` encodes a reason as its array index, not its
+ * string, so `off-sector` (`sector-interest.md` §6) is appended after `'already-planted'`
+ * rather than inserted by category — inserting anywhere but the end would silently renumber
+ * every refusal reason already encoded on the wire and in stored evidence.
+ */
 export const REFUSAL_REASONS = [
   'not-eligible', 'wrong-phase', 'outside-volume', 'not-carrier', 'already-planted',
+  'off-sector',
 ];
 const EV_CANCEL = new Set([EV_CODE.get('plantCancel'), EV_CODE.get('defuseCancel')]);
 const EV_REFUSED = EV_CODE.get('interactRefused');

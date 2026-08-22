@@ -489,6 +489,27 @@ export class BotManager {
 
   // ------------------------------------------------------------------ spawns
 
+  /**
+   * sector-interest.md §4.3 — population cap is per declared sector, enforced against
+   * arrivals only ("refused outright... no queueing, no eviction"). Counts live bots
+   * currently resolved into the sector the candidate spawn point would place this bot in;
+   * `Match.spawner` picks the actual point, so this is necessarily an estimate keyed to
+   * `_chooseSpawnPoint`'s own candidate, not a hard pre-check against every possible point.
+   */
+  _sectorAdmits(sectors, bot) {
+    const sp = this._chooseSpawnPoint(bot);
+    const pos = sp?.position;
+    if (!pos) return true; // nothing to check against — do not block placement on this alone
+    const sectorId = sectors.sectorOf(pos);
+    if (!sectorId) return true;
+    let count = 0;
+    for (const b of this.bots) {
+      if (b === bot || !b.alive) continue;
+      if (sectors.sectorOf(b.position) === sectorId) count++;
+    }
+    return sectors.canAdmit(sectorId, count);
+  }
+
   _spawnBot(bot) {
     // Match owns respawn timing and runs the fully-scored spawner (LOS to enemies,
     // recent-use decay, died-here penalties). If it already put this bot back in the
@@ -610,6 +631,7 @@ export class BotManager {
     //
     // Same ceiling Match applies: a scored spawn is the most expensive thing either
     // class does, so the safety net must never turn into a burst of its own.
+    const sectors = game.sectorInterest?.hasSectors() ? game.sectorInterest : null;
     let fallbackSpawns = 0;
     for (let i = 0; i < bots.length; i++) {
       const b = bots[i];
@@ -620,13 +642,24 @@ export class BotManager {
         // strand a legal round spawn and prevents eliminated bots reappearing mid-round.
         if (game.match?.mode?.allowRespawn?.(game.match, b) === false) continue;
         if (fallbackSpawns >= MAX_FALLBACK_SPAWNS_PER_STEP) continue;
+        // sector-interest.md §4.3 overflow rule — refused outright, no queueing, no
+        // eviction. A bot the sector cannot admit stays dead this tick and is retried
+        // (via the same respawn-delay/fallback path) once population frees up.
+        if (sectors && !this._sectorAdmits(sectors, b)) continue;
         // Never placed at all: Match owns the initial placement, so only step in
         // as a safety net if it has not done so a second into the match.
         if (!b._everSpawned) { if (now > 1.5) { this._spawnBot(b); fallbackSpawns++; } continue; }
         if (now - b.deathTime >= RESPAWN_DELAY) { this._spawnBot(b); fallbackSpawns++; }
         continue;
       }
-      const stride = b.thinkStride || 8;
+      // sector-interest.md §4.1/§4.3 — a `dormant` sector's AI gets zero think ticks; a
+      // `warming` sector's stride is doubled relative to its configured base. A bot whose
+      // sector cannot be resolved (map has no sectors, or the bot is off-map transiently)
+      // falls back to its own configured stride, i.e. unthrottled — current behaviour.
+      const botSectorId = sectors ? sectors.sectorOf(b.position) : null;
+      if (sectors && botSectorId && !sectors.thinkEnabled(botSectorId)) continue;
+      const baseStride = b.thinkStride || 8;
+      const stride = sectors && botSectorId ? sectors.thinkStrideFor(botSectorId, baseStride) : baseStride;
       if ((tick + b.thinkPhase) % stride === 0) {
         const last = b._lastThinkTime ?? now;
         b._lastThinkTime = now;
@@ -640,16 +673,26 @@ export class BotManager {
     for (let i = 0; i < bots.length; i++) this._applyBombObjective(bots[i]);
 
     // 2) global A* budget, round-robin so nobody starves
+    //
+    // sector-interest.md §4.3 — "shared across all active+warming sectors, served
+    // round-robin ... a sector with more relevant AI does not starve a smaller one". A
+    // warming sector's share is halved: its bots are skipped on odd passes through this
+    // block rather than removed from the round-robin entirely, so they still eventually
+    // get served (no starvation) at roughly half the rate of an active-sector bot.
     if (tick % PATH_INTERVAL === 0) {
       let served = 0;
       for (let n = 0; n < bots.length && served < PATH_BUDGET; n++) {
         const b = bots[this._pathCursor % bots.length];
         this._pathCursor++;
-        if (b.alive && b.pathPending) {
-          b.servicePath();
-          served++;
-          this._pathCount++;
+        if (!b.alive || !b.pathPending) continue;
+        if (sectors) {
+          const bSector = sectors.sectorOf(b.position);
+          const share = bSector ? sectors.pathShareFor(bSector) : 1;
+          if (share < 1 && (this._pathCursor & 1) === 0) continue;
         }
+        b.servicePath();
+        served++;
+        this._pathCount++;
       }
     }
 

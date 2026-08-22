@@ -24,6 +24,7 @@ import { Match } from '../game/match.js';
 import { normalizeKillLimit, normalizeModeId } from '../game/modes.js';
 import { WEAPON_LIST } from '../weapons/weaponDefs.js';
 import { BotModel } from '../ai/botModel.js';
+import { SectorInterest } from '../game/sectorInterest.js';
 
 const MAX_SUBSTEPS = 6;
 
@@ -197,6 +198,9 @@ export class Game {
       this.world = new World(this);
       await this.world.init();
       this.engine.fitShadowCamera(this.world.bounds);
+      // sector-interest.md §3 — inert (`hasSectors() === false`) until a map declares
+      // `MAP_MANIFEST.sectors` (P3-06); every method degrades to "everything relevant".
+      this.sectorInterest = new SectorInterest(this.world.manifest?.sectors);
     });
     await step('baking navigation', async () => {
       this.nav = new NavGrid(this);
@@ -288,6 +292,8 @@ export class Game {
     // that cannot choose its map is a harness whose result is about the rotation, not the code
     // it claims to test.
     await this.world.init({ mapId });
+    // sector-interest.md §3 — inert until a map declares `MAP_MANIFEST.sectors` (P3-06).
+    this.sectorInterest = new SectorInterest(this.world.manifest?.sectors);
 
     this.nav = new NavGrid(this);
     await this.nav.init();
@@ -613,6 +619,22 @@ export class Game {
     for (let i = 0; i < this._extraEntities.length; i++) {
       // Keyed per entity, so one client whose step throws cannot silence everybody else's.
       this._safe(`entity${i}`, 'fixed', this._extraEntities[i], 'fixedUpdate', dt);
+    }
+    // sector-interest.md §4.1 — advance activation state from relevant (alive human)
+    // players BEFORE bots think this tick, so `BotManager` gates on this tick's state, not
+    // last tick's. A no-op when the map has no sectors (see SectorInterest's own header).
+    if (this.sectorInterest?.hasSectors()) {
+      const occupied = this._sectorOccupiedScratch || (this._sectorOccupiedScratch = new Set());
+      occupied.clear();
+      if (this.player?.alive) {
+        for (const id of this.sectorInterest.occupiedSectorsFor(this.player.position)) occupied.add(id);
+      }
+      for (let i = 0; i < this._extraEntities.length; i++) {
+        const e = this._extraEntities[i];
+        if (e?.isPlayer === false || !e?.alive) continue;
+        for (const id of this.sectorInterest.occupiedSectorsFor(e.position)) occupied.add(id);
+      }
+      this.sectorInterest.tick(this.time, occupied);
     }
     this._safe('bots', 'fixed', this.bots, 'fixedUpdate', dt);
     this._safe('weapons', 'fixed', this.weapons, 'fixedUpdate', dt);

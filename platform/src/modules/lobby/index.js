@@ -603,7 +603,12 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       matchId, serverUrl, sessionTicket, expiresAt: iso(expiresAt), reconnectGraceMs: GRACE_MS,
       mapId: room.mapId, mapVersion: room.mapVersion, mode: room.mode,
       rulesetVersion: room.rulesetVersion, region: room.region, serverBuild: room.build,
-      protocolVersion: 3,
+      // src/net/protocol.js's PROTOCOL_VERSION. `platform` is a separate package (no direct
+      // import of match-server code — see its own package.json), so this is a literal kept
+      // in lockstep by hand, same as `evidenceDigest.js`'s allowlist below. Bumped to 4 for
+      // sector-interest.md §6's appended REFUSAL_REASONS entry; a stale value here would
+      // hand a client a MatchHandoff that the real server rejects as a version mismatch.
+      protocolVersion: 4,
       series: room.mode === 'bomb'
         ? { roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, overtime: false }
         : { roundsToWin: 1, maxRounds: 1, sideSwitchAfter: 1, overtime: false },
@@ -806,7 +811,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     const evidence = {
       version: 1,
       matchId: resultCore.matchId, rulesetVersion: resultCore.rulesetVersion,
-      serverBuild: resultCore.serverBuild, protocolVersion: 3,
+      serverBuild: resultCore.serverBuild, protocolVersion: 4, // see the handoff literal above
       authority: {
         matchId: resultCore.matchId, rulesetVersion: resultCore.rulesetVersion,
         statDefinitionVersion: resultCore.statDefinitionVersion,

@@ -32,7 +32,10 @@ export function authoritativeEvidenceProblems(evidence) {
     'droppedRows', 'authority', 'terminalSummary', 'roster', 'participants', 'roundSummary',
     'combatSummary', 'connectionSummary', 'result'];
   if (!exact(evidence, top)) fail('evidence', 'unknown-or-missing-key');
-  if (evidence?.version !== 1 || ![2, 3].includes(evidence?.protocolVersion)) fail('evidence.version', 'unsupported');
+  // wire-protocol.md's PROTOCOL_VERSION — bumped to 4 by sector-interest.md §6's appended
+  // 'off-sector' REFUSAL_REASONS entry. Extend, never replace: evidence recorded under an
+  // older still-supported wire version must keep verifying exactly as it always has.
+  if (evidence?.version !== 1 || ![2, 3, 4].includes(evidence?.protocolVersion)) fail('evidence.version', 'unsupported');
   if (!ulid(evidence?.matchId)) fail('evidence.matchId', 'ulid');
   if (Buffer.byteLength(stableEvidenceJson(evidence ?? null)) > 2 * 1024 * 1024) fail('evidence', 'too-large');
   if (forbiddenKey(evidence)) fail('evidence', 'forbidden-sensitive-key');

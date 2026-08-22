@@ -654,7 +654,7 @@ export function matchHandoff(matchId, clock) {
     rulesetVersion: 'bomb-1.0.0',
     region: 'yyz',
     serverBuild: SERVER_BUILD,
-    protocolVersion: 3,
+    protocolVersion: 4, // src/net/protocol.js PROTOCOL_VERSION — see lobby/index.js's own comment
     series: { roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, overtime: false },
     spectatorPolicyVersion: 1,
     sites: [

@@ -362,6 +362,22 @@ export function buildManifest(entry, world) {
     provenance.callouts = 'missing';
   }
 
+  // -- sectors (sector-interest.md §3.1 — additive amendment to MAP_MANIFEST, owed by
+  // P3-06). Deliberately NOT added to `provenance` when absent: unlike objectives/callouts,
+  // §3's required-export list has not itself been amended to require `sectors` yet — P3-06
+  // is the landing of that amendment (map-data.md's own MAP_VERSION-bump rule), so an
+  // absent `sectors` array today is schedule, not a partial manifest, and must not turn
+  // `manifestGaps()` red on maps that predate P3-06.
+  let sectors = [];
+  if (src !== null && Array.isArray(src.sectors)) {
+    sectors = readVolumes(src.sectors, (v) => ({
+      neighbours: Array.isArray(v.neighbours) ? v.neighbours.map(String) : [],
+      populationCap: Number.isFinite(v.populationCap) ? v.populationCap : Infinity,
+      baseThinkStride: Number.isFinite(v.baseThinkStride) ? v.baseThinkStride : 8,
+    }));
+    provenance.sectors = 'declared';
+  }
+
   // -- nav hints (§3.5)
   let navHints;
   if (src !== null && present(src, 'navHints')) {
@@ -404,6 +420,7 @@ export function buildManifest(entry, world) {
     spawns,
     objectives,
     callouts,
+    sectors,
     navHints,
     budgets,
     boundary,

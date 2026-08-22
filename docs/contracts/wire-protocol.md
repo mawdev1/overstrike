@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.10.0 |
+| **Version** | 1.11.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -553,6 +553,15 @@ bounds. Off-by-one at a trust boundary is the one place it is never cosmetic.
 
 Decoder tests must include both boundary vectors: the **last valid** appended kind
 (`interactRefused`, currently 20) and the **first invalid** (`EV_KINDS.length`, currently 21).
+
+## 8.1 Protocol v4 — `off-sector` refusal reason
+
+`sector-interest.md` §6 adds an `off-sector` refusal for interactions the server's own sector
+membership record disqualifies. `REFUSAL_REASONS` is decoded positionally (`reasonIndex`), so
+appending an entry — even though the array itself is additive — changes what a `reasonIndex`
+byte decodes to for a peer that has not learned the new length, the same G3 precedent as
+`bomb-rules.md`'s appended event kinds. `off-sector` lands at index 5, after `already-planted`,
+never inserted by category. `PROTOCOL_VERSION` → 4.
 
 ## 9. Change rules
 

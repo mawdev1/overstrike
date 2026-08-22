@@ -813,10 +813,12 @@ function wireEntity(id, over = {}) {
   return Object.assign(e, over);
 }
 
-console.log('\nprotocol v3 — version and the append-only rule');
+console.log('\nprotocol v4 — version and the append-only rule');
 
 {
-  eq('PROTOCOL_VERSION', PROTOCOL_VERSION, 3);
+  // v4 (sector-interest.md §6): REFUSAL_REASONS gains 'off-sector' at index 5, covered by
+  // scripts/sectortest.mjs rather than duplicated here.
+  eq('PROTOCOL_VERSION', PROTOCOL_VERSION, 4);
 
   // §7 G3 / §9.2: the interact field is APPENDED. Its index IS its bit in the field mask, so
   // an insert anywhere before it silently reassigns the meaning of every later field on every
