@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 2.1.0 |
+| **Version** | 2.2.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -23,7 +23,15 @@
 - Every request carries `X-Client-Build`. Below the supported floor → `UNSUPPORTED_CLIENT`.
 - Errors follow `errors.md` without exception.
 - Timestamps are ISO-8601 UTC with milliseconds. IDs are ULIDs as strings.
-- **No endpoint returns a partial success.** A 2xx means the whole operation happened.
+- **No endpoint returns a partial success.** A 2xx means the whole operation happened. An
+  endpoint's owning contract may declare, explicitly and in its own text, an atomic unit smaller
+  than the whole request — for example one participant of a multi-participant submission. When it
+  does, a 2xx means every declared unit reached its own defined terminal state, not that every
+  unit's effects were identical; the endpoint's contract states the per-unit terminal states this
+  can mean. This is an explicit opt-in an endpoint's contract must state, not a default any
+  endpoint gets by omission — an endpoint that says nothing about a sub-request atomic unit is
+  still held to "the whole operation happened." (`settlement.md` §5.3, `POST
+  /v1/runs/:runId/result`, is the first and so-far only endpoint that declares one.)
 
 ## 2. Authentication
 

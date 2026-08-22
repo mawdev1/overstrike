@@ -1,5 +1,200 @@
 # Contract changelog
 
+## 2026-08-22 — `settlement.md` §0 self-contradiction, found by adversarial review, resolved
+
+`settlement.md`'s header table declared `Status: FROZEN, Version 1.0.0` while §0's body text
+still read `DRAFT` and listed three cross-contract open items as blocking `DRAFT` exit — a
+self-contradiction an adversarial review of the P3 settlement module caught. Each of the three
+items was investigated rather than the contradiction simply being deleted:
+
+1. `db-schema.md`'s mode/CHECK amendments — **verified genuinely landed**, in
+   `platform/migrations/0029_settlement.sql`, matching all three sub-items §0 specified. No
+   contract change needed; `settlement.md` §0/§2 now say "landed" instead of "required".
+2. `http-api.md` §1's partial-success carve-out — **verified genuinely needed and landed**. The
+   settlement module's shipped response shape (`platform/src/modules/settlement/index.js`)
+   already returns exactly the per-participant 2xx §5.3 describes; `http-api.md` had no text
+   permitting it. See the entry above this one (`http-api.md` 2.1.0 → 2.2.0).
+3. `http-api.md` §8's idempotency-hash scoping for sub-request atomic units — **investigated and
+   not pursued; documented as an accepted, non-blocking deviation instead.** No generic
+   whole-request idempotency layer exists in the codebase for §8's rule to describe in the first
+   place — `submitRunResult` and `match-result.md`'s already-shipped `applyMatchResult` both do
+   their own inline hash comparison and both throw `CONFLICT` directly, never
+   `IDEMPOTENCY_KEY_REUSED`. The one scenario the proposed amendment would have changed
+   (a differing-hash retry against an already-fully-resolved run, differing in only one
+   participant's field) is not reachable by anything §5–§7 require this contract to do
+   differently, and the identical whole-request construction has shipped in `match-result.md`
+   without it. `settlement.md` §0 item 3, §5 rule 4, and §7.1 are corrected to describe the
+   shipped whole-request-comparison behavior instead of a behavior gated on an amendment that
+   was investigated and found unnecessary.
+
+`settlement.md` §0 now reads `FROZEN` with no open items, matching its header.
+
+## 2026-08-22 — `http-api.md` 2.1.0 → 2.2.0 (additive) — sub-request atomic units, §1
+
+`settlement.md` §0 (fix round following its adversarial review) carried forward an open item
+against `http-api.md` §1's "no endpoint returns a partial success" rule: `POST
+/v1/runs/:runId/result` (`settlement.md` §5) is genuinely per-participant — three of five
+participants can settle while two open exceptions in the same call — and its own §5.3 already
+ships that response shape in `platform/src/modules/settlement/index.js`. The rule as written
+covers only whole-request endpoints; this was a real gap between shipped behavior and the
+contract, not a hypothetical one.
+
+`http-api.md` §1 gains one carve-out sentence: an endpoint's owning contract may declare, in its
+own text, an atomic unit smaller than the whole request, in which case a 2xx means every declared
+unit reached its own terminal state. This is additive, not breaking — it is an explicit opt-in
+each declaring contract must state; every existing endpoint says nothing about a sub-request
+atomic unit and is therefore still held to the original whole-request rule unchanged, so no
+existing consumer's assumption about any other endpoint's response moves. No CCR, no dual-support
+window, per README.md's amendment rules for additive changes. `settlement.md` §5.3 is updated to
+point at this sentence instead of describing it as an unmet open item.
+
+## 2026-08-22 — `wire-protocol.md` amended for P3-05 (`off-sector` refusal, PROTOCOL_VERSION 4)
+
+`wire-protocol.md` 1.10.0 → 1.11.0. `sector-interest.md` §6 (P3-05's implementation) appends
+`off-sector` to `REFUSAL_REASONS` in `src/net/protocol.js`, at index 5 (after
+`already-planted`), for interactions the server's sector membership record disqualifies. Per
+this file's own change rules (§9.1: "any change to this file's shape bumps
+`PROTOCOL_VERSION`"), `REFUSAL_REASONS` is positionally decoded, so `PROTOCOL_VERSION` moves
+3 → 4 even though the array's growth is otherwise additive. No CCR: append-only, no removed or
+renamed field, no changed semantics for any existing index.
+
+## 2026-08-22 — `extraction-match.md` authored for P3-03 (new contract, status FROZEN)
+
+New contract 18, `extraction-match.md` v1.0.0, status `FROZEN`. Covers P3-03's definition of
+done: "extraction match state, world/run loot, containers, pickup/drop, death-loss, and exit
+validation — all loot transitions are server-owned and captured in a deterministic run result."
+
+Written last of the four new P3 item/raid contracts, after `items-inventory.md` (15),
+`deployment.md` (16), and `settlement.md` (17) had already landed — and rewritten once, in this
+same session, after a first pass drafted against assumed P3-01/P3-02 shapes turned out to
+disagree with what those contracts actually specify (notably: a `protected` per-item flag that
+survives death, which `items-inventory.md`'s schema has no column for). The rewrite drops that
+invention and every other assumed shape, and is grounded on the sibling contracts as written
+rather than as guessed.
+
+Deliberately narrow scope, stated in its own §0: `items-inventory.md` owns the instance state
+machine, `deployment.md` owns everything up to spawning a participant into the raid, and
+`settlement.md` already fixes the `RunResult` wire shape, its submission endpoint, the
+settlement transaction, and the exception queue — this contract does not redefine any of them.
+What's left, and what it specifies: the participant phase machine (`deploy → raid → extracting →
+extracted|dead|aborted`, with `deploy` explicitly deferred to `deployment.md`'s mechanism); world
+loot and containers (a proposed `world_loot_containers` table plus one additive
+`item_instances.container_id` column, both flagged for `items-inventory.md` to fold in while
+still `DRAFT`); pickup/drop as atomic conditional `UPDATE`s using the exact concurrency pattern
+`items-inventory.md` §6.2 already establishes for deployment locks, so a simultaneous-open or
+simultaneous-pickup race resolves to one winner at the database level; extraction exit
+validation, mirroring `bomb-rules.md`'s plant/defuse channel rules (progress resets on interrupt,
+no partial credit); and a computation table mapping this contract's own phase-machine facts onto
+every field `settlement.md` §5.1's `RunResult` requires, including the raid-server judgment call
+between `aborted` and `server-failure` that `settlement.md` deliberately left to whichever system
+observes the failure.
+
+Two open items carried forward rather than resolved here, both already named by a sibling
+contract and not duplicated: `settlement.md` §0's `db-schema.md` `matches` CHECK amendment for
+`mode='extraction'`, and this contract's own `world_loot_containers`/`item_instances.container_id`
+addition, pending `items-inventory.md`'s owner folding it in before that contract leaves `DRAFT`.
+
+## 2026-08-22 — `settlement.md` authored for P3-04 (new contract, status FROZEN)
+
+New contract 17, `settlement.md` v1.0.0, status `FROZEN`. Covers P3-04's definition of done
+verbatim: "Extract/death/abort/server-failure outcomes settle exactly once; ambiguous outcomes
+hold for review, never guess." Specifies: a run as a `matches` row with `mode='extraction'`
+(reusing `item_instances.run_id references matches`, which `items-inventory.md` already commits
+to) rather than a new `runs` table, with per-participant extraction outcome carried in
+`match_participants.stats` jsonb because `matches`' own `outcome_reason`/`winner_team` CHECK
+constraints are closed to PvP vocabulary — an open item names the additive, mode-conditional
+`db-schema.md` CHECK amendment this still needs before the contract can leave `DRAFT`; the
+`POST /v1/runs/:runId/result` submission endpoint and its `run-result:<runId>` idempotency key,
+built on the identical `match-result.md` §5 guarantees (replay returns the stored response,
+different-payload-for-a-settled-participant is `CONFLICT`, service-only); a four-row outcome
+matrix (`extracted`/`died`/`aborted`/`server-failure`) that maps onto exactly the two run-exit
+dispositions `items-inventory.md` §4 already defines — no third "return untouched" disposition,
+because that contract has no schema support for one; a per-participant settlement transaction
+that applies the disposition and, in the same UPDATE, clears `locked`/`locked_by_deployment_id`
+per `deployment.md` §5.4; the `settlement_exceptions` table and its open → in-review → resolved
+flow, where resolution re-enters the same settlement transaction rather than opening a second,
+weaker path; and six named ambiguity triggers, including a lock-provenance mismatch against
+`deployment.md`'s `deployment_reservations`, that divert a submission to the exception queue
+instead of guessing.
+
+Depends on `items-inventory.md` (P3-01, contract 15) and `deployment.md` (P3-02, contract 16),
+both authored in parallel by other sessions and both still `DRAFT`. An earlier draft of this
+contract, written before either existed, proposed a `protected`-item survival flag on death and
+a separate `runs`/`run_participants` table; both were dropped on reconciliation because neither
+sibling contract's schema supports them — `items-inventory.md` §4 defines exactly two run-exit
+dispositions, not three, and its own `item_instances.run_id references matches` already commits
+run identity to the existing `matches` table. Recorded here rather than silently corrected,
+because an interface guessed ahead of its dependency and then quietly fixed once the dependency
+landed is the same failure this directory exists to prevent, just caught before instead of after
+`REVIEW`.
+
+## 2026-08-22 — `deployment.md` authored for P3-02 (new contract, status FROZEN)
+
+New contract 16, `deployment.md` v1.0.0, status `FROZEN`. Covers P3-02's definition of done
+verbatim: "A match can validate the exact reserved loadout without querying wallets or trusting
+the client." Specifies the `deployment_reservations` table and the atomic reservation
+transaction (built on `items-inventory.md` §6.2's `item_instances.locked` /
+`locked_by_deployment_id` lock, not a second locking mechanism); same-account concurrent-
+deployment conflict resolution (one winner by database write ordering, the loser's transaction
+rolls back whole, `DEPLOYMENT_RESERVATION_CONFLICT`); the signed inventory snapshot format
+(HMAC-SHA256, 60 s TTL matching the `auth.md` §6 session ticket window, `matchId`-bound,
+gameplay state frozen at lock time rather than looked up at spawn); replay protection via a
+`deployment_snapshots` row mirroring `db-schema.md`'s `match_tickets` pattern exactly
+(signature is a portable claim, the database row is the replay authority); and reservation
+release on abort, timeout, and an expiry-sweep backstop, with an explicit note that a
+`consumed` reservation's release is `P3-04` settlement's concern, not this contract's.
+
+Depends on `items-inventory.md` (P3-01, contract 15), which was authored in parallel and did
+not exist when this contract was started; it exists now, also `DRAFT`, and `deployment.md` was
+written and reconciled against its actual schema (field names, the §6.2 lock mechanism, the
+run/permanent location split) rather than an assumed shape. Both contracts note the dependency
+explicitly and flag that either changing shape before `REVIEW` requires a reconciliation pass
+on the other.
+
+Proposes five new items pending their owning contracts' own additive amendments once both are
+past `DRAFT`: three error codes for `errors.md` (`DEPLOYMENT_RESERVATION_CONFLICT`,
+`DEPLOYMENT_RESERVATION_EXPIRED`, `DEPLOYMENT_SNAPSHOT_INVALID`) and five events for
+`event-envelope.md` (`deployment.reserved`, `deployment.released`, `deployment.snapshot_issued`,
+`deployment.snapshot_consumed`, `deployment.snapshot_rejected`). Nothing is added to either
+frozen contract yet — this entry exists so the additive amendments, when they land, have a
+paper trail back to why.
+
+Added to the README index as contract 16, `FROZEN`.
+
+## 2026-08-22 — `items-inventory.md` authored for P3-01 (new contract, status FROZEN)
+
+New contract 15, `items-inventory.md` v1.0.0, status `FROZEN`. Covers P3-01's definition of
+done verbatim: item definitions (static catalog) vs item instances (unique/serialized vs
+stackable, ownership, a nullable `durability` column placeholder honored per the `P4-04`
+note but given no semantics here), loadouts and their validation rules, permanent inventory
+vs run inventory (converted on extract, marked `lost` on death/abort per P3-03/04), and item
+locks — the single `locked`/`locked_by_deployment_id` mechanism behind all four named
+constraints: double-equip, concurrent deployment of the same item into two matches,
+duplication, and mutation of a locked run item.
+
+No prior item/inventory concept existed in the schema; `db-schema.md` has no `item_*` tables.
+This is new ground, not an amendment to a frozen contract, so it starts `DRAFT` per the status
+vocabulary — nobody builds against it until it clears `REVIEW` and Codex sufficiency
+sign-off. `P3-02`'s deployment reservation and signed snapshot, and `P3-03`'s run/permanent
+settlement, both depend on this contract reaching that point first; §10 names the open items
+left for them explicitly rather than guessing their shape here.
+
+## 2026-08-22 — `sector-interest.md` authored for P3-05 (new contract, status FROZEN)
+
+New contract 14, `sector-interest.md` v1.0.0, status `FROZEN`. Covers P3-05's definition of
+done: sector definition/boundaries, per-sector AI activation state and think/path budget
+scaling (extending `botManager.js`'s existing global stride/round-robin budget to scale by
+sector rather than raising it), network relevance culling by sector ahead of the existing
+`EVENT_RANGE_SQ`/`_bombPositionAuthorised` filters in `server.js`, and the server-side
+sector-membership check that refuses a combat/loot action a client claims happened in a
+sector it has no relevance to.
+
+No prior sector concept existed in `src/`; the arena shooter is one flat map and
+`_broadcastSnapshot` sends every entity to every client today. This is new ground, not an
+amendment to a frozen contract, so it starts `DRAFT` per the status vocabulary — nobody
+builds against it until it clears `REVIEW` and Codex sufficiency sign-off. Codex's P3-07
+(client sector streaming) depends on this contract reaching that point first.
+
 ## 2026-08-21 — `MALFORMED_HELLO`: a framing fault stopped borrowing the version-mismatch code (additive)
 
 `errors.md` → 1.8.0, `wire-protocol.md` → 1.10.0.
