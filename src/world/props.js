@@ -573,6 +573,23 @@ export class Builder {
       else this.box(x0, y0 - 0.2, z0 + t0, x1, top, z0 + t0 + tread, matName, surface);
     }
     // Stringers: a solid skirt each side so you never see the step ends floating.
+    //
+    // These BLOCK BULLETS. The skirt reads as a solid wall flanking the run — at the
+    // foot of a 3.6 m stair it is a head-high wall — and players use it as cover. It
+    // was `deco` for years, so the server's hitscan (`World.raycast` only ever consults
+    // the collider set) let rounds sail through a wall the shooter could not see
+    // through: the reported "bullets go through the walls on the sides of the ramps".
+    //
+    // The collider is NOT one full-height box under the visual. Below the slope line
+    // the treads themselves back the thin skirt — a round crossing there is stopped by
+    // the tread mass 0.16 m later, buried inside the wall — so only the wedge that
+    // stands PROUD of the slope needs solid of its own. It is emitted as a short
+    // staircase of chunks whose bottoms follow the pitch, and that shape is what keeps
+    // the navigation delta honest: a single y0..y1 box beside the run also walled the
+    // flanking floor cells at the TOP of the stair, where no wall stands above the
+    // walking surface at all. On MERIDIAN that erased the L1 node beside the market
+    // hall roof stair's top mouth — a spot bots camp — and bottest's off-graph guard
+    // (12 s budget) caught one standing there for 16.95 s.
     if (opts.stringer !== false) {
       const st = 0.16;
       if (alongX) {
@@ -581,6 +598,22 @@ export class Builder {
       } else {
         this.deco(x0 - st, y0 - 0.25, z0, x0, y1, z1, matName, { cast: true });
         this.deco(x1, y0 - 0.25, z0, x1 + st, y1, z1, matName, { cast: true });
+      }
+      const CHUNKS = 4;
+      for (let i = 0; i < CHUNKS; i++) {
+        const f0 = i / CHUNKS, f1 = (i + 1) / CHUNKS;   // run fraction, FOOT = 0
+        // At or below the slope across the whole chunk, so the union with the treads
+        // is airtight; the foot chunk drops to the skirt's own base.
+        const yb = i === 0 ? y0 - 0.25 : y0 + rise * f0;
+        const a0 = asc ? runLen * f0 : runLen * (1 - f1);
+        const a1 = asc ? runLen * f1 : runLen * (1 - f0);
+        if (alongX) {
+          this.collider(x0 + a0, yb, z0 - st, x0 + a1, y1, z0, surface);
+          this.collider(x0 + a0, yb, z1, x0 + a1, y1, z1 + st, surface);
+        } else {
+          this.collider(x0 - st, yb, z0 + a0, x0, y1, z0 + a1, surface);
+          this.collider(x1, yb, z0 + a0, x1 + st, y1, z0 + a1, surface);
+        }
       }
     }
     if (opts.rail) {
@@ -625,13 +658,38 @@ export class Builder {
     g.translate((x0 + x1) / 2, (y0 + y1) / 2 - 0.1, (z0 + z1) / 2);
     projectWorldUV(g, UV);
     this.addGeo(g, matName, true, true);
-    // Side cheeks.
+    // Side cheeks. These BLOCK BULLETS — on the lower half of the ramp the cheek
+    // stands proud of the walking surface (its top is y0 + rise/2 for the whole run)
+    // and players crouch behind it as cover. As `deco` the server's hitscan never saw
+    // it: a round fired at the visible wall crossed the cheek, the whole ramp, and the
+    // far cheek without stopping (measured 6.8 m of pass-through on the-square's west
+    // ramp).
+    //
+    // Same collider shape as the stair stringers above, for the same reason: solid is
+    // emitted only where the cheek stands proud of the slope — the lower half of the
+    // run, in pitched chunks — because below the slope the stepped core backs the thin
+    // visual, and a single full-run box would wall floor cells beside the upper half
+    // where no wall rises above the walking surface.
+    const cheekTop = y0 + rise * 0.5;
     if (alongX) {
-      this.deco(x0, y0 - 0.4, z0 - 0.14, x1, y0 + rise * 0.5, z0, matName);
-      this.deco(x0, y0 - 0.4, z1, x1, y0 + rise * 0.5, z1 + 0.14, matName);
+      this.deco(x0, y0 - 0.4, z0 - 0.14, x1, cheekTop, z0, matName);
+      this.deco(x0, y0 - 0.4, z1, x1, cheekTop, z1 + 0.14, matName);
     } else {
-      this.deco(x0 - 0.14, y0 - 0.4, z0, x0, y0 + rise * 0.5, z1, matName);
-      this.deco(x1, y0 - 0.4, z0, x1 + 0.14, y0 + rise * 0.5, z1, matName);
+      this.deco(x0 - 0.14, y0 - 0.4, z0, x0, cheekTop, z1, matName);
+      this.deco(x1, y0 - 0.4, z0, x1 + 0.14, cheekTop, z1, matName);
+    }
+    for (let i = 0; i < 2; i++) {
+      const f0 = i * 0.25, f1 = (i + 1) * 0.25;       // proud only over run fraction 0..0.5
+      const yb = i === 0 ? y0 - 0.4 : y0 + rise * f0;
+      const a0 = asc ? runLen * f0 : runLen * (1 - f1);
+      const a1 = asc ? runLen * f1 : runLen * (1 - f0);
+      if (alongX) {
+        this.collider(x0 + a0, yb, z0 - 0.14, x0 + a1, cheekTop, z0, surface);
+        this.collider(x0 + a0, yb, z1, x0 + a1, cheekTop, z1 + 0.14, surface);
+      } else {
+        this.collider(x0 - 0.14, yb, z0 + a0, x0, cheekTop, z0 + a1, surface);
+        this.collider(x1, yb, z0 + a0, x1 + 0.14, cheekTop, z0 + a1, surface);
+      }
     }
   }
 
