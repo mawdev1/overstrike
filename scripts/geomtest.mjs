@@ -1,5 +1,7 @@
 /**
- * geomtest — wall geometry audit for MERIDIAN.
+ * geomtest — wall geometry audit for any registered map (default: the active rotation
+ * map, The Square; `--map=<id>` selects any registered map, in or out of rotation,
+ * exactly like maptest — e.g. `--map=square-extraction` audits the raid map).
  *
  * Everything here is measured on the REAL collider set (world.boxes), because authored
  * intent in level.js and what the Builder emits are not the same thing: `wall()` splits
@@ -20,15 +22,32 @@
  *   7 SYMMETRY   near-miss matches under the map's mirror transforms.
  *
  * Usage:
- *   node scripts/geomtest.mjs                 # boot the world and audit it
+ *   node scripts/geomtest.mjs                 # boot the active map and audit it
+ *   node scripts/geomtest.mjs --map=square-extraction
  *   node scripts/geomtest.mjs /tmp/geom.json  # cache the collider dump there and reuse
  *   node scripts/geomtest.mjs --only=seam     # one section (seam|overlap|float|align|open|thin|sym)
  */
 import fs from 'node:fs';
-import { MAP_MANIFEST } from '../src/world/level.js';
+import { selectMap, getMapEntry, listMaps, activeMapId } from '../src/world/world.js';
 
 const only = (process.argv.find((a) => a.startsWith('--only=')) || '').split('=')[1];
 const cache = process.argv.slice(2).find((a) => !a.startsWith('--')) || null;
+
+const MAP_ARG = process.argv.slice(2).find((a) => a.startsWith('--map='));
+if (MAP_ARG) {
+  const id = MAP_ARG.slice('--map='.length);
+  if (getMapEntry(id) === null) {
+    console.error(`geomtest: no registered map '${id}'. Registered: ${listMaps().map((m) => m.id).join(', ')}`);
+    process.exit(2);
+  }
+  selectMap(id);
+}
+const MAP_ID = activeMapId();
+const MAP_MANIFEST = getMapEntry(MAP_ID)?.module?.MAP_MANIFEST ?? null;
+
+/** DUMP FORMAT v2: colliders carry a `kind` recorded at emit time (see dump()). Old
+ *  cache files predate that and would misclassify everything; refuse to reuse them. */
+const DUMP_VERSION = 2;
 
 /**
  * Boot the world headlessly and record, for every collider, the Builder method and the
@@ -51,9 +70,34 @@ async function dump() {
     }
     return frames;
   };
+  // Which Builder method emitted each collider — recorded AT EMIT TIME by wrapping the
+  // public emitters and reading the outermost wrapped frame when a box lands. This used
+  // to be a table of props.js LINE-NUMBER ranges, which forced props.js to freeze the
+  // line numbering of its whole emitter section (a fragility its maintainer note had to
+  // carry and this file never mentioned); method-name tracking cannot go stale when
+  // props.js gains or loses a line.
+  const KINDS = ['box', 'deco', 'slab', 'floorFinish', 'groundPlane', 'wall', 'beam',
+    'cable', 'cylinder', 'stairs', 'ramp', 'parapet', 'railing', 'railingSloped',
+    'doorFrame', 'prop', ['_glassPane', 'glass']];
+  const kindStack = [];
+  for (const entry of KINDS) {
+    const [method, label] = Array.isArray(entry) ? entry : [entry, entry];
+    const orig = Builder.prototype[method];
+    if (typeof orig !== 'function') {
+      throw new Error(`geomtest: Builder.prototype.${method} no longer exists — update the KINDS list`);
+    }
+    Builder.prototype[method] = function (...a) {
+      kindStack.push(label);
+      try { return orig.apply(this, a); } finally { kindStack.pop(); }
+    };
+  }
   for (const name of ['addBox', 'addBoxRaw']) {
     const orig = World.prototype[name];
-    World.prototype[name] = function (...a) { const b = orig.apply(this, a); prov.set(b, site()); return b; };
+    World.prototype[name] = function (...a) {
+      const b = orig.apply(this, a);
+      prov.set(b, { src: site(), kind: kindStack.length ? kindStack[0] : '?' });
+      return b;
+    };
   }
   const walls = [];
   const origWall = Builder.prototype.wall;
@@ -73,50 +117,42 @@ async function dump() {
   const game = new Game({ headless: true });
   await game.initHeadless({ presenter: new NullPresenter() });
   return {
+    v: DUMP_VERSION,
+    mapId: MAP_ID,
     bounds: { min: game.world.bounds.min.toArray(), max: game.world.bounds.max.toArray() },
-    boxes: game.world.boxes.map((b, i) => ({
-      i,
-      min: [b.min.x, b.min.y, b.min.z],
-      max: [b.max.x, b.max.y, b.max.z],
-      surface: b.surface,
-      src: prov.get(b) || [],
-    })),
+    boxes: game.world.boxes.map((b, i) => {
+      const p = prov.get(b) || { src: [], kind: '?' };
+      return {
+        i,
+        min: [b.min.x, b.min.y, b.min.z],
+        max: [b.max.x, b.max.y, b.max.z],
+        surface: b.surface,
+        src: p.src,
+        kind: p.kind,
+      };
+    }),
     walls,
   };
 }
 
-const D = cache && fs.existsSync(cache) ? JSON.parse(fs.readFileSync(cache, 'utf8')) : await dump();
+let D = cache && fs.existsSync(cache) ? JSON.parse(fs.readFileSync(cache, 'utf8')) : await dump();
+if (cache && (D.v !== DUMP_VERSION || D.mapId !== MAP_ID)) {
+  console.log(`(cache ${cache} is v${D.v ?? 1}/'${D.mapId ?? '?'}', need v${DUMP_VERSION}/'${MAP_ID}' — re-dumping)`);
+  D = await dump();
+  fs.writeFileSync(cache, JSON.stringify(D));
+}
 if (cache && !fs.existsSync(cache)) fs.writeFileSync(cache, JSON.stringify(D));
 
 // ── model ────────────────────────────────────────────────────────────────────────────
 const AX = ['x', 'y', 'z'];
-/** Which Builder method emitted this collider — from the props.js line in its stack. */
-const BUILDER = [
-  [279, 291, 'box'], [292, 300, 'deco'], [301, 327, 'slab'], [328, 336, 'floorFinish'],
-  [337, 365, 'groundPlane'], [366, 408, 'wall'], [409, 421, 'glass'], [501, 514, 'beam'],
-  [515, 531, 'cable'], [532, 547, 'cylinder'], [548, 591, 'stairs'], [592, 632, 'ramp'],
-  [633, 675, 'parapet'], [676, 699, 'railing'], [700, 723, 'railingSloped'],
-  [753, 762, 'doorFrame'], [763, 811, 'prop'],
-];
-function builderKind(src) {
-  let kind = '?';
-  for (const f of src) {
-    const m = f.match(/^src\/world\/props\.js:(\d+)$/);
-    if (!m) continue;
-    const n = +m[1];
-    const hit = BUILDER.find(([lo, hi]) => n >= lo && n <= hi);
-    if (hit) kind = hit[2];         // outermost props frame wins
-  }
-  return kind;
-}
 /** Architecture proper — the things that are supposed to line up and close. */
 const ARCH = new Set(['box', 'slab', 'wall', 'parapet', 'groundPlane', 'glass', 'floorFinish']);
 const boxes = D.boxes.map((b) => {
   const size = [b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]];
   const lvl = b.src.find((f) => f.startsWith('src/world/level.js')) || '?';
   return {
-    ...b, size, lvl, kind: builderKind(b.src),
-    isProp: b.src.some((f) => f === 'src/world/props.js:794'),
+    ...b, size, lvl,
+    isProp: b.kind === 'prop',
     thin: Math.min(...size),
     vol: size[0] * size[1] * size[2],
   };
@@ -456,7 +492,14 @@ R.dup = []; R.degen = []; R.buried = [];
 }
 
 // ── 7 SYMMETRY ───────────────────────────────────────────────────────────────────────
-if (!only || only === 'sym') {
+// Mirror-transform near-misses only mean something on the mirrored competitive layouts.
+// 'square-extraction' is deliberately asymmetric (three unequal sectors around one POI),
+// so on that map every "near-miss" would be noise; the section skips itself and says so.
+const SYM_MAPS = new Set(['the-square', 'meridian']);
+if ((!only || only === 'sym') && !SYM_MAPS.has(MAP_ID)) {
+  console.log(`(7 SYMMETRY skipped: '${MAP_ID}' declares no mirror symmetry — advisory-only section.)`);
+}
+if ((!only || only === 'sym') && SYM_MAPS.has(MAP_ID)) {
   const mirrors = [
     ['x=0 (mirror in X)', (b) => ({ min: [-b.max[0], b.min[1], b.min[2]], max: [-b.min[0], b.max[1], b.max[2]] })],
     ['z=0 (mirror in Z)', (b) => ({ min: [b.min[0], b.min[1], -b.max[2]], max: [b.max[0], b.max[1], -b.min[2]] })],
@@ -485,7 +528,7 @@ if (!only || only === 'sym') {
 }
 
 // ── report ───────────────────────────────────────────────────────────────────────────
-console.log(`\nGEOMETRY AUDIT — ${N} colliders, ${D.walls.length} authored wall runs\n`);
+console.log(`\nGEOMETRY AUDIT — map '${MAP_ID}', ${N} colliders, ${D.walls.length} authored wall runs\n`);
 
 if (R.seam.length) {
   // Collapse repeats: twenty stair treads standing 0.20 m off the same wall is one

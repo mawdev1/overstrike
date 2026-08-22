@@ -655,8 +655,34 @@ const TERMINAL_RESULT = S.obj({
 
 const PENDING_RESULT = S.obj({
   matchId: S.ulid, status: S.enum('pending'),
-  mode: S.enum('tdm', 'bomb'), mapId: S.str, mapVersion: S.str,
+  // 2.1.0 (§4.4): a run pending settlement is this same shape with mode 'extraction'.
+  mode: S.enum('tdm', 'bomb', 'extraction'), mapId: S.str, mapVersion: S.str,
   startedAt: S.iso, endedAt: S.nullable(S.iso), retryAfterMs: S.int,
+  ...CORRELATION,
+});
+
+/** match-result.md §4.4 (2.1.0) — `RunTerminalResult`, discriminated by mode 'extraction'.
+ * The PvP keys are ABSENT by contract; S.obj's exact-keys check is what enforces that here. */
+const RUN_TERMINAL_RESULT = S.obj({
+  matchId: S.ulid,
+  status: S.enum('completed', 'aborted'),
+  mode: S.enum('extraction'),
+  mapId: S.str, mapVersion: S.str, region: S.str, serverBuild: S.nullable(S.str),
+  startedAt: S.iso, endedAt: S.iso,
+  roster: S.arr(S.obj({ accountId: S.ulid, team: S.nullable(S.any), joinedAt: S.iso, leftAt: S.nullable(S.iso) })),
+  settlement: S.obj({
+    runLevelException: S.nullable(S.obj({ exceptionId: S.str, trigger: S.str })),
+    participants: S.arr(S.obj({
+      accountId: S.ulid,
+      settlementStatus: S.enum('ended', 'settled', 'exception-open', 'exception-resolved'),
+      outcome: S.nullable(S.enum('extracted', 'died', 'aborted', 'server-failure')),
+      exitId: S.nullable(S.str),
+      deathCause: S.nullable(S.str),
+      exceptionId: S.nullable(S.str),
+      trigger: S.nullable(S.str),
+    })),
+  }),
+  evidenceRef: S.nullable(S.str),
   ...CORRELATION,
 });
 
@@ -767,7 +793,8 @@ function specFor(pattern, body) {
     case 'GET /v1/matches/active':
       return S.obj({ matchId: S.ulid, roomId: S.ulid, graceEndsAt: S.iso, serverNow: S.iso, ...CORRELATION });
     case 'GET /v1/matches/:matchId':
-      return body.status === 'pending' ? PENDING_RESULT : TERMINAL_RESULT;
+      if (body.status === 'pending') return PENDING_RESULT;
+      return body.mode === 'extraction' ? RUN_TERMINAL_RESULT : TERMINAL_RESULT;
     case 'POST /v1/matches/:matchId/reconnect-ticket':
       return S.obj({ handoff: HANDOFF, graceEndsAt: S.iso, serverNow: S.iso, ...CORRELATION });
     case 'POST /v1/reports':
@@ -850,6 +877,35 @@ function validateResponse(req, res) {
       }
       if (!Object.hasOwn(VOCABULARY.roam, key)) problems.push(`${pattern}: ${key} is not a ROAM setting`);
     }
+  }
+
+  // match-result.md §4.4: the run projection's own invariants, per settlement.md §3/§5.3.
+  if (pattern === 'GET /v1/matches/:matchId' && res.body.status !== 'pending'
+      && res.body.mode === 'extraction') {
+    const b = res.body;
+    for (const p of b.settlement.participants) {
+      if ((p.outcome === 'extracted') !== (p.exitId !== null)) {
+        problems.push(`${pattern}: ${p.accountId} exitId must be non-null iff outcome extracted`);
+      }
+      if ((p.outcome === 'died') !== (p.deathCause !== null)) {
+        problems.push(`${pattern}: ${p.accountId} deathCause must be non-null iff outcome died`);
+      }
+      if (p.settlementStatus === 'exception-open' && (p.exceptionId === null || p.trigger === null || p.outcome !== null)) {
+        problems.push(`${pattern}: ${p.accountId} exception-open needs exceptionId+trigger and a null outcome`);
+      }
+      if (p.settlementStatus !== 'exception-open' && p.trigger !== null) {
+        problems.push(`${pattern}: ${p.accountId} trigger is exception-open-only`);
+      }
+      if (p.settlementStatus === 'ended' && p.outcome !== null) {
+        problems.push(`${pattern}: ${p.accountId} ended carries no applied outcome`);
+      }
+    }
+    const rosterIds = new Set(b.roster.map((r) => r.accountId));
+    if (b.settlement.participants.length !== rosterIds.size
+        || !b.settlement.participants.every((p) => rosterIds.has(p.accountId))) {
+      problems.push(`${pattern}: settlement.participants must cover exactly the roster`);
+    }
+    return problems;
   }
 
   // match-result.md §4.2: the status-dependent invariants are what make the union checkable.

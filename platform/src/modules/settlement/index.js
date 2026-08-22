@@ -242,8 +242,16 @@ export function createSettlementService({ store, inventoryService, outbox, clock
     const statsPatch = {
       settlementStatus: resolvingExceptionId ? 'exception-resolved' : 'settled',
       outcome: resolved,
+      // Persisted for the read side (match-result.md §4.4's run projection): the applied
+      // outcome's supporting fact, null-stuffed on the other branches so a stale value from a
+      // prior exception snapshot can never survive into a settled row. For a server-failure
+      // resolved to 'extracted', the exit is the lastKnownState's (§4.1) — the submission
+      // carries no top-level exitId on that outcome.
+      exitId: resolved === 'extracted'
+        ? (participant.exitId ?? participant.lastKnownState?.exitId ?? null) : null,
+      deathCause: resolved === 'died' ? (participant.deathCause ?? null) : null,
     };
-    if (resolvingExceptionId) statsPatch.exceptionId = null;
+    if (resolvingExceptionId) { statsPatch.exceptionId = null; statsPatch.trigger = null; }
 
     const ctx = { correlationId: correlationId || runId, actor: { kind: 'service', id: RESULT_ACTOR, role: 'service' } };
     await outbox.commit(ctx, async (tx, emit) => {
@@ -381,6 +389,7 @@ export function createSettlementService({ store, inventoryService, outbox, clock
         const accountIds = runResult.participants.map((p) => p.accountId);
         await store.matches.transitionRunEnded(runResult.runId, {
           status, startedAt: runResult.startedAt, endedAt: runResult.endedAt,
+          evidenceRef: runResult.evidenceRef,
         }, tx);
         await store.matches.markParticipantsEnded(runResult.runId, accountIds, tx);
 
@@ -517,7 +526,7 @@ export function createSettlementService({ store, inventoryService, outbox, clock
         actor: { kind: 'admin', id: reviewedBy, role: 'admin' } };
       await outbox.commit(ctx, async (tx, emit) => {
         await store.matches.mergeParticipantStats(exception.runId, exception.accountId, {
-          settlementStatus: 'exception-resolved', outcome: null, exceptionId: null,
+          settlementStatus: 'exception-resolved', outcome: null, exceptionId: null, trigger: null,
         }, tx);
         await store.settlementExceptions.resolve({
           exceptionId, resolution: 'void', resolutionNotes, resolutionEvidenceRef, reviewedBy,

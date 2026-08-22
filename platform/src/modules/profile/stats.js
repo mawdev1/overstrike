@@ -842,6 +842,54 @@ export function createStatsService({ store, clock = Date, outbox, visibilityFor 
         correlationId,
       };
     }
+    if (row.mode === 'extraction') {
+      // §4.4 (2.1.0): a terminal RUN projects as `RunTerminalResult`, not a PvP TerminalResult.
+      // settlement.md §2 leaves winnerTeam/outcomeReason/teamScores/rounds null for a run, and
+      // per-participant truth lives in `match_participants.stats` exactly as settlement wrote
+      // it — this projection reads it back verbatim rather than inventing PvP-shaped nulls.
+      let runLevelException = null;
+      if (store.settlementExceptions?.listByRun) {
+        const open = (await store.settlementExceptions.listByRun(row.matchId))
+          .find((e) => e.accountId === null && e.status !== 'resolved');
+        if (open) runLevelException = { exceptionId: open.exceptionId, trigger: open.trigger };
+      }
+      return {
+        matchId: row.matchId,
+        status: row.status,
+        mode: 'extraction',
+        mapId: row.mapId,
+        mapVersion: row.mapVersion ?? null,
+        region: row.region ?? null,
+        serverBuild: row.serverBuild ?? null,
+        startedAt: row.startedAt,
+        endedAt: row.endedAt,
+        roster: participants.map((p) => ({
+          accountId: p.accountId, team: p.team ?? null,
+          joinedAt: p.joinedAt ?? null, leftAt: p.leftAt ?? null,
+        })),
+        settlement: {
+          runLevelException,
+          participants: participants.map((p) => {
+            const s = p.stats || {};
+            // A terminal row whose stats carry no settlement keys at all is a participant the
+            // §5.2 ended-write never stamped (e.g. missing from the submission) — 'ended' is
+            // the honest reading, keeping the client's four-state vocabulary total (§4.4).
+            const settlementStatus = typeof s.settlementStatus === 'string' ? s.settlementStatus : 'ended';
+            return {
+              accountId: p.accountId,
+              settlementStatus,
+              outcome: s.outcome ?? null,
+              exitId: s.exitId ?? null,
+              deathCause: s.deathCause ?? null,
+              exceptionId: s.exceptionId ?? null,
+              trigger: settlementStatus === 'exception-open' ? (s.trigger ?? null) : null,
+            };
+          }),
+        },
+        evidenceRef: access.service ? row.evidenceRef : null,
+        correlationId,
+      };
+    }
     return {
       matchId: row.matchId,
       status: row.status,

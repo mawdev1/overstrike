@@ -416,6 +416,101 @@ export const SCENARIOS = {
     },
   },
 
+  // ── extraction run results (match-result.md §4.4 / settlement.md §3, §5.3) ────────────────
+  // The real wire shape for a `mode='extraction'` run, one scenario per state the P3-10
+  // results screen must tell apart. Exit ids are the map entry's authoritative set
+  // (REQ-CC-075); the shell's fixture-driven presentation can now be driven by these instead.
+  'result-extraction-extracted': {
+    note: 'extraction: local extracted through the rail gate; a squadmate died in the same run.',
+    routes: {
+      'GET /v1/matches/:matchId': (ctx) => ({
+        status: 200,
+        body: fx.extractionRunResult(ctx.params.matchId, {
+          participants: [
+            { accountId: fx.ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted', exitId: 'exit-rail-gate' },
+            { accountId: fx.OTHER_ACCOUNT_ID, settlementStatus: 'settled', outcome: 'died', deathCause: 'ai' },
+          ],
+        }),
+      }),
+    },
+  },
+
+  'result-extraction-lost': {
+    note: 'extraction: local died — everything carried is lost (settlement.md §4).',
+    routes: {
+      'GET /v1/matches/:matchId': (ctx) => ({
+        status: 200,
+        body: fx.extractionRunResult(ctx.params.matchId, {
+          participants: [
+            { accountId: fx.ACCOUNT_ID, settlementStatus: 'settled', outcome: 'died', deathCause: 'player' },
+          ],
+        }),
+      }),
+    },
+  },
+
+  'result-extraction-exception': {
+    note: 'extraction: settlement could not commit — exception-open, outcome null, held for review.',
+    routes: {
+      'GET /v1/matches/:matchId': (ctx) => ({
+        status: 200,
+        body: fx.extractionRunResult(ctx.params.matchId, {
+          participants: [
+            { accountId: fx.ACCOUNT_ID, settlementStatus: 'exception-open', outcome: null,
+              exceptionId: 'exc-stub-01', trigger: 'lock-mismatch' },
+          ],
+        }),
+      }),
+    },
+  },
+
+  'result-extraction-mixed': {
+    note: 'extraction: split squad (extracted + aborted + exception) PLUS a run-level missing-participant exception.',
+    routes: {
+      'GET /v1/matches/:matchId': (ctx) => ({
+        status: 200,
+        body: fx.extractionRunResult(ctx.params.matchId, {
+          runLevelException: { exceptionId: 'exc-stub-run-01', trigger: 'missing-participant' },
+          participants: [
+            { accountId: fx.ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted', exitId: 'exit-ferry-landing' },
+            { accountId: fx.OTHER_ACCOUNT_ID, settlementStatus: 'settled', outcome: 'aborted' },
+            { accountId: fx.THIRD_ACCOUNT_ID, settlementStatus: 'exception-open', outcome: null,
+              exceptionId: 'exc-stub-02', trigger: 'server-failure-without-state' },
+          ],
+        }),
+      }),
+    },
+  },
+
+  'result-extraction-pending': {
+    note: 'extraction: §4.2 pending with mode extraction for 2 polls (retry-safe window), then settled — local still `ended` on the first terminal read.',
+    routes: {
+      'GET /v1/matches/:matchId': (ctx) => {
+        ctx.state.polls++;
+        if (ctx.state.polls <= 2) {
+          return { status: 200, body: fx.pendingResult(ctx.params.matchId, {
+            endedAt: ctx.clock.fromEpoch(-120 * 1000), mode: 'extraction' }) };
+        }
+        if (ctx.state.polls === 3) {
+          // The retry-safe participant state: the run is terminal, this participant is still
+          // `ended` — submission received, settlement not yet resolved (settlement.md §5.2).
+          return { status: 200, body: fx.extractionRunResult(ctx.params.matchId, {
+            participants: [
+              { accountId: fx.ACCOUNT_ID, settlementStatus: 'ended', outcome: null },
+              { accountId: fx.OTHER_ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted', exitId: 'exit-rail-gate' },
+            ],
+          }) };
+        }
+        return { status: 200, body: fx.extractionRunResult(ctx.params.matchId, {
+          participants: [
+            { accountId: fx.ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted', exitId: 'exit-rail-gate' },
+            { accountId: fx.OTHER_ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted', exitId: 'exit-rail-gate' },
+          ],
+        }) };
+      },
+    },
+  },
+
   // ── career ────────────────────────────────────────────────────────────────────────────────
   'history-mixed': {
     note: 'Terminal and pending items in one page, so the §4.3 union is actually exercised.',
@@ -692,4 +787,12 @@ export const EXTRA_SCENARIOS = {
   // The refusals and the result shape the §12 fixture set cannot express at all.
   'room-refusals': '/room/:roomId — ROOM_CLOSED, ROOM_FULL, TEAM_FULL and a second launch, decided by the room',
   'result-tdm-completed': '/results/:matchId — the TDM half of the result union: kill limit, no rounds',
+
+  // REQ-CC-072: match-result.md §4.4's extraction run-result projection, per settlement.md
+  // §3/§5.3 state — the real wire shape behind the shell's P3-10 settlement presentation.
+  'result-extraction-extracted': '/results/:matchId — §4.4 run result: local extracted, squadmate died',
+  'result-extraction-lost': '/results/:matchId — §4.4 run result: local died, run inventory lost',
+  'result-extraction-exception': '/results/:matchId — §4.4 run result: exception-open, held for review',
+  'result-extraction-mixed': '/results/:matchId — §4.4 run result: split squad plus a run-level exception',
+  'result-extraction-pending': '/results/:matchId — §4.2 pending (mode extraction), then ended, then settled',
 };

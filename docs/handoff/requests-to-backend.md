@@ -847,7 +847,7 @@ backend-owned module.
 - Proposed shape: Add `"uiraid": "node scripts/uiraid.mjs"` and run it in the `ci` chain next to
   `uibomb`, same as REQ-CC-069 did for the earlier harnesses.
 - Requester's workaround until then: run `node scripts/uiraid.mjs` directly.
-- Status: OPEN
+- Status: DONE — `package.json`: `uiraid` script + in `ci` next to `uishell`; plus `maptest:extraction`/`navtest:extraction`/`collisiontest:extraction`/`stairtest:extraction`/`vertprobe:extraction` (`--map=square-extraction`, collisiontest gained `--map` support) all in `ci`. Review round 1 follow-up (same pattern, closed without a separate request): `uistream`, `uistreamperf` (P3-07 renderer measurement) and `geomtest:extraction` (geomtest gained `--map`) are wired into `package.json` `ci` and the Actions workflow steps, which also gained the extraction map-guard variants, `extractiontest` and `raidtest` they were missing.
 
 ### REQ-CC-072 — Browser-readable extraction run result projection for the results screen
 - Phase: P3
@@ -868,7 +868,7 @@ backend-owned module.
   add the matching validator.
 - Requester's workaround until then: presentation is fixture-driven and asserted in
   `scripts/uishell.mjs`; `getResult` remains PvP-only.
-- Status: OPEN
+- Status: DONE — `match-result.md` 2.1.0 §4.4 `RunTerminalResult` (settlement.md §5.3 statuses), served by `profile/stats.js` `getMatch`, stub scenarios `result-extraction-*` drive the real shape; CX follow-up: `shell-api.js` `validMatch` still refuses `mode='extraction'` and should add the §4.4 validator.
 
 ### REQ-CC-073 — Client raid runtime: `match.raidView()` sample and `raid` bus topic for the in-match HUD
 - Phase: P3
@@ -887,7 +887,7 @@ backend-owned module.
   sample (the projection also drops them, §3.1).
 - Requester's workaround until then: fixture-driven package acceptance (`scripts/uiraid.mjs`),
   which includes a control proving the refusal vocabulary matches the real `ExtractionRun`.
-- Status: OPEN
+- Status: DONE — `mode='extraction'` is the mode table's third entry (`modes.js` `EXTRACTION` + `src/game/extractionRules.js`, the BombRules-shaped adapter; bomb-rules.md §1 amended to 1.8.0): run built from the map entry's exits/containers + P3-11 catalog, seeded from `matchSeed`, ticked from `_fixedUpdate`; `match.raidView()` serves the v1 sample (sealed caches carry zero item rows at the source) and one `raid` bus topic emits the typed vocabulary (`lootRefused` with literal refusal reasons, `pickedUp`/`dropped`/`containerOpened`/`exitCompleted`/`channelInterrupted`); interact edge/hold route via the existing command path (`interact` bus event / `_held.interactHeld`), drop via `extractionRules.drop()`. Proven by `scripts/raidtest.mjs` (in `ci`): deploy->loot->extract and deploy->death, byte-identical across two seeded runs, sample projects through `model.js` with no ruleViolation. Bots stay plain combatants — loot-then-exit objectives deferred to P3-05 rather than destabilizing bot.js. CX follow-ups: `settings.js` ENUMS.mode still rejects 'extraction' (persist-only; `opts.mode` wins everywhere), and no drop keybinding exists yet.
 
 ### REQ-CC-074 — Land the map-data.md `sectors` amendment that sector-interest.md §3.1 specifies
 - Phase: P3
@@ -912,7 +912,7 @@ backend-owned module.
 - Requester's workaround until then: the manifest shape is authored verbatim to
   sector-interest.md §3.1 and validated by `sectortest`; nothing is blocked at runtime, but
   the frozen contract and the shipped producer disagree until the text lands.
-- Status: OPEN
+- Status: DONE — `map-data.md` 1.3.0 §3.7 documents `sectors` exactly as `world.js` parses it (absent-key-is-not-a-gap posture included); CHANGELOG + README index updated.
 
 ### REQ-CC-075 — One authoritative exit/container set for map 'square-extraction'
 - Phase: P3
@@ -940,4 +940,4 @@ backend-owned module.
 - Requester's workaround until then: the map exports remain the authoritative set for
   'square-extraction'; both sets validate against the same P3-11 catalog so no reference
   dangles whichever is consumed.
-- Status: OPEN
+- Status: DONE — map entry is the sole positional authority: `extractionContent.js` dropped its `STATIC_CONTAINERS`/`EXTRACTION_EXITS` (catalog/rules only now); `extractiontest.mjs` wires `ExtractionRun` from `SQUARE_EXTRACTION`'s sets and fails if a positional export ever reappears in the content module.

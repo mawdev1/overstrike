@@ -1070,7 +1070,7 @@ export function createMemoryStore(config = {}, deps = {}) {
      * untouched (the pseudocode's own "no-op on replay; §5 rule 3 covers idempotency"), so a
      * retried submission never re-derives `started_at`/`ended_at` from a second payload.
      */
-    transitionRunEnded(runId, { status, startedAt, endedAt }, txh) {
+    transitionRunEnded(runId, { status, startedAt, endedAt, evidenceRef = null }, txh) {
       return write(txh, (st) => {
         const m = st.matches.get(runId);
         if (!m) throw new ApiError('NOT_FOUND', 'No such run.', { details: { runId } });
@@ -1083,6 +1083,9 @@ export function createMemoryStore(config = {}, deps = {}) {
         m.status = status;
         m.startedAt = toIso(startedAt) ?? m.startedAt;
         m.endedAt = toIso(endedAt) ?? m.endedAt;
+        // §5.1 supplies it and the 0029 terminal-completeness CHECK requires it non-null on a
+        // terminal run row — this write site is the only one that makes a run terminal.
+        m.evidenceRef = evidenceRef ?? m.evidenceRef ?? null;
         m.updatedAt = nowIso();
         return clone(m);
       });

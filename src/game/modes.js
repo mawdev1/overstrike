@@ -1,19 +1,25 @@
 import { WEAPON_LIST } from '../weapons/weaponDefs.js';
 import { BombRules, BOMB_PARAMS, resolveMapManifest, compileObjectives } from './bomb.js';
+import { ExtractionRules } from './extractionRules.js';
+import { RUN_RULES } from './extractionContent.js';
 
 /**
- * OVERSTRIKE has two rulesets: Team Deathmatch and Bomb.
+ * OVERSTRIKE has three rulesets: Team Deathmatch, Bomb, and Extraction.
  *
  * TDM proves movement, shooting, hit registration, respawns, teams, scoring, replication,
  * reconnect and persistence. Bomb (`docs/contracts/bomb-rules.md`) proves round state,
- * no-respawn play, planting and defusing, spectating and match-series logic.
+ * no-respawn play, planting and defusing, spectating and match-series logic. Extraction
+ * (`docs/contracts/extraction-match.md`, the P3 vertical slice) proves loot, conditional
+ * exits, the extraction channel and terminal per-participant outcomes.
  *
- * **Two entries is the freeze** (bomb-rules §1). `tdmtest.mjs` and `bombtest.mjs` assert
- * this table's exact contents, so a third mode fails CI. That is deliberate: the mode
- * freeze needs teeth, not goodwill.
+ * **The table's exact contents are the freeze** (bomb-rules §1, amended 1.8.0 when
+ * extraction-match.md's `mode='extraction'` landed as the P3 third entry). `tdmtest.mjs`
+ * and `bombtest.mjs` assert exactly these three ids, so a fourth mode — or a competitive
+ * third — fails CI. The teeth stay; the count moved with the contract that moved it.
  *
  * The configured kill limit lives on Match so every TDM round can choose its own limit
- * without mutating a singleton; the Bomb series parameters are frozen in `bomb.js`.
+ * without mutating a singleton; the Bomb series parameters are frozen in `bomb.js`, and
+ * the Extraction run parameters are P3-11 data (`extractionContent.js` `RUN_RULES`).
  */
 
 export const TEAM_COLORS = [0x4ea6ff, 0xff7a3c];
@@ -296,10 +302,69 @@ export const BOMB = {
   },
 };
 
-// These exports are the two-entry public contract for Match and Menu. Two is the freeze
-// (bomb-rules §1) — adding a third entry is a contract change, not a code change.
-export const MODES = Object.freeze({ [TDM.id]: TDM, [BOMB.id]: BOMB });
-export const MODE_LIST = Object.freeze([TDM, BOMB]);
+// ─────────────────────────────────────────────────────────────────────────── Extraction
+//
+// The rules themselves live in `extraction.js` (extraction-match.md, FROZEN); the client
+// runtime adapter is `extractionRules.js`, and this object is the same thin lifecycle
+// shim BOMB is for `bomb.js`. Local vertical slice (P3): one local participant, the map
+// entry's authoritative exits/containers, the P3-11 catalog, and the raid HUD's
+// `match.raidView()` sample + `raid` bus topic.
+
+export const EXTRACTION = {
+  id: 'extraction',
+  name: 'EXTRACTION',
+  description: 'Deploy, loot the district, reach an exit. Death loses everything carried.',
+  // Bots on a raid map are hostile POPULATION, not a second squad: they are dealt across
+  // the two team ids purely so the existing combat/team plumbing treats them as valid
+  // combatants. A loot-then-exit bot objective is P3-05 follow-up, not this adapter's.
+  teamBased: true,
+  /** §1.1 — the run's hard timeout is the only match clock (P3-11 `RUN_RULES`). */
+  timeLimit: RUN_RULES.hardTimeoutSeconds,
+  hudLabels: {
+    left: TEAM_NAMES[0],
+    right: TEAM_NAMES[1],
+    metric: 'RAID',
+    objective: 'LOOT — THEN GET OUT',
+  },
+
+  /** Throws if the map entry declares no extraction exits; raids name their map by id. */
+  init(match) { match.extractionRules = new ExtractionRules(match); },
+  /** Same deferred-teardown rule as Bomb: released by `Match.reset()`/`dispose()`. */
+  cleanup(match) {
+    if (!match) return;
+    match.extractionRules?.dispose();
+    match.extractionRules = null;
+  },
+  onSpawn() {},
+
+  /** §1 — a participant death is terminal; the run records outcome and cause. */
+  onKill(match, payload) { match.extractionRules?.onKill(payload?.victim, payload?.attacker); },
+
+  /** One fixed 1/120 s step of the run (§4.1's "validated every server tick"). */
+  onTick(match) { match.extractionRules?.tick(); },
+
+  /** The run resolves the match: extracted, died, or aborted (hard timeout). */
+  checkEnd(match) { return match.extractionRules ? match.extractionRules.checkEnd() : null; },
+
+  /** A dead participant stays dead (§1); bots respawn as ongoing map population. */
+  allowRespawn(match, entity) { return !entity?.isPlayer; },
+
+  hudScores(match, out) { out[0] = 0; out[1] = 0; return out; },
+
+  /** The §6 RunResult rides the match result; a raid has no winning team to name. */
+  decorateResult(match, result) {
+    const rules = match.extractionRules;
+    if (!rules) return;
+    result.raid = { runResult: rules.run.buildRunResult() };
+    result.winnerName = '';
+  },
+};
+
+// These exports are the closed public contract for Match and Menu. The exact contents are
+// the freeze (bomb-rules §1, 1.8.0) — adding an entry is a contract change, not a code
+// change, and the mode tests assert the table verbatim.
+export const MODES = Object.freeze({ [TDM.id]: TDM, [BOMB.id]: BOMB, [EXTRACTION.id]: EXTRACTION });
+export const MODE_LIST = Object.freeze([TDM, BOMB, EXTRACTION]);
 export const DEFAULT_MODE = TDM.id;
 
 for (const m of MODE_LIST) {

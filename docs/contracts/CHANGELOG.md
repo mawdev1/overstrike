@@ -1,5 +1,52 @@
 # Contract changelog
 
+## 2026-08-22 — `bomb-rules.md` 1.7.0 → 1.8.0 (additive) — the mode table admits `extraction` as its third and final entry (REQ-CC-073 / P3-05)
+
+§1's "two entries is the freeze" predates P3: it froze the **competitive** Alpha mode set and
+gave it teeth via `tdmtest.mjs`/`bombtest.mjs` asserting `src/game/modes.js`'s table verbatim.
+`extraction-match.md` (FROZEN 1.0.0) then defined `mode='extraction'` end to end — §1.2's
+participant model, `db-schema.md`'s `matches.mode` CHECK admitting `'extraction'`,
+`match-result.md` 2.1.0 §4.4's run-result projection — but the client mode table could not
+bind it without contradicting §1's literal count. §1 now carries a 1.8.0 amendment note: Bomb
+stays the second and final *competitive* mode, `extraction` is the third and final table
+entry (out of rotation, raid maps selected by id), and the freeze mechanism is unchanged —
+both mode tests assert exactly `tdm, bomb, extraction`, so a fourth mode still fails CI.
+Bound in code by `src/game/modes.js` `EXTRACTION` + `src/game/extractionRules.js` (the
+`BombRules`-shaped adapter over `src/game/extraction.js`), proven by `scripts/raidtest.mjs`.
+
+## 2026-08-22 — `map-data.md` 1.2.0 → 1.3.0 (additive) — `sectors` lands in `MAP_MANIFEST` (REQ-CC-074 / P3-06)
+
+`sector-interest.md` §3.1 specified the exact additive amendment P3-06 must produce; the
+producer (`src/world/level.js`, `EXTRACTION_SECTORS` on the 'square-extraction' manifest) and
+the reader (`src/world/world.js`'s `buildManifest`) both shipped it, but `map-data.md` was
+still 1.2.0 with no `sectors` key documented. New §3.7 documents the key exactly as the code
+behaves: array of `{ id, box, neighbours, populationCap, baseThinkStride }`; required for raid
+maps, optional for pre-P3-06 maps; **absent-key-is-not-a-gap** (the reader records
+`provenance.sectors` only when declared, so `manifestGaps()` stays green on competitive maps —
+deliberate, per the reader's own comment); reader defaults (`neighbours: []`,
+`populationCap: Infinity`, `baseThinkStride: 8`); tiling/symmetry rules per
+`sector-interest.md` §3; and `MAP_VERSION` bumps on any `sectors` change, which is what makes
+§3.2's `sectorVersion` = deployed `MAP_VERSION` rule hold. Additive, minor bump, no CCR, per
+`map-data.md`'s own amendment rules. Guarded by `scripts/sectortest.mjs`.
+
+## 2026-08-22 — `match-result.md` 2.0.0 → 2.1.0 (additive) — extraction run-result read projection (REQ-CC-072)
+
+`GET /v1/matches/:matchId` had no shape for a `mode='extraction'` run: §4.2's union closed
+`mode` to `tdm|bomb`, so the shell's P3-10 settlement presentation could only be
+fixture-driven. New §4.4 adds a fifth response shape, discriminated by `mode: 'extraction'` on
+a terminal row, carrying the run identifiers plus one `settlement` object per
+`settlement.md` §3/§5.3: `runLevelException` and `participants[]` with `settlementStatus`
+(`ended|settled|exception-open|exception-resolved`), `outcome`
+(`extracted|died|aborted|server-failure`|null), `exitId`, `deathCause`, `exceptionId`,
+`trigger`. The §4.2 pending shape's `mode` now also admits `'extraction'`. PvP-only fields
+(`winnerTeam`, `outcomeReason`, `teamScores`, `rounds`, `rulesSnapshot`, `players`) are absent
+from the new shape rather than null-stuffed — `settlement.md` §2 leaves the columns null for a
+run and no consumer has a defined reading for them. Additive: a new discriminant value plus a
+new shape behind it; every existing `tdm|bomb` response is byte-identical. Implemented in
+`platform/src/modules/profile/stats.js` (`getMatch`), settlement now persists
+`exitId`/`deathCause` into `match_participants.stats`, and the stub fixtures/scenarios serve
+the real shape so `uishell` can drive it.
+
 ## 2026-08-22 — `settlement.md` §0 self-contradiction, found by adversarial review, resolved
 
 `settlement.md`'s header table declared `Status: FROZEN, Version 1.0.0` while §0's body text

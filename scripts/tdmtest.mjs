@@ -17,13 +17,15 @@ const expect = (condition, name, detail = '') => condition ? ok(name) : bad(name
 
 console.log('\nTeam Deathmatch round contract');
 
-// bomb-rules.md §1: TDM and Bomb are the only entries, and TWO IS THE FREEZE. This
-// assertion is one half of the teeth — `bombtest.mjs` asserts the same table — so a third
-// mode fails CI rather than arriving on goodwill.
+// bomb-rules.md §1 (1.8.0): TDM, Bomb and Extraction are the only entries, and THE EXACT
+// TABLE IS THE FREEZE. This assertion is one half of the teeth — `bombtest.mjs` asserts
+// the same table — so a fourth mode fails CI rather than arriving on goodwill. Extraction
+// is the P3 third entry extraction-match.md's `mode='extraction'` defines.
 expect(
-  MODE_LIST.length === 2 && MODE_LIST[0].id === 'tdm' && MODE_LIST[1].id === 'bomb'
-    && Object.keys(MODES).join(',') === 'tdm,bomb' && DEFAULT_MODE === 'tdm',
-  'TDM and Bomb are the only registered game modes, and TDM is the default',
+  MODE_LIST.length === 3 && MODE_LIST[0].id === 'tdm' && MODE_LIST[1].id === 'bomb'
+    && MODE_LIST[2].id === 'extraction'
+    && Object.keys(MODES).join(',') === 'tdm,bomb,extraction' && DEFAULT_MODE === 'tdm',
+  'TDM, Bomb and Extraction are the only registered game modes, and TDM is the default',
   `modes=${Object.keys(MODES).join(',')}`,
 );
 

@@ -40,9 +40,9 @@ buildable — a single open question does not freeze a whole document.
 | 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN 1.11.0 | Lobby WebSocket: presence, roster, teams, ready, launch |
 | 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN 1.11.0 | The binary match protocol, as it exists and as it must change |
 | 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.11.0 | The only surface Codex uses to reach netcode |
-| 7 | [`match-result.md`](match-result.md) | FROZEN 2.0.0 | Canonical stat definitions and the immutable result record |
+| 7 | [`match-result.md`](match-result.md) | FROZEN 2.1.0 | Canonical stat definitions and the immutable result record |
 | 8 | [`event-envelope.md`](event-envelope.md) | FROZEN 1.4.0 | Canonical platform event envelope and catalogue |
-| 9 | [`map-data.md`](map-data.md) | FROZEN 1.2.0 | What `level.js` must export for the server to consume |
+| 9 | [`map-data.md`](map-data.md) | FROZEN 1.3.0 | What `level.js` must export for the server to consume |
 | 10 | [`bomb-rules.md`](bomb-rules.md) | FROZEN 1.7.0 | The Bomb ruleset |
 | 11 | [`db-schema.md`](db-schema.md) | FROZEN 2.1.0 | Initial PostgreSQL schema |
 | 12 | [`telemetry.md`](telemetry.md) | FROZEN 2.1.0 | Client and server telemetry, privacy and retention classes |

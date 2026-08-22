@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Owner** | [CC] Claude Code (contract) |
 | **Producer** | [CX] Codex — `src/world/level.js`, `src/world/props.js` |
 | **Consumers** | `world.js`, `navGrid.js`, `spawner.js`, `match.js`, Bomb ruleset, minimap, evidence |
@@ -44,8 +44,9 @@ explicit walkability tagging, map versioning, and performance budget metadata.
 
 ```js
 export const MAP_ID = 'the-square';
-export const MAP_VERSION = '1.0.0';   // bumped on ANY change affecting §3.2–§3.5
-export const MAP_MANIFEST = { bounds, spawns, objectives, callouts, navHints, budgets };
+export const MAP_VERSION = '1.0.0';   // bumped on ANY change affecting §3.2–§3.5 or §3.7
+export const MAP_MANIFEST = { bounds, spawns, objectives, callouts, navHints, budgets,
+  sectors /* §3.7 — required for raid maps, optional otherwise */ };
 ```
 
 `MAP_VERSION` appears in every match result (`match-result.md` §4). A balance argument about
@@ -180,6 +181,46 @@ a failure — the binding number is the scene, and the allocation is only how we
 
 Colliders carry no render cost; their bound exists because `world.build()`'s spatial hash and
 every `move`/`raycast`/`losClear` query scale with box count.
+
+### 3.7 Sectors — **required for raid maps** (1.3.0, per `sector-interest.md` §3.1)
+
+Added in 1.3.0 as the additive amendment `sector-interest.md` §3.1 specifies verbatim (P3-06's
+deliverable). `MAP_MANIFEST` gains one top-level key, `sectors` — an array of:
+
+```js
+{ id: 'square',                        // stable forever, never an index
+  box: { min: Vector3, max: Vector3 }, // authoring shape identical to objectives/callouts
+  neighbours: ['north-yard', 'east-docks'],  // sector IDs sharing a traversable boundary
+  populationCap: 12,                   // max concurrent AI entities (sector-interest.md §4.3)
+  baseThinkStride: 8 }                 // this sector's `active`-state think stride baseline
+```
+
+Binding rules, matching the shipped reader (`src/world/world.js`'s `buildManifest`):
+
+- **Optional for pre-P3-06 maps; required for raid (extraction) maps.** An absent `sectors`
+  key on a map authored before this amendment is **schedule, not a gap**: the reader records
+  `provenance.sectors = 'declared'` only when the key is present and deliberately records
+  nothing when it is absent, so `manifestGaps()` does not turn red on the competitive maps
+  that predate raids. Absent ≠ partial manifest. A raid map without sectors, by contrast, is
+  a non-conforming raid map — `sectortest.mjs` is its guard.
+- Each entry must carry `id` and a well-formed `box`; a malformed entry is dropped by the
+  same volume reader objectives and callouts use, not repaired.
+- Reader defaults when a per-sector key is absent: `neighbours` → `[]`,
+  `populationCap` → unbounded (`Infinity`), `baseThinkStride` → `8`. Authored raid maps
+  should declare all three; the defaults exist so a partially-authored sector fails loudly in
+  `sectortest` rather than crashing the reader.
+- Sector boxes must tile the playable bounds with **no gaps and no overlap**, and
+  `neighbours` must be symmetric (`sector-interest.md` §3).
+- **`MAP_VERSION` bumps on any `sectors` change** — the §3 comment now includes §3.7 in its
+  "bumped on ANY change" list. This is what makes `sector-interest.md` §3.2's `sectorVersion`
+  rule hold: a run's `sectorVersion` IS the deployed map's `MAP_VERSION`; there is no separate
+  sector-only version counter. `sectorSet` is `MAP_MANIFEST.sectors.map(s => s.id)` at raid
+  start.
+
+Producer and reader both shipped ahead of this text (`src/world/level.js` exports
+`EXTRACTION_SECTORS` on the 'square-extraction' manifest in exactly this shape;
+`src/world/world.js` parses it); this section is the contract landing that reconciles the
+frozen text with them — additive, minor bump, no CCR, per this contract's own amendment rules.
 
 ## 4. The artifact — nav bake
 

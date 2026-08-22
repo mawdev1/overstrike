@@ -195,8 +195,8 @@ function beginDefuse(game, defender) {
 console.log('\nBomb ruleset — docs/contracts/bomb-rules.md §12');
 head('§1 mode table');
 
-eqJson(MODE_LIST.map((m) => m.id), ['tdm', 'bomb'], 'the mode table has exactly two entries, tdm and bomb');
-eqJson(Object.keys(MODES), ['tdm', 'bomb'], 'MODES is keyed by exactly those two ids');
+eqJson(MODE_LIST.map((m) => m.id), ['tdm', 'bomb', 'extraction'], 'the mode table has exactly three entries: tdm, bomb, extraction (bomb-rules §1 as amended 1.8.0)');
+eqJson(Object.keys(MODES), ['tdm', 'bomb', 'extraction'], 'MODES is keyed by exactly those three ids');
 eq(DEFAULT_MODE, 'tdm', 'TDM remains the default ruleset');
 eq(getMode('bomb'), BOMB, 'getMode resolves the bomb id to the Bomb ruleset');
 eq(getMode('capture-the-flag'), TDM, 'an unknown mode id resolves to TDM');

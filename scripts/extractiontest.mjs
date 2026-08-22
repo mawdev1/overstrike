@@ -9,10 +9,16 @@
 import { ExtractionRun, containerSeed, rollLootTable } from '../src/game/extraction.js';
 import { sha256, sha256Hex, hmacSha256, utf8, toHex, stableJson } from '../src/core/hash.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
+import * as extractionContent from '../src/game/extractionContent.js';
 import {
   LOOT_TABLE_VERSION, ITEM_DEFINITIONS, EXTRACTION_ITEM_DEFS, LOOT_TABLES as CONTENT_LOOT_TABLES,
-  POI_TAGS, STATIC_CONTAINERS, EXTRACTION_EXITS, RUN_RULES, AI_PROFILES, EXTRACTION_CONTENT,
+  POI_TAGS, RUN_RULES, AI_PROFILES, EXTRACTION_CONTENT,
 } from '../src/game/extractionContent.js';
+// REQ-CC-075: placements are map data. The map registry entry is THE positional authority for
+// 'square-extraction' — the exact arrays `ExtractionRun` consumes as opts.exits/opts.containers.
+import {
+  EXTRACTION_EXITS as MAP_EXTRACTION_EXITS, LOOT_CONTAINERS as MAP_LOOT_CONTAINERS,
+} from '../src/world/level.js';
 import { createInventoryService, createMemoryInventoryStore } from '../platform/src/modules/inventory/index.js';
 import { DIFFICULTY, PERSONALITIES } from '../src/ai/bot.js';
 
@@ -575,47 +581,69 @@ head('P3-11 content — loot tables satisfy the roll schema and the inventory co
   eq(grantFailures.length, 0, `every loot entry grants through the shipped inventory path (${grantFailures.join('; ') || 'none failed'})`);
 }
 
-head('P3-11 content — containers, POI tags, and exits hold together and drive a real run');
+head('REQ-CC-075 — ONE positional authority: the map entry\'s exits/containers drive the run');
 {
-  eq(new Set(STATIC_CONTAINERS.map((c) => c.containerId)).size, STATIC_CONTAINERS.length, 'container ids are unique');
+  // The content module must never grow a second positional truth again. These names existing
+  // there is exactly the divergence REQ-CC-075 closed — fail on reappearance, not on drift.
+  expect(!('STATIC_CONTAINERS' in extractionContent),
+    'the content module exports NO container placements (map entry is the sole positional authority)');
+  expect(!('EXTRACTION_EXITS' in extractionContent),
+    'the content module exports NO exit placements (map entry is the sole positional authority)');
+
+  eq(new Set(MAP_LOOT_CONTAINERS.map((c) => c.containerId)).size, MAP_LOOT_CONTAINERS.length, 'map container ids are unique');
+  eq(MAP_LOOT_CONTAINERS.length, 9, 'the map authors nine containers across the three sectors');
   eq(new Set(POI_TAGS.map((p) => p.poiId)).size, POI_TAGS.length, 'POI ids are unique');
-  const poiById = new Map(POI_TAGS.map((p) => [p.poiId, p]));
   let containerFaults = 0;
-  for (const c of STATIC_CONTAINERS) {
+  for (const c of MAP_LOOT_CONTAINERS) {
     const table = CONTENT_LOOT_TABLES[c.lootTableId];
-    const poi = poiById.get(c.poiId);
     const posOk = ['x', 'y', 'z'].every((k) => Number.isFinite(c.position[k]));
-    if (!table || table.tier !== c.tier || !poi || poi.lootTier !== c.tier || !posOk) {
+    if (!table || table.tier !== c.tier || !posOk) {
       containerFaults++; console.log(`       fault: ${c.containerId}`);
     }
   }
-  eq(containerFaults, 0, 'every container: known loot table of the SAME tier, known POI of the same tier, finite position');
+  eq(containerFaults, 0, 'every map container: known P3-11 loot table of the SAME tier, finite position');
   expect(POI_TAGS.every((p) => typeof p.calloutId === 'string' && p.calloutId !== ''
     && p.tags.length > 0 && p.tags.every((t) => typeof t === 'string' && /^[a-z-]+$/.test(t))),
   'every POI names a callout region and carries lowercase-kebab tags');
 
-  // Exits: exactly two, both CONDITIONAL (Build Plan slice), item conditions resolvable.
+  // Exits: exactly two, both CONDITIONAL (Build Plan slice), item conditions resolvable
+  // against THIS module's catalog — the map references the P3-11 vocabulary, never its own.
   const itemIds = new Set(ITEM_DEFINITIONS.map((d) => d.itemId));
-  eq(EXTRACTION_EXITS.length, 2, 'exactly two extraction exits are authored');
-  expect(EXTRACTION_EXITS.every((ex) => ex.requiresItemDefId != null || ex.requiresSquadCount != null || ex.activeWindow != null),
+  eq(MAP_EXTRACTION_EXITS.length, 2, 'exactly two extraction exits are authored on the map entry');
+  expect(MAP_EXTRACTION_EXITS.every((ex) => ex.requiresItemDefId != null || ex.requiresSquadCount != null || ex.activeWindow != null),
     'both exits are conditional — at least one declared §4 condition each');
-  expect(EXTRACTION_EXITS.every((ex) => ex.requiresItemDefId == null || itemIds.has(ex.requiresItemDefId)),
+  expect(MAP_EXTRACTION_EXITS.every((ex) => ex.requiresItemDefId == null || itemIds.has(ex.requiresItemDefId)),
     'every requiresItemDefId names a catalog item');
-  expect(EXTRACTION_EXITS.every((ex) => ex.activeWindow == null
+  expect(MAP_EXTRACTION_EXITS.every((ex) => ex.activeWindow == null
     || (Number.isInteger(ex.activeWindow[0]) && Number.isInteger(ex.activeWindow[1]) && ex.activeWindow[0] < ex.activeWindow[1])),
   'every activeWindow is a valid run-relative [startTick, endTick)');
-  expect(EXTRACTION_EXITS.every((ex) => ex.durationSeconds > 0), 'every exit has a positive channel duration');
-  // hardTimeout must not end the run before the window-gated exit ever opens.
-  const van = EXTRACTION_EXITS.find((ex) => ex.activeWindow != null);
-  expect(van.activeWindow[0] * FIXED_DT < RUN_RULES.hardTimeoutSeconds,
+  expect(MAP_EXTRACTION_EXITS.every((ex) => ex.durationSeconds > 0), 'every exit has a positive channel duration');
+  // The two authorities stay coupled where they touch: the item-free window exit must remain
+  // open until RUN_RULES' collapse warning begins, so an item-less player is never stranded
+  // before the final collapse minute — the P3-11 invariant, now asserted across the seam.
+  const gate = MAP_EXTRACTION_EXITS.find((ex) => ex.activeWindow != null && ex.requiresItemDefId == null);
+  expect(gate != null, 'an item-free window-gated exit exists (nobody is stranded by loot luck)');
+  expect(gate.activeWindow[0] * FIXED_DT < RUN_RULES.hardTimeoutSeconds,
     'the window-gated exit opens before the hard timeout can end the run');
+  eq(gate.activeWindow[1] * FIXED_DT, RUN_RULES.hardTimeoutSeconds - RUN_RULES.collapseWarningSeconds,
+    'the item-free exit closes exactly when RUN_RULES\'s collapse warning begins (840 s)');
+  // The keycard gating the other exit must roll somewhere on THIS map's containers.
+  const keyed = MAP_EXTRACTION_EXITS.find((ex) => ex.requiresItemDefId != null);
+  if (keyed) {
+    const tablesOnMap = new Set(MAP_LOOT_CONTAINERS.map((c) => c.lootTableId));
+    const rollsOnMap = [...tablesOnMap].some((tid) => (CONTENT_LOOT_TABLES[tid]?.entries ?? [])
+      .some((e) => e.itemId === keyed.requiresItemDefId));
+    expect(rollsOnMap, `the item-gated exit's ${keyed.requiresItemDefId} rolls from a table a map container references`);
+  }
 
-  // The whole bundle constructs a real ExtractionRun — the exits pass checkBox, every static
-  // container rolls, and the roll is deterministic across two independent constructions.
+  // The map placements + this module's catalog construct a real ExtractionRun — the exits pass
+  // checkBox, every static container rolls, and the roll is deterministic across two
+  // independent constructions. This is the run wiring: opts.exits/opts.containers come from
+  // the MAP entry, everything else from the content module.
   const build = () => new ExtractionRun({
     runId: 'run_content', runSeed: 'content-fixture-001', lootTableVersion: LOOT_TABLE_VERSION,
     lootTables: CONTENT_LOOT_TABLES, itemDefs: EXTRACTION_ITEM_DEFS,
-    exits: EXTRACTION_EXITS, containers: STATIC_CONTAINERS,
+    exits: MAP_EXTRACTION_EXITS, containers: MAP_LOOT_CONTAINERS,
     reconnectGraceSeconds: RUN_RULES.reconnectGraceSeconds, hardTimeoutSeconds: RUN_RULES.hardTimeoutSeconds,
   });
   const runA = build();

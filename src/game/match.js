@@ -99,6 +99,14 @@ export class Match {
     /** Staged replication values for harnesses; ignored whenever `bombRules` exists. */
     this._bombView = {};
     /**
+     * Extraction's run adapter (`extractionRules.js`), or null in every other mode —
+     * exactly the `bombRules` arrangement: created by `EXTRACTION.init`, torn down by
+     * `EXTRACTION.cleanup`, and it outlives the final whistle until `reset()`/`dispose()`
+     * for the same reason `bombRules` does (the results screen and the raid HUD read the
+     * terminal state of a match that is being SAT IN, not one that evaporated).
+     */
+    this.extractionRules = null;
+    /**
      * The map manifest the objective volumes come from (`map-data.md` §3.3). Resolved
      * from the map at `begin()`, or supplied explicitly by a harness building against a
      * map whose objectives are not authored yet. Never coordinates in the ruleset.
@@ -748,6 +756,14 @@ export class Match {
 
   /** Key released. §6: progress resets to zero — no partial credit, no resume. */
   releaseInteract(entity) { this.bombRules?.releaseInteract(entity); }
+
+  /**
+   * The raid HUD's sample (REQ-CC-073): the documented v1 raid state
+   * (`src/ui/raid/model.js` header) while an extraction run is bound, null otherwise.
+   * `src/ui/raid/local.js` activates only on `modeId === 'extraction'` plus this method
+   * existing, and treats null as "no frame yet".
+   */
+  raidView() { return this.extractionRules ? this.extractionRules.raidView() : null; }
 
   // ─────────────────────────────────────────── the replication view of the Bomb ruleset
   //

@@ -120,7 +120,8 @@ export const LOOT_TABLES = deepFreeze({
  * POI tagging for loot placement and (later, P3-05/P4-02) AI population direction.
  * `calloutId` values are `level.js`'s shipped Square callout region ids (map-data.md §3.4) —
  * the single naming vocabulary rule — so a POI is always a place a player can already name.
- * `lootTier` says which cache tier that POI hosts in this slice.
+ * `lootTier` is an advisory authoring tag (which cache tier a POI is meant to host);
+ * positional container truth is the map entry's `LOOT_CONTAINERS` (REQ-CC-075 note below).
  */
 export const POI_TAGS = deepFreeze([
   { poiId: 'poi-fountain', calloutId: 'plaza-fountain', tags: ['landmark', 'open', 'contested'], lootTier: 1 },
@@ -131,43 +132,27 @@ export const POI_TAGS = deepFreeze([
   { poiId: 'poi-transit', calloutId: 'transit-control', tags: ['interior', 'vertical', 'loot-dense'], lootTier: 2 },
 ]);
 
-/**
- * Static container placements (`world_loot_containers` kind='static', §3.1) — the exact
- * `containers` array `ExtractionRun`'s constructor rolls at spinning-up. Positions sit inside
- * the named POI's callout box in `level.js`. Tier-N containers reference the tier-N table only.
- */
-export const STATIC_CONTAINERS = deepFreeze([
-  { containerId: 'crate-fountain-1', tier: 1, lootTableId: 'lt.tier1.cache', position: { x: 0, y: 0, z: 8 }, poiId: 'poi-fountain' },
-  { containerId: 'crate-arcade-1', tier: 1, lootTableId: 'lt.tier1.cache', position: { x: -32, y: 0, z: 18 }, poiId: 'poi-arcade' },
-  { containerId: 'crate-alley-1', tier: 1, lootTableId: 'lt.tier1.cache', position: { x: -28, y: 0, z: 35 }, poiId: 'poi-alley' },
-  { containerId: 'crate-tunnel-1', tier: 1, lootTableId: 'lt.tier1.cache', position: { x: 30, y: 0, z: 30 }, poiId: 'poi-tunnel' },
-  { containerId: 'cache-archive-1', tier: 2, lootTableId: 'lt.tier2.cache', position: { x: -31, y: 0, z: -17 }, poiId: 'poi-archive' },
-  { containerId: 'cache-transit-1', tier: 2, lootTableId: 'lt.tier2.cache', position: { x: 31, y: 0, z: 17 }, poiId: 'poi-transit' },
-]);
-
-// ────────────────────────────────────────────────────────────────── extraction exits (§4)
-
-/**
- * TWO conditional exits, per the Build Plan slice, in `ExtractionExit`'s exact authored shape
- * (§4: map-data.md §3.3 box idiom, conditions declared not implemented — the channel mechanism
- * that enforces them every tick is `extraction.js`'s, never this file's):
- *
- *  - `exit-transit-gate` — item-gated: requires a `keycard_transit` among the participant's
- *    `location='run'` instances. The keycard only rolls from tier-2 caches (risk buys the exit).
- *  - `exit-market-van` — window-gated: opens 2 minutes in and closes at 14 minutes
- *    (run-relative ticks at FIXED_DT = 1/120), always item-free so a solo player with no
- *    keycard luck is never stranded.
- */
-export const EXTRACTION_EXITS = deepFreeze([
-  { id: 'exit-transit-gate',
-    volume: { min: { x: 38, y: 0, z: 34 }, max: { x: 42, y: 3, z: 42 } },
-    requiresItemDefId: 'keycard_transit',
-    durationSeconds: 8 },
-  { id: 'exit-market-van',
-    volume: { min: { x: -42, y: 0, z: 36 }, max: { x: -36, y: 3, z: 42 } },
-    activeWindow: [14400, 100800], // 120 s .. 840 s at 120 Hz
-    durationSeconds: 12 },
-]);
+// ─────────────────────────────────────── positional exit/container data lives on the MAP entry
+//
+// REQ-CC-075: this module authored a district-only `STATIC_CONTAINERS` (6) and
+// `EXTRACTION_EXITS` (exit-transit-gate / exit-market-van) concurrently with P3-06's
+// three-sector map, which authored its own set anchored to the built geometry. Two positional
+// truths for one map is exactly the divergence a run wired from one and tooling wired from the
+// other turns into a live fault, so this module no longer exports positional placements AT ALL.
+//
+// THE authoritative exit/container set for map 'square-extraction' is the map registry entry:
+// `SQUARE_EXTRACTION.EXTRACTION_EXITS` (2 exits) and `SQUARE_EXTRACTION.LOOT_CONTAINERS`
+// (9 containers) in `src/world/level.js` — placements are map data anchored to geometry
+// (extraction-match.md §3.1/§4), already in the exact shapes `ExtractionRun` consumes
+// (`opts.exits` / `opts.containers`). Run wiring takes them from the map entry; this module
+// stays the catalog/tier/rules layer those placements reference (item definitions, loot
+// tables, POI tags, run rules, AI profiles). `scripts/extractiontest.mjs` fails if a
+// positional export ever reappears here.
+//
+// The map's rail-gate window is `[0, 100800]` — it closes when RUN_RULES' 60 s collapse
+// warning begins (840 s of the 900 s hard timeout), preserving P3-11's "an item-less player
+// is never stranded" invariant; the ferry exit is gated on `keycard_transit`, which rolls
+// only from `lt.tier2.cache`. extractiontest asserts both couplings against RUN_RULES below.
 
 // ──────────────────────────────────────────────────────── run lifecycle parameters (§1.1)
 
@@ -204,14 +189,16 @@ export const AI_PROFILES = deepFreeze([
     budget: { maxActivePerSector: 2, maxActiveTotal: 4 } },
 ]);
 
-/** One handle over everything above, for validators that sweep the whole slice at once. */
+/**
+ * One handle over everything above, for validators that sweep the whole slice at once.
+ * Positional exits/containers are deliberately NOT here — see the REQ-CC-075 note above;
+ * they live on the map entry (`SQUARE_EXTRACTION` in `src/world/level.js`).
+ */
 export const EXTRACTION_CONTENT = deepFreeze({
   lootTableVersion: LOOT_TABLE_VERSION,
   itemDefinitions: ITEM_DEFINITIONS,
   lootTables: LOOT_TABLES,
   poiTags: POI_TAGS,
-  staticContainers: STATIC_CONTAINERS,
-  exits: EXTRACTION_EXITS,
   runRules: RUN_RULES,
   aiProfiles: AI_PROFILES,
 });

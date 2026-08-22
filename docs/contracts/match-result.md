@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 2.0.0 |
+| **Version** | 2.1.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -276,7 +276,8 @@ Plus the non-terminal fourth shape, which shares only its identifiers:
 ```jsonc
 // status: "pending" — allocated, live, or ended and awaiting persistence
 { "matchId": "…", "status": "pending",
-  "mode": "tdm|bomb", "mapId": "…", "mapVersion": "…",
+  "mode": "tdm|bomb|extraction",   // 2.1.0: a run pending settlement is this same shape (§4.4)
+  "mapId": "…", "mapVersion": "…",
   "startedAt": "…"|null,      // null while ALLOCATED; the real timestamp once the match starts
   "endedAt": "…"|null,        // null until it ends; the real timestamp once ended and queued
   "retryAfterMs": 2000,
@@ -337,6 +338,70 @@ live pending state its own detail endpoint defines.
 
 A pending entry carries **null** for every outcome field rather than omitting them, so one
 renderer handles both and a missing key is always a bug rather than a state.
+
+### 4.4 `RunTerminalResult` — the extraction run-result projection (2.1.0, additive — REQ-CC-072)
+
+A run is a `matches` row with `mode='extraction'` (`settlement.md` §2), read through the same
+`GET /v1/matches/:matchId`. It cannot be a `TerminalResult` refinement: `settlement.md` §2
+deliberately leaves `outcome_reason`, `winner_team`, `team_scores`, and `rounds` null for a run,
+and per-participant truth lives in `match_participants.stats` as settlement writes it. So a
+terminal `mode='extraction'` row returns a **fifth shape**, discriminated by `mode` — a client
+that sees `status ∈ {completed, aborted}` branches on `mode` before assuming the §4.2 field set:
+
+```jsonc
+{
+  "matchId": "…",
+  "status": "completed|aborted",     // §2 of settlement.md: a run is never `invalidated` in this version
+  "mode": "extraction",              // the discriminant for this shape
+  "mapId": "…", "mapVersion": "…", "region": "…", "serverBuild": "…"|null,
+  "startedAt": "…", "endedAt": "…",
+  "roster": RosterEntry[],           // team is null — a run has no alpha/bravo
+  "settlement": {
+    "runLevelException": { "exceptionId": "…", "trigger": "…" } | null,
+                                      // settlement.md §7.1's run-level trigger; null when none
+    "participants": [ {
+      "accountId": "…",
+      "settlementStatus": "ended|settled|exception-open|exception-resolved",  // settlement.md §3
+      "outcome": "extracted|died|aborted|server-failure" | null,  // null iff not yet applied
+                                      // (`ended`) or no outcome was applied (`exception-open`,
+                                      // or an exception resolved as void)
+      "exitId": "…"|null,            // non-null iff outcome is "extracted"
+      "deathCause": "…"|null,        // non-null iff outcome is "died"
+      "exceptionId": "…"|null,       // non-null iff an exception is currently OPEN for this
+                                      // participant — settlement clears it on resolution
+      "trigger": "…"|null            // settlement.md §7.1's row name; non-null iff exception-open
+    } ]
+  },
+  "evidenceRef": "…"|null,           // §7's rule unchanged: real for a service caller, null otherwise
+  "correlationId": "…"
+}
+```
+
+Rules:
+
+- **The PvP-only keys are absent, not null-stuffed**: no `winnerTeam`, `outcomeReason`,
+  `terminationReason`, `teamScores`, `rounds`, `rulesSnapshot`, `players`,
+  `invalidationReason`, `rulesetVersion`, or `statDefinitionVersion`. None has a defined
+  extraction meaning (`settlement.md` §2), and a fabricated null teaches a renderer to read a
+  key that never carries information. `settlement` is, symmetrically, absent from every
+  `tdm|bomb` response.
+- `settlement.participants[]` covers the **full roster**. A participant the raid server never
+  submitted (settlement.md §7.1's missing-participant trigger) appears with its stored stats
+  state — `ended` if stamped, and `settlementStatus` reads as `"ended"` when the stats carry no
+  settlement keys at all on a terminal row, so the client's four-state vocabulary is total.
+- `runLevelException` mirrors `settlement.md` §5.3's response field, read back from the open
+  run-level `settlement_exceptions` row (accountId null); null once resolved or when none was
+  opened.
+- Access rules are §4.2's unchanged: service / participant / everyone-published, 404 otherwise,
+  `evidenceRef` service-only.
+- A **non-terminal** run row projects as §4.2's `pending` shape with `mode: "extraction"` —
+  same three stored-row states, same `retryAfterMs` contract. P3-10's retry-safe presentation
+  polls it exactly as a PvP results screen does.
+
+This is additive (2.0.0 → 2.1.0, no CCR): a new discriminant value and a new shape behind it;
+no existing `tdm|bomb` response changes by a byte. The submission side is not here —
+`RunResult` submission is `settlement.md` §5's `POST /v1/runs/:runId/result`, service-only;
+this section is only the browser-readable projection of what settlement wrote.
 
 ## 5. Submission and idempotency
 

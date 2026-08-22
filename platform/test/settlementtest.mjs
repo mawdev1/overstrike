@@ -526,6 +526,88 @@ async function main() {
     check('a real-disposition resolution opens exactly ONE core-store transaction', newTxOpens === 1,
       `newTxOpens=${newTxOpens}`);
   }
+
+  // ----------------------- match-result.md §4.4 — the extraction run-result read projection
+
+  {
+    const { createStatsService } = await import('../src/modules/profile/stats.js');
+    const { createOutbox: mkOutbox } = await import('../src/modules/events/outbox.js');
+    const { store, inventoryStore, inventoryService, settlement } = await freshHarness();
+    const stats = createStatsService({ store, outbox: mkOutbox({ store, logger: null }) });
+    const runId = ulid();
+    const [a, b, c] = [ulid(), ulid(), ulid()];
+    // Three on the roster, TWO submitted: c is settlement.md §7.1's run-level trigger.
+    await allocateRun(store, { runId, accountIds: [a, b, c] });
+    await seedDefinition(inventoryService);
+    await seedRunInstance(inventoryStore, { runId, accountId: a });
+    await seedRunInstance(inventoryStore, { runId, accountId: b });
+
+    await settlement.submitRunResult({
+      actor: SERVICE_ACTOR, idempotencyKey: idempotencyKeyFor(runId),
+      runResult: runResult({
+        runId,
+        participants: [
+          { accountId: a, outcome: 'extracted', exitId: 'exit-rail-gate' },
+          { accountId: b, outcome: 'died', deathCause: 'player' },
+        ],
+      }),
+    });
+
+    const proj = await stats.getMatch(runId, { viewer: { accountId: a } });
+    check('§4.4: terminal run projects mode extraction', proj.mode === 'extraction' && proj.status === 'completed');
+    check('§4.4: no PvP keys are null-stuffed onto a run projection',
+      !('winnerTeam' in proj) && !('teamScores' in proj) && !('rounds' in proj)
+      && !('players' in proj) && !('rulesSnapshot' in proj) && !('outcomeReason' in proj),
+      JSON.stringify(Object.keys(proj)));
+    check('§4.4: roster covers the full participant set with team null',
+      proj.roster.length === 3 && proj.roster.every((r) => r.team === null));
+    const pa = proj.settlement.participants.find((p) => p.accountId === a);
+    const pb = proj.settlement.participants.find((p) => p.accountId === b);
+    const pc = proj.settlement.participants.find((p) => p.accountId === c);
+    check('§4.4: extracted participant carries settled + outcome + exitId',
+      pa?.settlementStatus === 'settled' && pa?.outcome === 'extracted' && pa?.exitId === 'exit-rail-gate'
+      && pa?.deathCause === null && pa?.exceptionId === null && pa?.trigger === null, JSON.stringify(pa));
+    check('§4.4: died participant carries settled + deathCause, exitId null',
+      pb?.settlementStatus === 'settled' && pb?.outcome === 'died' && pb?.deathCause === 'player'
+      && pb?.exitId === null, JSON.stringify(pb));
+    check('§4.4: the never-submitted participant reads as ended with every fact null',
+      pc?.settlementStatus === 'ended' && pc?.outcome === null && pc?.exitId === null
+      && pc?.exceptionId === null && pc?.trigger === null, JSON.stringify(pc));
+    check('§4.4: the run-level exception surfaces through settlement.runLevelException',
+      proj.settlement.runLevelException !== null
+      && proj.settlement.runLevelException.trigger === 'missing-participant'
+      && typeof proj.settlement.runLevelException.exceptionId === 'string',
+      JSON.stringify(proj.settlement.runLevelException));
+    check('§4.4: evidenceRef withheld from a participant caller', proj.evidenceRef === null);
+    const svc = await stats.getMatch(runId, { viewer: { kind: 'service' } });
+    check('§4.4: evidenceRef real for a service caller', typeof svc.evidenceRef === 'string'
+      && svc.evidenceRef.startsWith('sha256:'));
+
+    // A participant-level exception projects as exception-open with its trigger; a PvP match
+    // is untouched by any of this (control: the tdm path still returns the §4.2 union).
+    const runId2 = ulid();
+    const d = ulid();
+    await allocateRun(store, { runId: runId2, accountIds: [d] });
+    // Unlocked surviving instance → §7.1 lock-mismatch → exception-open.
+    const inst = await inventoryStore.instances.create({
+      instanceId: ulid(), itemId: 'rifle_ak74', ownerAccountId: d, quantity: 1,
+      location: 'run', runId: runId2, containerId: null,
+    });
+    void inst;
+    await settlement.submitRunResult({
+      actor: SERVICE_ACTOR, idempotencyKey: idempotencyKeyFor(runId2),
+      runResult: runResult({
+        runId: runId2,
+        participants: [{ accountId: d, outcome: 'extracted', exitId: 'exit-rail-gate' }],
+      }),
+    });
+    const proj2 = await stats.getMatch(runId2, { viewer: { accountId: d } });
+    const pd = proj2.settlement.participants.find((p) => p.accountId === d);
+    check('§4.4: an exception-open participant carries exceptionId + trigger and a null outcome',
+      pd?.settlementStatus === 'exception-open' && pd?.outcome === null
+      && typeof pd?.exceptionId === 'string' && pd?.trigger === 'lock-mismatch', JSON.stringify(pd));
+    check('§4.4: a clean run carries runLevelException null', proj2.settlement.runLevelException === null);
+  }
 }
 
 main().then(() => {

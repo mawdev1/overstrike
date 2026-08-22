@@ -925,13 +925,17 @@ export async function createPostgresStore(config = {}, deps = {}) {
      * run has already reached a terminal status, so a retried submission never re-derives
      * `started_at`/`ended_at` from a second payload.
      */
-    async transitionRunEnded(runId, { status, startedAt, endedAt }, txh) {
+    async transitionRunEnded(runId, { status, startedAt, endedAt, evidenceRef = null }, txh) {
+      // `evidence_ref` is written here because migration 0029's terminal-completeness CHECK
+      // requires it non-null on a terminal extraction row, and THIS update is the only write
+      // that makes a run terminal — without it the transition itself violates the CHECK.
       const { rows } = await q(txh,
         `update matches set status = $2, started_at = coalesce($3::timestamptz, started_at),
-            ended_at = coalesce($4::timestamptz, ended_at), updated_at = now()
+            ended_at = coalesce($4::timestamptz, ended_at),
+            evidence_ref = coalesce($5, evidence_ref), updated_at = now()
           where match_id = $1 and mode = 'extraction' and status = 'in-progress'
           returning *`,
-        [runId, status, startedAt ?? null, endedAt ?? null]);
+        [runId, status, startedAt ?? null, endedAt ?? null, evidenceRef ?? null]);
       if (rows.length) return mapRow(rows[0]);
       const { rows: current } = await q(txh, 'select * from matches where match_id = $1', [runId]);
       if (!current.length) throw new ApiError('NOT_FOUND', 'No such run.', { details: { runId } });

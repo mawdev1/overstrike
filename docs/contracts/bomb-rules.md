@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.7.0 |
+| **Version** | 1.8.0 |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
 
@@ -20,6 +20,14 @@ match-series logic.
 a two-entry table. **Two entries is the freeze** — `tdmtest.mjs` and `bombtest.mjs` assert the
 table's exact contents, so a third mode fails CI. That is deliberate: the roadmap's mode
 freeze needs teeth, not goodwill.
+
+> **Amended (1.8.0, P3):** Bomb remains the second and final **competitive** (Alpha) mode;
+> nothing above changes. The P3 vertical slice adds `extraction-match.md`'s
+> `mode='extraction'` — already `FROZEN` and already admitted at the schema level
+> (`db-schema.md`'s `matches.mode` CHECK, `match-result.md` 2.1.0 §4.4) — as the table's
+> **third and final** entry, out of the competitive rotation. The freeze mechanism is
+> unchanged: `tdmtest.mjs`/`bombtest.mjs` assert the table verbatim
+> (`tdm, bomb, extraction`), so a fourth mode — or any competitive third — still fails CI.
 
 ## 2. Parameters — **DECIDED** (D4)
 

@@ -182,6 +182,12 @@ export const SCENARIO_PROBES = {
   'result-invalidated': [signin, matchDetail],
   'result-draw': [signin, matchDetail],
   'result-tdm-completed': [signin, matchDetail],
+  'result-extraction-extracted': [signin, matchDetail],
+  'result-extraction-lost': [signin, matchDetail],
+  'result-extraction-exception': [signin, matchDetail],
+  'result-extraction-mixed': [signin, matchDetail],
+  // 2 pending polls, the retry-safe `ended` read, then the settled terminal read.
+  'result-extraction-pending': [signin, matchDetail, matchDetail, matchDetail, matchDetail],
   'history-mixed': [signin, history],
   'history-empty': [signin, statsAll, history],
   'privacy-filtered': [signin, publicProfile],

@@ -20,6 +20,7 @@ const DAY = 24 * 3600 * 1000;
 
 export const ACCOUNT_ID = stubUlid('account:me', EPOCH_MS - 400 * DAY);
 export const OTHER_ACCOUNT_ID = stubUlid('account:other', EPOCH_MS - 300 * DAY);
+export const THIRD_ACCOUNT_ID = stubUlid('account:third', EPOCH_MS - 200 * DAY);
 export const DISPLAY_NAME = 'StubRunner';
 export const BUILD = '1.0.0-stub';
 export const SERVER_BUILD = 'match-1.0.0-stub';
@@ -624,17 +625,66 @@ export function terminalResult(matchId, {
   };
 }
 
-/** The non-terminal fourth shape, §4.2. `endedAt` null while live, set once ended and queued. */
-export function pendingResult(matchId, { endedAt = null } = {}) {
+/** The non-terminal fourth shape, §4.2. `endedAt` null while live, set once ended and queued.
+ * 2.1.0: a run pending settlement is this same shape with `mode: 'extraction'` (§4.4). */
+export function pendingResult(matchId, { endedAt = null, mode = 'bomb' } = {}) {
   return {
     matchId,
     status: 'pending',
-    mode: 'bomb',
+    mode,
     mapId: 'the-square',
     mapVersion: '1.0.0',
     startedAt: iso(EPOCH_MS - 900 * 1000),
     endedAt,
     retryAfterMs: 2000,
+  };
+}
+
+/**
+ * `RunTerminalResult`, match-result.md §4.4 (2.1.0) — the extraction run-result projection.
+ *
+ * The union's rules hold here exactly as `terminalResult` holds §4.2's: the PvP keys are
+ * ABSENT (never null-stuffed), `settlement.participants[]` covers the full roster, and
+ * `evidenceRef` is null because the stub always answers a player caller. Participant entries
+ * default to the local stub account extracting through the map's item-free rail-gate exit
+ * (`level.js`'s authoritative set — REQ-CC-075: exit ids come from the map entry).
+ */
+export function extractionRunResult(matchId, {
+  status = 'completed',
+  participants = null,
+  runLevelException = null,
+} = {}) {
+  const entries = participants ?? [
+    { accountId: ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted',
+      exitId: 'exit-rail-gate', deathCause: null, exceptionId: null, trigger: null },
+  ];
+  return {
+    matchId,
+    status,
+    mode: 'extraction',
+    mapId: 'square-extraction',
+    mapVersion: '0.1.0',
+    region: 'yyz',
+    serverBuild: SERVER_BUILD,
+    startedAt: iso(EPOCH_MS - 2400 * 1000),
+    endedAt: iso(EPOCH_MS - 300 * 1000),
+    roster: entries.map((p) => ({
+      accountId: p.accountId, team: null,
+      joinedAt: iso(EPOCH_MS - 2400 * 1000), leftAt: null,
+    })),
+    settlement: {
+      runLevelException,
+      participants: entries.map((p) => ({
+        accountId: p.accountId,
+        settlementStatus: p.settlementStatus,
+        outcome: p.outcome ?? null,
+        exitId: p.exitId ?? null,
+        deathCause: p.deathCause ?? null,
+        exceptionId: p.exceptionId ?? null,
+        trigger: p.trigger ?? null,
+      })),
+    },
+    evidenceRef: null,
   };
 }
 
