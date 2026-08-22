@@ -61,6 +61,13 @@ export const CATALOGUE = new Map([
   def('admin.action.executed',  [1], ['admin'],            ANY_SUBJECT, 'sensitive', 'audit'),
   def('config.changed',         [1], ['admin'],            ANY_SUBJECT, 'internal',  'audit'),
   def('flag.toggled',           [1], ['admin', 'system'],  ANY_SUBJECT, 'internal',  'audit'),
+
+  // settlement.md §9 (P3-04, additive). `subject.kind` is `match` throughout — a run IS a
+  // `matches` row (settlement.md §2) — so ordering follows §3's per-subject rule automatically.
+  def('run.ended',              [1], ['service'],          ['match'],   'internal',  'standard'),
+  def('run.settled',            [1], ['service'],          ['match'],   'internal',  'audit'),
+  def('run.exception.opened',   [1], ['system', 'service'], ['match'],  'internal',  'audit'),
+  def('run.exception.resolved', [1], ['admin'],             ['match'],  'internal',  'audit'),
 ]);
 
 /** §5: `<domain>.<entity>.<past-tense-verb>`, lowercase, dot-separated, two or three parts. */

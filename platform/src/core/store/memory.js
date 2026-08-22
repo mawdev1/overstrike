@@ -104,6 +104,7 @@ function emptyState() {
     audit: new Map(),
     idempotency: new Map(),
     flags: new Map(),
+    settlementExceptions: new Map(),
   };
 }
 
@@ -1025,6 +1026,194 @@ export function createMemoryStore(config = {}, deps = {}) {
         };
       });
     },
+
+    // ---------------------------------------------------------------- P3-04 settlement.md
+
+    /**
+     * A minimal run allocation. `deployment.md`'s admission-time write is the eventual real
+     * producer of a `mode='extraction'` matches row (settlement.md §0's carried-forward
+     * dependency); until that lands, this is the one way a caller — today, only this module's
+     * own tests — can create one at all. Rejects a duplicate matchId rather than silently
+     * reusing it, the same posture `record()` takes toward a second terminal write.
+     */
+    allocateRun({ matchId, region, mapId, mapVersion = null, serverId = null, roomId = null,
+      serverBuild = null, participants = [] }, txh) {
+      return write(txh, (st) => {
+        if (st.matches.has(matchId)) {
+          throw new ApiError('CONFLICT', `Run ${matchId} already exists.`, { details: { matchId } });
+        }
+        const now = nowIso();
+        const values = {
+          matchId, roomId, region, serverId, mapId, mapVersion, mode: 'extraction',
+          rulesetVersion: null, statDefinitionVersion: null, serverBuild,
+          status: 'in-progress', terminationReason: null, outcomeReason: null,
+          invalidationReason: null, winnerTeam: null, rulesSnapshot: {},
+          teamScores: null, rounds: null, evidenceRef: null, startedAt: now, endedAt: null,
+        };
+        const rec = {};
+        for (const c of MATCH_COLUMNS) rec[c] = values[c] ?? null;
+        rec.allocatedAt = now; rec.recordedAt = now; rec.resultAppliedAt = null; rec.updatedAt = now;
+        st.matches.set(matchId, rec);
+        for (const accountId of participants) {
+          requireAccount(st, accountId, 'match_participants');
+          st.matchParticipants.set(key(matchId, accountId), {
+            matchId, accountId, team: null, joinedAt: now, leftAt: null,
+            disconnected: false, abandoned: false, stats: {}, createdAt: now, updatedAt: now,
+          });
+        }
+        return clone(rec);
+      });
+    },
+
+    /**
+     * settlement.md §5.2 — the run-terminal write. A run already at a terminal status is left
+     * untouched (the pseudocode's own "no-op on replay; §5 rule 3 covers idempotency"), so a
+     * retried submission never re-derives `started_at`/`ended_at` from a second payload.
+     */
+    transitionRunEnded(runId, { status, startedAt, endedAt }, txh) {
+      return write(txh, (st) => {
+        const m = st.matches.get(runId);
+        if (!m) throw new ApiError('NOT_FOUND', 'No such run.', { details: { runId } });
+        if (m.mode !== 'extraction') {
+          throw new ApiError('VALIDATION_FAILED', 'transitionRunEnded is for mode=extraction rows only.', {
+            details: { runId, mode: m.mode },
+          });
+        }
+        if (TERMINAL_MATCH_STATUSES.includes(m.status)) return clone(m);
+        m.status = status;
+        m.startedAt = toIso(startedAt) ?? m.startedAt;
+        m.endedAt = toIso(endedAt) ?? m.endedAt;
+        m.updatedAt = nowIso();
+        return clone(m);
+      });
+    },
+
+    /**
+     * §5.2's `settlementStatus: 'ended'` stamp — only where absent, for exactly the accounts
+     * named in this submission. Returns the count actually stamped, so a caller can tell a
+     * fresh submission from a pure replay without a second read.
+     */
+    markParticipantsEnded(matchId, accountIds, txh) {
+      return write(txh, (st) => {
+        let count = 0;
+        for (const accountId of accountIds) {
+          const p = st.matchParticipants.get(key(matchId, accountId));
+          if (!p || p.stats?.settlementStatus) continue;   // missing row, or already past `ended`
+          p.stats = { ...p.stats, settlementStatus: 'ended' };
+          p.updatedAt = nowIso();
+          count++;
+        }
+        return count;
+      });
+    },
+
+    /** §6/§6.1's unconditional `stats = stats || jsonb_build_object(…)` merge. */
+    mergeParticipantStats(matchId, accountId, patch, txh) {
+      return write(txh, (st) => {
+        const p = st.matchParticipants.get(key(matchId, accountId));
+        if (!p) throw new ApiError('NOT_FOUND', 'No such match participant.', { details: { matchId, accountId } });
+        p.stats = { ...p.stats, ...patch };
+        p.updatedAt = nowIso();
+        return clone(p);
+      });
+    },
+
+    /** One participant's current stats, for the natural per-participant idempotency check. */
+    getParticipant(matchId, accountId, txh) {
+      return read(txh, (st) => clone(st.matchParticipants.get(key(matchId, accountId)) ?? null));
+    },
+
+    /** §7.2's stall-detector precondition set: terminal run, participant with no disposition yet. */
+    listUnsettledRunParticipants(txh) {
+      return read(txh, (st) => {
+        const out = [];
+        for (const p of st.matchParticipants.values()) {
+          const m = st.matches.get(p.matchId);
+          if (!m || m.mode !== 'extraction') continue;
+          if (!['completed', 'aborted'].includes(m.status)) continue;
+          if (p.stats?.settlementStatus) continue;
+          out.push({ matchId: p.matchId, accountId: p.accountId, endedAt: m.endedAt });
+        }
+        return out;
+      });
+    },
+  };
+
+  const settlementExceptions = {
+    /** §7.1's ambiguity triggers land here, whether opened by the endpoint or the stall detector. */
+    open(row, txh) {
+      return write(txh, (st) => {
+        const exceptionId = row.exceptionId ?? newId();
+        const now = nowIso();
+        const rec = {
+          exceptionId, runId: row.runId, accountId: row.accountId ?? null,
+          trigger: row.trigger, status: 'open',
+          openedAt: now, openedBy: row.openedBy,
+          evidenceSnapshot: clone(row.evidenceSnapshot ?? {}),
+          assignedTo: null, reviewedAt: null, reviewedBy: null,
+          resolution: null, resolutionNotes: null, resolutionEvidenceRef: null,
+          createdAt: now, updatedAt: now,
+        };
+        st.settlementExceptions.set(exceptionId, rec);
+        return clone(rec);
+      });
+    },
+
+    byId(exceptionId, txh) {
+      return read(txh, (st) => clone(st.settlementExceptions.get(exceptionId) ?? null));
+    },
+
+    listByRun(runId, txh) {
+      return read(txh, (st) => [...st.settlementExceptions.values()]
+        .filter((e) => e.runId === runId).map(clone));
+    },
+
+    listOpenForParticipant(runId, accountId, txh) {
+      return read(txh, (st) => [...st.settlementExceptions.values()]
+        .filter((e) => e.runId === runId && e.accountId === accountId && e.status !== 'resolved')
+        .map(clone));
+    },
+
+    /** §7.4 step 3 — optimistic-locked claim. Zero-row (returns null) means claimed/resolved since read. */
+    claim({ exceptionId, operatorId, expectedUpdatedAt }, txh) {
+      return write(txh, (st) => {
+        const e = st.settlementExceptions.get(exceptionId);
+        if (!e || e.status !== 'open' || e.updatedAt !== expectedUpdatedAt) return null;
+        e.assignedTo = operatorId;
+        e.status = 'in-review';
+        e.updatedAt = nowIso();
+        return clone(e);
+      });
+    },
+
+    /**
+     * §7.4 step 4/6 — the terminal write. `resolution`/`resolutionNotes` are the audit trail.
+     *
+     * Guarded by `status === 'in-review'`, the same optimistic-lock shape as `refreshTokens`'
+     * `markUsed`: a second call for an already-resolved (or never-claimed) exception must not
+     * silently re-run and clobber the first operator's audit trail with its own. This is the
+     * DB-level backstop behind `resolveException`'s own read-then-check in the settlement
+     * module — the one that actually holds under a genuine race the module's read can't see.
+     */
+    resolve({ exceptionId, resolution, resolutionNotes, resolutionEvidenceRef = null, reviewedBy }, txh) {
+      return write(txh, (st) => {
+        const e = st.settlementExceptions.get(exceptionId);
+        if (!e) throw new ApiError('NOT_FOUND', 'No such settlement exception.', { details: { exceptionId } });
+        if (e.status !== 'in-review') {
+          throw new ApiError('CONFLICT', 'That exception is not in review (already resolved, or not yet claimed).', {
+            details: { exceptionId, status: e.status },
+          });
+        }
+        e.status = 'resolved';
+        e.resolution = resolution;
+        e.resolutionNotes = resolutionNotes;
+        e.resolutionEvidenceRef = resolutionEvidenceRef;
+        e.reviewedBy = reviewedBy;
+        e.reviewedAt = nowIso();
+        e.updatedAt = nowIso();
+        return clone(e);
+      });
+    },
   };
 
   /**
@@ -1645,7 +1834,7 @@ export function createMemoryStore(config = {}, deps = {}) {
     tx,
     accounts, accountNameHistory, sessions, refreshTokens, profiles, stats, weaponStats, matches,
     preAuthConsent, outbox, audit, idempotency, flags, rooms, roomMembers, reports, matchTickets, chatMessages,
-    matchEvidence, matchServers,
+    matchEvidence, matchServers, settlementExceptions,
     async health() {
       return closed ? { ok: false, detail: 'closed' } : { ok: true, detail: 'memory' };
     },

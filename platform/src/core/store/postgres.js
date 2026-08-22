@@ -108,6 +108,10 @@ export const TABLE_COLUMNS = {
   chat_messages: ['messageId', 'roomId', 'senderAccountId', 'text', 'createdAt', 'expiresAt',
     'removedAt', 'removedBy', 'removalReason'],
   match_tickets: ['jti', 'accountId', 'roomId', 'matchId', 'expiresAt', 'consumedAt', 'createdAt'],
+  // settlement.md §7.3. `status`/`resolution`/`opened_at`/`reviewed_at`/`created_at`/`updated_at`
+  // are either defaulted by the schema or written only by the dedicated claim/resolve methods
+  // above, never by a generic patch — so they are deliberately absent from this allow-list.
+  settlement_exceptions: ['exceptionId', 'runId', 'accountId', 'trigger', 'openedBy', 'evidenceSnapshot'],
 };
 
 /**
@@ -127,6 +131,7 @@ const JSONB_COLUMNS = Object.assign(Object.create(null), {
   match_evidence: new Set(['evidence']),
   rooms: new Set(['settings']),
   room_members: new Set(['loadout', 'mutedAccountIds']),
+  settlement_exceptions: new Set(['evidenceSnapshot']),
 });
 
 function encode(table, camelKey, value) {
@@ -886,6 +891,173 @@ export async function createPostgresStore(config = {}, deps = {}) {
         nextCursor: rows.length > size ? page[page.length - 1].match_id : null,
       };
     },
+
+    // ---------------------------------------------------------------- P3-04 settlement.md
+
+    /**
+     * A minimal run allocation — see the memory adapter's identical note: `deployment.md`'s
+     * admission-time write is the eventual real producer of a `mode='extraction'` row; until
+     * that lands, this is the one way a caller creates one.
+     */
+    async allocateRun({ matchId, region, mapId, mapVersion = null, serverId = null, roomId = null,
+      serverBuild = null, participants = [] }, txh) {
+      const run = async (t) => {
+        await insertRow(t, 'matches', {
+          matchId, roomId, region, serverId, mapId, mapVersion, mode: 'extraction',
+          rulesetVersion: null, statDefinitionVersion: null, serverBuild,
+          status: 'in-progress', terminationReason: null, outcomeReason: null,
+          invalidationReason: null, winnerTeam: null, rulesSnapshot: {},
+          teamScores: null, rounds: null, evidenceRef: null, startedAt: new Date().toISOString(),
+          endedAt: null,
+        }, { returning: '' });
+        for (const accountId of participants) {
+          await insertRow(t, 'match_participants',
+            { matchId, accountId, team: null, stats: {} }, { returning: '' });
+        }
+        const { rows } = await q(t, 'select * from matches where match_id = $1', [matchId]);
+        return mapRow(rows[0]);
+      };
+      return inTransaction(txh) ? run(txh) : tx((t) => run(t));
+    },
+
+    /**
+     * settlement.md §5.2 — the run-terminal write. No-op (returns the row unchanged) once the
+     * run has already reached a terminal status, so a retried submission never re-derives
+     * `started_at`/`ended_at` from a second payload.
+     */
+    async transitionRunEnded(runId, { status, startedAt, endedAt }, txh) {
+      const { rows } = await q(txh,
+        `update matches set status = $2, started_at = coalesce($3::timestamptz, started_at),
+            ended_at = coalesce($4::timestamptz, ended_at), updated_at = now()
+          where match_id = $1 and mode = 'extraction' and status = 'in-progress'
+          returning *`,
+        [runId, status, startedAt ?? null, endedAt ?? null]);
+      if (rows.length) return mapRow(rows[0]);
+      const { rows: current } = await q(txh, 'select * from matches where match_id = $1', [runId]);
+      if (!current.length) throw new ApiError('NOT_FOUND', 'No such run.', { details: { runId } });
+      if (current[0].mode !== 'extraction') {
+        throw new ApiError('VALIDATION_FAILED', 'transitionRunEnded is for mode=extraction rows only.', {
+          details: { runId, mode: current[0].mode },
+        });
+      }
+      return mapRow(current[0]);   // already terminal: no-op on replay
+    },
+
+    /** §5.2's `settlementStatus: 'ended'` stamp — only where absent, for the named accounts. */
+    async markParticipantsEnded(matchId, accountIds, txh) {
+      const { rowCount } = await q(txh,
+        `update match_participants set stats = stats || '{"settlementStatus":"ended"}'::jsonb,
+            updated_at = now()
+          where match_id = $1 and account_id = any($2)
+            and (stats ->> 'settlementStatus') is null`,
+        [matchId, accountIds]);
+      return rowCount;
+    },
+
+    /** §6/§6.1's unconditional `stats = stats || jsonb_build_object(…)` merge. */
+    async mergeParticipantStats(matchId, accountId, patch, txh) {
+      const { rows } = await q(txh,
+        `update match_participants set stats = stats || $3::jsonb, updated_at = now()
+          where match_id = $1 and account_id = $2
+          returning *`,
+        [matchId, accountId, JSON.stringify(patch)]);
+      if (!rows.length) {
+        throw new ApiError('NOT_FOUND', 'No such match participant.', { details: { matchId, accountId } });
+      }
+      return mapRow(rows[0]);
+    },
+
+    /** One participant's current stats, for the natural per-participant idempotency check. */
+    async getParticipant(matchId, accountId, txh) {
+      const { rows } = await q(txh,
+        'select * from match_participants where match_id = $1 and account_id = $2', [matchId, accountId]);
+      return mapRow(rows[0]);
+    },
+
+    /** §7.2's stall-detector precondition set: terminal run, participant with no disposition yet. */
+    async listUnsettledRunParticipants(txh) {
+      const { rows } = await q(txh,
+        `select p.match_id, p.account_id, m.ended_at
+           from match_participants p
+           join matches m on m.match_id = p.match_id
+          where m.mode = 'extraction' and m.status in ('completed', 'aborted')
+            and (p.stats ->> 'settlementStatus') is null`);
+      return rows.map((r) => ({
+        matchId: r.match_id, accountId: r.account_id,
+        endedAt: r.ended_at instanceof Date ? r.ended_at.toISOString() : r.ended_at,
+      }));
+    },
+  };
+
+  const settlementExceptions = {
+    /** §7.1's ambiguity triggers land here, whether opened by the endpoint or the stall detector. */
+    async open(row, txh) {
+      return mapRow(await insertRow(txh, 'settlement_exceptions', {
+        exceptionId: row.exceptionId ?? newId(),
+        runId: row.runId, accountId: row.accountId ?? null, trigger: row.trigger,
+        openedBy: row.openedBy, evidenceSnapshot: row.evidenceSnapshot ?? {},
+      }));
+    },
+
+    async byId(exceptionId, txh) {
+      const { rows } = await q(txh, 'select * from settlement_exceptions where exception_id = $1', [exceptionId]);
+      return mapRow(rows[0]);
+    },
+
+    async listByRun(runId, txh) {
+      const { rows } = await q(txh,
+        'select * from settlement_exceptions where run_id = $1 order by opened_at', [runId]);
+      return rows.map((r) => mapRow(r));
+    },
+
+    async listOpenForParticipant(runId, accountId, txh) {
+      const { rows } = await q(txh,
+        `select * from settlement_exceptions
+          where run_id = $1 and account_id = $2 and status <> 'resolved'`,
+        [runId, accountId]);
+      return rows.map((r) => mapRow(r));
+    },
+
+    /** §7.4 step 3 — optimistic-locked claim. Zero rows (returns null) means claimed/resolved since read. */
+    async claim({ exceptionId, operatorId, expectedUpdatedAt }, txh) {
+      const { rows } = await q(txh,
+        `update settlement_exceptions set assigned_to = $1, status = 'in-review', updated_at = now()
+          where exception_id = $2 and updated_at = $3::timestamptz and status = 'open'
+          returning *`,
+        [operatorId, exceptionId, expectedUpdatedAt]);
+      return mapRow(rows[0]);
+    },
+
+    /**
+     * §7.4 step 4/6 — the terminal write.
+     *
+     * The `WHERE ... status = 'in-review'` is a guarded UPDATE, the same optimistic-lock shape
+     * `refreshTokens.markUsed` uses: zero rows back means the exception was already resolved (or
+     * never claimed), and the caller must not treat that as success — a second resolve on an
+     * already-resolved row would re-emit `run.settled` and clobber the first operator's audit
+     * trail. This is the DB-level backstop behind `resolveException`'s own read-then-check in
+     * the settlement module, the one that still holds under a genuine concurrent race.
+     */
+    async resolve({ exceptionId, resolution, resolutionNotes, resolutionEvidenceRef = null, reviewedBy }, txh) {
+      const { rows } = await q(txh,
+        `update settlement_exceptions
+            set status = 'resolved', resolution = $2, resolution_notes = $3,
+                resolution_evidence_ref = $4, reviewed_by = $5, reviewed_at = now(), updated_at = now()
+          where exception_id = $1 and status = 'in-review'
+          returning *`,
+        [exceptionId, resolution, resolutionNotes, resolutionEvidenceRef, reviewedBy]);
+      if (!rows.length) {
+        const { rows: existing } = await q(txh,
+          'select status from settlement_exceptions where exception_id = $1', [exceptionId]);
+        if (!existing.length) {
+          throw new ApiError('NOT_FOUND', 'No such settlement exception.', { details: { exceptionId } });
+        }
+        throw new ApiError('CONFLICT', 'That exception is not in review (already resolved, or not yet claimed).', {
+          details: { exceptionId, status: existing[0].status },
+        });
+      }
+      return mapRow(rows[0]);
+    },
   };
 
   /**
@@ -1453,7 +1625,7 @@ export async function createPostgresStore(config = {}, deps = {}) {
     tx,
     accounts, accountNameHistory, sessions, refreshTokens, profiles, stats, weaponStats, matches,
     preAuthConsent, outbox, audit, idempotency, flags, rooms, roomMembers, reports, matchTickets, chatMessages,
-    matchEvidence, matchServers,
+    matchEvidence, matchServers, settlementExceptions,
     async health() {
       try {
         await pool.query('select 1');
