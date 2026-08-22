@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.9.0 |
+| **Version** | 1.10.0 |
 | **Implements** | `src/net/protocol.js`, `src/net/client.js`, `src/net/server.js` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, `NetClient`, `MultiplayerSession` |
@@ -251,6 +251,10 @@ intentions. This is the byte layout. `PROTOCOL_VERSION` becomes **2** only when 
 Server behaviour, in this order — **the version check precedes the ticket check**, because a
 mismatched client cannot be trusted to have encoded the ticket the way we read it:
 
+0. The frame fails to decode at all — truncated, wrong type byte, or a declared ticket length
+   that does not match the bytes actually sent — → `MSG_REJECT(MALFORMED_HELLO)`, close. This
+   is the §8.11 "known type, wrong length" case: a framing/desync fault, distinct from a version
+   disagreement, because nothing about a corrupt frame says which protocol version sent it.
 1. `protocolVersion !== PROTOCOL_VERSION` → `MSG_REJECT(PROTOCOL_VERSION_MISMATCH)`, close.
 2. Ticket invalid, consumed, expired, or wrong room → `MSG_REJECT(SESSION_TOKEN_INVALID)`, close.
 3. Account already has a live entity in this match → replace per `auth.md` §7, and send

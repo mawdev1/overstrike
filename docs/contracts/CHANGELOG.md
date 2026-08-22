@@ -1,5 +1,19 @@
 # Contract changelog
 
+## 2026-08-21 — `MALFORMED_HELLO`: a framing fault stopped borrowing the version-mismatch code (additive)
+
+`errors.md` → 1.8.0, `wire-protocol.md` → 1.10.0.
+
+`_onHello` (`server.js`) sent `MSG_REJECT(PROTOCOL_VERSION_MISMATCH)` whenever `decodeHello`
+returned null — which covers every malformed `MSG_HELLO` frame (under 4 bytes, wrong type
+byte, or a declared ticket length that does not match the bytes actually sent), not only an
+actual protocol-version disagreement. §8.11 already treats "known type, wrong length" as a
+distinct framing/desync case; the fix gives it its own wire code, `MALFORMED_HELLO` (400),
+rather than telling a client with a pure framing bug — nothing to do with which version it
+speaks — to upgrade its build. Additive: no existing code changed meaning, `PROTOCOL_VERSION`
+did not move (no byte layout changed, only which string a REJECT names), and a real version
+mismatch (a well-formed hello with the wrong `protocolVersion`) is unaffected.
+
 ## 2026-08-21 — Three amendment-process gaps in inherited work, recorded not papered over
 
 The Codex and second backend sessions ended with a large body of uncommitted work. Landing it

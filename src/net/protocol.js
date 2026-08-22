@@ -148,6 +148,11 @@ export function decodeTacticalPingEvent(data) {
 export const REJECT_PROTOCOL_VERSION_MISMATCH = 'PROTOCOL_VERSION_MISMATCH';
 export const REJECT_SESSION_TOKEN_INVALID = 'SESSION_TOKEN_INVALID';
 export const REJECT_AUTH_SESSION_REPLACED = 'AUTH_SESSION_REPLACED';
+// §8.11: "known type, wrong length" is a desynced/corrupt frame, not a version disagreement —
+// `decodeHello` returns null for that case (buffer under 4 bytes, wrong type byte, or a
+// declared ticket length that does not match the remaining bytes) and it must not be told to
+// upgrade its build. errors.md §"Lobby and match".
+export const REJECT_MALFORMED_HELLO = 'MALFORMED_HELLO';
 
 const _utf8enc = new TextEncoder();
 const _utf8dec = new TextDecoder();

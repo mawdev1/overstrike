@@ -25,7 +25,7 @@ import {
   encodeMatchState, encodeOutcome, MATCHSTATE_BYTES, INTERACT_PROGRESS_MAX, packInteract,
   REJECT_PROTOCOL_VERSION_MISMATCH, REJECT_SESSION_TOKEN_INVALID, BOMB_STATES, PHASES,
   INTERACT_KINDS, CANCEL_REASONS, REFUSAL_REASONS, OUTCOME_REASONS,
-  REJECT_AUTH_SESSION_REPLACED,
+  REJECT_AUTH_SESSION_REPLACED, REJECT_MALFORMED_HELLO,
   W_RECONNECT,
   MSG_TACTICAL_PING, decodeTacticalPingIntent, encodeTacticalPingEvent,
 } from './protocol.js';
@@ -611,8 +611,12 @@ export class GameServer {
     if (session.authenticating) return;
     session.authenticating = true;
     const hello = decodeHello(data);
-    // A known type at the wrong length means a desynced stream (§8.11): close it.
-    if (!hello) { this.rejectClient(session, REJECT_PROTOCOL_VERSION_MISMATCH); return; }
+    // A known type at the wrong length means a desynced/corrupt frame (§8.11), not a version
+    // disagreement — `decodeHello` returns null for a truncated buffer, a wrong type byte, or a
+    // ticket-length byte that does not match the remaining bytes, none of which say anything
+    // about which protocol version the client speaks. Reusing PROTOCOL_VERSION_MISMATCH here
+    // told a client with a pure framing bug to upgrade its build, which is the wrong diagnosis.
+    if (!hello) { this.rejectClient(session, REJECT_MALFORMED_HELLO); return; }
     session.helloVersion = hello.protocolVersion;
     if (hello.protocolVersion !== PROTOCOL_VERSION) {
       this.rejectClient(session, REJECT_PROTOCOL_VERSION_MISMATCH);

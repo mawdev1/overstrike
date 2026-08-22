@@ -35,10 +35,10 @@ buildable — a single open question does not freeze a whole document.
 | # | Contract | Status | Covers |
 |---|---|---|---|
 | 1 | [`http-api.md`](http-api.md) | FROZEN 2.1.0 | Platform REST surface for P1–P4 |
-| 2 | [`errors.md`](errors.md) | FROZEN 1.7.0 | Error envelope and the closed error-code enumeration |
+| 2 | [`errors.md`](errors.md) | FROZEN 1.8.0 | Error envelope and the closed error-code enumeration |
 | 3 | [`auth.md`](auth.md) | FROZEN 1.7.0 | Tokens, sessions, revocation, recovery |
 | 4 | [`realtime-lobby.md`](realtime-lobby.md) | FROZEN 1.11.0 | Lobby WebSocket: presence, roster, teams, ready, launch |
-| 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN 1.8.0 | The binary match protocol, as it exists and as it must change |
+| 5 | [`wire-protocol.md`](wire-protocol.md) | FROZEN 1.10.0 | The binary match protocol, as it exists and as it must change |
 | 6 | [`net-facade.md`](net-facade.md) | FROZEN 1.11.0 | The only surface Codex uses to reach netcode |
 | 7 | [`match-result.md`](match-result.md) | FROZEN 2.0.0 | Canonical stat definitions and the immutable result record |
 | 8 | [`event-envelope.md`](event-envelope.md) | FROZEN 1.4.0 | Canonical platform event envelope and catalogue |

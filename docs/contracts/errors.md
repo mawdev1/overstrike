@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.7.0 |
+| **Version** | 1.8.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Every platform endpoint, the lobby socket, the client HTTP layer |
 
@@ -104,6 +104,7 @@ a code is an additive amendment, changing what one *means* is breaking.
 | `MATCH_SERVER_UNREACHABLE` | 503 | Allocated but not connectable | Retryable once, then return to lobby |
 | `SESSION_TOKEN_INVALID` | 401 | Handoff token bad, used, or expired | Return to lobby and re-join |
 | `PROTOCOL_VERSION_MISMATCH` | 426 | Wire version disagreement | Upgrade message. **Never retry** |
+| `MALFORMED_HELLO` | 400 | `MSG_HELLO` frame failed to decode — truncated, wrong type byte, or a declared ticket length that does not match the bytes sent (`wire-protocol.md` §8.11) | Reconnect once. This is a framing/desync fault, not a version disagreement — **do not show an upgrade message** |
 | `ROOM_PASSWORD_REQUIRED` | 401 | Private room, no password given | Prompt |
 | `ROOM_PASSWORD_INVALID` | 403 | Wrong password | Re-prompt. Rate-limited per room |
 | `ROOM_REMOVED` | 403 | Kicked or removed by owner/moderation | Return to browser. `details.reason`, `details.until` if temporary. **No auto-rejoin** |

@@ -228,6 +228,17 @@ export class BombRules {
     this._clutch = [null, null];
     this._lastAlive = [-1, -1];
     this._refusals = [];
+    /**
+     * entity id → last `${kind}:${reason}` this entity was refused for (§8.7 `interactRefused`
+     * evidence dedupe). `requestInteract` runs every tick while a client holds the interact
+     * key (§6.4), and a client that simply holds the key while ineligible would otherwise
+     * refuse — and evidence-record — once per tick indefinitely, exhausting the shared
+     * evidence buffer (`ObjectiveEvidence.record`, `server.js`) within a minute or two and
+     * silently dropping every objective fact after it, including the plant/defuse that
+     * decides the round. One row per state transition is the §8.7 fact; every tick after
+     * that is the same fact repeated.
+     */
+    this._lastRefusal = new Map();
   }
 
   // ───────────────────────────────────────────────────────────────────── small accessors
@@ -331,7 +342,18 @@ export class BombRules {
     return row;
   }
 
-  _refuse(entityId, kind, reason) {
+  /**
+   * @param {boolean} [repeat] when true, always emit — used by `_accumulate`'s already-in-
+   *   progress path, which fires at most once per hold because the request is removed from
+   *   `_requests` on the same refusal. The per-tick spam this guards against is entirely
+   *   `requestInteract`'s ineligible-on-every-call path (§6.4), which passes this false.
+   */
+  _refuse(entityId, kind, reason, repeat = true) {
+    if (!repeat) {
+      const sig = `${kind}:${reason}`;
+      if (this._lastRefusal.get(entityId) === sig) return null;
+      this._lastRefusal.set(entityId, sig);
+    }
     // §11 event kind 20: requested kind + refusal reason, to the requester only.
     const row = this._emit('interactRefused', { entityId, requested: kind, reason });
     this._refusals.push(row);
@@ -365,6 +387,9 @@ export class BombRules {
     this._freshDeaths.clear();
     this._clutch = [null, null];
     this._lastAlive = [-1, -1];
+    // A new round is a new set of facts — the same reason refused in the round just ended
+    // must be told again if it recurs here.
+    this._lastRefusal.clear();
 
     // §9 absence bookkeeping drives the `abandoned` stat.
     for (const [id, row] of this._conn) {
@@ -574,18 +599,34 @@ export class BombRules {
     if (!check.ok) {
       this._requests.delete(entity.id);
       this._resetProgress(entity.id, check.reason);
-      this._refuse(entity.id, kind, check.reason);
+      // Not `repeat`: a client holding the interact key while ineligible calls this every
+      // tick (§6.4), and the refusal is one §8.7 fact per state transition, not per tick.
+      this._refuse(entity.id, kind, check.reason, false);
       return false;
     }
     this._requests.set(entity.id, { kind });
+    // Eligible again — the next refusal, if any, is a new fact and must be told again.
+    this._lastRefusal.delete(entity.id);
     return true;
   }
 
   /** Key released — §6 "progress resets to zero, no partial credit and no resume". */
   releaseInteract(entity) {
     if (!entity) return;
+    // Only an entity that was actually accepted into `_requests` — i.e. `requestInteract`
+    // found them eligible at least once this hold — gets a fresh dedupe slate on release.
+    // `releaseInteract` runs every tick the wire's `cmd.interactHeld` bit is false
+    // (server.js), so an entity that was never accepted (every `requestInteract` this hold
+    // was refused) must NOT have `_lastRefusal` cleared here: a client can toggle
+    // `interactHeld` true/false every tick, alternating `requestInteract` (refused, deduped)
+    // with `releaseInteract` (no-op release), and clearing the dedupe on every release would
+    // re-arm it every other tick — reproducing the original per-tick evidence-spam bug this
+    // dedupe exists to close (§8.7).
+    const wasAccepted = this._requests.has(entity.id);
     this._requests.delete(entity.id);
     this._resetProgress(entity.id, REFUSE.released);
+    // The hold ended; a fresh hold's first refusal is a new fact even if the reason repeats.
+    if (wasAccepted) this._lastRefusal.delete(entity.id);
   }
 
   /**
@@ -797,7 +838,10 @@ export class BombRules {
     const detonated = this.bomb.state === 'planted';
     if (detonated) {
       this.bomb.state = 'detonated';
-      this._emit('bombDetonated', { site: this.bomb.siteId });
+      this._emit('bombDetonated', {
+        site: this.bomb.siteId,
+        x: this.bomb.position.x, y: this.bomb.position.y, z: this.bomb.position.z,
+      });
     }
     // 3. Record.
     const alive = this.aliveCounts();
@@ -835,8 +879,17 @@ export class BombRules {
   /** After the 5 s round-end delay: series check (§2.1a), side switch (§2), next round. */
   _afterRoundEnd() {
     this.roundIndex++;
-    if (this.roundWins[0] >= BOMB_PARAMS.roundsToWin) return this._endMatch(0, 'roundsToWin');
-    if (this.roundWins[1] >= BOMB_PARAMS.roundsToWin) return this._endMatch(1, 'roundsToWin');
+    // §8.9's `outcomeReason` must describe how the match actually ended, and for an early
+    // series win that is how the DECIDING round ended (elimination/defuse/detonation/timer) —
+    // not the literal 'roundsToWin' label, which is a series-progress fact, not a §8.9 reason.
+    // The deciding round is always the one just recorded by `_endRound`.
+    const decidingReason = this.rounds[this.rounds.length - 1]?.reason ?? 'elimination';
+    if (this.roundWins[0] >= BOMB_PARAMS.roundsToWin) {
+      return this._endMatch(0, 'roundsToWin', { outcomeReason: decidingReason });
+    }
+    if (this.roundWins[1] >= BOMB_PARAMS.roundsToWin) {
+      return this._endMatch(1, 'roundsToWin', { outcomeReason: decidingReason });
+    }
     if (this.roundIndex >= BOMB_PARAMS.maxRounds) return this._endMatch(-1, 'draw');
     // §2.1a side switch after round 6, so each side plays 6 attacking and 6 defending.
     if (this.roundIndex === BOMB_PARAMS.sideSwitchAfterRound) {
