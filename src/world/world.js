@@ -214,6 +214,13 @@ if (Object.hasOwn(MERIDIAN, 'MERIDIAN_FIXTURE')) {
   registerMap(MERIDIAN.MERIDIAN_FIXTURE, { fallbackId: 'meridian', inRotation: false });
 }
 
+// P3-06: the extraction raid map (The Square embedded as its POI plus two graybox
+// sectors). Registered, selectable by id, and OUT of the competitive rotation — raids
+// select their map explicitly; TDM/Bomb rotation stays 'the-square'.
+if (Object.hasOwn(MERIDIAN, 'SQUARE_EXTRACTION')) {
+  registerMap(MERIDIAN.SQUARE_EXTRACTION, { fallbackId: 'square-extraction', inRotation: false });
+}
+
 // ── manifest construction ────────────────────────────────────────────────────────────
 
 /**

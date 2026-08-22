@@ -242,12 +242,20 @@ let reachable = new Set();
     }
     return top;
   };
+  // Wall LINES are derived from the world bounds, not hardcoded. `at: ±41` was correct
+  // for exactly the two 86–88 m origin-centred maps that existed when it was written; on
+  // the raid-sized extraction map (bounds −44…100 × −100…44) it measured "walls" in open
+  // ground and asserted that a 1.1 m cover crate was the perimeter. A 3 m inset lands the
+  // line inside every map's wall assembly: −44+3 = −41 reproduces the old value on The
+  // Square exactly, and meridian's ±43-bound walls sit well within 2.5 m of ±40.
+  const WALL_INSET = 3;
   const walls = [
-    { name: 'west', axis: 'x', at: -41, top: wallTop('x', -41) },
-    { name: 'east', axis: 'x', at: 41, top: wallTop('x', 41) },
-    { name: 'north', axis: 'z', at: -41, top: wallTop('z', -41) },
-    { name: 'south', axis: 'z', at: 41, top: wallTop('z', 41) },
+    { name: 'west', axis: 'x', at: w.bounds.min.x + WALL_INSET },
+    { name: 'east', axis: 'x', at: w.bounds.max.x - WALL_INSET },
+    { name: 'north', axis: 'z', at: w.bounds.min.z + WALL_INSET },
+    { name: 'south', axis: 'z', at: w.bounds.max.z - WALL_INSET },
   ];
+  for (const wl of walls) wl.top = wallTop(wl.axis, wl.at);
   // A surface only matters here if a player can actually REACH it. Footprint alone is not
   // enough — it calls a 1x1 antenna mast at 13.5 m a standing surface, and the market-hall
   // lantern at 11.67 m sits 7 cm above what anything below it can climb to.
@@ -318,8 +326,10 @@ let reachable = new Set();
   const minTop = Math.min(...walls.map((x) => x.top));
   let highest = 0, highestAt = null;
   for (const bx of reachable) {
-    if (Math.abs(bx.max.x) > 41 || Math.abs(bx.min.x) > 41) continue;
-    if (Math.abs(bx.max.z) > 41 || Math.abs(bx.min.z) > 41) continue;
+    // Interior only — the wall lines derived above, for the same reason: ±41 was the
+    // 88 m footprint, not a property of maps in general.
+    if (bx.max.x > walls[1].at || bx.min.x < walls[0].at) continue;
+    if (bx.max.z > walls[3].at || bx.min.z < walls[2].at) continue;
     // No blanket height exemption. Skipping "anything above 13 m" quietly excused
     // exactly the perches this check exists to find; the perimeter is excluded by being
     // outside the play area, which the bounds test above already does.
