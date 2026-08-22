@@ -506,10 +506,15 @@ export class Viewmodel {
       B.box(metal, 0.005, 0.016, 0.014, -(hg.w / 2 + 0.004), -0.008, hgZ - hg.len * 0.28);
     }
     if (vm.carryHandle) {
-      B.box(metal, 0.014, 0.010, 0.090, 0, railY + 0.030, upperZ - upper.len * 0.10);
-      B.box(metal, 0.014, 0.026, 0.010, 0, railY + 0.016, upperZ - upper.len * 0.10 - 0.044);
-      B.box(metal, 0.014, 0.026, 0.010, 0, railY + 0.016, upperZ - upper.len * 0.10 + 0.044);
-      B.box(DK, 0.017, 0.008, 0.070, 0, railY + 0.035, upperZ - upper.len * 0.10);
+      // Folded to the left, the way a real LMG carries one — centred on the rail it sat
+      // dead on the iron sightline (the irons anchor at railY + ~0.030, the handle body
+      // spanned railY + 0.025..0.039) and filled the middle of the ADS picture.
+      const chx = -0.034;
+      const chz = upperZ - upper.len * 0.10;
+      B.box(metal, 0.014, 0.010, 0.090, chx, railY + 0.030, chz, 0, 0, 0.35);
+      B.box(metal, 0.014, 0.026, 0.010, chx * 0.55, railY + 0.014, chz - 0.044, 0, 0, 0.6);
+      B.box(metal, 0.014, 0.026, 0.010, chx * 0.55, railY + 0.014, chz + 0.044, 0, 0, 0.6);
+      B.box(DK, 0.017, 0.008, 0.070, chx, railY + 0.034, chz, 0, 0, 0.35);
     }
 
     // ------------------------------------------------------------ bake it down
@@ -783,9 +788,15 @@ export class Viewmodel {
     if (op.type === 'holo') {
       B.box(m, w, h * 0.52, L, 0, opticBase + h * 0.28, z);
       B.box(DK, w + 0.002, 0.005, L * 0.9, 0, opticBase + h * 0.52, z);
-      B.box(m, w * 0.28, h, 0.014, -w * 0.35, opticBase + h * 0.52, z - L * 0.34);   // hood posts
-      B.box(m, w * 0.28, h, 0.014, w * 0.35, opticBase + h * 0.52, z - L * 0.34);
-      B.box(m, w, 0.010, 0.016, 0, opticBase + h * 1.00, z - L * 0.34);              // hood top
+      // Hood: posts OUTSIDE the glass, top bar ABOVE it. The reticle anchors at
+      // h*0.88 and the glass runs to h*1.25, so a hood bar at h*1.00 was an opaque
+      // strip crossing the sight picture ~1-2° above the reticle — exactly where a
+      // player tracks a target ("the top of the scope blocks the view"). The bar now
+      // clears the glass top on every holo def, and the posts are slimmer and pushed
+      // to the window's edge so they frame the picture instead of eating into it.
+      B.box(m, w * 0.16, h * 0.95, 0.014, -w * 0.44, opticBase + h * 0.95, z - L * 0.34);  // hood posts
+      B.box(m, w * 0.16, h * 0.95, 0.014, w * 0.44, opticBase + h * 0.95, z - L * 0.34);
+      B.box(m, w, 0.010, 0.016, 0, opticBase + h * 1.40, z - L * 0.34);                    // hood top
       B.box('glassOptic', w * 0.78, h * 0.74, 0.004, 0, y - h * 0.12, z - L * 0.30);
       B.box(DK, w * 0.5, 0.010, 0.012, 0, opticBase + h * 0.10, z + L * 0.42);       // buttons
       const rz = z - L * 0.30;
@@ -813,9 +824,13 @@ export class Viewmodel {
     const ry = opticBase + h * 0.62;
     const rz = z + L * 0.5;
     B.box(m, 0.024, 0.006, 0.006, 0, opticBase + 0.004, rz);      // base
-    B.box(m, 0.005, 0.024, 0.005, -0.009, ry, rz);                // aperture ears
-    B.box(m, 0.005, 0.024, 0.005, 0.009, ry, rz);
-    B.box(m, 0.021, 0.005, 0.005, 0, ry + 0.010, rz);             // aperture top
+    // The camera sits behind the aperture (the anchor below), so the top bar's height
+    // over `ry` IS the ceiling of the sight picture. At +0.010 it hung ~1.2° above the
+    // reticle and read as "the sight blocks everything above the dot"; +0.015 keeps the
+    // ghost-ring silhouette but opens the window a player actually aims through.
+    B.box(m, 0.005, 0.030, 0.005, -0.009, ry + 0.002, rz);        // aperture ears
+    B.box(m, 0.005, 0.030, 0.005, 0.009, ry + 0.002, rz);
+    B.box(m, 0.021, 0.005, 0.005, 0, ry + 0.015, rz);             // aperture top
     B.box(m, 0.005, h * 0.62, 0.005, 0, opticBase + h * 0.31, z - L * 0.5);   // front post
     B.box('brass', 0.0045, 0.0045, 0.0045, 0, ry, z - L * 0.5);   // bead, at post top
     B.box(m, 0.004, h * 0.74, 0.004, -0.008, opticBase + h * 0.37, z - L * 0.5);
