@@ -65,6 +65,21 @@ export const CODES = {
   PROTOCOL_VERSION_MISMATCH:         { status: 426, retryable: false },
   RECONNECT_GRACE_EXPIRED:           { status: 409, retryable: false },
 
+  // inventory (items-inventory.md §8)
+  LOADOUT_INVALID_SLOT:              { status: 400, retryable: false },
+  LOADOUT_ITEM_NOT_OWNED:            { status: 400, retryable: false },
+  LOADOUT_DUPLICATE_INSTANCE:        { status: 400, retryable: false },
+  ITEM_LOCKED:                       { status: 409, retryable: false },
+  ITEM_NOT_STACKABLE:                { status: 400, retryable: false },
+  ITEM_ALREADY_DEPLOYED:             { status: 409, retryable: false },
+
+  // deployment reservation + signed snapshot (deployment.md §8)
+  DEPLOYMENT_REQUEST_INVALID:        { status: 400, retryable: false },
+  DEPLOYMENT_RESERVATION_CONFLICT:   { status: 409, retryable: true },
+  DEPLOYMENT_RESERVATION_EXPIRED:    { status: 409, retryable: false },
+  DEPLOYMENT_SNAPSHOT_INVALID:       { status: 401, retryable: false },
+  DEPLOYMENT_ALREADY_CONSUMED:       { status: 409, retryable: false },
+
   // moderation
   SANCTIONED:                        { status: 403, retryable: false },
   CHAT_RATE_LIMITED:                 { status: 429, retryable: true },
