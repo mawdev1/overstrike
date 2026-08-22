@@ -477,6 +477,414 @@ function buildSquareBoundary(B) {
   }
 }
 
+// ── SQUARE EXTRACTION — P3-06 graybox expansion ──────────────────────────────────────
+//
+// The Square district embedded as the central high-risk POI of an extraction raid map,
+// with two adjoining graybox sectors around it:
+//
+//   RAIL YARD  (north, z −100…−44)  a freight yard: warehouse with a mezzanine interior,
+//                                   container alleys, a watchtower over the approach into
+//                                   the district's north court, and the RAIL GATE exit.
+//   EAST DOCKS (east, x 44…100)     a quay: customs shed interior, crane, container
+//                                   stacks, an elevated pier walk along the sea wall, and
+//                                   the FERRY LANDING exit.
+//
+// This is a NEW map entry (map-data.md's registry pattern, same shape as
+// MERIDIAN_FIXTURE), NOT a mutation of the competitive Square: 'the-square' keeps its
+// certified geometry, manifest, and version untouched — sectortest.mjs explicitly asserts
+// the competitive map declares no sectors, and its siteoutcome/sightline certification
+// must not be re-litigated by a graybox slice. The district builder functions are reused
+// verbatim; only the removable COMPETITIVE_BOUNDARY layer is omitted (map-data.md §5 —
+// which is exactly what that layer exists for).
+//
+// Sectors follow sector-interest.md §3/§3.1: three AABBs that tile the playable bounds
+// with no gaps and no overlap; ids are stable strings, never indices. Extraction exits
+// and loot-container spawn points follow extraction-match.md §4 / §3.1 and are exported
+// on the map entry in exactly the shapes `ExtractionRun` consumes (`opts.exits`,
+// `opts.containers`).
+
+const XM_ID = 'square-extraction';
+const XM_VERSION = '0.1.0';
+
+// Playable bounds. The three sector boxes below tile this exactly:
+//   square      (−44…44)  × (−44…44)
+//   north-yard  (−44…44)  × (−100…−44)
+//   east-docks  (44…100)  × (−100…44)
+const XM_BOUNDS = Object.freeze(volume(-44, -4, -100, 100, 18, 44));
+
+export const EXTRACTION_SECTORS = Object.freeze([
+  {
+    id: 'square',
+    box: volume(-44, -4, -44, 44, 18, 44),
+    neighbours: Object.freeze(['north-yard', 'east-docks']),
+    populationCap: 12,
+    baseThinkStride: 8,
+  },
+  {
+    id: 'north-yard',
+    box: volume(-44, -4, -100, 44, 18, -44),
+    neighbours: Object.freeze(['square', 'east-docks']),
+    populationCap: 10,
+    baseThinkStride: 12,
+  },
+  {
+    id: 'east-docks',
+    box: volume(44, -4, -100, 100, 18, 44),
+    neighbours: Object.freeze(['square', 'north-yard']),
+    populationCap: 10,
+    baseThinkStride: 12,
+  },
+]);
+
+/**
+ * Extraction exits — extraction-match.md §4's `ExtractionExit` shape verbatim, consumable
+ * as `ExtractionRun`'s `opts.exits`. Both are conditional, per the Build Plan's "two
+ * conditional exits" slice, and every condition references only vocabulary the shipped
+ * P3-11 content module defines (`src/game/extractionContent.js` — the single authored
+ * catalog `scripts/extractiontest.mjs` validates):
+ *   - rail-gate is window-gated (activeWindow, run-relative ticks at the 120 Hz fixed
+ *     step): open from infil until the RUN_RULES collapse warning — 840 s of the 900 s
+ *     hard timeout — so a run that never finds a keycard is never stranded; only the
+ *     final collapse minute has no item-free way out.
+ *   - ferry-landing is item-gated on `keycard_transit` (P3-11's epic material, which
+ *     rolls only from `lt.tier2.cache` — the district's tier-2 caches — so risk buys
+ *     the quay exit).
+ *
+ * This array is THE authoritative exit set for map 'square-extraction' (its ids anchor
+ * to the rail-gate / ferry-landing callouts and built geometry above). The content
+ * module's own `EXTRACTION_EXITS` (exit-transit-gate / exit-market-van) were authored
+ * concurrently against the district-only slice; REQ-CC-074 reconciles the two so runs
+ * on this map consume exactly one set.
+ */
+export const EXTRACTION_EXITS = Object.freeze([
+  {
+    id: 'exit-rail-gate',
+    volume: volume(-40, 0, -98, -32, 3, -92),
+    // 0…840 s at 120 Hz: closes when RUN_RULES' 60 s collapse warning begins, mirroring
+    // the P3-11 window exit so an item-less player always has an exit before collapse.
+    activeWindow: Object.freeze([0, 100800]),
+    durationSeconds: 6,
+  },
+  {
+    id: 'exit-ferry-landing',
+    volume: volume(88, 0, 32, 98, 3, 40),
+    requiresItemDefId: 'keycard_transit',   // P3-11 item; rolls from lt.tier2.cache
+    durationSeconds: 8,
+  },
+]);
+
+/**
+ * Static loot-container spawn points — extraction-match.md §3.1's static-container shape,
+ * consumable as `ExtractionRun`'s `opts.containers`. Two tiers, per §3.1 (`tier` is an
+ * int, 1|2 for this slice) and the Build Plan's two-tier slice; `lootTableId` values are
+ * the shipped P3-11 tables (`LOOT_TABLES` in `src/game/extractionContent.js`), so every
+ * roll resolves against defined contents. The Square POI carries tier 2 (risk pays — and
+ * `keycard_transit`, the ferry exit's gate, rolls only there); the flanking sectors carry
+ * tier 1. Container ids are stable forever (evidence's `lootEvents` reference them).
+ *
+ * As with the exits above, this is THE authoritative container set for map
+ * 'square-extraction'; the content module's district-only `STATIC_CONTAINERS` are the
+ * concurrent duplicate REQ-CC-074 reconciles.
+ */
+export const LOOT_CONTAINERS = Object.freeze([
+  { containerId: 'c-square-fountain', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(5.5, 0, -5.5) },
+  { containerId: 'c-square-transit', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(33, 0, 11.5) },
+  { containerId: 'c-square-archive', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(-27, 0, -26) },
+  { containerId: 'c-warehouse-mezz', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(-28, 3.6, -77) },
+  { containerId: 'c-warehouse-floor', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(-14, 0, -84) },
+  { containerId: 'c-customs-shed', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(71, 0, -14) },
+  { containerId: 'c-pier-walk', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(96, 3.8, -20) },
+  { containerId: 'c-container-alley', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(14, 0, -83) },
+  { containerId: 'c-quay-open', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(56, 0, 20) },
+]);
+
+// Raid perimeter — the extraction map's own outer wall, reused for collision AND for the
+// nav `blocked` list so the baker never rasters phantom nodes on the 1 m wall tops (the
+// same double duty COMPETITIVE_BOUNDARY performs on the competitive map).
+const XM_PERIMETER = Object.freeze([
+  volume(-44, 0, -100, 100, 15, -99),   // north
+  volume(-44, 0, 43, 100, 15, 44),      // south
+  volume(-44, 0, -100, -43, 15, 44),    // west
+  volume(99, 0, -100, 100, 15, 44),     // east
+]);
+
+// Freight containers, as [x0, z0, x1, z1] footprints at CONTAINER_H. 2.8 m: above the
+// 2.50 m jump-plus-mantle ceiling, so tops are NOT playspace and every one gets a blocked
+// cap below (the phantom-node rule, map-data.md §3.5).
+const XM_CONTAINERS = Object.freeze([
+  // Rail-yard rows A/B — two staggered rows forming an east-west alley.
+  Object.freeze([4, -88, 10, -85.4]), Object.freeze([12, -88, 18, -85.4]),
+  Object.freeze([20, -88, 26, -85.4]), Object.freeze([28, -88, 34, -85.4]),
+  Object.freeze([8, -80, 14, -77.4]), Object.freeze([16, -80, 22, -77.4]),
+  Object.freeze([24, -80, 30, -77.4]), Object.freeze([32, -80, 38, -77.4]),
+  // Dock stacks, scattered on the north quay.
+  Object.freeze([52, -90, 58, -87.4]), Object.freeze([62, -84, 68, -81.4]),
+  Object.freeze([74, -92, 80, -89.4]), Object.freeze([82, -78, 88, -75.4]),
+  Object.freeze([54, -66, 60, -63.4]), Object.freeze([70, -60, 76, -57.4]),
+]);
+const CONTAINER_H = 2.8;
+// One double-stack landmark on the quay; its cap is blocked at its own height.
+const XM_STACK = Object.freeze([64, -74, 70, -71.4]);
+const STACK_H = 5.6;
+
+const xmRoofBlockers = Object.freeze([
+  // District roofs, pylon caps and upper-massing caps: same surfaces, same rule.
+  ...squareRoofBlockers,
+  // Container and stack tops (see XM_CONTAINERS above).
+  ...XM_CONTAINERS.map(([x0, z0, x1, z1]) => volume(x0, CONTAINER_H - 0.6, z0, x1, CONTAINER_H + 0.6, z1)),
+  volume(XM_STACK[0], STACK_H - 0.6, XM_STACK[1], XM_STACK[2], STACK_H + 0.6, XM_STACK[3]),
+  // The raid perimeter wall tops.
+  ...XM_PERIMETER,
+]);
+
+const xmSpawns = Object.freeze([
+  // Extraction infil points sit in the flanking sectors, never inside the POI. Team −1:
+  // extraction squads are not alpha/bravo. 'tdm' is retained so headless harnesses that
+  // spawn probe bots by mode (vertprobe) can drive the map.
+  ['xs-rail-1', -38, 0, -70, Math.PI / 2, 'infil-rail'],
+  ['xs-rail-2', -38, 0, -75, Math.PI / 2, 'infil-rail'],
+  ['xs-rail-3', -38, 0, -80, Math.PI / 2, 'infil-rail'],
+  ['xs-depot-1', 32, 0, -52, Math.PI, 'infil-depot'],
+  ['xs-depot-2', 36, 0, -56, Math.PI, 'infil-depot'],
+  ['xs-depot-3', 30, 0, -60, Math.PI, 'infil-depot'],
+  ['xs-quay-1', 84, 0, 26, -Math.PI / 2, 'infil-quay'],
+  ['xs-quay-2', 88, 0, 22, -Math.PI / 2, 'infil-quay'],
+  ['xs-quay-3', 80, 0, 18, -Math.PI / 2, 'infil-quay'],
+].map(([id, x, y, z, yaw, group]) => Object.freeze({
+  id, position: v3(x, y, z), yaw, team: -1, group, protectionRadius: 4,
+  modes: Object.freeze(['extraction', 'tdm']),
+})));
+
+const xmCallouts = Object.freeze([
+  // Whole-map catch-all first (lowest priority), then the district's own vocabulary —
+  // the SAME names players already use on the competitive Square — then the new ground.
+  { id: 'outlands', name: 'Outlands', box: volume(-44, -4, -100, 100, 14, 44), priority: -200 },
+  ...squareCallouts,
+  { id: 'rail-yard', name: 'Rail Yard', box: volume(-43, -1, -99, 44, 10, -44), priority: -50 },
+  { id: 'warehouse', name: 'Warehouse', box: volume(-32, -1, -90, -8, 8, -64), priority: 20 },
+  { id: 'warehouse-mezzanine', name: 'Warehouse Mezzanine', box: volume(-32, 3.4, -90, -24, 5.4, -64), priority: 40 },
+  { id: 'container-rows', name: 'Container Rows', box: volume(2, -1, -92, 40, 6, -72), priority: 15 },
+  { id: 'watchtower', name: 'Watchtower', box: volume(-2, 3.5, -56, 4, 5.6, -50), priority: 40 },
+  { id: 'rail-gate', name: 'Rail Gate', box: volume(-42, -1, -99, -30, 5, -90), priority: 30 },
+  { id: 'east-docks', name: 'East Docks', box: volume(44, -1, -99, 99, 10, 43), priority: -50 },
+  { id: 'customs-shed', name: 'Customs Shed', box: volume(60, -1, -20, 84, 8, 4), priority: 20 },
+  { id: 'pier-walk', name: 'Pier Walk', box: volume(93, 3.5, -45, 98.5, 5.6, 15), priority: 40 },
+  { id: 'crane-yard', name: 'Crane Yard', box: volume(48, -1, -95, 92, 8, -48), priority: 10 },
+  { id: 'ferry-landing', name: 'Ferry Landing', box: volume(86, -1, 30, 99, 5, 43), priority: 30 },
+]);
+
+export const EXTRACTION_MANIFEST = Object.freeze({
+  bounds: XM_BOUNDS,
+  spawns: xmSpawns,
+  // No bomb sites on a raid map: extraction "objectives" are the exits/containers above,
+  // which are extraction-match.md's vocabulary, not map-data §3.3's.
+  objectives: Object.freeze([]),
+  callouts: xmCallouts,
+  sectors: EXTRACTION_SECTORS,
+  navHints: Object.freeze({
+    walkable: Object.freeze([
+      volume(-43, -0.1, -99, 99, 0.35, 43),
+      // District elevated route (identical to the competitive declaration).
+      volume(-12, 3.8, -5, 12, 4.25, 5),
+      volume(-2, 7.8, -5, 2, 8.25, 5),
+      // Warehouse mezzanine, watchtower deck, pier walk.
+      volume(-32, 3.4, -90, -24, 3.85, -64),
+      volume(-2, 3.6, -56, 4, 4.05, -50),
+      volume(93, 3.6, -45, 98.5, 4.05, 15),
+    ]),
+    blocked: xmRoofBlockers,
+    links: Object.freeze([
+      // District (identical to the competitive declaration).
+      { from: v3(-21.5, 0, -3), to: v3(-12, 4, -3), kind: 'stair' },
+      { from: v3(21.5, 0, 3), to: v3(12, 4, 3), kind: 'stair' },
+      { from: v3(-9.5, 4, 3), to: v3(-1.5, 8, 3), kind: 'stair' },
+      { from: v3(9.5, 4, -3), to: v3(1.5, 8, -3), kind: 'stair' },
+      // Warehouse mezzanine stair, watchtower ramp, pier stairs, pier drop-down.
+      { from: v3(-16, 0, -76.8), to: v3(-25, 3.6, -76.8), kind: 'stair' },
+      { from: v3(13, 0, -54), to: v3(1, 3.8, -54), kind: 'stair' },
+      { from: v3(94.7, 0, 20), to: v3(94.7, 3.8, 13), kind: 'stair' },
+      { from: v3(94.7, 0, -50), to: v3(94.7, 3.8, -43), kind: 'stair' },
+    ]),
+    cover: Object.freeze([
+      { position: v3(-8, 0, -9), facing: 0 }, { position: v3(8, 0, 9), facing: Math.PI },
+      { position: v3(14, 0, -84), facing: Math.PI }, { position: v3(-20, 0, -62), facing: 0 },
+      { position: v3(66, 0, -76), facing: -Math.PI / 2 }, { position: v3(90, 0, 0), facing: -Math.PI / 2 },
+    ]),
+  }),
+  budgets: Object.freeze({
+    // Graybox raid allocation: ~2.7× the competitive footprint, still inside the
+    // ARCHITECTURE.md §11 whole-scene ceiling with the same reserved shares.
+    profileId: 'ref-integrated-1080p', drawCalls: 180, triangles: 360000,
+    materials: 48, lights: 6, colliders: 1800,
+  }),
+});
+
+/** Build the extraction raid map: the district POI plus the two graybox sectors. */
+export function buildExtractionLevel(game, world) {
+  const B = new Builder(game, world);
+  world.setBounds(XM_BOUNDS.min, XM_BOUNDS.max);
+  // The Square district, verbatim, WITHOUT its removable competitive boundary layer.
+  buildSquareGround(B);
+  buildSquareDistrict(B);
+  buildExtractionGround(B);
+  buildRailYard(B);
+  buildEastDocks(B);
+  buildExtractionPerimeter(B);
+  buildLootMarkers(B);
+  const stats = B.finish();
+  world.buildStats.drawCalls = stats.meshes + stats.instanced;
+  world.buildStats.triangles = Math.round(stats.triangles);
+  world.buildStats.colliders = world.boxes.length;
+}
+
+/** Registry entry, same shape as MERIDIAN_FIXTURE. Out of rotation: extraction runs
+ *  select this map by id; the competitive rotation stays TDM/Bomb on 'the-square'. */
+export const SQUARE_EXTRACTION = Object.freeze({
+  MAP_ID: XM_ID,
+  MAP_VERSION: XM_VERSION,
+  MAP_MANIFEST: EXTRACTION_MANIFEST,
+  // Deliberately empty, not absent: this map HAS no competitive boundary — that is the
+  // §5 embedding — and an empty declared layer says so, where a missing export would
+  // read as an unfinished manifest.
+  COMPETITIVE_BOUNDARY: Object.freeze([]),
+  EXTRACTION_EXITS,
+  LOOT_CONTAINERS,
+  buildLevel: buildExtractionLevel,
+});
+
+function buildExtractionGround(B) {
+  // Non-overlapping tiles around the district's own −42…42 ground.
+  B.groundPlane(-43, -99, 44, -42, 0, 'concreteDark', 'concrete');   // rail yard + north rim
+  B.groundPlane(-43, -42, -42, 43, 0, 'concreteDark', 'concrete');   // west rim
+  B.groundPlane(-42, 42, 42, 43, 0, 'concreteDark', 'concrete');     // south rim
+  B.groundPlane(44, -99, 99, -42, 0, 'asphalt', 'concrete');         // dock quay north
+  B.groundPlane(42, -42, 99, 43, 0, 'asphalt', 'concrete');          // dock quay east
+  // Rail-gate and ferry pads read as landmarks from across their sectors.
+  B.floorFinish(-40, -98, -32, -92, 0.03, 'tile', { cast: false });
+  B.floorFinish(88, 32, 98, 40, 0.03, 'tile', { cast: false });
+}
+
+function buildRailYard(B) {
+  // Warehouse shell with two-way interiors: every room has at least two entrances.
+  const t = 0.45;
+  B.wall(-32, -90, -8, -90 + t, 0, 6.5, 'metal', 'metal', {
+    openings: [{ a0: -26, a1: -23, y0: 0, y1: 2.8, frame: 'door' }],
+  });
+  B.wall(-32, -64 - t, -8, -64, 0, 6.5, 'metal', 'metal', {
+    openings: [
+      { a0: -28, a1: -25, y0: 0, y1: 2.8, frame: 'door' },
+      { a0: -14, a1: -11, y0: 0, y1: 2.8, frame: 'door' },
+    ],
+  });
+  B.wall(-32, -90, -32 + t, -64, 0, 6.5, 'metal', 'metal', {
+    openings: [{ a0: -80, a1: -77, y0: 0, y1: 2.8, frame: 'door' }],
+  });
+  B.wall(-8 - t, -90, -8, -64, 0, 6.5, 'metal', 'metal', {
+    openings: [
+      { a0: -86, a1: -83, y0: 0, y1: 2.8, frame: 'door' },
+      { a0: -72, a1: -69, y0: 0, y1: 2.8, frame: 'door' },
+    ],
+  });
+  // Mezzanine over the west half, with a guarded edge and one stair down to the floor.
+  B.box(-32, 3.4, -90, -24, 3.6, -64, 'concreteDark', 'concrete');
+  B.stairs({ x0: -24, z0: -78, x1: -17.2, z1: -75.6, y0: 0, y1: 3.6, dir: '-x', matName: 'metal', surface: 'metal', rail: true });
+  B.parapet(-24, -90, -24, -78.2, 3.6, 1.0, 'metal');
+  B.parapet(-24, -75.4, -24, -64, 3.6, 1.0, 'metal');
+  // Floor clutter so the hall is cover, not a shooting gallery.
+  B.box(-20, 0, -86, -16, 1.4, -82, 'metal', 'metal');
+  B.box(-14, 0, -74, -10, 1.1, -70, 'wood', 'wood');
+  B.box(-22, 0, -70, -18, 2.0, -67, 'concrete', 'concrete');
+
+  // Container rows (footprints shared with the blocked caps).
+  for (const [x0, z0, x1, z1] of XM_CONTAINERS.slice(0, 8)) {
+    B.box(x0, 0, z0, x1, CONTAINER_H, z1, 'metal', 'metal');
+  }
+
+  // Watchtower over the approach into the district's north court.
+  for (const [px, pz] of [[-1.8, -55.8], [3.4, -55.8], [-1.8, -50.6], [3.4, -50.6]]) {
+    B.box(px, 0, pz, px + 0.4, 3.6, pz + 0.4, 'metal', 'metal');
+  }
+  B.box(-2, 3.6, -56, 4, 3.8, -50, 'metal', 'metal');
+  B.ramp({ x0: 4, z0: -55.2, x1: 12, z1: -52.8, y0: 0, y1: 3.8, dir: '-x', matName: 'metal', surface: 'metal' });
+  B.parapet(-2, -56, 4, -56, 3.8, 1.0, 'metal');
+  B.parapet(-2, -56, -2, -50, 3.8, 1.0, 'metal');
+  B.parapet(-2, -50, 4, -50, 3.8, 1.0, 'metal');
+
+  // Open-yard cover between the warehouse and the district edge.
+  B.box(-22, 0, -60, -18, 1.4, -57, 'concrete', 'concrete');
+  B.box(-6, 0, -63, -2, 1.1, -60, 'wood', 'wood');
+  B.box(14, 0, -62, 18, 1.4, -59, 'concrete', 'concrete');
+  B.box(24, 0, -50, 28, 1.1, -47, 'wood', 'wood');
+  // Rail-gate frame: two posts flanking the exit pad.
+  B.box(-41, 0, -92.6, -40.2, 4.5, -91.8, 'metal', 'metal');
+  B.box(-31.8, 0, -92.6, -31, 4.5, -91.8, 'metal', 'metal');
+}
+
+function buildEastDocks(B) {
+  // Customs shed, four ways in.
+  const t = 0.45;
+  B.wall(60, -20, 84, -20 + t, 0, 6.5, 'concreteDark', 'concrete', {
+    openings: [{ a0: 70, a1: 73, y0: 0, y1: 2.8, frame: 'door' }],
+  });
+  B.wall(60, 4 - t, 84, 4, 0, 6.5, 'concreteDark', 'concrete', {
+    openings: [
+      { a0: 64, a1: 67, y0: 0, y1: 2.8, frame: 'door' },
+      { a0: 76, a1: 79, y0: 0, y1: 2.8, frame: 'door' },
+    ],
+  });
+  B.wall(60, -20, 60 + t, 4, 0, 6.5, 'concreteDark', 'concrete', {
+    openings: [{ a0: -14, a1: -11, y0: 0, y1: 2.8, frame: 'door' }],
+  });
+  B.wall(84 - t, -20, 84, 4, 0, 6.5, 'concreteDark', 'concrete', {
+    openings: [{ a0: -6, a1: -3, y0: 0, y1: 2.8, frame: 'door' }],
+  });
+  B.box(64, 0, -16, 68, 1.4, -12, 'metal', 'metal');
+  B.box(74, 0, -10, 78, 2.0, -6, 'concrete', 'concrete');
+  B.box(66, 0, -4, 70, 1.1, 0, 'metal', 'metal');
+
+  // Dock container stacks (footprints shared with the blocked caps) and the crane.
+  for (const [x0, z0, x1, z1] of XM_CONTAINERS.slice(8)) {
+    B.box(x0, 0, z0, x1, CONTAINER_H, z1, 'metal', 'metal');
+  }
+  B.box(XM_STACK[0], 0, XM_STACK[1], XM_STACK[2], STACK_H, XM_STACK[3], 'metal', 'metal');
+  B.cylinder(64, 0, -70, 1.45, 10.5, 12, 'metal', 'metal', { collide: true });
+
+  // Pier walk: the docks' elevated read over the quay, stairs at both ends. The west
+  // parapet runs UNBROKEN: a gap in a mostly-barriered roof edge is exactly the
+  // walk-straight-over trap maptest's roof-barrier check exists to catch, and it did.
+  B.box(93, 3.6, -45, 98.5, 3.8, 15, 'metal', 'metal');
+  B.stairs({ x0: 93.5, z0: 15, x1: 95.9, z1: 22.2, y0: 0, y1: 3.8, dir: '-z', matName: 'metal', surface: 'metal', rail: true });
+  B.stairs({ x0: 93.5, z0: -52.2, x1: 95.9, z1: -45, y0: 0, y1: 3.8, dir: '+z', matName: 'metal', surface: 'metal', rail: true });
+  B.parapet(93, -45, 93, 15, 3.8, 1.0, 'metal');
+
+  // Quay cover so the open asphalt is crossable.
+  B.box(50, 0, -30, 54, 1.4, -27, 'concrete', 'concrete');
+  B.box(60, 0, -44, 64, 1.1, -41, 'wood', 'wood');
+  B.box(76, 0, -34, 80, 1.4, -31, 'concrete', 'concrete');
+  B.box(52, 0, 6, 56, 1.1, 9, 'wood', 'wood');
+  B.box(68, 0, 16, 72, 1.4, 19, 'concrete', 'concrete');
+  B.box(84, 0, 8, 88, 1.1, 11, 'wood', 'wood');
+  // Ferry-landing frame posts flanking the exit pad.
+  B.box(87.4, 0, 35.2, 88.2, 4.5, 36, 'metal', 'metal');
+  B.box(97.8, 0, 35.2, 98.6, 4.5, 36, 'metal', 'metal');
+}
+
+function buildExtractionPerimeter(B) {
+  for (const box of XM_PERIMETER) {
+    B.box(box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z,
+      'concreteDark', 'concrete');
+  }
+}
+
+function buildLootMarkers(B) {
+  // Graybox stand-ins at every static container spawn point, so the placement is visible
+  // in-world and in screenshots. LOOT_CONTAINERS is the authoritative list.
+  for (const c of LOOT_CONTAINERS) {
+    const p = c.position;
+    B.box(p.x - 0.6, p.y, p.z - 0.6, p.x + 0.6, p.y + 0.9, p.z + 0.6, 'wood', 'wood');
+  }
+}
+
 /**
  * Painted board flat on a wall face, `w` wide × `h` high, bottom edge at `y`.
  * The sign/cloth/shutter family faces +Z at yaw 0, so: +Z → 0, -Z → π, +X → π/2, -X → -π/2.
