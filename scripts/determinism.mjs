@@ -441,6 +441,81 @@ try {
   auditOk('WeaponInstance manifest covers every live field', manifest.weaponAudit, ` (${manifest.weaponFields} captured)`);
   auditOk('Loadout manifest covers every live field', manifest.loadoutAudit);
 
+  // ── PROJECTILE_SNAPSHOT / SMOKE_SNAPSHOT cover every live field ──────────────────
+  //
+  // Same reasoning as the Player/WeaponInstance/Loadout audit above, and the missing half
+  // of it: `ProjectileSystem.saveState`/`restoreState` back `net/prediction.js`'s
+  // `_correct()` rewind of grenades/rockets in flight, but nothing ran `audit()` against a
+  // live pool entry or smoke-cloud record, so a field added to the object literals in
+  // `ProjectileSystem.init()` (or grown onto a cloud by `_popSmoke`) could fall out of the
+  // manifest with the whole suite staying green — exactly the failure class this codebase
+  // has hit before with Player/WeaponInstance/Loadout.
+  console.log('\nPROJECTILE_SNAPSHOT / SMOKE_SNAPSHOT cover every live field');
+  const projManifest = await page.evaluate(async () => {
+    const { PROJECTILE_SNAPSHOT, SMOKE_SNAPSHOT } = await import('/src/weapons/projectiles.js');
+    const { FRAG, SMOKE } = await import('/src/weapons/weaponDefs.js');
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 0, difficulty: 'regular', seed: 41 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const DT = 1 / 120;
+    const p = g.player;
+
+    // A live, in-flight frag: audited BEFORE it detonates, so the pool slot carries a
+    // real fuse/age/bounces/velocity rather than the all-zero shape `init()` allocates.
+    const origin = p.position.clone(); origin.y += 1.5;
+    const dir = new (p.position.constructor)(0, 0, -1);
+    g.projectiles.throwGrenade(p, origin, dir, 1, FRAG, 0);
+    for (let i = 0; i < 5; i++) g.projectiles.fixedUpdate(DT);
+    const live = g.projectiles.pool.find((x) => x.active);
+
+    // A live smoke cloud: only allocated by `_popSmoke` on detonation, so throw a smoke
+    // grenade cooked almost all the way down and step until it pops.
+    const smokeFuse = SMOKE.projectile.fuse ?? 3;
+    g.projectiles.throwGrenade(p, origin, dir, 1, SMOKE, Math.max(0, smokeFuse - 0.05));
+    let cloud = null;
+    for (let i = 0; i < 30 && !cloud; i++) {
+      g.projectiles.fixedUpdate(DT);
+      cloud = g.projectiles.smokeClouds.find((c) => c.active);
+    }
+
+    const projAudit = live ? PROJECTILE_SNAPSHOT.audit(live) : null;
+    const smokeAudit = cloud ? SMOKE_SNAPSHOT.audit(cloud) : null;
+
+    // Negative control, same shape as the Player one above: an audit that cannot fail is
+    // worth nothing.
+    let projCaught = false, smokeCaught = false;
+    if (live) {
+      live._plantedUndeclaredField = 1;
+      projCaught = PROJECTILE_SNAPSHOT.audit(live).missing.includes('_plantedUndeclaredField');
+      delete live._plantedUndeclaredField;
+    }
+    if (cloud) {
+      cloud._plantedUndeclaredField = 1;
+      smokeCaught = SMOKE_SNAPSHOT.audit(cloud).missing.includes('_plantedUndeclaredField');
+      delete cloud._plantedUndeclaredField;
+    }
+
+    g.projectiles.reset();
+
+    return {
+      hadLive: !!live, hadCloud: !!cloud,
+      projAudit, smokeAudit, projCaught, smokeCaught,
+      projFields: PROJECTILE_SNAPSHOT.captured.length,
+      smokeFields: SMOKE_SNAPSHOT.captured.length,
+    };
+  });
+  if (projManifest.hadLive) ok('an in-flight frag was captured for the audit');
+  else bad('an in-flight frag was captured for the audit', 'throwGrenade + a few fixedUpdate steps left no active pool slot — the audit below proves nothing');
+  if (projManifest.hadCloud) ok('a live smoke cloud was captured for the audit');
+  else bad('a live smoke cloud was captured for the audit', 'the smoke grenade never popped within the step budget — the audit below proves nothing');
+  if (projManifest.projCaught) ok('the audit catches a planted undeclared field on a pool entry (the guard is live)');
+  else bad('the audit catches a planted undeclared field on a pool entry', 'audit() reported nothing — the manifest check below proves nothing');
+  if (projManifest.smokeCaught) ok('the audit catches a planted undeclared field on a smoke cloud (the guard is live)');
+  else bad('the audit catches a planted undeclared field on a smoke cloud', 'audit() reported nothing — the manifest check below proves nothing');
+  if (projManifest.projAudit) auditOk('PROJECTILE_SNAPSHOT covers every live field on a pool entry', projManifest.projAudit, ` (${projManifest.projFields} captured)`);
+  if (projManifest.smokeAudit) auditOk('SMOKE_SNAPSHOT covers every live field on a smoke cloud', projManifest.smokeAudit, ` (${projManifest.smokeFields} captured)`);
+
   // ── save / restore actually rewinds the simulation ───────────────────────────────
   //
   // The manifest being complete is necessary but not sufficient — it also has to restore
@@ -691,15 +766,13 @@ try {
     const rngState = g.rng.getState();
     const startTick = g.tick;
 
-    // Projectiles are NOT snapshotted — there is no manifest for them, and a grenade in
-    // flight is world state a full rollback would have to carry. This harness sidesteps
-    // that by restoring the projectile system to empty, which is a FAITHFUL restore only
-    // because nothing is in flight at capture time. Assert that rather than assume it, so
-    // this stays honest if the warm-up ever changes.
-    //
-    // Left deliberately open: Phase 6 cannot reconcile a tick containing a live grenade
-    // until projectiles are snapshotted too. This test found that by diverging on
-    // `health`/`_lastDamageAt` when run 1's grenade detonated during run 2.
+    // A manifest exists now (PROJECTILE_SNAPSHOT/SMOKE_SNAPSHOT, see the audit block above,
+    // and `net/prediction.js` `_correct()` actually rewinds/replays through it — see the
+    // "client reconciliation replays a grenade in flight without double-firing its
+    // detonation" block below). THIS harness, though, restores Player/Loadout only and
+    // resets projectiles to empty via `g.projectiles.reset()`, which is a FAITHFUL restore
+    // only because nothing is in flight at capture time. Assert that rather than assume it,
+    // so this stays honest if the warm-up ever changes.
     const activeAtCapture = g.projectiles.pool.filter((x) => x.active).length
       + g.projectiles.smokeClouds.filter((c) => c.active).length;
 
@@ -811,9 +884,148 @@ try {
   else bad('a grenade is spent', 'lethalCount never moved');
   if (rewind.activeAtCapture === 0) ok('nothing is in flight at capture, so resetting projectiles on restore is faithful');
   else bad('nothing is in flight at capture',
-    `${rewind.activeAtCapture} projectile(s) live when the snapshot was taken — resetting them on restore is no longer a faithful rewind, and projectiles have no manifest`);
+    `${rewind.activeAtCapture} projectile(s) live when the snapshot was taken — resetting them on restore is no longer a faithful rewind for THIS harness, which only restores Player/Loadout`);
   if (rewind.firstBad === -1) ok('every tick of the replay is identical, field for field');
   else bad('every tick of the replay is identical', `first divergence at tick ${rewind.firstBad}: ${rewind.badFields.join(', ')}`);
+
+  // ── client reconciliation replays a grenade in flight without double-firing it ───
+  //
+  // The actual thing `net/prediction.js` `_correct()` was changed for, driven exactly the
+  // way a real client drives it: through `Prediction.predict()`/`Prediction.reconcile()`,
+  // not by calling ProjectileSystem directly. A frag is thrown, ticked partway to
+  // detonation, and a server correction arrives whose acked command lands BEFORE the
+  // detonation tick but whose unacked queue extends past it — the exact situation the
+  // module header on `saveState`/`restoreState` and the `game._replaying` guard in
+  // `_detonate` describe. If the rewind failed to restore the in-flight grenade, the
+  // replay would re-throw it from scratch and it would not detonate on schedule. If the
+  // `game._replaying` guard were missing or misplaced, the replay would re-run
+  // `_popExplosive` on the same detonation a second time and a bystander would take blast
+  // damage twice for one grenade.
+  console.log('\nclient reconciliation replays a grenade in flight without double-firing it');
+  const grenadeCorrection = await page.evaluate(async () => {
+    const { Prediction } = await import('/src/net/prediction.js');
+    const { PLAYER_SNAPSHOT } = await import('/src/player/player.js');
+    const { FRAG } = await import('/src/weapons/weaponDefs.js');
+    const g = window.__GAME__;
+    g.stop();
+    g.startMatch({ mode: 'tdm', botCount: 1, difficulty: 'regular', seed: 51 });
+    g.match.phase = 'live'; g.match.countdown = 0;
+    const DT = 1 / 120;
+    const p = g.player;
+    const bystander = g.bots.bots[0];
+    p.position.set(0, 1, 0);
+    p.velocity.set(0, 0, 0);
+    // Blast damage is gated behind spawn protection and friendly fire (see
+    // `damageScale`/`isProtected` in ballistics.js/match.js) — neither of which this test
+    // is about. Clear both so the explosion actually lands.
+    g.match.clearProtection(bystander);
+    bystander.team = p.team === 0 ? 1 : 0;
+
+    // A fake NetClient: `Prediction` only ever reads `net.unacked`, an array of commands
+    // with `.seq`, which this test fills in by hand.
+    const net = { unacked: [] };
+    const pred = new Prediction(g, p, net);
+
+    const cmd = (seq) => ({
+      seq, wishForward: 0, wishRight: 0, crouchHeld: false, toggleAdsMode: false,
+      aimButtonHeld: false, fireHeld: false, sprintKeyHeld: false, breathHold: false,
+      leanKeyHeld: false, leanRightKeyHeld: false, deltaYaw: 0, deltaPitch: 0,
+      crouchPressed: false, jump: false, reload: false, melee: false, grenade: false,
+      interact: false, interactHeld: false, inspect: false, killstreak: false,
+      lastWeapon: false, slot: -1, sprintDown: false, sprintUp: false, wheel: 0,
+      firePressed: false, aimButtonPressed: false,
+    });
+
+    // seq 0: baseline tick, nothing thrown yet.
+    pred.predict(cmd(0));
+
+    // Throw the frag directly through ProjectileSystem (not through the command — this
+    // test is about the projectile rewind, not the throw-input path) and park it near, but
+    // not on top of, the bystander with zero velocity, so the ONLY thing left to happen is
+    // its fuse running out exactly where it stands. Offset rather than co-located: at
+    // point-blank the 130-damage frag (radius 6.5) one-shots a 100 HP bot, and a target
+    // already dead when the "replay" detonation fires is skipped by `applyExplosionDamage`
+    // regardless of whether the `game._replaying` guard works — which would make the
+    // double-damage assertion below pass even with the guard removed. ~5 m out puts the
+    // falloff-scaled hit around 18-20 HP, leaving the bystander alive with headroom to
+    // show a SECOND hit if the guard fails to stop one.
+    const origin = bystander.position.clone(); origin.x += 5.0; origin.y += 1.0;
+    const dir = new (p.position.constructor)(0, 0, -1);
+    g.projectiles.throwGrenade(p, origin, dir, 1, FRAG, 0);
+    const live = g.projectiles.pool.find((x) => x.active);
+    live.pos.copy(origin);
+    live.vel.set(0, 0, 0);
+    live.mesh.position.copy(live.pos);
+    live.fuse = 3.5 / 120;            // detonates on the 4th fixed tick from here
+
+    // seq 1..3: fuse ticks down but the grenade is still live. seq 3's captured history is
+    // what the correction below acks — the grenade mid-flight, one tick from going off.
+    pred.predict(cmd(1));
+    pred.predict(cmd(2));
+    pred.predict(cmd(3));
+    const ackedMine = pred.history.get(3);
+    const healthBeforeDetonation = bystander.health;
+
+    // seq 4: for real, the first time, the grenade detonates and the bystander takes
+    // blast damage. This is the run whose effects a replay must NOT repeat.
+    pred.predict(cmd(4));
+    const healthAfterFirstDetonation = bystander.health;
+    const tookDamageFirstRun = healthAfterFirstDetonation < healthBeforeDetonation;
+    const projectileGone = !g.projectiles.pool.some((x) => x.active);
+
+    // A server snapshot acking seq 3 (before the detonation) but disagreeing on position
+    // by enough to force a correction — `reconcile()` -> `_correct()` will rewind the
+    // player AND the projectile pool to their seq-3 state (grenade still live, one tick
+    // from its fuse) and replay commands 4.. through `game._fixedUpdate`, re-arming the
+    // exact tick that detonated it the first time.
+    net.unacked = [cmd(4)];
+    const wire = {
+      id: p.id,
+      x: ackedMine.player.position.x + 0.5, y: ackedMine.player.position.y, z: ackedMine.player.position.z,
+      vx: ackedMine.player.velocity.x, vy: ackedMine.player.velocity.y, vz: ackedMine.player.velocity.z,
+      health: ackedMine.player.health, armor: ackedMine.player.armor,
+      height: ackedMine.player.height, lean: ackedMine.player.lean,
+      flags: 1, team: p.team,
+    };
+    let replayingDuringDetonation = null;
+    const origDetonate = g.projectiles._detonate.bind(g.projectiles);
+    g.projectiles._detonate = (proj) => { replayingDuringDetonation = g._replaying; origDetonate(proj); };
+
+    const corrected = pred.reconcile({ entities: [wire], lastCommandSeq: 3, tick: g.tick });
+    const healthAfterCorrection = bystander.health;
+    g.projectiles._detonate = origDetonate;
+
+    return {
+      corrected,
+      tookDamageFirstRun,
+      projectileGone,
+      replayingDuringDetonation,
+      doubleDamaged: healthAfterCorrection < healthAfterFirstDetonation,
+      healthBeforeDetonation, healthAfterFirstDetonation, healthAfterCorrection,
+      replayedOutsideGuard: g._replaying,
+    };
+  });
+  if (grenadeCorrection.tookDamageFirstRun) ok('the grenade detonates on schedule and damages the bystander (test precondition)');
+  else bad('the grenade detonates on schedule and damages the bystander (test precondition)',
+    'health never dropped on the first, unreplayed run — the scenario below proves nothing');
+  if (grenadeCorrection.corrected) ok('reconcile() actually triggered a correction (test precondition)');
+  else bad('reconcile() actually triggered a correction (test precondition)', '_correct() never ran — the rewind/replay below never happened');
+  if (grenadeCorrection.replayingDuringDetonation === true) {
+    ok('_detonate re-ran during the replay with game._replaying set (the guard was reached, not skipped)');
+  } else {
+    bad('_detonate re-ran during the replay with game._replaying set',
+      `game._replaying was ${grenadeCorrection.replayingDuringDetonation} when _detonate ran during replay — either the rewind did not put the grenade back in flight to re-detonate, or the flag was not set the second time`);
+  }
+  if (!grenadeCorrection.doubleDamaged) {
+    ok(`the game._replaying guard prevented double damage (bystander health stayed at ${grenadeCorrection.healthAfterCorrection} through the correction)`);
+  } else {
+    bad('the game._replaying guard prevented double damage',
+      `bystander health dropped again on correction: ${grenadeCorrection.healthAfterFirstDetonation} -> ${grenadeCorrection.healthAfterCorrection} — the same detonation applied blast damage twice`);
+  }
+  if (grenadeCorrection.projectileGone) ok('the projectile pool slot was freed by the first detonation');
+  else bad('the projectile pool slot was freed by the first detonation', 'a slot was still active after the fuse should have expired');
+  if (!grenadeCorrection.replayedOutsideGuard) ok('game._replaying is false again once the correction finishes');
+  else bad('game._replaying is false again once the correction finishes', 'the flag leaked true past _correct()\'s finally block');
 
   // ── the browser and the server build the same map ────────────────────────────────
   //

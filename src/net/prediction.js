@@ -134,6 +134,7 @@ export class Prediction {
     this.history.set(seq, {
       player: PLAYER_SNAPSHOT.save(this.entity),
       loadout: lo ? saveLoadout(lo) : null,
+      projectiles: this.game.projectiles?.saveState?.() || null,
       tick: this.game.tick,
     });
     // The server acks continuously, so this stays short; the cap is a backstop against a
@@ -307,6 +308,11 @@ export class Prediction {
     PLAYER_SNAPSHOT.restore(e, mine.player);
     const lo = g.weapons?.getLoadout?.(e);
     if (lo && mine.loadout) restoreLoadout(lo, mine.loadout);
+    // Rewind grenades/rockets in flight to their state at the acked command too — replay
+    // below re-runs the whole local sim, including ProjectileSystem.fixedUpdate, and
+    // without this it would re-integrate and re-fuse anything airborne for the same ticks
+    // a second time. See ProjectileSystem.saveState/restoreState.
+    if (g.projectiles && mine.projectiles) g.projectiles.restoreState(mine.projectiles);
 
     e.position.set(wire.x, wire.y, wire.z);
     e.velocity.set(wire.vx, wire.vy, wire.vz);
@@ -325,6 +331,10 @@ export class Prediction {
     const savedPresent = g.present;
     const savedTick = g.tick;
     g.present = new NullPresenter();
+    // See the field's doc in core/game.js: NullPresenter also runs on a headless server,
+    // permanently, so it cannot itself signal "this tick already happened" — a dedicated
+    // flag is what lets systems like ProjectileSystem tell a replay from a first run.
+    g._replaying = true;
     g.tick = mine.tick;
 
     try {
@@ -335,6 +345,7 @@ export class Prediction {
       }
     } finally {
       g.present = savedPresent;
+      g._replaying = false;
       // The replay advanced the clock exactly as far as it should have; if it somehow did
       // not, the local clock is authoritative for the client's own rendering.
       if (g.tick < savedTick) g.tick = savedTick;

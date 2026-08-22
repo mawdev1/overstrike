@@ -86,6 +86,19 @@ export class Game {
     this._running = false;
     this._raf = 0;
     this._nextRender = 0;
+
+    /**
+     * True only while `net/prediction.js` `_correct()` is replaying already-executed
+     * ticks after a rewind. `game.present` being swapped to `NullPresenter` already
+     * silences feedback that goes through the presentation port, but it is also the
+     * server's permanent presenter, so it cannot double as "this is a replay" for
+     * anything that isn't presentation. Irreversible side effects that bypass
+     * `game.present` — bus events other systems act on, damage application, pooled
+     * state allocated outside the snapshot manifest — must check this flag instead of
+     * running a second time for a tick that already happened once. See
+     * `ProjectileSystem._detonate`.
+     */
+    this._replaying = false;
     this._systems = null;
     this._loop = this._loop.bind(this);
 

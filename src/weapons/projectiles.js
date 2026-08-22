@@ -3,6 +3,7 @@ import { assets } from '../core/assets.js';
 import { clamp } from '../core/mathUtils.js';
 import { applyExplosionDamage } from './ballistics.js';
 import { FRAG } from './weaponDefs.js';
+import { defineSnapshot } from '../core/snapshot.js';
 
 /**
  * OVERSTRIKE — projectiles (grenades, tacticals, and anything else that flies).
@@ -44,7 +45,45 @@ const _warnEvt = { id: 0, kind: 'frag', position: new THREE.Vector3(), distance:
 const _flashEvt = { amount: 0, duration: 0, position: new THREE.Vector3() };
 const _smokeEvt = { id: 0, position: new THREE.Vector3(), radius: 0, duration: 0 };
 
+/**
+ * One pooled projectile record (the pool-entry shape allocated in `init()` above).
+ *
+ * `def`/`proj` and `owner` are captured as scalars — i.e. assigned, not deep-copied. That
+ * is correct here for two different reasons: `def`/`proj` point at shared, immutable
+ * weapon-def data (safe to alias, same as every other snapshot in this codebase treats a
+ * def), while `owner` is a live entity reference that must stay pointing at the same
+ * entity, not a clone of it. Unlike `WeaponInstance`, which owns one `def` for its whole
+ * lifetime and so leaves it out of WEAPON_SNAPSHOT entirely, a pool slot here is reused
+ * across throws of different kinds — WHICH def a slot points at is itself part of its
+ * state, so it has to be captured, not ignored.
+ */
+export const PROJECTILE_SNAPSHOT = defineSnapshot('Projectile', {
+  scalars: [
+    'id', 'active', 'kind', 'def', 'proj', 'owner',
+    'fuse', 'age', 'radius', 'resting', 'bounces',
+  ],
+  vec3s: ['pos', 'vel', 'angVel', 'trailFrom'],
+  ignore: [
+    // Presentation, entirely derived from the fields above: geometry/material/scale by
+    // `_dressMesh`, transform by the `p.mesh.position.copy(p.pos)` calls in spawn and
+    // `fixedUpdate`. Mirrors Player's `hitboxes` — whoever restores a snapshot must
+    // re-derive this rather than expect it carried across (see `restoreProjectiles`).
+    'mesh', 'geoms',
+  ],
+});
 
+/**
+ * One pooled smoke-cloud record (see `smokeClouds` above). `owner` is a live entity
+ * reference, captured by reference like `Projectile.owner` for the same reason.
+ *
+ * Grown every `fixedUpdate` by `_updateSmoke` and allocated by `_popSmoke` on
+ * detonation — i.e. exactly as live and tick-mutated as the projectile pool, so it needs
+ * the same rewind-before-replay treatment. See `ProjectileSystem.saveState`.
+ */
+export const SMOKE_SNAPSHOT = defineSnapshot('SmokeCloud', {
+  scalars: ['id', 'active', 'radius', 'targetRadius', 't', 'duration', 'growTime', 'puffAccum', 'puffRate', 'owner'],
+  vec3s: ['position'],
+});
 
 // ==================================================================== system
 
@@ -376,6 +415,20 @@ export class ProjectileSystem {
     p.active = false;
     p.mesh.visible = false;
 
+    // `net/prediction.js` `_correct()` rewinds the pool (see saveState/restoreState above)
+    // and replays already-executed ticks to keep in-flight physics deterministic. Pool
+    // bookkeeping above is fine to redo — it just ends up in the same state — but a
+    // detonation's actual effects are not: `_popExplosive` applies blast damage/knockback
+    // to every entity in radius, `_popSmoke`/`_popFlash` allocate a slot in the pooled
+    // `smokeClouds` array (never part of the snapshot manifest — see saveState's doc) and
+    // both emit bus events (`smokeStart`, `flashbang`, ...) that other systems act on
+    // directly, not through `game.present`. `game.present` being swapped to a
+    // `NullPresenter` during replay silences presentation but does not reach any of that,
+    // so without this guard a projectile whose detonation tick falls inside the unacked
+    // replay window would re-blind the player, re-apply damage and leak a smoke cloud on
+    // every correction that still precedes that tick.
+    if (game._replaying) return;
+
     switch (p.kind) {
       case 'smoke': this._popSmoke(p); break;
       case 'flash': this._popFlash(p); break;
@@ -627,10 +680,81 @@ export class ProjectileSystem {
     return n;
   }
 
+  /**
+   * Snapshot every pooled slot for client-side reconciliation (see `net/prediction.js`).
+   *
+   * `_correct()` rewinds the local Player and Loadout to their state at the acked command
+   * and replays unacked commands through the whole local sim — which runs this system's
+   * `fixedUpdate` every replayed tick. Without rewinding the pool too, any grenade or
+   * rocket in flight would have gravity, collision and its fuse re-applied for the SAME
+   * ticks a second time, so how far it travelled or when it detonated would depend on how
+   * often the client happened to get corrected. `def`/`proj` and `owner` are captured by
+   * reference: they are shared, immutable weapon data and a live entity respectively,
+   * never per-projectile state to be copied.
+   *
+   * `smokeClouds` rides along for the same reason: `fixedUpdate` grows it every tick via
+   * `_updateSmoke` regardless of replay, so without rewinding it too, a correction would
+   * re-age every live cloud by the replayed span on top of the ageing it already got the
+   * first time the ticks ran — the cloud would dissipate far faster than real time, and
+   * faster still on every subsequent correction. `_detonate` itself is additionally gated
+   * on `game._replaying` (see there) so that a detonation tick caught inside the replay
+   * window does not re-fire its one-shot side effects a second time.
+   */
+  saveState() {
+    return {
+      pool: this.pool.map((p) => PROJECTILE_SNAPSHOT.save(p)),
+      smokeClouds: this.smokeClouds.map((c) => SMOKE_SNAPSHOT.save(c)),
+    };
+  }
+
+  /** Write a `saveState()` snapshot back onto the pool, in place, including the meshes. */
+  restoreState(snap) {
+    const pool = this.pool;
+    const poolSnap = snap.pool || snap; // tolerate a pre-existing pool-only snapshot
+    for (let i = 0; i < pool.length && i < poolSnap.length; i++) {
+      const p = pool[i];
+      PROJECTILE_SNAPSHOT.restore(p, poolSnap[i]);
+      // `mesh`/`geoms` are deliberately outside the manifest (presentation, derived from
+      // the fields above) — re-derive them here rather than expect them carried across.
+      if (p.active) this._dressMesh(p);
+      p.mesh.position.copy(p.pos);
+      p.mesh.visible = p.active;
+    }
+
+    const clouds = this.smokeClouds;
+    const cloudSnap = snap.smokeClouds;
+    if (cloudSnap) {
+      for (let i = 0; i < clouds.length && i < cloudSnap.length; i++) {
+        SMOKE_SNAPSHOT.restore(clouds[i], cloudSnap[i]);
+      }
+    }
+  }
+
   dispose() {
     for (const g of this._geoms) g.dispose();
     this._geoms.length = 0;
     this.group.parent?.remove(this.group);
     this.pool.length = 0;
+  }
+
+  /** Field-by-field comparison of two `saveState()` snapshots, for the bit-equality harness. */
+  static diffState(a, b) {
+    const list = [];
+    const poolA = a.pool || a, poolB = b.pool || b; // tolerate a pre-existing pool-only snapshot
+    const n = Math.min(poolA.length, poolB.length);
+    for (let i = 0; i < n; i++) {
+      for (const f of PROJECTILE_SNAPSHOT.diff(poolA[i], poolB[i])) list.push(`pool[${i}].${f}`);
+    }
+    if (poolA.length !== poolB.length) list.push('pool.length');
+
+    const cloudsA = a.smokeClouds, cloudsB = b.smokeClouds;
+    if (cloudsA && cloudsB) {
+      const m = Math.min(cloudsA.length, cloudsB.length);
+      for (let i = 0; i < m; i++) {
+        for (const f of SMOKE_SNAPSHOT.diff(cloudsA[i], cloudsB[i])) list.push(`smokeClouds[${i}].${f}`);
+      }
+      if (cloudsA.length !== cloudsB.length) list.push('smokeClouds.length');
+    }
+    return list;
   }
 }
