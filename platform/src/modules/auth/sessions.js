@@ -244,7 +244,23 @@ export function createSessionService(deps) {
       const session = await store.sessions.byId(row.sessionId, tx);
       if (!session || session.revokedAt) throw new ApiError('AUTH_SESSION_REVOKED', 'You were signed out. Sign in again.');
 
-      await store.refreshTokens.markUsed(tokenId, iso(now), tx);
+      // The guard against double-use is `markUsed`'s conditional UPDATE, not the `usedAt`
+      // check above — that check only catches reuse this transaction's own SELECT already
+      // saw. A genuinely concurrent rotation (another process, another overlapping
+      // transaction) races past it and loses here instead: `markUsed` throws CONFLICT when
+      // its guarded UPDATE affects zero rows. That loss is still reuse — the token existed
+      // and was already spent by the time this call reached it — so it gets the same
+      // sentinel treatment as the pre-check above, not a bare error the caller learns
+      // nothing from.
+      try {
+        await store.refreshTokens.markUsed(tokenId, iso(now), tx);
+      } catch (err) {
+        if (err instanceof ApiError && err.code === 'CONFLICT') {
+          const reuseRow = await store.refreshTokens.byId(tokenId, tx);
+          return { reuse: reuseRow ?? row };
+        }
+        throw err;
+      }
       const account = await store.accounts.byId(row.accountId, tx);
       const roles = account?.roles ?? ['player'];
       const refreshToken = await mintRefresh(
