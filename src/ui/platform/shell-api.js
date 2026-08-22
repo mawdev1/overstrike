@@ -307,15 +307,69 @@ const validPlayer = (value) => closed(value,
   && PLAYER_COUNT_KEYS.every((key) => count(value[key])) && integer(value.score)
   && bool(value.disconnected) && bool(value.abandoned) && iso(value.joinedAt)
   && (value.leftAt === null || iso(value.leftAt)) && validWeapons(value.weapons);
+// match-result.md §4.4 (2.1.0): `RunTerminalResult`, the fifth GET /v1/matches/:matchId shape,
+// discriminated by `mode: 'extraction'`. The PvP-only keys are ABSENT, never null-stuffed —
+// `closed` is what enforces that — and `settlement` is symmetrically absent from every
+// tdm|bomb response. A run roster seat has `team: null`: a run has no alpha/bravo.
+const RUN_TERMINAL_KEYS = ['matchId', 'status', 'mode', 'mapId', 'mapVersion', 'region',
+  'serverBuild', 'startedAt', 'endedAt', 'roster', 'settlement', 'evidenceRef', 'correlationId'];
+const validRunRosterEntry = (value) => closed(value, ['accountId', 'team', 'joinedAt', 'leftAt'])
+  && text(value.accountId) && value.team === null && iso(value.joinedAt)
+  && (value.leftAt === null || iso(value.leftAt));
+// settlement.md §3's four-state vocabulary, with §4.4's iff rules: `outcome` is null exactly
+// when none was applied (`ended`, `exception-open`, or an exception resolved as void), `exitId`
+// rides only an extraction, `deathCause` only a death, and the exception pair only an OPEN
+// exception — settlement clears both on resolution.
+const validRunParticipant = (value) => closed(value,
+  ['accountId', 'settlementStatus', 'outcome', 'exitId', 'deathCause', 'exceptionId', 'trigger'])
+  && text(value.accountId)
+  && ['ended', 'settled', 'exception-open', 'exception-resolved'].includes(value.settlementStatus)
+  && (value.outcome === null
+    || ['extracted', 'died', 'aborted', 'server-failure'].includes(value.outcome))
+  && (['ended', 'exception-open'].includes(value.settlementStatus) ? value.outcome === null : true)
+  && (value.settlementStatus === 'settled' ? value.outcome !== null : true)
+  && (value.outcome === 'extracted' ? text(value.exitId) : value.exitId === null)
+  && (value.outcome === 'died' ? text(value.deathCause) : value.deathCause === null)
+  && (value.settlementStatus === 'exception-open'
+    ? text(value.exceptionId) && text(value.trigger)
+    : value.exceptionId === null && value.trigger === null);
+function validRunTerminal(value) {
+  return closed(value, RUN_TERMINAL_KEYS)
+    && text(value.matchId)
+    // settlement.md §2: a run is never `invalidated` in this version.
+    && ['completed', 'aborted'].includes(value.status)
+    && value.mode === 'extraction'
+    && text(value.mapId) && text(value.mapVersion) && text(value.region)
+    && nullableText(value.serverBuild)
+    && iso(value.startedAt) && iso(value.endedAt)
+    && Array.isArray(value.roster) && value.roster.every(validRunRosterEntry)
+    && closed(value.settlement, ['runLevelException', 'participants'])
+    && (value.settlement.runLevelException === null
+      || (closed(value.settlement.runLevelException, ['exceptionId', 'trigger'])
+        && text(value.settlement.runLevelException.exceptionId)
+        && text(value.settlement.runLevelException.trigger)))
+    && Array.isArray(value.settlement.participants)
+    && value.settlement.participants.every(validRunParticipant)
+    // §4.4: `settlement.participants[]` covers the FULL roster — same seats, no extras.
+    && value.settlement.participants.length === value.roster.length
+    && new Set(value.roster.map((seat) => seat.accountId)).size === value.roster.length
+    && value.roster.every((seat) => value.settlement.participants.some(
+      (participant) => participant.accountId === seat.accountId))
+    && (value.evidenceRef === null || text(value.evidenceRef)) && text(value.correlationId);
+}
 function validMatch(value) {
   if (!record(value)) return false;
   if (value.status === 'pending') return closed(value,
     ['matchId', 'status', 'mode', 'mapId', 'mapVersion', 'startedAt', 'endedAt', 'retryAfterMs',
-      'correlationId']) && text(value.matchId) && ['tdm', 'bomb'].includes(value.mode)
+      'correlationId']) && text(value.matchId)
+      // 2.1.0: a run pending settlement is this same shape with mode 'extraction' (§4.4).
+      && ['tdm', 'bomb', 'extraction'].includes(value.mode)
       && text(value.mapId) && text(value.mapVersion)
       && (value.startedAt === null || iso(value.startedAt))
       && (value.endedAt === null || iso(value.endedAt)) && integer(value.retryAfterMs)
       && text(value.correlationId);
+  // §4.4: a client seeing a terminal status branches on `mode` before assuming the §4.2 set.
+  if (value.mode === 'extraction') return validRunTerminal(value);
   return closed(value, TERMINAL_MATCH_KEYS)
     && text(value.matchId) && ['completed', 'aborted', 'invalidated'].includes(value.status)
     && value.terminationReason === value.status && ['tdm', 'bomb'].includes(value.mode)

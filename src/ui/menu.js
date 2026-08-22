@@ -42,6 +42,7 @@ const BIND_ACTIONS = [
   ['forward', 'Move forward'], ['back', 'Move back'], ['left', 'Strafe left'], ['right', 'Strafe right'],
   ['jump', 'Jump'], ['sprint', 'Sprint'], ['crouch', 'Crouch / slide'], ['lean', 'Lean'],
   ['reload', 'Reload'], ['melee', 'Melee'], ['grenade', 'Throw grenade'], ['interact', 'Interact'],
+  ['drop', 'Drop item'],
   ['weapon1', 'Primary weapon'], ['weapon2', 'Secondary weapon'], ['weapon3', 'Tertiary / special'],
   ['lastWeapon', 'Last weapon'], ['killstreak', 'Killstreak'], ['inspect', 'Inspect weapon'],
   ['scoreboard', 'Scoreboard (hold)'],

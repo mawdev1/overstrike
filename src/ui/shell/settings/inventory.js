@@ -89,8 +89,8 @@ export const SETTINGS_INVENTORY = Object.freeze([
   choice('difficulty', 'input', 'PRACTICE', 'Practice bot difficulty', ['recruit', 'regular', 'hardened', 'veteran'], 'regular'),
   number('botCount', 'input', 'PRACTICE', 'Practice bot count', 0, 15, 1, 7, { synonyms: ['bots'] }),
   number('killLimit', 'input', 'PRACTICE', 'Practice kill limit', 5, 200, 5, 75, { synonyms: ['score limit'] }),
-  choice('mode', 'input', 'PRACTICE', 'Practice mode', ['tdm', 'bomb'], 'tdm',
-    { synonyms: ['team deathmatch', 'bomb'] }),
+  choice('mode', 'input', 'PRACTICE', 'Practice mode', ['tdm', 'bomb', 'extraction'], 'tdm',
+    { synonyms: ['team deathmatch', 'bomb', 'extraction', 'raid'] }),
 ]);
 
 const action = (id, label, primary, secondary = null, extra = {}) =>

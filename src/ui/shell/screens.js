@@ -2002,7 +2002,7 @@ function settlementPresentation(participant) {
   return base;
 }
 
-function settlementParticipantCard(participant) {
+function settlementParticipantCard(participant, isLocal = participant?.isLocal === true) {
   const presentation = settlementPresentation(participant);
   const facts = [
     ['Result', presentation.label],
@@ -2017,7 +2017,7 @@ function settlementParticipantCard(participant) {
   }, [
     element('h2', {}, [
       element('span', {}, participant.displayName || participant.accountId || 'Participant'),
-      participant.isLocal ? statusBadge('You') : null,
+      isLocal ? statusBadge('You') : null,
     ]),
     statusBadge(presentation.label),
     definitionList(facts),
@@ -2025,10 +2025,16 @@ function settlementParticipantCard(participant) {
   ]);
 }
 
-function renderExtractionResults({ view, actions, isFeatureEnabled }, result) {
+function renderExtractionResults({ view, actions, isFeatureEnabled, session }, result) {
   const settlement = result.settlement || {};
   const participants = Array.isArray(settlement.participants) ? settlement.participants : [];
-  const local = participants.find((participant) => participant.isLocal) || null;
+  // The wire shape (match-result.md §4.4) identifies participants by accountId only — there is
+  // no isLocal on it. The signed-in account is what makes one of them "you"; the isLocal flag
+  // remains honoured for the fixture-driven variants that predate the wire shape.
+  const localAccountId = session?.profile?.accountId ?? session?.accountId ?? null;
+  const isLocalParticipant = (participant) => participant.isLocal === true
+    || (Boolean(localAccountId) && participant.accountId === localAccountId);
+  const local = participants.find(isLocalParticipant) || null;
   const localPresentation = local ? settlementPresentation(local) : null;
   const anyUnsettled = participants.some((participant) => {
     const kind = settlementPresentation(participant).kind;
@@ -2064,7 +2070,7 @@ function renderExtractionResults({ view, actions, isFeatureEnabled }, result) {
     ]),
     participants.length
       ? element('section', { className: 'os-card-grid', 'aria-label': 'Squad settlement' },
-        participants.map((participant) => settlementParticipantCard(participant)))
+        participants.map((participant) => settlementParticipantCard(participant, isLocalParticipant(participant))))
       : element('p', { role: 'status' }, 'No participant settlement has been reported for this run yet.'),
     actionsRow([
       shellLink('View inventory', '/inventory', { className: 'os-button os-button--primary' }),
@@ -2080,10 +2086,11 @@ function renderExtractionResults({ view, actions, isFeatureEnabled }, result) {
   ]);
 }
 
-function renderResults({ view, actions, isFeatureEnabled }) {
+function renderResults(context) {
+  const { view, actions, isFeatureEnabled } = context;
   const result = view.data?.result || view.data || {};
   if (result.mode === 'extraction' && result.status !== 'pending') {
-    return renderExtractionResults({ view, actions, isFeatureEnabled }, result);
+    return renderExtractionResults(context, result);
   }
   if (result.status === 'pending') {
     const retryAfterMs = Number.isFinite(result.retryAfterMs) ? result.retryAfterMs : 3000;

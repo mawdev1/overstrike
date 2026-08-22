@@ -61,7 +61,11 @@ export function createRaidHud({ game, root, document: documentRef = globalThis.d
       runState,
       nowMs,
       typedEvent: transient,
-      bindings: { interact: game?.settings?.keyForAction?.('interact') || 'E' },
+      bindings: {
+        interact: game?.settings?.keyForAction?.('interact') || 'E',
+        // §3.3 drop intent (extractionRules.js `drop`): rebindable via the 'drop' action.
+        drop: game?.settings?.keyForAction?.('drop') || 'H',
+      },
       preferences: {
         reduceMotion: game?.settings?.get?.('reduceMotion') === true,
         colorVisionPreset: game?.settings?.get?.('colorVisionPreset') || 'default',

@@ -68,7 +68,7 @@ export const DEFAULTS = {
     KeyR: 'reload', KeyF: 'melee', KeyG: 'grenade', KeyQ: 'lean',
     KeyE: 'interact', Tab: 'scoreboard', KeyV: 'lastWeapon',
     Digit1: 'weapon1', Digit2: 'weapon2', Digit3: 'weapon3',
-    KeyX: 'inspect', KeyB: 'killstreak',
+    KeyX: 'inspect', KeyB: 'killstreak', KeyH: 'drop',
   },
 };
 
@@ -106,6 +106,23 @@ export class Settings {
       }
       v = coerced;
     }
+    if (k === 'binds') {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) {
+        console.warn('[settings] rejected invalid value for "binds":', v);
+        return;
+      }
+      // A wholesale binds write wins for every code and every action it names — but it must
+      // not silently UNBIND actions it does not govern. The shell settings bridge rebuilds
+      // this map from its own action inventory on every game creation, and actions that
+      // inventory does not yet carry (e.g. the raid HUD's 'drop', pending the roaming
+      // keybind vocabulary) would otherwise lose their key each time a game starts.
+      const incomingActions = new Set(Object.values(v));
+      const merged = { ...v };
+      for (const [code, action] of Object.entries(this.data.binds)) {
+        if (!incomingActions.has(action) && !(code in merged)) merged[code] = action;
+      }
+      v = merged;
+    }
     if (this.data[k] === v) return;
     this.data[k] = v;
     this.save();
@@ -115,6 +132,18 @@ export class Settings {
   onChange(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
 
   actionFor(code) { return this.data.binds[code]; }
+
+  /**
+   * Short display label for the first key bound to `action` ('E', 'H', 'Mouse2'), or null when
+   * unbound. This is what HUD hints render — `src/ui/raid/local.js` was already calling it
+   * optioned (`keyForAction?.`) and silently falling back to a hardcoded key.
+   */
+  keyForAction(action) {
+    for (const [code, bound] of Object.entries(this.data.binds)) {
+      if (bound === action) return code.replace(/^(Key|Digit)/, '');
+    }
+    return null;
+  }
 
   rebind(code, action) {
     // Remove any existing binding of this action to keep the map single-purpose.
@@ -159,7 +188,7 @@ export class Settings {
     colorVisionPreset: ['default', 'deuteranopia', 'protanopia', 'tritanopia'],
     networkDiagnosticsOverlay: ['off', 'compact', 'full'],
     difficulty: ['recruit', 'regular', 'hardened', 'veteran'],
-    mode: ['tdm', 'bomb'],
+    mode: ['tdm', 'bomb', 'extraction'],
   };
 
   /**

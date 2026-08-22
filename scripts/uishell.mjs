@@ -31,6 +31,12 @@ import {
 import { SHELL_ROUTES, matchShellRoute } from '../src/ui/shell/router.js';
 import { SETTLEMENT_RESULT_FIXTURES, SHELL_SCREEN_FIXTURES, SHELL_VARIANT_MATRIX } from '../src/ui/shell/fixtures.js';
 import { Input } from '../src/core/input.js';
+import { createShellApi } from '../src/ui/platform/shell-api.js';
+import { createStubApi, STUB_FLAG } from '../platform/src/modules/stubs/index.js';
+import {
+  ACCOUNT_ID as STUB_ACCOUNT_ID, OTHER_ACCOUNT_ID as STUB_OTHER_ACCOUNT_ID,
+  MATCH_ID as STUB_MATCH_ID, extractionRunResult,
+} from '../platform/src/modules/stubs/fixtures.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXPECTED_CATEGORIES = Object.freeze([
@@ -613,7 +619,155 @@ window.__SETTINGS__ = settingsController;
 window.__HARNESS_READY__ = true;
 </script></body></html>`;
 
-async function browserChecks() {
+/**
+ * match-result.md §4.4 — the extraction run-result projection, proven against the bodies the
+ * platform stub actually serves (`result-extraction-*`), through the shell's own closed
+ * validator (`createShellApi().getResult`). The validated bodies are returned so the browser
+ * pass can drive the P3-10 screens with real wire shapes instead of hand-written fixtures.
+ */
+async function extractionResultChecks() {
+  const CLIENT_BUILD = '1.0.0';
+  const drive = (scenario) => {
+    const stub = createStubApi({
+      config: { env: 'test' }, flags: { [STUB_FLAG]: true }, env: {},
+      sleep: () => Promise.resolve(),
+    });
+    let token = null;
+    const request = async (path, options = {}) => {
+      const res = await stub.handle({
+        method: options.method || 'GET', path, query: {}, body: options.body || {},
+        headers: {
+          'X-Stub-Scenario': scenario,
+          'X-Client-Session-Id': `uishell-${scenario}`,
+          'X-Client-Build': CLIENT_BUILD,
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+      if (res.body && typeof res.body.accessToken === 'string') token = res.body.accessToken;
+      if (res.status >= 400) {
+        throw Object.assign(new Error(res.body?.error?.code || `HTTP ${res.status}`), {
+          code: res.body?.error?.code, status: res.status,
+        });
+      }
+      return { status: res.status, data: res.body, correlationId: res.correlationId };
+    };
+    return { request, api: createShellApi({ client: { request }, legacyStorage: null }) };
+  };
+  const signedIn = async (scenario) => {
+    const driver = drive(scenario);
+    await driver.request('/v1/auth/signin', {
+      method: 'POST', body: { email: 'uishell@stub.invalid', password: 'stub-password' },
+    });
+    return driver;
+  };
+
+  const results = {};
+  const scenarioResult = async (scenario) => {
+    const { api } = await signedIn(scenario);
+    const { result } = await api.getResult({ matchId: STUB_MATCH_ID });
+    return result;
+  };
+
+  results.extracted = await scenarioResult('result-extraction-extracted');
+  equal(results.extracted.mode, 'extraction', 'the run result is discriminated by mode');
+  equal(results.extracted.status, 'completed', 'the extracted scenario serves a terminal run');
+  equal(results.extracted.settlement.participants[0], {
+    accountId: STUB_ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted',
+    exitId: 'exit-rail-gate', deathCause: null, exceptionId: null, trigger: null,
+  }, 'the validated §4.4 participant reaches the caller byte-for-byte, not reshaped');
+  equal(results.extracted.settlement.participants[1].outcome, 'died',
+    'the squadmate death rides the same response — outcomes are per-participant');
+  check(results.extracted.winnerTeam === undefined && results.extracted.teamScores === undefined
+    && results.extracted.rounds === undefined,
+  'the PvP-only keys are absent from a run result, exactly as §4.4 requires');
+  check(typeof results.extracted.correlationId === 'string' && results.extracted.correlationId.length > 0,
+    'the run result carries its correlation id');
+
+  results.lost = await scenarioResult('result-extraction-lost');
+  equal(results.lost.settlement.participants[0].outcome, 'died',
+    'the lost scenario settles the local account as died');
+  equal(results.lost.settlement.participants[0].deathCause, 'player',
+    'deathCause is present exactly when the outcome is a death');
+
+  results.exception = await scenarioResult('result-extraction-exception');
+  equal(results.exception.settlement.participants[0].settlementStatus, 'exception-open',
+    'the exception scenario is held open, not misread as settled');
+  equal(results.exception.settlement.participants[0].outcome, null,
+    'an open exception carries no outcome — nothing was applied');
+  equal(results.exception.settlement.participants[0].exceptionId, 'exc-stub-01',
+    'the open exception names its review reference');
+
+  results.mixed = await scenarioResult('result-extraction-mixed');
+  equal(results.mixed.settlement.runLevelException,
+    { exceptionId: 'exc-stub-run-01', trigger: 'missing-participant' },
+    'the run-level exception (settlement.md §5.3) survives validation alongside per-participant states');
+  equal(results.mixed.settlement.participants.map((p) => p.settlementStatus),
+    ['settled', 'settled', 'exception-open'],
+    'a split squad validates with each participant in its own state');
+
+  // The retry-safe timeline: §4.2 pending with mode extraction, then terminal with the local
+  // participant still `ended` (submission received, settlement unresolved), then settled.
+  {
+    const { api } = await signedIn('result-extraction-pending');
+    const first = (await api.getResult({ matchId: STUB_MATCH_ID })).result;
+    equal(first.status, 'pending', 'a non-terminal run projects as the §4.2 pending shape');
+    equal(first.mode, 'extraction', 'the pending shape admits mode extraction (2.1.0)');
+    check(Number.isInteger(first.retryAfterMs), 'pending keeps the §4.2 retry contract');
+    results.pending = first;
+    await api.getResult({ matchId: STUB_MATCH_ID });
+    const third = (await api.getResult({ matchId: STUB_MATCH_ID })).result;
+    equal(third.status, 'completed', 'the third poll is terminal');
+    equal(third.settlement.participants.map((p) => p.settlementStatus), ['ended', 'settled'],
+      'a terminal run with a still-`ended` participant validates — the §5.2 retry-safe window is a legal state');
+    equal(third.settlement.participants[0].outcome, null,
+      'an `ended` participant has no outcome yet');
+    results.retrySafe = third;
+    const fourth = (await api.getResult({ matchId: STUB_MATCH_ID })).result;
+    equal(fourth.settlement.participants.map((p) => p.outcome), ['extracted', 'extracted'],
+      'the settled read closes the timeline');
+  }
+
+  // Fail-closed controls: the discipline of the shell is that an unknown, omitted, or
+  // wrong-typed 2xx raises CLIENT_PROTOCOL rather than rendering a guess.
+  const doctored = async (mutate) => {
+    const body = { ...extractionRunResult('uishell-doctored-run', {
+      participants: [
+        { accountId: STUB_ACCOUNT_ID, settlementStatus: 'settled', outcome: 'extracted', exitId: 'exit-rail-gate' },
+        { accountId: STUB_OTHER_ACCOUNT_ID, settlementStatus: 'exception-open', outcome: null,
+          exceptionId: 'exc-uishell-01', trigger: 'lock-mismatch' },
+      ],
+    }), correlationId: 'uishell-doctored' };
+    mutate(body);
+    const api = createShellApi({
+      client: { request: async () => ({ status: 200, data: body, correlationId: body.correlationId }) },
+      legacyStorage: null,
+    });
+    try {
+      await api.getResult({ matchId: body.matchId });
+      return null;
+    } catch (error) {
+      return error?.code || 'ERROR';
+    }
+  };
+  equal(await doctored(() => {}), null, 'the undoctored control passes — the probes below fail for their mutation alone');
+  equal(await doctored((body) => { body.winnerTeam = null; }), 'CLIENT_PROTOCOL',
+    'a null-stuffed PvP key on a run result is refused — §4.4 says absent, not null');
+  equal(await doctored((body) => { body.settlement.participants[1].settlementStatus = 'archived'; }),
+    'CLIENT_PROTOCOL', 'an unknown settlementStatus fails closed instead of rendering a guess');
+  equal(await doctored((body) => { delete body.settlement.participants[1].trigger; }),
+    'CLIENT_PROTOCOL', 'an omitted participant key is a defect, never a state');
+  equal(await doctored((body) => { body.settlement.participants[0].exitId = null; }),
+    'CLIENT_PROTOCOL', 'an extracted participant without its exit is refused — exitId rides extraction');
+  equal(await doctored((body) => { body.roster[1].team = 'alpha'; }), 'CLIENT_PROTOCOL',
+    'a run roster seat with a PvP team is refused — a run has no alpha/bravo');
+  equal(await doctored((body) => {
+    body.settlement.participants = [body.settlement.participants[0]];
+  }), 'CLIENT_PROTOCOL', 'settlement must cover the full roster — a missing participant is refused');
+
+  return { accountId: STUB_ACCOUNT_ID, ...results };
+}
+
+async function browserChecks(stubResults) {
   let server;
   let browser;
   const errors = [];
@@ -1301,6 +1455,63 @@ async function browserChecks() {
     equal(runtimeAuthority.stored.lifetime.kills, 999999999,
       'network runtime never rewrites or promotes the modified practice blob');
 
+    // ── §4.4 extraction results, driven by the stub scenarios' real wire bodies ─────────
+    //
+    // The same bodies the platform stub serves for `result-extraction-*`, already passed
+    // through the shell's closed validator node-side, now drive the P3-10 screens. The wire
+    // shape carries no isLocal and no displayName — the signed-in account is what makes a
+    // participant "you", so the session is promoted to the stub account first.
+    await page.evaluate((profile) => window.__SHELL__.resumeAuthenticated({
+      authenticated: true, profile,
+    }), { accountId: stubResults.accountId, displayName: 'Stub Runner', flags: { setupNextStep: null } });
+    const showStubResult = (result) => page.evaluate((data) => {
+      window.__SHELL__.navigate(`/results/${encodeURIComponent(data.result.matchId)}`);
+      window.__SHELL__.injectFixture('results', { variant: 'ready', data });
+    }, { result });
+
+    await showStubResult(stubResults.extracted);
+    check((await page.locator('[data-local-settlement="extracted"]').count()) === 1,
+      'the stub-served extracted run resolves the local participant by ACCOUNT ID, not a fixture flag');
+    equal(await page.locator('.os-settlement-card').count(), 2,
+      'every roster participant gets a settlement card from the wire shape');
+    check((await page.locator('.os-settlement-card[data-settlement="lost"]').count()) === 1,
+      'the squadmate death renders as lost alongside the local extraction');
+    const extractedText = await page.locator('main').innerText();
+    check(extractedText.includes('exit-rail-gate'),
+      'the exit used is shown from the wire exitId');
+    equal(await page.locator('.os-settlement-card', { hasText: 'You' }).getAttribute('data-account-id'),
+      stubResults.accountId, 'the You badge lands on the signed-in account\'s card');
+
+    await showStubResult(stubResults.lost);
+    check((await page.locator('[data-local-settlement="lost"]').count()) === 1,
+      'a stub-served death presents the lost headline state');
+
+    await showStubResult(stubResults.exception);
+    const stubExceptionText = await page.locator('main').innerText();
+    check((await page.locator('[data-local-settlement="pending-review"]').count()) === 1,
+      'a stub-served open exception presents as held for review');
+    check(stubExceptionText.includes('exc-stub-01'),
+      'the wire exceptionId is surfaced as the review reference');
+    check(stubExceptionText.includes('lock mismatch'),
+      'the wire trigger is surfaced in words');
+
+    await showStubResult(stubResults.mixed);
+    equal(await page.locator('.os-settlement-card').evaluateAll(
+      (nodes) => nodes.map((node) => node.dataset.settlement)),
+    ['extracted', 'lost', 'pending-review'],
+    'the mixed stub squad renders each wire participant in its own state');
+    check((await page.locator('main').innerText()).includes('exc-stub-run-01'),
+      'the run-level exception is announced with its wire reference');
+
+    await showStubResult(stubResults.pending);
+    check((await page.locator('main').innerText()).includes('This run is still finalising'),
+      'the §4.2 pending shape with mode extraction says run, not match');
+
+    await showStubResult(stubResults.retrySafe);
+    check((await page.locator('[data-local-settlement="retry-safe"]').count()) === 1,
+      'a terminal run with the local participant still `ended` presents the retry-safe state');
+    await page.evaluate(() => window.__SHELL__.clearFixture('results'));
+
     equal(errors, [], 'browser console/page/request errors occurred');
 
     // Exercise the deployed entrypoint as well as the isolated shell mount above. This catches
@@ -1452,7 +1663,8 @@ async function browserChecks() {
 
 try {
   await modelChecks();
-  await browserChecks();
+  const stubResults = await extractionResultChecks();
+  await browserChecks(stubResults);
   console.log(`✓ UI shell acceptance passed (${checks} assertions).`);
 } catch (error) {
   console.error(`✗ UI shell acceptance failed after ${checks} assertions.`);
