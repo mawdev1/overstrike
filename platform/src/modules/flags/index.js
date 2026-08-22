@@ -36,8 +36,13 @@ export const CLIENT_FLAG_DEFAULTS = Object.freeze({
   'shell.career.enabled': true,
   'shell.serverbrowser.enabled': true,
   'mode.tdm.enabled': true,
-  'mode.bomb.enabled': false,
-  'map.the_square.enabled': false,
+  // feature-flags.md §4: both ship "off → on at P3". P3 closed without this flip, so the
+  // deployed create form (which hides any map/mode whose flag is false) offered NO map at
+  // all — 'the-square' vanished from room creation while every suite that creates rooms
+  // quietly papered over it with PLATFORM_FLAG_OVERRIDES. The compiled default is the value
+  // production actually serves; overrides remain the kill switch, not the enable switch.
+  'mode.bomb.enabled': true,
+  'map.the_square.enabled': true,
   'chat.text.enabled': true,
   'chat.pings.enabled': true,
   'reports.enabled': true,

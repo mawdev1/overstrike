@@ -245,6 +245,25 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
         }
         await persistRoom(room);
       }
+      // Orphaned-reservation sweep. `reserve()` marks a server full in the DURABLE registry,
+      // but the release saga's match map is process memory — so a restart mid-saga used to
+      // leave the row at in_use=capacity with nothing left that would ever release it, and the
+      // region reported no capacity forever (overstrike-gs-iad-1, 2026-08-21). Match rows ARE
+      // durable, so a reserved server whose match is terminal or absent — and which the
+      // hydration above did not re-adopt — is provably orphaned and released here. A server
+      // whose durable match is still allocated/in-progress is left alone even when its room
+      // could not be rehydrated; if that authority is in fact idle, the heartbeat window in the
+      // store adapters heals it within RESERVATION_PROTECT_MS regardless.
+      if (store.matchServers?.listReserved && store.matches?.activeForServer) {
+        const adopted = new Set([...matches.values()].map((match) => match.serverId).filter(Boolean));
+        for (const row of await store.matchServers.listReserved()) {
+          if (adopted.has(row.serverId)) continue;
+          if (await store.matches.activeForServer(row.serverId)) continue;
+          logger.warn('lobby.orphaned_reservation_released',
+            { serverId: row.serverId, region: row.region, inUse: row.inUse });
+          await store.matchServers.release(row.serverId);
+        }
+      }
     })();
     return hydration;
   }
@@ -1446,10 +1465,18 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
           details: { reason: 'region-unavailable', region },
         });
       }
-      if (!['tdm', 'bomb'].includes(mode)) throw failValidation('Unsupported mode.', 'mode');
-      if (mapId !== 'the-square') throw failValidation('Unsupported map.', 'mapId');
+      // Rooms are TDM/Bomb on 'the-square' — deliberately NOT 'square-extraction'. Extraction
+      // is a registered map and a bootable mode, but its delivery path is /v1/deployments and
+      // the raid runtime, not a room: the allocation handshake accepts only tdm|bomb
+      // (server/index.js), tickets/stats/results are PvP-shaped, and an extraction room would
+      // be created here only to fail at launch. If extraction rooms ever ship, extend this
+      // pairing rather than the two lists independently — extraction has no business on
+      // 'the-square' (no sectors) and tdm/bomb none on 'square-extraction'.
+      if (!['tdm', 'bomb'].includes(mode)) throw failValidation('Unsupported mode. Rooms support tdm and bomb; extraction raids start from a deployment, not a room.', 'mode');
+      if (mapId !== 'the-square') throw failValidation("Unsupported map. Rooms play 'the-square'.", 'mapId');
       const evaluated = flags?.evaluate?.().flags || {};
-      if ((mode === 'bomb' && evaluated['mode.bomb.enabled'] !== true)
+      if ((mode === 'tdm' && evaluated['mode.tdm.enabled'] !== true)
+        || (mode === 'bomb' && evaluated['mode.bomb.enabled'] !== true)
         || (mapId === 'the-square' && evaluated['map.the_square.enabled'] !== true)) {
         throw new ApiError('FEATURE_DISABLED', 'That map or mode is not currently enabled.', {
           details: { reason: 'feature-disabled', mode, mapId },

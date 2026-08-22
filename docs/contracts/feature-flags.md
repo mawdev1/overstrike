@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.1.0 |
+| **Version** | 1.2.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Platform, match server, [CX] client, Admin Portal |
 
@@ -100,8 +100,8 @@ its existence is information about unshipped work.
 | `shell.career.enabled` | `true` | Career and history screens route to an unavailable state |
 | `shell.serverbrowser.enabled` | `true` | Browser hidden; direct room links still resolve |
 | `mode.tdm.enabled` | `true` | TDM hidden in room creation; **live TDM matches finish** |
-| `mode.bomb.enabled` | `false` | Bomb hidden in room creation; live Bomb matches finish |
-| `map.the_square.enabled` | `false` | Map hidden in room creation; live matches finish |
+| `mode.bomb.enabled` | `true` (1.2.0 — §4's "on at P3" executed) | Bomb hidden in room creation; live Bomb matches finish |
+| `map.the_square.enabled` | `true` (1.2.0 — §4's "on at P3" executed) | Map hidden in room creation; live matches finish |
 | `chat.text.enabled` | `true` | Chat input hidden, history retained, pings unaffected |
 | `chat.pings.enabled` | `true` | Ping control hidden |
 | `reports.enabled` | `true` | Report entry points hidden |
@@ -126,8 +126,8 @@ built for that job.
 | `room.create.enabled` | **yes** | on | No new rooms; existing joinable |
 | `match.allocation.enabled` | **yes** | on | No new matches; live matches finish. **The drain lever** |
 | `mode.tdm.enabled` | yes | on | TDM unavailable |
-| `mode.bomb.enabled` | yes | off → on at P3 | Bomb unavailable |
-| `map.the_square.enabled` | yes | off → on at P3 | Map unavailable |
+| `mode.bomb.enabled` | yes | off → on at P3 (flipped, 1.2.0) | Bomb unavailable |
+| `map.the_square.enabled` | yes | off → on at P3 (flipped, 1.2.0) | Map unavailable |
 | `chat.text.enabled` | **yes** | on | Chat disabled globally; pings remain |
 | `chat.pings.enabled` | yes | on | Pings disabled |
 | `room.backfill.tdm` | no | on | TDM rooms do not backfill |

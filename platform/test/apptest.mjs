@@ -608,9 +608,11 @@ await withApp(async ({ call }) => {
     JSON.stringify(flags));
 
   // The two that are not cosmetic. Shipping a rollout rule instead of the answer would let a
-  // modified client evaluate itself into any bucket it liked.
-  check(flags['mode.bomb.enabled'] === false && flags['map.the_square.enabled'] === false,
-    'unshipped work is OFF by compiled default (bomb, the_square)',
+  // modified client evaluate itself into any bucket it liked. Both shipped at P3
+  // (feature-flags.md §4: "off → on at P3"), so the compiled default is now ON — while they
+  // were still false post-P3, the deployed create form offered no map at all.
+  check(flags['mode.bomb.enabled'] === true && flags['map.the_square.enabled'] === true,
+    'P3-shipped work is ON by compiled default (bomb, the_square)',
     JSON.stringify({ bomb: flags['mode.bomb.enabled'], square: flags['map.the_square.enabled'] }));
 
   check(!keys.some((k) => k.startsWith('match.allocation') || k.startsWith('platform.')),
@@ -1716,6 +1718,64 @@ await withApp(async ({ call, port }) => {
       'CONTROL: a receipt minted under policy 2 is accepted by the policy-2 app',
       JSON.stringify(allowed.body));
   }, { PLATFORM_CONSENT_POLICY_VERSION: '2' });
+}
+
+// ── 13. boot releases match-server reservations the release saga orphaned ─────────────
+//
+// `reserve()` marks a server full in the DURABLE registry, but the release saga's match map is
+// process memory — so a platform restart mid-match used to leave the row at in_use=capacity
+// with nothing left that would ever release it: `healthy()` filtered it out and the region
+// reported no capacity forever (overstrike-gs-iad-1, 2026-08-21). Match rows ARE durable, so
+// boot can tell an orphan (no live match names the server) from a live seat (an
+// allocated/in-progress match row does) — and must release only the former. The store is
+// injected and pre-seeded to play the part of the database that survived the restart; the app
+// built over it is the real one. Deliberately memory: the pre-restart state is hand-made here,
+// and the adapter-parity of the store calls involved is storetest's job.
+{
+  section('boot releases orphaned match-server reservations, and only those');
+  const { createMemoryStore } = await import('../src/core/store/memory.js');
+  const { ulid } = await import('../src/core/ids.js');
+  const store = createMemoryStore({ storage: 'memory' }, {});
+  const orphanId = `apptest-orphan-${ulid()}`;
+  const liveId = `apptest-live-${ulid()}`;
+  for (const serverId of [orphanId, liveId]) {
+    await store.matchServers.register({ serverId, region: 'iad',
+      address: `wss://${serverId}.example.invalid`, capacity: 12, inUse: 0,
+      status: 'healthy', build: '1.0.0', lastHeartbeatAt: new Date().toISOString() });
+  }
+  const since = new Date(Date.now() - 1000).toISOString();
+  const reservedA = await store.matchServers.reserve('iad', since);
+  const reservedB = await store.matchServers.reserve('iad', since);
+  check(reservedA && reservedB && reservedA.serverId !== reservedB.serverId,
+    'control: the pre-restart platform reserved both servers',
+    JSON.stringify([reservedA?.serverId, reservedB?.serverId]));
+  // The live seat: a durable allocated match names liveId. The orphan: nothing names orphanId.
+  await store.matches.record({ matchId: ulid(), status: 'allocated', mode: 'tdm',
+    mapId: 'the-square', mapVersion: '1.0.0', region: 'iad', rulesetVersion: 'tdm-1.0.0',
+    statDefinitionVersion: '1.0.0', serverBuild: 'apptest', rulesSnapshot: {},
+    startedAt: null, endedAt: null, serverId: liveId, players: [] });
+
+  const config = loadConfig({ ...process.env, NODE_ENV: 'test', PLATFORM_PORT: '0',
+    PLATFORM_STORAGE: 'memory' });
+  const app = await buildApp(config, { logger: silent(), store });
+  try {
+    // Any lobby entry point hydrates; listRooms is the cheapest one that needs no fixtures.
+    const listed = await app.deps.lobby.handlers.listRooms(
+      { actor: { accountId: ulid() }, query: new URLSearchParams(), headers: {} });
+    check(Array.isArray(listed.items), 'control: the restarted lobby hydrates and answers',
+      JSON.stringify(listed));
+    const orphan = await store.matchServers.byId(orphanId);
+    check(orphan.inUse === 0,
+      'the reservation with no durable match is released at boot',
+      `in_use=${orphan.inUse} — the region would report no capacity forever`);
+    const live = await store.matchServers.byId(liveId);
+    check(live.inUse === 12,
+      'the reservation named by a durable active match survives the boot sweep',
+      `in_use=${live.inUse} — a live match just lost its server to the sweep`);
+  } finally {
+    app.stop();
+    await new Promise((r) => app.server.close(r));
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -1,5 +1,22 @@
 # Contract changelog
 
+## 2026-08-22 — `feature-flags.md` 1.1.0 → 1.2.0 — §4's "off → on at P3" executed for `mode.bomb.enabled` and `map.the_square.enabled`
+
+§4 always said both flip on at P3; P3 closed (extraction bootable, both maps in CI) without
+anyone flipping the compiled defaults, so production — which sets no `PLATFORM_FLAG_OVERRIDES`
+— kept serving `false`, and the shell's room-create form (which hides any map/mode whose flag
+is false) offered **no map at all**: 'the-square' was simply missing, with the "no approved
+mode and map combination" notice. Every harness that creates rooms had quietly masked this
+with `PLATFORM_FLAG_OVERRIDES=…=true`. §3.2's Default column now reads `true` for both;
+overrides go back to being the kill switch, not the enable switch. The room-create surface is
+otherwise unchanged: rooms remain TDM/Bomb on 'the-square' only — 'square-extraction'
+(mode `extraction`) is deliberately NOT a room map, because extraction's delivery path is
+`/v1/deployments` + the raid runtime, and the allocation handshake accepts only `tdm|bomb`.
+`POST /v1/rooms` additionally now enforces `mode.tdm.enabled` symmetrically with
+`mode.bomb.enabled` (§3.2's "TDM hidden in room creation" previously had no server-side
+teeth). Bound in code by `platform/src/modules/flags/index.js` `CLIENT_FLAG_DEFAULTS`,
+mirrored by the stub `clientFlags()`, asserted by `platform/test/apptest.mjs`.
+
 ## 2026-08-22 — `bomb-rules.md` 1.7.0 → 1.8.0 (additive) — the mode table admits `extraction` as its third and final entry (REQ-CC-073 / P3-05)
 
 §1's "two entries is the freeze" predates P3: it froze the **competitive** Alpha mode set and

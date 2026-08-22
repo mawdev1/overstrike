@@ -745,8 +745,20 @@ async function testMatchLifecycle(store, a, b) {
   const id = ulid();
   const roster = [newPlayer(a.accountId, 'alpha', { kills: 0, deaths: 0, score: 0 })];
 
+  // The lobby's boot-time orphan sweep asks one question of this table: "is any non-terminal
+  // match still holding this server?" — so the lifecycle below also proves the answer flips
+  // from row to null exactly when the match goes terminal. serverId is a real FK.
+  const lifecycleServerId = `storetest-lifecycle-${ulid()}`;
+  await store.matchServers.register({ serverId: lifecycleServerId, region: 'yyz',
+    address: `wss://${lifecycleServerId}.example.invalid`, capacity: 12, inUse: 0,
+    status: 'healthy', build: '1.0.0', lastHeartbeatAt: iso(-3_600_000) });
+
   await expectOk('a match row is created at allocation, before any result exists',
-    () => store.matches.record(newAllocation(id, roster)));
+    () => store.matches.record(newAllocation(id, roster, { serverId: lifecycleServerId })));
+  check('an allocated match answers activeForServer — the sweep must not release its seat',
+    (await store.matches.activeForServer(lifecycleServerId))?.matchId === id);
+  check('control: a server nothing allocated has no active match',
+    await store.matches.activeForServer(`storetest-nothing-${ulid()}`) === null);
   const allocated = await store.matches.byId(id);
   check('the allocated row reads back as allocated with no outcome',
     allocated?.status === 'allocated' && allocated.winnerTeam === null
@@ -772,6 +784,9 @@ async function testMatchLifecycle(store, a, b) {
   check('the allocation timestamp survives the finalise',
     finalised?.allocatedAt === allocated?.allocatedAt,
     `${allocated?.allocatedAt} vs ${finalised?.allocatedAt}`);
+  check('a terminal match no longer answers activeForServer — its seat is provably orphanable',
+    await store.matches.activeForServer(lifecycleServerId) === null,
+    'the boot sweep would keep a finished match’s reservation forever');
 
   // CONTROL: exactly once. §5.5 — a second, different truth for a finalised match is a bug or
   // an attack, and it stays CONFLICT even though the allocated → terminal edge now exists.
@@ -2328,6 +2343,49 @@ async function testMatchServerRegistry(store, tag) {
     (await store.matchServers.reserve('ord', iso(-1000)))?.serverId === ord.serverId
       && (await store.matchServers.reserve('yyz', iso(-1000)))?.serverId === rows[3].serverId);
   for (const row of rows) await store.matchServers.release(row.serverId);
+
+  // ── Reservation-protection window ────────────────────────────────────────────────────────
+  // The greatest() ratchet defends a fresh reservation from the stale pre-allocation heartbeat
+  // race, but it must EXPIRE: the release saga's match map is process memory, so a platform
+  // restart mid-match orphans the reservation, and a ratchet with no window left the row full
+  // forever while the idle gameserver reported inUse=0 every 5s (overstrike-gs-iad-1,
+  // 2026-08-21). Timestamps are driven through lastHeartbeatAt so no check has to sleep, and
+  // the region is unique per run so a persistent database cannot leak rows between runs.
+  const winRegion = `win-${ulid()}`;
+  const winId = `${tag}-win-${ulid()}`;
+  await store.matchServers.register({ serverId: winId, region: winRegion,
+    address: `wss://${winId}.example.invalid`, capacity: 12, inUse: 0, status: 'healthy',
+    build: '1.0.0', lastHeartbeatAt: iso() });
+  check('control: the fresh row is reservable at all',
+    (await store.matchServers.reserve(winRegion, iso(-1000)))?.serverId === winId);
+  await store.matchServers.heartbeat(winId,
+    { capacity: 12, inUse: 0, status: 'healthy', lastHeartbeatAt: iso() });
+  check('inside the window a stale idle heartbeat cannot release a fresh reservation',
+    (await store.matchServers.byId(winId)).inUse === 12, 'the pre-allocation race came back');
+  check('inside the window the region still reports no capacity',
+    await store.matchServers.reserve(winRegion, iso(-1000)) === null);
+  await store.matchServers.heartbeat(winId,
+    { capacity: 12, inUse: 12, status: 'healthy', lastHeartbeatAt: iso(80_000) });
+  check('past the window a bound authority reporting full keeps its seat held',
+    (await store.matchServers.byId(winId)).inUse === 12);
+  await store.matchServers.heartbeat(winId,
+    { capacity: 12, inUse: 0, status: 'healthy', lastHeartbeatAt: iso(80_000) });
+  check('past the window an idle authority heals its own orphaned reservation',
+    (await store.matchServers.byId(winId)).inUse === 0, 'the orphan is still holding the region');
+  check('the healed row is allocatable again without any manual reset',
+    (await store.matchServers.reserve(winRegion, iso(-1000)))?.serverId === winId);
+  await store.matchServers.release(winId);
+  check('normal reserve then release still frees the seat',
+    (await store.matchServers.byId(winId)).inUse === 0
+      && (await store.matchServers.reserve(winRegion, iso(-1000)))?.serverId === winId);
+  check('a reserved row appears in the orphan sweep listing',
+    (await store.matchServers.listReserved()).some((row) => row.serverId === winId));
+  await store.matchServers.release(winId);
+  check('a released row leaves the orphan sweep listing',
+    !(await store.matchServers.listReserved()).some((row) => row.serverId === winId));
+  // Stale the row out so a rerun against a persistent database never sees it as fresh capacity.
+  await store.matchServers.heartbeat(winId,
+    { capacity: 12, inUse: 0, status: 'draining', lastHeartbeatAt: iso(-3_600_000) });
 }
 
 async function testP2Persistence(store, tag) {

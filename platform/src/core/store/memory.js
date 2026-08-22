@@ -861,6 +861,18 @@ export function createMemoryStore(config = {}, deps = {}) {
       });
     },
     /**
+     * Is any non-terminal match holding this server? Existence is the whole question — the
+     * lobby's boot-time orphan sweep releases a reserved server only when the answer is no —
+     * so the row comes back bare, without the participants join the projections need.
+     */
+    activeForServer(serverId, txh) {
+      return read(txh, (st) => {
+        const row = [...st.matches.values()].find((item) => item.serverId === serverId
+          && ['allocated', 'in-progress'].includes(item.status));
+        return row ? clone(row) : null;
+      });
+    },
+    /**
      * Create the row, or advance an existing non-terminal one to its terminal result.
      *
      * The row is created at ALLOCATION (§4, db-schema.md §4), so by the time a result arrives
@@ -1790,6 +1802,25 @@ export function createMemoryStore(config = {}, deps = {}) {
     },
   };
 
+  /**
+   * How long a fresh reservation is protected from the authority's own heartbeat.
+   *
+   * `reserve()` ratchets `inUse` to capacity before the gameserver knows anything about the
+   * allocation, so for a while the gameserver's heartbeats (`inUse: 0`) are honestly stale and
+   * must not release the seat — that is the race `Math.max` guards. But the guard cannot hold
+   * forever: the release saga's match map is process memory, so a platform restart mid-match
+   * used to orphan the reservation and the row read "full" for the rest of its life while the
+   * idle gameserver reported `inUse: 0` every 5s (overstrike-gs-iad-1, 2026-08-21).
+   *
+   * Once the reservation is older than the seat-connect window, every handoff ticket has
+   * expired (the gameserver's connectBy deadline is 60s; the margin mirrors the lobby's
+   * UNCLAIMED_MATCH_MS), so a gameserver still reporting idle can never become bound to this
+   * lease — its report is the truth and the row heals. A gameserver actually running the match
+   * reports `inUse: MAX_CLIENTS`, so a live seat is never released by this path.
+   * Must match the postgres adapter's interval exactly.
+   */
+  const RESERVATION_PROTECT_MS = 75_000;
+
   const matchServers = {
     register(row, txh) {
       assertCloneable(row, 'match server row');
@@ -1802,6 +1833,7 @@ export function createMemoryStore(config = {}, deps = {}) {
         const prior = st.matchServers.get(row.serverId) || {};
         const exists = Object.hasOwn(prior, 'serverId');
         const rec = { ...prior, ...clone(row), inUse: exists ? prior.inUse : (row.inUse ?? 0),
+          reservedAt: exists ? (prior.reservedAt ?? null) : null,
           status: exists ? prior.status : (row.status ?? 'healthy'), lastHeartbeatAt: row.lastHeartbeatAt ?? nowIso(),
           createdAt: prior.createdAt ?? nowIso(), updatedAt: nowIso() };
         st.matchServers.set(rec.serverId, rec); return clone(rec);
@@ -1811,7 +1843,16 @@ export function createMemoryStore(config = {}, deps = {}) {
       return write(txh, (st) => {
         const prior = st.matchServers.get(serverId);
         if (!prior) throw new ApiError('NOT_FOUND', 'Match server is not registered.');
-        Object.assign(prior, clone(patch), { inUse: Math.max(prior.inUse, patch.inUse),
+        // The ratchet holds only while the reservation is fresh (RESERVATION_PROTECT_MS above);
+        // past the window the authority's own report is the truth, so an orphaned reservation
+        // heals on the next heartbeat instead of reading "full" forever. Freshness is judged
+        // against the heartbeat's own timestamp so both adapters use the same clock.
+        const at = Date.parse(patch.lastHeartbeatAt ?? nowIso());
+        const leaseFresh = prior.reservedAt != null
+          && at < Date.parse(prior.reservedAt) + RESERVATION_PROTECT_MS;
+        Object.assign(prior, clone(patch), {
+          inUse: leaseFresh ? Math.max(prior.inUse, patch.inUse) : patch.inUse,
+          reservedAt: leaseFresh || patch.inUse > 0 ? (prior.reservedAt ?? null) : null,
           lastHeartbeatAt: patch.lastHeartbeatAt ?? nowIso(), updatedAt: nowIso() });
         return clone(prior);
       });
@@ -1830,15 +1871,21 @@ export function createMemoryStore(config = {}, deps = {}) {
           .sort((a, b) => a.inUse - b.inUse || a.serverId.localeCompare(b.serverId));
         const row = rows[0];
         if (!row) return null;
-        row.inUse = row.capacity; row.updatedAt = nowIso(); return clone(row);
+        row.inUse = row.capacity; row.reservedAt = nowIso(); row.updatedAt = nowIso(); return clone(row);
       });
     },
     release(serverId, txh) {
       return write(txh, (st) => {
         const row = st.matchServers.get(serverId);
         if (!row) return false;
-        row.inUse = 0; row.updatedAt = nowIso(); return true;
+        row.inUse = 0; row.reservedAt = null; row.updatedAt = nowIso(); return true;
       });
+    },
+    /** Every row currently holding capacity — what the lobby's boot-time orphan sweep walks. */
+    listReserved(txh) {
+      return read(txh, (st) => [...st.matchServers.values()]
+        .filter((row) => row.inUse > 0)
+        .sort((a, b) => a.serverId.localeCompare(b.serverId)).map(clone));
     },
     byId(serverId, txh) { return read(txh, (st) => clone(st.matchServers.get(serverId))); },
   };

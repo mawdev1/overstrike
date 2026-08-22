@@ -97,7 +97,7 @@ export const TABLE_COLUMNS = {
   ],
   match_evidence: ['matchId', 'evidenceRef', 'evidence', 'createdAt'],
   match_servers: ['serverId', 'region', 'address', 'capacity', 'inUse', 'status', 'build',
-    'lastHeartbeatAt', 'createdAt', 'updatedAt'],
+    'lastHeartbeatAt', 'reservedAt', 'createdAt', 'updatedAt'],
   rooms: ['roomId', 'ownerAccountId', 'name', 'region', 'mapId', 'mapVersion', 'mode',
     'rulesetVersion', 'build', 'capacity', 'status', 'settings', 'passwordHash', 'createdAt',
     'updatedAt', 'destroyedAt', 'destroyedReason'],
@@ -724,6 +724,16 @@ export async function createPostgresStore(config = {}, deps = {}) {
       const { rows: participants } = await q(txh,
         'select * from match_participants where match_id=$1 order by joined_at,account_id', [match.matchId]);
       return { ...match, participants: participants.map((row) => mapRow(row)) };
+    },
+    /**
+     * Is any non-terminal match holding this server? Existence is the whole question — the
+     * lobby's boot-time orphan sweep releases a reserved server only when the answer is no —
+     * so the row comes back bare, without the participants join the projections need.
+     */
+    async activeForServer(serverId, txh) {
+      const { rows } = await q(txh, `select * from matches where server_id=$1
+        and status in ('allocated','in-progress') order by allocated_at desc limit 1`, [serverId]);
+      return rows.length ? mapRow(rows[0]) : null;
     },
     /**
      * The match row and its participants, in ONE transaction — creating the row, or advancing an
@@ -1606,8 +1616,21 @@ export async function createPostgresStore(config = {}, deps = {}) {
       return mapRow(rows[0], ['capacity', 'inUse']);
     },
     async heartbeat(serverId, patch, txh) {
-      const { rows } = await q(txh, `update match_servers set in_use=greatest(in_use,$2),status=$3,
-        capacity=$4,last_heartbeat_at=$5 where server_id=$1 returning *`,
+      // The greatest() ratchet holds only while the reservation is fresh — see the memory
+      // adapter's RESERVATION_PROTECT_MS for the full story (60s connectBy plus margin; the two
+      // adapters must agree). Past the window the authority's own reported occupancy is the
+      // truth, so a reservation orphaned by a platform restart heals on the next heartbeat
+      // instead of reading "full" forever. Freshness is judged against the heartbeat's own
+      // timestamp ($5), keeping both sides of the comparison on the platform's clock.
+      const { rows } = await q(txh, `update match_servers set
+          in_use = case when reserved_at is not null
+              and reserved_at > $5::timestamptz - interval '75 seconds'
+            then greatest(in_use,$2) else $2 end,
+          reserved_at = case when (reserved_at is not null
+              and reserved_at > $5::timestamptz - interval '75 seconds') or $2 > 0
+            then reserved_at else null end,
+          status=$3, capacity=$4, last_heartbeat_at=$5
+        where server_id=$1 returning *`,
       [serverId,patch.inUse,patch.status,patch.capacity,patch.lastHeartbeatAt ?? new Date().toISOString()]);
       if (!rows.length) throw new ApiError('NOT_FOUND', 'Match server is not registered.');
       return mapRow(rows[0], ['capacity', 'inUse']);
@@ -1623,13 +1646,20 @@ export async function createPostgresStore(config = {}, deps = {}) {
           select server_id from match_servers where region=$1 and status='healthy'
             and last_heartbeat_at >= $2 and in_use < capacity
           order by in_use,server_id for update skip locked limit 1
-        ) update match_servers m set in_use=m.capacity from candidate c
+        ) update match_servers m set in_use=m.capacity, reserved_at=now() from candidate c
           where m.server_id=c.server_id returning m.*`, [region,since]);
       return mapRow(rows[0], ['capacity', 'inUse']);
     },
     async release(serverId, txh) {
-      const { rowCount } = await q(txh, 'update match_servers set in_use=0 where server_id=$1', [serverId]);
+      const { rowCount } = await q(txh,
+        'update match_servers set in_use=0, reserved_at=null where server_id=$1', [serverId]);
       return rowCount > 0;
+    },
+    /** Every row currently holding capacity — what the lobby's boot-time orphan sweep walks. */
+    async listReserved(txh) {
+      const { rows } = await q(txh,
+        'select * from match_servers where in_use > 0 order by server_id');
+      return rows.map((row) => mapRow(row, ['capacity', 'inUse']));
     },
     async byId(serverId, txh) {
       const { rows } = await q(txh, 'select * from match_servers where server_id=$1', [serverId]);

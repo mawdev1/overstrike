@@ -1,0 +1,15 @@
+-- Reservation-protection window for the match-server registry.
+--
+-- `reserve()` ratchets in_use to capacity, and heartbeats could only ever raise it — the
+-- ratchet exists so a stale pre-allocation heartbeat (inUse: 0, sent before reserve() landed)
+-- cannot release a seat the platform just leased. But the only thing that ever LOWERED in_use
+-- was the terminal saga's release(), whose match map is process memory: a platform restart
+-- mid-match orphaned the reservation and the row read "full" forever while the gameserver
+-- idled reporting inUse=0 every 5s (overstrike-gs-iad-1, 2026-08-21).
+--
+-- `reserved_at` stamps when the lease was taken. While it is fresh (within the seat-connect
+-- window; the gameserver's own connectBy deadline is 60s) heartbeats keep the ratchet; once it
+-- has aged out, the gameserver's reported occupancy is authoritative and an orphaned row heals
+-- on the next heartbeat. NULL means "no live platform lease" — pre-migration rows heal on
+-- their first heartbeat, which is exactly the recovery the incident needed.
+alter table match_servers add column reserved_at timestamptz;

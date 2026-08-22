@@ -730,8 +730,10 @@ export function clientFlags() {
     'shell.career.enabled': true,
     'shell.serverbrowser.enabled': true,
     'mode.tdm.enabled': true,
-    'mode.bomb.enabled': false,
-    'map.the_square.enabled': false,
+    // Mirrors CLIENT_FLAG_DEFAULTS after the §4 P3 flip — the stub must serve what the real
+    // platform compiles in, or the dev shell hides 'the-square' that production offers.
+    'mode.bomb.enabled': true,
+    'map.the_square.enabled': true,
     'chat.text.enabled': true,
     'chat.pings.enabled': true,
     'reports.enabled': true,
