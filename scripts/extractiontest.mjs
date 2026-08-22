@@ -9,6 +9,12 @@
 import { ExtractionRun, containerSeed, rollLootTable } from '../src/game/extraction.js';
 import { sha256, sha256Hex, hmacSha256, utf8, toHex, stableJson } from '../src/core/hash.js';
 import { FIXED_DT } from '../src/core/mathUtils.js';
+import {
+  LOOT_TABLE_VERSION, ITEM_DEFINITIONS, EXTRACTION_ITEM_DEFS, LOOT_TABLES as CONTENT_LOOT_TABLES,
+  POI_TAGS, STATIC_CONTAINERS, EXTRACTION_EXITS, RUN_RULES, AI_PROFILES, EXTRACTION_CONTENT,
+} from '../src/game/extractionContent.js';
+import { createInventoryService, createMemoryInventoryStore } from '../platform/src/modules/inventory/index.js';
+import { DIFFICULTY, PERSONALITIES } from '../src/ai/bot.js';
 
 let failures = 0;
 let checks = 0;
@@ -504,6 +510,156 @@ head('§9.10 full-run determinism — identical seed and input stream -> identic
   eqJson(r1.buildEvidence(), r2.buildEvidence(), 'identical evidence (lootEvents, phaseLog, deathFacts) across two identical runs');
   eqJson(r1.buildRunResult().participants, r2.buildRunResult().participants, 'identical RunResult participants across two identical runs');
   eq(r1.buildEvidenceRef(), r2.buildEvidenceRef(), 'identical evidenceRef across two identical runs');
+}
+
+// ───────────────────────────────────────────────── P3-11 content data (src/game/extractionContent.js)
+
+head('P3-11 content — item catalog parses through the shipped inventory validation');
+{
+  const inv = createInventoryService({ store: createMemoryInventoryStore() });
+  const defineFailures = [];
+  for (const def of ITEM_DEFINITIONS) {
+    try { await inv.defineItem(def); } catch (err) { defineFailures.push(`${def.itemId}: ${err.message}`); }
+  }
+  eq(defineFailures.length, 0, `all ${ITEM_DEFINITIONS.length} definitions pass defineItem (${defineFailures.join('; ') || 'none failed'})`);
+  eq(new Set(ITEM_DEFINITIONS.map((d) => d.itemId)).size, ITEM_DEFINITIONS.length, 'item ids are unique');
+  expect(ITEM_DEFINITIONS.every((d) => d.tradable === false), 'every definition is tradable=false (P3/P4 data never opens P7-03)');
+
+  // Failing control: the same validator rejects a mis-authored definition — proof the pass
+  // above exercised real validation, not a formality.
+  let rejected = false;
+  try { await inv.defineItem({ itemId: 'bad_item', class: 'weapon', slot: 'head', rarityTier: 'common', stackable: false }); } catch { rejected = true; }
+  expect(rejected, 'control: a definition with an unknown slot is rejected by the same validator');
+
+  // Both loot tiers are represented in the catalog via the tables that reference it below.
+  const tiers = new Set(Object.values(CONTENT_LOOT_TABLES).map((t) => t.tier));
+  eqJson([...tiers].sort(), [1, 2], 'exactly two loot tiers are authored');
+}
+
+head('P3-11 content — loot tables satisfy the roll schema and the inventory constraints');
+{
+  const defById = new Map(ITEM_DEFINITIONS.map((d) => [d.itemId, d]));
+  let entryFaults = 0;
+  const allEntryIds = new Set();
+  for (const [tableId, table] of Object.entries(CONTENT_LOOT_TABLES)) {
+    for (const e of table.entries) {
+      const def = defById.get(e.itemId);
+      const qty = e.quantity ?? 1;
+      const bad = typeof e.id !== 'string' || e.id === '' || allEntryIds.has(e.id)
+        || !def
+        || !(e.weight >= 0 && e.weight <= 1)
+        || !(Number.isInteger(qty) && qty >= 1)
+        || e.stackable !== def.stackable
+        || (!def.stackable && qty !== 1)
+        || (def.stackable && def.maxStack != null && qty > def.maxStack);
+      if (bad) { entryFaults++; console.log(`       fault: ${tableId}/${e.id}`); }
+      allEntryIds.add(e.id);
+    }
+  }
+  eq(entryFaults, 0, 'every entry: unique stable id, known item, weight in [0,1], integer quantity, stackable flag and maxStack agree with the catalog');
+
+  // Every entry, granted through the shipped creation path (grantItem = the ONLY instance
+  // creation path per items-inventory.md §6.3), is accepted by the real constraints.
+  const inv = createInventoryService({ store: createMemoryInventoryStore() });
+  for (const def of ITEM_DEFINITIONS) await inv.defineItem(def);
+  const actor = { kind: 'service', id: 'raid-server', role: 'loot-spawn' };
+  const grantFailures = [];
+  for (const [tableId, table] of Object.entries(CONTENT_LOOT_TABLES)) {
+    for (const e of table.entries) {
+      try {
+        await inv.grantItem({ itemId: e.itemId, quantity: e.quantity ?? 1,
+          location: 'container', containerId: `fixture-${tableId}`, actor });
+      } catch (err) { grantFailures.push(`${tableId}/${e.id}: ${err.message}`); }
+    }
+  }
+  eq(grantFailures.length, 0, `every loot entry grants through the shipped inventory path (${grantFailures.join('; ') || 'none failed'})`);
+}
+
+head('P3-11 content — containers, POI tags, and exits hold together and drive a real run');
+{
+  eq(new Set(STATIC_CONTAINERS.map((c) => c.containerId)).size, STATIC_CONTAINERS.length, 'container ids are unique');
+  eq(new Set(POI_TAGS.map((p) => p.poiId)).size, POI_TAGS.length, 'POI ids are unique');
+  const poiById = new Map(POI_TAGS.map((p) => [p.poiId, p]));
+  let containerFaults = 0;
+  for (const c of STATIC_CONTAINERS) {
+    const table = CONTENT_LOOT_TABLES[c.lootTableId];
+    const poi = poiById.get(c.poiId);
+    const posOk = ['x', 'y', 'z'].every((k) => Number.isFinite(c.position[k]));
+    if (!table || table.tier !== c.tier || !poi || poi.lootTier !== c.tier || !posOk) {
+      containerFaults++; console.log(`       fault: ${c.containerId}`);
+    }
+  }
+  eq(containerFaults, 0, 'every container: known loot table of the SAME tier, known POI of the same tier, finite position');
+  expect(POI_TAGS.every((p) => typeof p.calloutId === 'string' && p.calloutId !== ''
+    && p.tags.length > 0 && p.tags.every((t) => typeof t === 'string' && /^[a-z-]+$/.test(t))),
+  'every POI names a callout region and carries lowercase-kebab tags');
+
+  // Exits: exactly two, both CONDITIONAL (Build Plan slice), item conditions resolvable.
+  const itemIds = new Set(ITEM_DEFINITIONS.map((d) => d.itemId));
+  eq(EXTRACTION_EXITS.length, 2, 'exactly two extraction exits are authored');
+  expect(EXTRACTION_EXITS.every((ex) => ex.requiresItemDefId != null || ex.requiresSquadCount != null || ex.activeWindow != null),
+    'both exits are conditional — at least one declared §4 condition each');
+  expect(EXTRACTION_EXITS.every((ex) => ex.requiresItemDefId == null || itemIds.has(ex.requiresItemDefId)),
+    'every requiresItemDefId names a catalog item');
+  expect(EXTRACTION_EXITS.every((ex) => ex.activeWindow == null
+    || (Number.isInteger(ex.activeWindow[0]) && Number.isInteger(ex.activeWindow[1]) && ex.activeWindow[0] < ex.activeWindow[1])),
+  'every activeWindow is a valid run-relative [startTick, endTick)');
+  expect(EXTRACTION_EXITS.every((ex) => ex.durationSeconds > 0), 'every exit has a positive channel duration');
+  // hardTimeout must not end the run before the window-gated exit ever opens.
+  const van = EXTRACTION_EXITS.find((ex) => ex.activeWindow != null);
+  expect(van.activeWindow[0] * FIXED_DT < RUN_RULES.hardTimeoutSeconds,
+    'the window-gated exit opens before the hard timeout can end the run');
+
+  // The whole bundle constructs a real ExtractionRun — the exits pass checkBox, every static
+  // container rolls, and the roll is deterministic across two independent constructions.
+  const build = () => new ExtractionRun({
+    runId: 'run_content', runSeed: 'content-fixture-001', lootTableVersion: LOOT_TABLE_VERSION,
+    lootTables: CONTENT_LOOT_TABLES, itemDefs: EXTRACTION_ITEM_DEFS,
+    exits: EXTRACTION_EXITS, containers: STATIC_CONTAINERS,
+    reconnectGraceSeconds: RUN_RULES.reconnectGraceSeconds, hardTimeoutSeconds: RUN_RULES.hardTimeoutSeconds,
+  });
+  const runA = build();
+  expect(runA.instances.size > 0, 'the authored containers roll at least one instance for this seed');
+  let rolledFaults = 0;
+  for (const inst of runA.instances.values()) {
+    const def = EXTRACTION_ITEM_DEFS[inst.itemId];
+    if (!def || inst.stackable !== def.stackable) rolledFaults++;
+  }
+  eq(rolledFaults, 0, 'every rolled instance is a catalog item with the correct stackable flag');
+  const snapshot = (run) => [...run.instances.entries()];
+  eqJson(snapshot(build()), snapshot(runA), 'two independent constructions from one seed roll identical contents');
+}
+
+head('P3-11 content — AI profiles reference only the shipped AI vocabulary; data carries no logic');
+{
+  eq(AI_PROFILES.length, 2, 'exactly two AI profiles are authored');
+  eq(new Set(AI_PROFILES.map((p) => p.profileId)).size, 2, 'profile ids are unique');
+  let profileFaults = 0;
+  for (const p of AI_PROFILES) {
+    const weights = Object.entries(p.personalityWeights);
+    const ok = DIFFICULTY[p.difficulty] != null
+      && weights.length > 0
+      && weights.every(([name, w]) => PERSONALITIES[name] != null && Number.isFinite(w) && w > 0)
+      && Number.isInteger(p.budget.maxActivePerSector) && p.budget.maxActivePerSector > 0
+      && Number.isInteger(p.budget.maxActiveTotal) && p.budget.maxActiveTotal >= p.budget.maxActivePerSector;
+    if (!ok) { profileFaults++; console.log(`       fault: ${p.profileId}`); }
+  }
+  eq(profileFaults, 0, 'every profile: real DIFFICULTY preset, real PERSONALITIES keys with positive weights, coherent activation budget');
+
+  // "Contains no logic that bypasses server checks" (P3-11's definition of done): the entire
+  // exported bundle is plain frozen data — no function anywhere, every object frozen.
+  let functions = 0;
+  let unfrozen = 0;
+  const walk = (v) => {
+    if (typeof v === 'function') { functions++; return; }
+    if (v && typeof v === 'object') {
+      if (!Object.isFrozen(v)) unfrozen++;
+      for (const k of Object.keys(v)) walk(v[k]);
+    }
+  };
+  walk(EXTRACTION_CONTENT);
+  eq(functions, 0, 'the content bundle contains zero functions — data only, no logic');
+  eq(unfrozen, 0, 'every object in the bundle is frozen — nothing at runtime can retune authored data');
 }
 
 // ──────────────────────────────────────────────────────────────────────────────── summary
