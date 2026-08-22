@@ -602,11 +602,16 @@ const session = {
   getSnapshot() { return this.value; },
   accept(next) { this.value = next; },
 };
+// A mutable flag source so probes can flip a kill switch and re-render. Keys left unset fall
+// back to the shell's compiled defaults (feature-flags.md §3, rule 1), which is itself under
+// test: bomb and the_square default ON since 1.2.0.
+window.__HARNESS_FLAGS__ = { flags: {} };
 window.__SHELL__ = mountAppShell({
   root: document.querySelector('#shell-root'),
   client,
   session,
   settings,
+  featureFlags: window.__HARNESS_FLAGS__,
   fixtures: SHELL_SCREEN_FIXTURES,
   fixtureVariant: variant,
   initialPath: requestedPath,
@@ -867,10 +872,11 @@ async function browserChecks(stubResults) {
     // The setting must reach the REQUEST. A checkbox that renders and sends nothing is this
     // same defect one layer further in, so the assertion is on the submitted payload.
     //
-    // Submitted with `requestSubmit()` rather than a click because this harness mounts with no
-    // feature-flag source, so `map.the_square.enabled` falls back to false, the map list is
-    // empty and the button is disabled for reasons that predate solo play. That gate is
-    // asserted on its own below; this drives the handler where the settings mapping lives.
+    // Submitted with `requestSubmit()` so the probe drives the handler where the settings
+    // mapping lives regardless of the button's enabled state. (Historically the button WAS
+    // disabled here: pre-1.2.0 compiled defaults left `map.the_square.enabled` false with no
+    // flag source, which is the exact production defect the flag-gate probes below now cover
+    // from both sides.)
     const submitCreate = async (name, solo) => {
       // A successful create navigates to the room, so the form is gone by the next call. Put
       // the browser back before each submission rather than assuming it survived the last one.
@@ -899,13 +905,38 @@ async function browserChecks(stubResults) {
       'and the region comes from the dropdown, defaulted to one with capacity',
       String(duoPayload?.region));
 
+    // ── the create form offers The Square by default, and the flag gate still has teeth ──
+    //
+    // The production regression this guards: feature-flags.md §4 flips bomb/the_square on at
+    // P3, but the compiled defaults stayed false after P3 closed, so the deployed create form
+    // offered NO map at all — 'the-square' simply missing. Default-on is asserted first, then
+    // the kill switch is flipped off explicitly to prove the gate (not a stale default) is
+    // what disables submission.
     await page.evaluate(() => {
       window.__SHELL__.navigate('/play/rooms');
       window.__SHELL__.injectFixture('play.rooms', 'ready');
     });
     await page.locator('summary', { hasText: 'Create a room' }).click();
+    check((await page.locator('#shell-room-create-map option[value="the-square"]').count()) === 1,
+      "the map select offers 'the-square' under compiled defaults — the map that went missing in production");
+    check(!(await page.getByRole('button', { name: 'Create and join', exact: true }).isDisabled()),
+      'and the submit button is enabled: an approved mode and map combination exists by default');
+
+    await page.evaluate(() => {
+      window.__HARNESS_FLAGS__.flags['map.the_square.enabled'] = false;
+      window.__SHELL__.navigate('/play/rooms');
+      window.__SHELL__.injectFixture('play.rooms', 'ready');
+    });
+    await page.locator('summary', { hasText: 'Create a room' }).click();
+    check((await page.locator('#shell-room-create-map option').count()) === 0,
+      'flipping the map kill switch off empties the map list');
     check((await page.getByRole('button', { name: 'Create and join', exact: true }).isDisabled()),
       'the submit gate still refuses when no approved map is enabled — solo does not bypass it');
+    await page.evaluate(() => {
+      delete window.__HARNESS_FLAGS__.flags['map.the_square.enabled'];
+      window.__SHELL__.navigate('/play/rooms');
+      window.__SHELL__.injectFixture('play.rooms', 'ready');
+    });
 
     check((await page.getByRole('button', { name: 'Local practice', exact: true }).count()) === 1,
       'a signed-in player can reach Local practice without signing out');

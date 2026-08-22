@@ -12,8 +12,11 @@ export const SHELL_FEATURE_DEFAULTS = Object.freeze({
   'shell.career.enabled': true,
   'shell.serverbrowser.enabled': true,
   'mode.tdm.enabled': true,
-  'mode.bomb.enabled': false,
-  'map.the_square.enabled': false,
+  // feature-flags.md §3.2 compiled defaults, 1.2.0: Bomb and The Square shipped at P3, so the
+  // unreachable-flags fallback must offer them — a stale `false` here silently removed the
+  // only map from the create form whenever the flag fetch failed.
+  'mode.bomb.enabled': true,
+  'map.the_square.enabled': true,
   'chat.text.enabled': true,
   'chat.pings.enabled': true,
   'reports.enabled': true,
