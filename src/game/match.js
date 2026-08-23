@@ -156,7 +156,7 @@ export class Match {
     this._onSpawn = this._onSpawn.bind(this);
     this._onShot = this._onShot.bind(this);
     this._onHit = this._onHit.bind(this);
-    this._onRoundStart = this._onRoundStart.bind(this);
+    this._onObjective = this._onObjective.bind(this);
   }
 
   async init() {
@@ -176,7 +176,12 @@ export class Match {
     this._unsub.push(bus.on('spawn', this._onSpawn));
     this._unsub.push(bus.on('shot', this._onShot));
     this._unsub.push(bus.on('hit', this._onHit));
-    this._unsub.push(bus.on('roundStart', this._onRoundStart));
+    // NOT `bus.on('roundStart')` — the ruleset publishes every objective fact under the single
+    // `'objective'` topic with a `kind` discriminator (`BombRules._emit`), so a bare 'roundStart'
+    // subscription never fired and `roundsPlayed` was permanently 0 for every Bomb player. A
+    // completed 9-round series stored 0 for all four accounts before this was fixed; the
+    // multi-client playtest harness caught it by reading the career rows the match actually wrote.
+    this._unsub.push(bus.on('objective', this._onObjective));
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -678,7 +683,8 @@ export class Match {
     return row;
   }
 
-  _onRoundStart() {
+  _onObjective(row) {
+    if (row?.kind !== 'roundStart') return;
     for (const stats of this._book.values()) stats.roundsPlayed++;
   }
 

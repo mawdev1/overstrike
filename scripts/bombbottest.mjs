@@ -222,6 +222,15 @@ check(terminalEvidence.combatSummary.every((summary) => {
     .every((key) => player[key] === summary[key])
     && JSON.stringify(player.weapons) === JSON.stringify(summary.weapons);
 }), 'discarding the embedded result still reconstructs every canonical player counter');
+// `roundsPlayed` was silently 0 for every player of every Bomb series: `Match` subscribed to a
+// bare `'roundStart'` bus event, but the ruleset publishes every objective fact under the single
+// `'objective'` topic with a `kind`, so the handler was dead code. The field was listed in the
+// counter sweep above, which only compares two copies of the SAME wrong number — equal and both
+// zero passes. This asserts the value is real: a multi-round series must record rounds played.
+check(terminal.rounds.length > 1 && terminal.players.length > 0
+  && terminal.players.every((player) => player.roundsPlayed === terminal.rounds.length),
+'every player records the series actual round count, not zero',
+`rounds=${terminal.rounds.length} roundsPlayed=[${terminal.players.map((p) => p.roundsPlayed).join(',')}]`);
 const { evidenceRef: _terminalEvidenceRef, ...terminalCore } = terminal;
 check(evidenceDigest(reconstructEvidenceResult({ ...terminalEvidence, result: undefined }))
   === evidenceDigest(terminalCore),
