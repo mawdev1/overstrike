@@ -40,8 +40,18 @@ primary_region = "iad"
     # Connections, not requests: a player holds one WebSocket for the whole match, so
     # request-based limits measure nothing here.
     type = "connections"
-    soft_limit = 12
-    hard_limit = 16
+    # Well past 2 x MAX_CLIENTS (server/index.js), because every entering player holds TWO
+    # concurrent sockets: facade.reserve() opens a reservation socket and promoteReservation()
+    # opens the gameplay socket BEFORE closing it — measured at a 17 s overlap in production.
+    # A full 12-player match therefore needs up to 24 connections, against limits of 12/16.
+    #
+    # Measured against the live app: upgrades stall once past soft_limit and consistently past
+    # hard_limit, for 12-16 s — against the client's 10 s admission deadline, so the socket is
+    # closed while still CONNECTING and the player is told "no welcome from the game server".
+    # These limits are a load-balancing signal, and a stateful single-match server must never
+    # overflow to a second machine anyway, so they buy nothing here and only gate real players.
+    soft_limit = 40
+    hard_limit = 60
 
   [[http_service.checks]]
     # Public /health is deliberately minimal liveness. Match/tick/session detail belongs to

@@ -98,10 +98,41 @@ export function createGameRuntime({
   loadGame = () => import('../../core/game.js'),
   onUnsupported = null,
   onNetworkDiagnostics = null,
+  onCanvasReplaced = null,
 } = {}) {
   if (!(canvas instanceof HTMLCanvasElement)) throw new TypeError('A game canvas is required.');
   if (!(gameLayer instanceof HTMLElement)) throw new TypeError('A game layer is required.');
   if (!(shellRoot instanceof HTMLElement)) throw new TypeError('A shell root is required.');
+
+  /**
+   * Retire the canvas a disposed Game owned, replacing it with an identical empty one.
+   *
+   * `Engine.dispose` force-loses its WebGL context, because that is the only thing that
+   * gives back the GPU memory a match leaves behind (see the comment there). A lost
+   * context is permanent for its canvas — `getContext` on that element returns the same
+   * dead context forever — so the element has to be retired with it, or the NEXT entry
+   * boots onto a dead context and renders nothing.
+   *
+   * Called BEFORE the dispose that loses the context, so the element still carrying the
+   * shell's `webglcontextlost` telemetry listeners is out of the way first: a deliberate
+   * teardown must not be reported as a client GPU fault. `cloneNode(false)` keeps the id,
+   * classes and inline style the stylesheet and settings write to, and takes none of the
+   * drawing buffer.
+   *
+   * `data-retired` on the outgoing element is the handshake that lets the engine lose the
+   * context: it means "this element is being thrown away, take the GPU memory with it".
+   * `Engine.dispose` force-loses ONLY when it sees that marker, so the engine half and this
+   * half can land in either order — without the marker the engine leaves the context alive
+   * (the old, leaky-but-working behaviour) instead of handing the next match a dead canvas.
+   */
+  function recycleCanvas() {
+    canvas.dataset.retired = 'true';
+    const fresh = canvas.cloneNode(false);
+    delete fresh.dataset.retired;
+    canvas.replaceWith(fresh);
+    canvas = fresh;
+    onCanvasReplaced?.(fresh);
+  }
 
   let game = null;
   let starting = null;
@@ -433,6 +464,7 @@ export function createGameRuntime({
         activeProgression?.endAuthoritativeSession?.();
         activeProgression = null;
         facade?.disconnect?.('runtime-start-failed');
+        if (candidate) recycleCanvas();
         candidate?.dispose?.();
         if (globalThis.__GAME__ === candidate) delete globalThis.__GAME__;
         revealShell();
@@ -468,6 +500,7 @@ export function createGameRuntime({
     terminalExitTimer = null;
     activeNetworkFacade?.disconnect?.('runtime-exit');
     activeNetworkFacade = null;
+    if (game) recycleCanvas();
     game?.dispose?.();
     if (globalThis.__GAME__ === game) delete globalThis.__GAME__;
     game = null;

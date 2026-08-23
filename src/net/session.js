@@ -125,7 +125,13 @@ export class MultiplayerSession {
    * does not know which entity in the snapshots is itself, so sending commands would be
    * predicting on behalf of nobody.
    */
-  static connect(game, url, { timeoutMs = 10000, sessionTicket = '' } = {}) {
+  // 30 s, not 10. Fly's proxy holds a WebSocket upgrade for 12-16 s once the app's
+  // connection limits are reached (measured), so a 10 s deadline turned a slow admission
+  // into a failed match: `transport.close()` on a socket still CONNECTING is exactly what
+  // makes the browser print "WebSocket is closed before the connection is established".
+  // The limits themselves are raised in fly.gameserver.toml; this is the second line of
+  // defence, so any future proxy stall degrades to a slow join rather than a dead one.
+  static connect(game, url, { timeoutMs = 30000, sessionTicket = '' } = {}) {
     return new Promise((resolve, reject) => {
       let transport;
       try { transport = new WebSocketTransport(url); } catch (e) { reject(e); return; }

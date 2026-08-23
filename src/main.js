@@ -338,8 +338,13 @@ session.subscribe((state) => {
 });
 
 let runtimeReturnPath = '/play/rooms';
+let removeWebglLossTelemetry = () => {};
 runtime = createGameRuntime({
   canvas,
+  onCanvasReplaced: (fresh) => {
+    removeWebglLossTelemetry();
+    removeWebglLossTelemetry = installWebglLossTelemetry(telemetry, fresh);
+  },
   gameLayer,
   shellRoot,
   boot,
@@ -427,7 +432,10 @@ Object.defineProperty(globalThis, '__OVERSTRIKE_SHELL__', {
 });
 
 installUnhandledErrorTelemetry(telemetry);
-installWebglLossTelemetry(telemetry, canvas);
+// The runtime retires a canvas with the match that owned it (its GL context is force-lost on
+// teardown, which the element can never come back from), so the loss listeners have to follow
+// the live element or GPU-fault telemetry would silently stop after the first match.
+removeWebglLossTelemetry = installWebglLossTelemetry(telemetry, canvas);
 
 // Finish the deferred first route only after the cookie-backed restore outcome is known.
 void sessionRestore.then(async ({ authenticated, profile, error }) => {

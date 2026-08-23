@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { clamp, damp } from './mathUtils.js';
-import { ATMOSPHERE, makeCloudTexture } from './assets.js';
+import { ATMOSPHERE, makeCloudTexture, assets } from './assets.js';
 import { ScopeFX } from '../fx/scope.js';
 
 // Scratch — the shadow cascade runs every frame and must not allocate (§1).
@@ -606,28 +606,28 @@ export class Engine {
      * Say WHICH GPU this is, once, at boot.
      *
      * A player reported 19 FPS on a scene of 88 draw calls and 26k triangles — numbers any
-     * GPU of the last decade renders in single-digit milliseconds, and which measure 5.5ms
-     * frames on this same build elsewhere. That gap is the signature of a software
-     * rasteriser (SwiftShader/llvmpipe), which a browser falls back to silently when
-     * hardware acceleration is off, blocklisted, or unavailable to the process. Nothing here
-     * reported the renderer, so "the game is slow" and "this browser is not using the
-     * graphics card" were indistinguishable from a console log, and several fixes aimed at
-     * the former were spent for nothing.
+     * discrete or integrated GPU of the last decade renders in single-digit milliseconds.
+     * That gap is the signature of a software rasteriser (SwiftShader/llvmpipe), which a
+     * browser silently falls back to when hardware acceleration is off, blocklisted, or
+     * unavailable to the process. Nothing in this client reported it, so the difference
+     * between "the game is slow" and "this browser is not using the graphics card" was
+     * invisible from a console log — and every fix aimed at the former was wasted.
      */
     try {
       const gl = this.renderer.getContext();
       const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-      const gpu = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || 'unknown');
-      const vendor = String((dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)) || 'unknown');
-      this.gpuInfo = { gpu, vendor };
-      this.softwareRenderer = /swiftshader|llvmpipe|software|basic render|microsoft basic/i.test(gpu);
-      if (this.softwareRenderer) {
-        console.warn(`[engine] SOFTWARE RENDERING — "${gpu}". The graphics card is NOT being used, `
-          + 'so the frame rate will be a fraction of what this machine can do. Turn on hardware '
-          + 'acceleration (brave://settings/system or chrome://settings/system) and check '
-          + 'brave://gpu / chrome://gpu.');
+      const gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      const vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+      this.gpuInfo = { gpu: String(gpu || 'unknown'), vendor: String(vendor || 'unknown') };
+      const soft = /swiftshader|llvmpipe|software|basic render|microsoft basic/i.test(this.gpuInfo.gpu);
+      this.softwareRenderer = soft;
+      if (soft) {
+        console.warn(`[engine] SOFTWARE RENDERING — "${this.gpuInfo.gpu}". The GPU is not being `
+          + 'used, so frame rate will be a fraction of what this hardware can do. Enable hardware '
+          + 'acceleration in the browser settings (brave://settings/system, chrome://settings/system) '
+          + 'and check brave://gpu / chrome://gpu.');
       } else {
-        console.info(`[engine] GPU: ${gpu} (${vendor})`);
+        console.info(`[engine] GPU: ${this.gpuInfo.gpu} (${this.gpuInfo.vendor})`);
       }
     } catch { /* diagnostics must never break boot */ }
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -673,7 +673,7 @@ export class Engine {
      */
     this.scope = new ScopeFX(game, this);
 
-    this.stats ={ fps: 0, frameMs: 0, drawCalls: 0, triangles: 0, programs: 0 };
+    this.stats = { fps: 0, frameMs: 0, wallMs: 0, bufferMPix: 0, drawCalls: 0, triangles: 0, programs: 0 };
     this._fpsAccum = 0;
     this._fpsFrames = 0;
     this._lastFrameStart = 0;
@@ -1062,18 +1062,39 @@ export class Engine {
 
   _targetSize() {
     let scale = clamp(this.game.settings.get('renderScale'), 0.4, 1.0);
-    // A software rasteriser costs per PIXEL what a GPU costs per triangle, so the only lever
-    // that helps is fewer pixels: half scale is a quarter of the work. Deliberately not
-    // written back to settings — this is a floor for a machine that is not using its
-    // graphics card, not a preference, and it must evaporate if acceleration returns.
+    // A software rasteriser costs roughly per-pixel what a GPU costs per-triangle, so the
+    // one lever that actually helps is fewer pixels. Half scale is a quarter of the work.
+    // Deliberately not written back to settings: this is a floor for a machine that is not
+    // using its graphics card, not a preference the player chose, and it must evaporate the
+    // moment hardware acceleration comes back.
     if (this.softwareRenderer) scale = Math.min(scale, 0.5);
     const dpr = this.softwareRenderer ? 1 : Math.min(window.devicePixelRatio || 1, 2);
-    return {
-      w: Math.max(320, Math.floor(window.innerWidth * dpr * scale)),
-      h: Math.max(240, Math.floor(window.innerHeight * dpr * scale)),
-      cssW: window.innerWidth,
-      cssH: window.innerHeight,
-    };
+
+    let w = Math.max(320, Math.floor(window.innerWidth * dpr * scale));
+    let h = Math.max(240, Math.floor(window.innerHeight * dpr * scale));
+
+    // CAP THE BUFFER, NOT THE PIXEL RATIO.
+    //
+    // This renderer is fill-bound, not geometry-bound: measured on an M4 via ANGLE/Metal it
+    // costs a flat ~1.5 ms per megapixel and does not care about draw calls at all (98 calls
+    // and 27k triangles cost the same at every resolution; shadow RECEIVING is ~48% of it,
+    // then bloom, then AO). Clamping dpr at 2 therefore controls the wrong variable — on a
+    // Retina laptop it still yields a 5.9 MPix buffer (~8.9 ms/frame, already over a 120 Hz
+    // budget) and on an external 5K it reaches 14.75 MPix (~24 ms, i.e. 42 fps) on hardware
+    // that renders this scene 270 fps at 2.4 MPix.
+    //
+    // So the ceiling is expressed in the unit that actually costs: pixels. 2.5 MPix is ~3.7 ms
+    // on that machine, leaving real headroom on a 60 Hz panel for the rest of the frame.
+    // `renderScale` above 1 is not reachable, so a player who wants more can still lower it,
+    // and anyone who wants MORE pixels than this can raise MAX_PIXELS knowingly.
+    const MAX_PIXELS = 2.5e6;
+    const pixels = w * h;
+    if (pixels > MAX_PIXELS) {
+      const k = Math.sqrt(MAX_PIXELS / pixels);
+      w = Math.max(320, Math.floor(w * k));
+      h = Math.max(240, Math.floor(h * k));
+    }
+    return { w, h, cssW: window.innerWidth, cssH: window.innerHeight };
   }
 
   _onResize() {
@@ -1245,6 +1266,16 @@ export class Engine {
 
     const ms = performance.now() - t0;
     this.stats.frameMs = this.stats.frameMs * 0.9 + ms * 0.1;
+    // `frameMs` is CPU INSIDE this call only — it contains no GPU or present time, so on a
+    // fill-bound frame it reads ~1.5 ms while the frame actually takes 50. That is the one
+    // stat that looks healthy precisely when the frame is many times over budget, and it
+    // sent this investigation down the wrong path for several rounds. `wallMs` is the real
+    // wall time between frames, and `bufferMPix` is the number that drives the cost.
+    const wall = t0 - (this._lastFrameStart || t0);
+    this._lastFrameStart = t0;
+    if (wall > 0 && wall < 1000) this.stats.wallMs = (this.stats.wallMs || wall) * 0.9 + wall * 0.1;
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    this.stats.bufferMPix = (size.x * size.y) / 1e6;
     this._fpsAccum += dt;
     this._fpsFrames++;
     if (this._fpsAccum >= 0.25) {
@@ -1252,6 +1283,44 @@ export class Engine {
       this._fpsAccum = 0;
       this._fpsFrames = 0;
     }
+  }
+
+  /**
+   * Let go of the renderer's grip on every SHARED three.js resource.
+   *
+   * three registers a `dispose` listener on each material, texture and geometry the first
+   * time it renders one (`onMaterialDispose` / `onTextureDispose` / `onGeometryDispose`),
+   * and only ever removes it when THAT resource is disposed. Most of ours never are: the
+   * `assets` library latches on `ready` and is shared by every match. So each retired
+   * renderer stayed reachable from a shared material's listener array for the life of the
+   * page — a heap snapshot after two round trips found both renderers still live, held by
+   * `MeshStandardMaterial._listeners.dispose`.
+   *
+   * Safe as a blanket clear because the client owns exactly one renderer at a time (the
+   * shell refuses a second `enter` while a Game exists) and nothing in this codebase
+   * listens for `dispose` itself — the next renderer re-registers on first use.
+   */
+  _releaseSharedResourceListeners() {
+    const drop = (resource) => {
+      const listeners = resource?._listeners;
+      if (listeners && listeners.dispose) listeners.dispose.length = 0;
+    };
+    const dropMaterial = (material) => {
+      if (!material) return;
+      drop(material);
+      for (const value of Object.values(material)) if (value?.isTexture) drop(value);
+    };
+    for (const scene of [this.scene, this.viewScene]) {
+      scene?.traverse((object) => {
+        drop(object.geometry);
+        const material = object.material;
+        if (Array.isArray(material)) material.forEach(dropMaterial);
+        else dropMaterial(material);
+      });
+    }
+    for (const texture of assets.textures.values()) drop(texture);
+    for (const material of assets.materials.values()) dropMaterial(material);
+    for (const geometry of assets.geometries.values()) drop(geometry);
   }
 
   dispose() {
@@ -1263,6 +1332,54 @@ export class Engine {
     this.aoPass?.dispose();
     this.cloudTex?.dispose();
     this.envMap?.dispose();
+    // After the engine's own resources have been disposed normally, and before the renderer
+    // goes: everything still shared with the next match stops pointing back at this one.
+    try { this._releaseSharedResourceListeners(); } catch { /* a partial boot has no scene */ }
     this.renderer.dispose();
+    /**
+     * `renderer.dispose()` does NOT release the GL context, and on this client that is the
+     * difference between a session and a crash.
+     *
+     * The page used to have ONE canvas for its whole life, so every match entry built a
+     * renderer on the SAME context, and each one uploaded the scene over again.
+     * Most of what a renderer uploads is owned by module-level singletons that are meant
+     * to outlive a match — `assets` latches on `ready`, the viewmodel and decal atlases are
+     * cached forever — so nothing disposes those textures or materials, and three only ever
+     * deletes a GL texture/program in response to a `dispose` on the object that owns it.
+     * The result, measured over ten entry/exit round trips (scripts/perfprofile.mjs
+     * --cycles=10): +47 GL textures and +30 GL programs left resident PER ENTRY on one
+     * live context, unbounded. That is GPU memory the driver keeps until the tab dies,
+     * which is "super lagging when I joined, then crashed" on the owner's second session.
+     *
+     * Force-losing the context is the only API three exposes that releases GL objects it
+     * did not personally allocate, and it releases ALL of them — it cannot be defeated by
+     * some future subsystem forgetting a `dispose()`. The listeners above are removed
+     * first on purpose: this loss is deliberate, so neither the rebuild handler nor the
+     * shell's `client.webgl_context_lost` telemetry should ever see it. A lost context is
+     * permanent for that canvas, so the shell hands each entry a fresh one — see
+     * `recycleCanvas` in ui/shell/gameRuntime.js. Nothing may render through this engine
+     * after `dispose()`, which is already true: the loop is stopped first.
+     *
+     * ── why this is conditional, and not simply always done ──────────────────────────
+     * Losing the context is only safe when SOMEONE RETIRES THE CANVAS WITH IT. A lost
+     * context is permanent for its element, so on a host that reuses one canvas for the
+     * whole page — which is what this repository shipped until the recycler landed — an
+     * unconditional loss here means the second match boots onto a dead context and never
+     * becomes playable. That is worse than the leak it fixes, and it is not hypothetical:
+     * it is exactly what happened when this file was applied on its own.
+     *
+     * So the recycler ASKS for the loss, by marking the element it is about to throw away
+     * (`data-retired`, set in `recycleCanvas` in ui/shell/gameRuntime.js immediately before
+     * this dispose). No marker means no recycler — a probe script, a test harness, or this
+     * file landed ahead of its other half — and the engine then behaves exactly as it did
+     * before: the context survives its renderer, and the caller can build another on it.
+     *
+     * The two halves live in different lanes and therefore land as separate commits; the
+     * handshake is what makes EITHER order, and a revert of either one, a working game.
+     */
+    if (this.canvas?.dataset?.retired === 'true') {
+      try { this.renderer.forceContextLoss(); } catch { /* context already gone */ }
+    }
+    this._disposed = true;
   }
 }
