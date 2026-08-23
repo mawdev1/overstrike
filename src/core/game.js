@@ -168,7 +168,7 @@ export class Game {
   async init(onProgress = () => {}, { mapId = null } = {}) {
     const prof = this.bootProfile;
     const tBoot = performance.now();
-    const TOTAL = 11;   // keep in step with the number of `step()` calls below
+    const TOTAL = 12;   // keep in step with the number of `step()` calls below
     let done = 0;
     const report = (label, frac) => {
       try { onProgress(label, (done + frac) / TOTAL); } catch { /* never let the UI break boot */ }
@@ -253,6 +253,15 @@ export class Game {
         mapSkinReady().catch(() => false),
         new Promise((r) => setTimeout(r, 8000)),
       ]);
+    });
+    // Hold the loading screen for the combat samples, so nobody walks into a firefight
+    // whose weapons are still synthesised. Cheap on any repeat visit now that
+    // `nginx.conf` lets these files be cached; bounded regardless, because an unheard
+    // gunshot must never be the reason a player cannot start a match.
+    await step('loading audio', async () => {
+      const ready = this.audio?.coreSamplesReady?.();
+      if (!ready) return;
+      await Promise.race([ready.catch(() => false), new Promise((r) => setTimeout(r, 10000))]);
     });
     await step('compiling shaders', () => this._prewarmShaders());
 

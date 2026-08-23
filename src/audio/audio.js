@@ -735,8 +735,23 @@ export class AudioEngine {
     if (this._sampleLoad || this._sampleLoadQueued) return;
     this._sampleLoadQueued = true;
     const go = () => { this._sampleLoadQueued = false; this._startSampleLoad(); };
-    if (typeof requestIdleCallback === 'function') requestIdleCallback(go, { timeout: 20000 });
-    else setTimeout(go, 6000);
+    // The CORE tier is what the first ten seconds of a firefight needs, so it no longer
+    // waits for an idle moment — the loading screen waits for IT instead (see
+    // `coreSamplesReady`, awaited by `Game.init`). Idle scheduling stays for everything
+    // after that: the announcer, beds, music and explosion layers have no deadline.
+    go();
+  }
+
+  /**
+   * Resolves when the core combat samples are in the bank (or have provably failed).
+   *
+   * Boot awaits this so a player never walks into a firefight whose weapons are still
+   * synthesised — the fix a player asked for directly: "can't we have a loading screen
+   * that makes sure all of that is loaded before the game begins?". Safe to await before
+   * the context exists: it simply resolves.
+   */
+  coreSamplesReady() {
+    return this._coreReady || Promise.resolve(false);
   }
 
   /* -------------------------------------------------------------- *
@@ -774,6 +789,11 @@ export class AudioEngine {
       if (this._ambienceWant === name) this._startAmbience(name);
     };
 
+    // Resolved as soon as the core tier settles, so `Game.init` can hold the loading
+    // screen for combat audio and nothing else.
+    let markCoreReady;
+    this._coreReady = new Promise((r) => { markCoreReady = r; });
+
     const run = async () => {
       const merged = { loaded: 0, failed: 0, bytes: 0, ms: 0, seconds: 0, failures: [] };
       for (const tiers of [['core'], ['extra', 'vo']]) {
@@ -782,6 +802,7 @@ export class AudioEngine {
           s = await loadSampleBank(ctx, { manifest: SAMPLE_MANIFEST, onSound: take, tiers });
         } catch (err) {
           console.warn('[audio] sample bank load failed — staying on the synth bank.', err);
+          markCoreReady?.(false); markCoreReady = null;
           break;
         }
         merged.loaded += s.loaded;
@@ -791,8 +812,12 @@ export class AudioEngine {
         merged.seconds += s.seconds;
         for (const f of s.failures) if (merged.failures.length < 12) merged.failures.push(f);
         this.sampleStats = { ...merged };
+        // First pass through the loop IS the core tier — release the loading screen now,
+        // regardless of what the remaining tiers do.
+        markCoreReady?.(true); markCoreReady = null;
         if (this.ctx !== ctx) break;
       }
+      markCoreReady?.(false); markCoreReady = null;
       const kb = (merged.bytes / 1024).toFixed(0);
       console.info(`[audio] samples: ${merged.loaded} loaded / ${merged.failed} failed, `
         + `${kb} KB, ${merged.seconds.toFixed(1)} s of audio in ${merged.ms.toFixed(0)} ms`);
