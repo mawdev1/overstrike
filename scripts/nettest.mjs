@@ -2587,5 +2587,105 @@ const PLANT_TICKS = Math.ceil(3.0 / FIXED_DT);
   }
 }
 
+console.log('\na network client books its OWN kills — every one of them, not one per victim');
+
+{
+  /**
+   * "My kills are not being counted in TDM."
+   *
+   * Nothing per-player is on the wire: `ENTITY_FIELDS` carries what a client needs to DRAW
+   * somebody, `MSG_MATCHSTATE` carries team totals, and `MSG_OUTCOME` is terminal. The kills,
+   * deaths, assists, K/D, accuracy, streak and score in the pause SITUATION panel all come out
+   * of the CLIENT's own `Match._book`, which online is a reconstruction from the `kill` events
+   * `session.js` replays onto the local bus. So the reconstruction has to be exact, and it
+   * was not: `Match._onKill`'s dedupe guard ("the same victim cannot be booked as dead twice
+   * inside 0.3 s") measured against `Match.elapsed`, which counts `fixedUpdate` calls —
+   * and `refereeAuthority.advancesLocalReferee` deliberately never calls `fixedUpdate` on a
+   * network client. `elapsed` is therefore pinned at 0 there for the whole match, `0 - 0 < 0.3`
+   * is true forever, and every death after a victim's FIRST one was thrown away. A player's
+   * book capped out at one kill per distinct opponent while the server had the real number.
+   *
+   * Two real games and a real wire, so the only thing joining them is the bytes. The server
+   * books through its own authoritative `Match`; the client books through nothing but the
+   * events it decoded. They have to agree.
+   */
+  const { Prediction: PredictionCtor } = await import('../src/net/prediction.js');
+  const { MultiplayerSession } = await import('../src/net/session.js');
+
+  const s = await makeSession({ clients: 0, bots: 6 });
+  const g = s.game;
+  const human = g.player;
+  const [cT, sT] = createLoopbackPair({});
+  const wire = s.server.addClient(sT, human);
+  s.server._onMessage(wire, encodeHello(PROTOCOL_VERSION, 'st_ownstats'));
+
+  const client = new Game({ headless: true });
+  await client.initHeadless({ presenter: new NullPresenter() });
+  client.startMatch({ mode: 'tdm', botCount: 0, seed: 4242 });
+  client.state = 'playing';
+  client.paused = false;
+  client.input = {
+    fire: false, aim: false, firePressed: false, aimPressed: false,
+    isDown: () => false, wasPressed: () => false, wasReleased: () => false,
+    consumeWheel: () => 0, consumeLook: (out) => { out.x = 0; out.y = 0; return out; },
+  };
+  const mp = new MultiplayerSession(client, cT);
+  client.net = mp;
+
+  let ms = 0;
+  const step = (n = 1) => {
+    for (let i = 0; i < n; i++) {
+      mp.step();
+      sT.pump(ms);
+      s.server.tick();
+      cT.pump(ms);
+      ms += FIXED_DT * 1000;
+    }
+  };
+
+  // The handshake, then exactly what `MultiplayerSession.connect` does once the welcome lands.
+  // `prediction` is not decoration here: it is what runs the client's fixed step, so a rig
+  // without it has a client whose clock never moves and cannot tell these two builds apart.
+  step(10);
+  mp.connected = true;
+  const localId = client.player.id;
+  client.player.id = mp.net.entityId;
+  client.match.rekeyEntity(localId, mp.net.entityId);
+  client.rosterChanged();
+  mp.prediction = new PredictionCtor(client, client.player, mp.net);
+  step(30);
+
+  eq('the client is bound to the entity the server named', client.player.id, mp.net.entityId);
+
+  // Kills are made on the SERVER, by the server's own referee, and reach the client only as
+  // wire events. Staged rather than fought for: this section is about the bookkeeping, and a
+  // gunfight the bots might win would measure something else.
+  const enemies = g.entities.filter((e) => e !== human && e.team !== human.team);
+  let issued = 0;
+  for (let round = 0; round < 4; round++) {
+    for (const bot of enemies) {
+      bot.alive = true;
+      g.bus.emit('kill', { victim: bot, attacker: human, weaponId: 'ar_vector', headshot: false, distance: 12 });
+      issued++;
+      step(30);
+    }
+  }
+
+  const authoritative = g.match.getPlayerStats();
+  const projected = client.match.getPlayerStats();
+  eq('the server booked every staged kill', authoritative?.kills, issued);
+  if (enemies.length >= 2 && issued > enemies.length) {
+    ok(`the staging repeats victims (${issued} kills over ${enemies.length} opponents), which is what exposed this`);
+  } else {
+    bad('the staging repeats victims', `${issued} kills over ${enemies.length} opponents proves nothing`);
+  }
+  eq('the client has a stat row for itself at all', Boolean(projected), true);
+  eq('...and it booked the same number of kills as the server', projected?.kills, authoritative?.kills);
+  eq('...the same personal score', projected?.score, authoritative?.score);
+  eq('...and the same team score', client.match.scores[0], g.match.scores[0]);
+  eq('none of them were misfiled as team kills', projected?.teamKills, 0);
+  eq('nor as suicides', projected?.suicides, 0);
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nnetcode runs clean');
 process.exit(failures ? 1 : 0);

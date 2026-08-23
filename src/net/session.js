@@ -164,7 +164,18 @@ export class MultiplayerSession {
           });
           // The server told us which entity we drive. Bind the local player to that id so
           // snapshots about us are recognised as us.
-          if (game.player) game.player.id = session.net.entityId;
+          //
+          // The referee's books are keyed by entity id and `startMatch()` has already filed
+          // this player under the LOCAL id (gameRuntime starts the match before promoting the
+          // reservation), so the row has to follow the id. Skipping this left
+          // `Match.getPlayerStats()` — the only source the pause SITUATION panel has — looking
+          // up an id nothing was ever filed under, and "YOUR LINE" rendered empty.
+          if (game.player) {
+            const previousId = game.player.id;
+            game.player.id = session.net.entityId;
+            game.match?.rekeyEntity?.(previousId, session.net.entityId);
+            game.rosterChanged?.();
+          }
           session.prediction = new Prediction(game, game.player, session.net);
           resolve(session);
           return;
@@ -296,6 +307,18 @@ export class MultiplayerSession {
           present.hitmarker(ev.headshot, null, false, ev.absorbed);
           if (ev.absorbed) present.playUI('hitmarker', { volume: 0.3, rate: 0.7 });
           else present.playUI(ev.headshot ? 'headshot' : 'hitmarker', { volume: 0.6 });
+          // ACCURACY in the pause SITUATION panel is `shotsHit / shotsFired` off the local
+          // book. `shotsFired` is booked locally (ballistics emits `shot` for our own trigger
+          // pull), but `shotsHit` never was online: remote players are avatar stand-ins, not
+          // `game.entities`, so local hitscan cannot hit one and the local `hit` event never
+          // fires. Every networked player therefore read 0% accuracy for the whole match.
+          //
+          // This hitmarker is the SERVER's own confirmation that our round landed — it is
+          // routed to the shooter alone (`presenter.js` `_push('hitmarker', owner?.id, …)`) —
+          // so it is exactly the fact `shotsHit` wants. `Match._onHit` rejects `absorbed`
+          // itself and its `_hitThisShot` latch books one hit per shot however many rounds
+          // connect, so a client that somehow booked the hit locally too cannot double-count.
+          g.bus?.emit?.('hit', { shooter: g.player, absorbed: ev.absorbed, headshot: ev.headshot });
           break;
 
         case 'fire': {

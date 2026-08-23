@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.11.0 |
+| **Version** | 1.12.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] shell UI, presence service, room service |
 
@@ -264,6 +264,7 @@ socket drops
 | Seat | Held for the whole window; `connection: "reconnecting"` is broadcast to the roster |
 | Heartbeat | 15 s; two missed heartbeats start the grace window |
 | On expiry | Seat released, `RECONNECT_GRACE_EXPIRED`, roster delta removes the player |
+| While the room's match is live | The grace window does **not** run. A member who is IN the match has no lobby socket by design — they closed it to enter the match server, which holds their seat and publishes its own grace through `/control/status` — so the lobby seat is held for the whole match and `POST /v1/rooms/:id/reconnect-ticket` keeps succeeding. Applying the flat window here evicted every member of a live match 90 s in, and the last eviction destroyed the room in the middle of its own match |
 
 Heartbeat-driven staleness is also what **drives presence expiry**, so a crashed client stops
 showing as online within one grace period rather than forever.

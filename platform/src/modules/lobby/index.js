@@ -227,9 +227,13 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
           ? await store.matches?.activeForRoom?.(row.roomId) : null;
         const terminalMatch = ['in-progress', 'closing'].includes(row.status) && !activeMatch
           ? await store.matches?.latestTerminalForRoom?.(row.roomId) : null;
-        if (row.status === 'in-progress' && !activeMatch && !terminalMatch) { await store.rooms.remove(row.roomId); continue; }
+        // `purgePersistedRoom`, not `store.rooms.remove`: this branch discards a room whose
+        // members are still on record as seated in it, and a soft-deleted room's open member
+        // rows are never revisited by any later boot. That is the one place in this module
+        // that leaked them.
+        if (row.status === 'in-progress' && !activeMatch && !terminalMatch) { await purgePersistedRoom(row.roomId); continue; }
         const persistedMembers = await store.roomMembers.listForRoom(row.roomId);
-        if (!persistedMembers.length && !activeMatch && !terminalMatch) { await store.rooms.remove(row.roomId); continue; }
+        if (!persistedMembers.length && !activeMatch && !terminalMatch) { await purgePersistedRoom(row.roomId); continue; }
         const room = {
           roomId: row.roomId, name: row.name, region: row.region, mapId: row.mapId,
           mapVersion: row.mapVersion, mode: row.mode, rulesetVersion: row.rulesetVersion,
@@ -796,6 +800,63 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       }
     }
     throw new ApiError('MATCH_ALLOCATION_FAILED', 'No registered regional match server has capacity.');
+  }
+
+  /**
+   * The live match this room launched, or null.
+   *
+   * `matches` is keyed by matchId and nothing indexed it the other way, which is why three
+   * separate places treated "this room has players with no lobby socket" as "these players
+   * have abandoned the room". They have not: a member who is IN the match is supposed to have
+   * no lobby socket — they closed it to enter the match server, which holds their seat and
+   * publishes its own grace through `/control/status`. See `lobbySeatExpired`.
+   */
+  function activeMatchForRoom(roomId) {
+    for (const match of matches.values()) {
+      if (match.roomId === roomId && !match.endedAt) return match;
+    }
+    return null;
+  }
+
+  /**
+   * Has this lobby seat really lapsed?
+   *
+   * Only when the room is NOT holding a live match. While it is, every member's lobby socket
+   * is legitimately closed for the whole match, so the flat `disconnectedAt + GRACE_MS` test
+   * evicted every one of them 90 seconds in — and the last eviction took `removeMember`'s
+   * empty-room branch and DESTROYED the room in the middle of its own match. After that the
+   * room is gone from `rooms`, so `persistRoom`'s `rooms.has(room.roomId)` guard makes
+   * `reopenAfterTerminal` a silent no-op: the durable row stays `destroyed`, `GET /v1/rooms/:id`
+   * 404s, and the player who launched the match has nothing to come back to and nothing to
+   * delete. That is the reported "I can't go back in or delete it".
+   *
+   * The match server's own seat grace is the authority for a player inside a match, and the
+   * sweep already polls it — an unreachable or ended authority reaches `abortActiveMatch`
+   * /`completeActiveMatch`, which reopens the room and lets these seats lapse normally.
+   */
+  function lobbySeatExpired(room, member, at) {
+    if (member.connection === 'connected') return false;
+    if (member.disconnectedAt + GRACE_MS > at) return false;
+    return !activeMatchForRoom(room.roomId);
+  }
+
+  /**
+   * Close a durable room AND every member row still open against it, in one transaction.
+   *
+   * `store.rooms.remove` is a SOFT delete in PostgreSQL (`status='destroyed'`), and
+   * `rooms.list()` filters destroyed rows out — so a member row left open by a bare
+   * `rooms.remove` is never looked at again by any later boot. It stays `left_at IS NULL`
+   * forever, and `roomMembers.recentFor`/`wasMemberAt` keep answering that those accounts are
+   * in a room that no longer exists. Both hydration branches below used the bare call.
+   */
+  async function purgePersistedRoom(roomId) {
+    if (!store.rooms?.remove) return;
+    const members = await store.roomMembers?.listForRoom?.(roomId) ?? [];
+    const leftAt = iso(now());
+    await store.tx(async (tx) => {
+      for (const member of members) await store.roomMembers.remove(roomId, member.accountId, leftAt, tx);
+      await store.rooms.remove(roomId, tx);
+    });
   }
 
   async function releaseServer(matchId, serverUrl, serverId, correlationId = matchId,
@@ -1637,9 +1698,6 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       if (room.ownerAccountId !== ctx.actor.accountId) {
         throw new ApiError('AUTH_FORBIDDEN', 'Only the room owner can delete this room.');
       }
-      if (room.status === 'in-progress') {
-        throw new ApiError('ROOM_IN_PROGRESS', 'This room has an active match. Wait for it to end, or leave instead.');
-      }
       // No connection in this codebase is ever force-closed by another party's action — a
       // kicked member's own socket is never told, only bystanders' via broadcastRoster (see
       // removeMember: `connections.delete(accountId)` runs BEFORE the broadcast that would
@@ -1647,9 +1705,42 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       // stays inside what removeMember's tested empty-room-destroy branch already covers:
       // deleting your own room requires it to have no one else in it. Owners with company
       // still have `leave`, which empties the room the same way once everyone's gone.
+      //
+      // Checked BEFORE the match teardown below, deliberately. Aborting first and refusing
+      // afterwards would end other people's live match and then leave the room standing.
       if (room.members.size > 1) {
         throw new ApiError('ROOM_NOT_EMPTY', 'Other players are still in this room. Wait for them to leave, then delete it.');
       }
+      /**
+       * A live match no longer refuses the delete — it is torn down first.
+       *
+       * `ROOM_IN_PROGRESS` used to be terminal here, and it stranded the exact player who
+       * reported this: launch a solo room of bots, leave the match, come back to the lobby.
+       * The room is `in-progress`, so `join` refuses it and `deleteRoom` refused it, and its
+       * only remaining exit was the sweep noticing the authority had gone — which, before
+       * `lobbySeatExpired`, first destroyed the room out from under its own match.
+       *
+       * The teardown is the EXISTING terminal saga, not a bespoke one, and that matters for
+       * capacity: `abortActiveMatch` writes the canonical `status:'aborted'` result through
+       * the same applier every other termination uses and then `reopenAfterTerminal` calls
+       * `releaseServer`, which is `POST /control/release` on the authority AND
+       * `store.matchServers.release(serverId)`. Skipping either is how a region ends up
+       * reporting no capacity with nothing running (overstrike-gs-iad-1).
+       *
+       * The owner is the room's only member here, so this can only ever end a match that is
+       * theirs alone — the case the reporter described, and the only one where nobody else
+       * loses a match in progress.
+       */
+      const live = activeMatchForRoom(room.roomId);
+      if (live) {
+        logger.info('lobby.room_delete.match_aborted',
+          { roomId: room.roomId, matchId: live.matchId, accountId: ctx.actor.accountId });
+        await abortActiveMatch(live, 'owner-deleted-room', false);
+      }
+      // `abortActiveMatch` reopens the room, so `countdown`/`in-progress` are behind us; but a
+      // countdown started between the two awaits would still be running its timer against a
+      // room that is about to vanish.
+      if (room.countdown) { room.countdown = null; room.status = 'open'; }
       await removeMember(room, ctx.actor.accountId, ctx.correlationId, false);
       return raw(204, null);
     },
@@ -1658,7 +1749,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       const room = assertRoom(ctx.params.id);
       const member = room.members.get(ctx.actor.accountId);
       if (!member) throw new ApiError('NOT_IN_ROOM', 'You are not in that room.');
-      if (member.connection !== 'connected' && member.disconnectedAt + GRACE_MS <= now()) {
+      if (lobbySeatExpired(room, member, now())) {
         await removeMember(room, member.accountId, ctx.correlationId);
         throw new ApiError('RECONNECT_GRACE_EXPIRED', 'Your lobby seat was released.', {
           details: { graceEndsAt: iso(member.disconnectedAt + GRACE_MS), roomId: room.roomId, rejoinable: room.status === 'open', reason: 'grace-expired' },
@@ -1912,7 +2003,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
           markDisconnected(room, member, at);
           continue;
         }
-        if (member.connection !== 'connected' && member.disconnectedAt + GRACE_MS <= at) await removeMember(room, member.accountId);
+        if (lobbySeatExpired(room, member, at)) await removeMember(room, member.accountId);
       }
     }
     for (const [accountId, state] of presence) if (state.lastSeenAt + GRACE_MS <= at) presence.set(accountId, { ...state, state: 'offline', joinable: false, roomId: null });

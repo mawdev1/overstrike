@@ -480,7 +480,7 @@ export class Match {
 
     let log = this._damageLog.get(victim.id);
     if (!log) this._damageLog.set(victim.id, (log = []));
-    const now = this.elapsed;
+    const now = this.eventClock;
     let row = null;
     for (let i = 0; i < log.length; i++) if (log[i].id === attacker.id) { row = log[i]; break; }
     if (row) {
@@ -502,7 +502,7 @@ export class Match {
     if (!e) return;
     const st = this._register(e);
     if (st) st.team = e.team;
-    this._protect.set(e.id, this.elapsed + SPAWN_PROTECTION);
+    this._protect.set(e.id, this.eventClock + SPAWN_PROTECTION);
     this._damageLog.delete(e.id);
     this.mode.onSpawn?.(this, e);
   }
@@ -514,11 +514,11 @@ export class Match {
     // Deaths can be reported by the entity (bots), by us on the player's behalf, or by
     // a system probing both paths. Book each death exactly once.
     const lastDeath = this._deathGuard.get(victim.id);
-    if (lastDeath !== undefined && this.elapsed - lastDeath < 0.3) return;
-    this._deathGuard.set(victim.id, this.elapsed);
+    if (lastDeath !== undefined && this.eventClock - lastDeath < 0.3) return;
+    this._deathGuard.set(victim.id, this.eventClock);
 
     const attacker = this._resolveAttacker(p.attacker);
-    const now = this.elapsed;
+    const now = this.eventClock;
     const vst = this._register(victim);
     const ast = attacker ? this._register(attacker) : null;
 
@@ -624,7 +624,7 @@ export class Match {
   _awardAssists(victim, killer) {
     const log = this._damageLog.get(victim.id);
     if (!log) return;
-    const now = this.elapsed;
+    const now = this.eventClock;
     for (let i = 0; i < log.length; i++) {
       const row = log[i];
       if (row.id === killer.id) continue;
@@ -982,7 +982,7 @@ export class Match {
     if (!entity) return false;
     const end = this._protect.get(entity.id);
     if (end === undefined) return false;
-    if (this.elapsed >= end) { this._protect.delete(entity.id); return false; }
+    if (this.eventClock >= end) { this._protect.delete(entity.id); return false; }
     return true;
   }
 
@@ -1076,6 +1076,35 @@ export class Match {
    * how many additions got it there — which a replayed or rewound match must not do.
    */
   get elapsed() { return this._elapsedTicks * FIXED_DT; }
+
+  /**
+   * The clock every RELATIVE window is measured against: the kill dedupe guard, the
+   * multikill window, the assist window and spawn protection.
+   *
+   * NOT `elapsed`, and this is the whole reason the accessor exists. `elapsed` counts
+   * `fixedUpdate` calls, and `refereeAuthority.advancesLocalReferee` deliberately does not
+   * call `fixedUpdate` on a network client — the server is the referee there. So on every
+   * networked client `elapsed` is frozen at 0 for the entire match, and the dedupe guard in
+   * `_onKill` ("the same victim cannot be booked as dead twice inside 0.3 s") read
+   * `0 - 0 < 0.3` and threw away EVERY death after a victim's first one. The book that the
+   * pause SITUATION panel, the TAB scoreboard and the HUD all read was therefore capped at
+   * one kill per distinct opponent for the whole match, which is what "my kills are not
+   * being counted" was. Measured over the real wire: a server that booked 12 kills for a
+   * player sent 12 `kill` events and the client booked 3, one per distinct victim.
+   *
+   * So a client falls back to `game.time`, which is derived from `game.tick` — the counter
+   * `Game._fixedUpdate` advances on a client too, and which `Prediction.reconcile` rewinds and
+   * restores around a replay so a correction cannot double-count it. Every use of this getter
+   * is a DIFFERENCE of two readings, so the different origin costs nothing.
+   *
+   * The branch is on `game.net`, deliberately, and NOT "always `game.time`". `game.time`
+   * advances only when something drives `Game._fixedUpdate`, and the rulesets' own harnesses
+   * (`bombtest`, `simtest`) step `Match.fixedUpdate` directly against a game whose tick never
+   * moves — so a blanket switch freezes the clock for exactly the callers `elapsed` was built
+   * for and stalls a Bomb series at round 2. `_updateRespawns` already branches on the same
+   * field for the same reason: who is refereeing decides which clock is real.
+   */
+  get eventClock() { return this.game.net ? this.game.time : this.elapsed; }
 
   get timeRemaining() {
     return Math.max(0, this.timeLimit - this.elapsed);
@@ -1354,6 +1383,49 @@ export class Match {
       }
     }
     return best;
+  }
+
+  /**
+   * Move an entity's books from one id to another.
+   *
+   * Exists for exactly one caller: `MultiplayerSession.connect`, which rewrites
+   * `game.player.id` to the entity id the server assigned so that snapshots about us are
+   * recognised as us. By then `startMatch()` has already run — `gameRuntime.js` starts the
+   * match BEFORE promoting the reservation — so the player's stat row, spawn protection and
+   * damage log are all filed under the local id the server has just overruled. Without this,
+   * `getPlayerStats()` looks up the new id, finds nothing, and the pause SITUATION panel
+   * renders "YOUR LINE" as an empty div (`menu.js` `_refreshStatus`: `if (!row) { … return; }`)
+   * until the first event happens to re-register the player from scratch under the new id.
+   *
+   * Every id-keyed map is moved, not just `_book`: leaving `_protect` behind would hand the
+   * player permanent spawn protection under a dead key, and leaving `_deathGuard` behind
+   * would reintroduce a stale dedupe entry.
+   *
+   * @returns {boolean} whether anything was actually moved.
+   */
+  rekeyEntity(oldId, newId) {
+    if (oldId === newId || oldId == null || newId == null) return false;
+    let moved = false;
+    const row = this._book.get(oldId);
+    if (row) {
+      this._book.delete(oldId);
+      row.id = newId;
+      // A row already filed under the new id wins: it is the one keyed to the id the rest
+      // of the system is about to use, and merging two histories would double-count.
+      if (!this._book.has(newId)) this._book.set(newId, row);
+      moved = true;
+    }
+    for (const map of [this._protect, this._deathGuard, this._damageLog]) {
+      if (!map.has(oldId)) continue;
+      const value = map.get(oldId);
+      map.delete(oldId);
+      if (!map.has(newId)) map.set(newId, value);
+      moved = true;
+    }
+    for (const log of this._damageLog.values()) {
+      for (const entry of log) if (entry.id === oldId) entry.id = newId;
+    }
+    return moved;
   }
 
   /** Convenience for the HUD: the player's own row. */

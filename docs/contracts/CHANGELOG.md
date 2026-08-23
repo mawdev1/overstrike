@@ -1,5 +1,33 @@
 # Contract changelog
 
+## 2026-08-23 — `realtime-lobby.md` 1.11.0 → 1.12.0 (clarifying) — a lobby seat does not lapse during its own match
+
+§8's grace window is scoped to a room with no live match. Entering a match closes the lobby
+socket, so the flat `disconnectedAt + graceMs` test treated every member of a live match as
+having abandoned the room and evicted them all 90 s after launch; the final eviction took
+`removeMember`'s empty-room branch and destroyed the room mid-match, after which
+`persistRoom`'s `rooms.has()` guard silently swallowed `reopenAfterTerminal` and the durable
+row stayed `destroyed`. The room the player launched from was simply gone — nothing to rejoin
+and nothing to delete. The match server's own seat grace, which the sweep already polls, is
+the authority for a player inside a match; an ended or unreachable authority still reaches the
+terminal saga, which reopens the room and lets these seats lapse normally.
+
+## 2026-08-23 — `http-api.md` 2.3.0 → 2.4.0 (behavioural) — a live match no longer strands a room's owner
+
+`DELETE /v1/rooms/:id` no longer refuses with `409 ROOM_IN_PROGRESS`. 2.3.0 shipped that
+refusal with the advice "wait for it to end, or leave instead", and for a solo room of bots
+there is nobody left playing to end it: `join` refuses an `in-progress` room and `deleteRoom`
+refused it too, so the owner had no exit by any route. The delete now ends the match first,
+through the ordinary terminal saga — a canonical `status:"aborted"` result through the same
+applier every other termination uses, then `POST /control/release` on the authority AND the
+registry reservation released — and destroys the room afterwards. Capacity is asserted, not
+assumed (`platform/test/roomdeletetest.mjs`); a release that only freed the store row is how
+a region ends up reporting no capacity with nothing running.
+
+`409 ROOM_NOT_EMPTY` is unchanged and is still checked FIRST, so this can only ever end a
+match belonging to the room's sole member. Building an actual kick/notify-other-members
+feature remains separate future work.
+
 ## 2026-08-23 — `http-api.md` 2.2.0 → 2.3.0 (additive) — an owner can delete a room they created
 
 `DELETE /v1/rooms/:id`, owner-only. Scoped deliberately: no connection in this contract is
