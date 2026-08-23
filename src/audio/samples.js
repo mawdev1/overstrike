@@ -62,15 +62,22 @@
  */
 export const SAMPLE_MANIFEST = {
   // ── weapons ──────────────────────────────────────────────────────────────────
-  rifle: { url: 'audio/sfx/ar_fire.mp3', max: 0.62, gain: 0.9 },
-  smg: { url: 'audio/sfx/smg_fire.mp3', max: 0.46, gain: 0.9 },
-  lmg: { url: 'audio/sfx/lmg_fire.mp3', max: 0.72, gain: 0.92 },
-  sniper: { url: 'audio/sfx/sniper_fire.mp3', max: 1.05, gain: 0.95 },
-  dmr: { url: 'audio/sfx/dmr_fire.mp3', max: 0.9, gain: 0.92 },
-  shotgun: { url: 'audio/sfx/shotgun_fire.mp3', max: 0.88, gain: 0.95 },
-  pistol: { url: 'audio/sfx/pistol_fire.mp3', max: 0.5, gain: 0.88 },
+  // GAINS ARE MEASURED, NOT GUESSED. The generated sources arrived at wildly different
+  // levels — lmg and sniper are peak-normalised to 1.0 while dmr peaks at 0.022 — so the
+  // original hand-picked 0.85-0.95 values left a 281x spread in perceived loudness between
+  // the loudest and quietest weapon, which a player reported as "some gun sounds are louder
+  // than others". Each gain below is (target loud-RMS / measured loud-RMS), capped so
+  // peak*gain stays under ~0.85, with the targets ordered deliberately: pistol quietest,
+  // then smg, rifle, dmr, lmg, shotgun, sniper. Re-measure before changing a source file.
+  rifle: { url: 'audio/sfx/ar_fire.mp3', max: 0.62, gain: 3.8 },
+  smg: { url: 'audio/sfx/smg_fire.mp3', max: 0.46, gain: 17.0 },
+  lmg: { url: 'audio/sfx/lmg_fire.mp3', max: 0.72, gain: 0.18 },
+  sniper: { url: 'audio/sfx/sniper_fire.mp3', max: 1.05, gain: 0.2 },
+  dmr: { url: 'audio/sfx/dmr_fire.mp3', max: 0.9, gain: 38.0 },
+  shotgun: { url: 'audio/sfx/shotgun_fire.mp3', max: 0.88, gain: 1.24 },
+  pistol: { url: 'audio/sfx/pistol_fire.mp3', max: 0.5, gain: 10.7 },
   /** Not a sound anything asks for by name — swapped in by distance, see `audio.js`. */
-  gunshotDistant: { url: 'audio/sfx/gunshot_distant.mp3', max: 1.5, gain: 0.85 },
+  gunshotDistant: { url: 'audio/sfx/gunshot_distant.mp3', max: 1.5, gain: 1.39 },
 
   // ── handling ─────────────────────────────────────────────────────────────────
   boltForward: { url: 'audio/sfx/bolt_cycle.mp3', max: 0.6, gain: 0.8 },
@@ -119,7 +126,6 @@ export const SAMPLE_MANIFEST = {
    * and the shell plays them from its own context. Loading them here would be dead weight in
    * a bank that only exists once a match does.
    */
-  streakReady: { url: 'audio/ui/killstreak_ready.mp3', gain: 0.85, tier: 'extra' },
   killConfirm: { url: 'audio/ui/kill_confirm.mp3', max: 0.5, gain: 0.8 },
 
   // ── ambience beds ────────────────────────────────────────────────────────────
