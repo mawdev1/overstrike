@@ -6,7 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { clamp, damp } from './mathUtils.js';
-import { ATMOSPHERE, makeCloudTexture, assets } from './assets.js';
+import { ATMOSPHERE, makeCloudTexture } from './assets.js';
 import { ScopeFX } from '../fx/scope.js';
 
 // Scratch — the shadow cascade runs every frame and must not allocate (§1).
@@ -586,11 +586,55 @@ function asRGB11F(texture) {
   return texture;
 }
 
+/**
+ * Every three.js resource a renderer has registered a `dispose` listener on, held weakly.
+ *
+ * three's renderer sub-modules (`WebGLTextures`, `WebGLGeometries`, `WebGLMaterials`,
+ * `WebGLShadowMap`, …) each attach a `dispose` listener the first time they upload a
+ * resource, and only ever detach it when THAT resource is disposed. The listener is a
+ * closure over the sub-module's scope, which reaches `renderer.info` — and through it the
+ * renderer's whole `programs` array. So any resource that OUTLIVES a renderer pins that
+ * renderer's entire program cache: the `WebGLProgram`s, their `WebGLUniforms` trees, and
+ * the GLSL source strings, forever.
+ *
+ * The resources that do this cannot be enumerated by walking our own scene graph or the
+ * `assets` library, which is what this file used to try. A heap snapshot taken after six
+ * match round trips found exactly two objects accumulating one listener per entry, and
+ * neither is reachable that way:
+ *   · three's OWN module-level `DFG_LUT` DataTexture (three.module.js, `let lut = null`),
+ *     private to the library and unreachable from any public API;
+ *   · the sky texture cached in `fx/mapSkin.js`'s `_skyCache`, which is deliberately
+ *     shared across matches and lives on `scene.background`, where `traverse()` never
+ *     looks.
+ * Between them they retained 30 `WebGLProgram`s, ~38 `WebGLTexture`s, 2288 `SingleUniform`s
+ * and 2372 `WebGLUniformLocation`s PER MATCH ENTRY.
+ *
+ * Recording is therefore done at the only place that is complete — the registration itself.
+ * The hook is additive (it records and delegates, it changes no behaviour), installed once,
+ * and holds nothing strongly.
+ */
+const _disposeListenerHosts = [];
+let _disposeHookInstalled = false;
+function _installDisposeListenerHook() {
+  if (_disposeHookInstalled) return;
+  _disposeHookInstalled = true;
+  const proto = THREE.EventDispatcher?.prototype;
+  if (!proto || typeof proto.addEventListener !== 'function') return;
+  const original = proto.addEventListener;
+  proto.addEventListener = function recordedAddEventListener(type, listener) {
+    if (type === 'dispose') _disposeListenerHosts.push(new WeakRef(this));
+    return original.call(this, type, listener);
+  };
+}
+
 export class Engine {
   constructor(game, canvas) {
     this.game = game;
     this.canvas = canvas;
     const s = game.settings;
+
+    // Before the renderer exists, so its very first upload is recorded.
+    _installDisposeListenerHook();
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -1304,35 +1348,25 @@ export class Engine {
    * time it renders one (`onMaterialDispose` / `onTextureDispose` / `onGeometryDispose`),
    * and only ever removes it when THAT resource is disposed. Most of ours never are: the
    * `assets` library latches on `ready` and is shared by every match. So each retired
-   * renderer stayed reachable from a shared material's listener array for the life of the
-   * page — a heap snapshot after two round trips found both renderers still live, held by
-   * `MeshStandardMaterial._listeners.dispose`.
+   * renderer stayed reachable from a shared resource's listener array for the life of the
+   * page.
    *
-   * Safe as a blanket clear because the client owns exactly one renderer at a time (the
-   * shell refuses a second `enter` while a Game exists) and nothing in this codebase
-   * listens for `dispose` itself — the next renderer re-registers on first use.
+   * The list to clear is `_disposeListenerHosts` — see the comment on it for why it is
+   * recorded at registration time rather than derived by walking the scene graph and the
+   * `assets` library, which is what this method used to do and which missed both of the
+   * two resources a heap snapshot actually caught leaking.
    */
   _releaseSharedResourceListeners() {
-    const drop = (resource) => {
-      const listeners = resource?._listeners;
+    for (const ref of _disposeListenerHosts) {
+      const listeners = ref.deref()?._listeners;
       if (listeners && listeners.dispose) listeners.dispose.length = 0;
-    };
-    const dropMaterial = (material) => {
-      if (!material) return;
-      drop(material);
-      for (const value of Object.values(material)) if (value?.isTexture) drop(value);
-    };
-    for (const scene of [this.scene, this.viewScene]) {
-      scene?.traverse((object) => {
-        drop(object.geometry);
-        const material = object.material;
-        if (Array.isArray(material)) material.forEach(dropMaterial);
-        else dropMaterial(material);
-      });
     }
-    for (const texture of assets.textures.values()) drop(texture);
-    for (const material of assets.materials.values()) dropMaterial(material);
-    for (const geometry of assets.geometries.values()) drop(geometry);
+    // The registry describes ONE renderer's registrations and this is the end of that
+    // renderer; the next one re-registers on its own first use, which is what makes the
+    // blanket clear safe (nothing in this codebase listens for `dispose` itself, and the
+    // client owns exactly one renderer at a time — the shell refuses a second `enter`
+    // while a Game exists).
+    _disposeListenerHosts.length = 0;
   }
 
   dispose() {
