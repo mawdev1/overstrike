@@ -1251,6 +1251,23 @@ export async function createPostgresStore(config = {}, deps = {}) {
     },
 
     /**
+     * telemetry-kpi.md's read surface: every outbox row of a given `eventType`, optionally
+     * bounded to `occurredAt >= since` (ISO string). A read over the same durable outbox
+     * `insert`/`list` already write — no second pipeline, no new storage.
+     */
+    async listByType(type, { since = null } = {}, txh) {
+      const params = [type];
+      let where = 'event_type = $1';
+      if (since !== null) {
+        params.push(since);
+        where += ` and occurred_at >= $${params.length}`;
+      }
+      const { rows } = await q(txh,
+        `select * from events_outbox where ${where} order by occurred_at, event_id`, params);
+      return rows.map((row) => mapRow(row));
+    },
+
+    /**
      * FOR UPDATE SKIP LOCKED is what lets several relay workers run at once: each claims a
      * disjoint set instead of every worker fighting over the same head of the queue and
      * publishing the same event N times. It requires a transaction, so outside one this

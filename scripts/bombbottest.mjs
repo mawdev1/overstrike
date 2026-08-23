@@ -23,10 +23,15 @@ const check = (condition, message, detail = '') => {
   if (!condition) failures.push(`${message}${detail ? ` — ${detail}` : ''}`);
 };
 
-const SEED = 20260817;
+// Repinned for the 2.0.0 symmetric ruleset (the old attacker/defender baseline is void):
+// this seed's series plants at BOTH authored sites, by BOTH teams, on both sides of the
+// side switch, and contains defuses — the full owner-directive surface in one series.
+const SEED = 20260822;
 const MAX_TICKS = 120 * 60 * 35;
+// bomb-rules §13.11: contest (race the neutral/dropped bomb), carry/escort (deliver to the
+// one legal target), defend (home site), retake/defusing (own site planted), postplant hold.
 const REQUIRED_ROLES = Object.freeze([
-  'plant', 'planting', 'escort', 'lurk', 'recover', 'hold', 'defend', 'retake', 'defusing',
+  'contest', 'carry', 'planting', 'escort', 'defend', 'retake', 'defusing', 'postplant',
 ]);
 
 const game = new Game({ headless: true });
@@ -106,25 +111,63 @@ check([...routeDistance.values()].some((distance) => distance > 40),
 check(plants.length >= 2, 'bots complete multiple authoritative plants', `${plants.length}`);
 check(defuses.length >= 1, 'bots complete an authoritative retake and defuse', `${defuses.length}`);
 check(drops.length >= 1, 'a carrier death drops the authoritative bomb', `${drops.length}`);
-check(recoveries.length >= 1, 'a teammate autonomously recovers a dropped bomb', `${recoveries.length}`);
+check(recoveries.length >= 1, 'a bot autonomously picks up a neutral/dropped bomb', `${recoveries.length}`);
 check(new Set(plants.map((row) => row.site)).size === 2, 'bots choose and plant both authored sites');
 check(plants.every((row) => botIds.has(row.entityId)), 'every planter is an autonomous bot');
 check(defuses.every((row) => botIds.has(row.entityId)), 'every defuser is an autonomous bot');
 check(recoveries.every((row) => botIds.has(row.entityId)), 'every recovery is by an autonomous bot');
 for (const role of REQUIRED_ROLES) check(roles.has(role), `objective planner exercises ${role}`);
 
+// Owner-directive acceptance (bomb-rules §13): BOTH teams plant across the series. The
+// per-round `plantedByTeam` is the authoritative record of who converted possession.
 const rounds = bomb.rounds;
+const teamOfBot = new Map(game.bots.bots.map((bot) => [bot.id, bot.team]));
+const plantingTeams = new Set(rounds.filter((row) => row.plantedByTeam !== null)
+  .map((row) => row.plantedByTeam));
+check(plantingTeams.has(0) && plantingTeams.has(1),
+  'both teams plant across the series (owner directive)',
+  `plantedByTeam values ${[...plantingTeams].join(',') || 'none'}`);
+
+// The mandated headless-series evidence: a bomb dropped by one team and RE-PICKED by the
+// other, inside one round, with that round still resolving legally. Walked over the
+// authoritative event log, not inferred.
+let crossPickup = false;
+for (let i = 0; i < events.length; i++) {
+  const drop = events[i];
+  if (drop.kind !== 'bombDropped' || !teamOfBot.has(drop.entityId)) continue;
+  for (let j = i + 1; j < events.length && events[j].round === drop.round; j++) {
+    const pick = events[j];
+    if (pick.kind === 'bombPickedUp' && pick.reason === 'pickup'
+      && teamOfBot.has(pick.entityId) && teamOfBot.get(pick.entityId) !== teamOfBot.get(drop.entityId)) {
+      crossPickup = true;
+      break;
+    }
+    if (pick.kind === 'bombDropped') break; // next possession chain
+  }
+  if (crossPickup) break;
+}
+check(crossPickup,
+  'a dropped bomb is re-picked by the OTHER team inside one round (contested pickup, §13.3)');
+
 check(rounds.length >= BOMB_PARAMS.roundsToWin && rounds.length <= BOMB_PARAMS.maxRounds,
   'series length stays inside the frozen first-to-seven/MR12 bounds', `${rounds.length}`);
 check(rounds.every((row, index) => row.round === index + 1), 'round records are contiguous');
 check(rounds.every((row) => ['elimination', 'defuse', 'detonation', 'timer'].includes(row.reason)),
   'every autonomous round has a legal closed reason');
-check(rounds.every((row) => row.attackingTeam === (row.round <= BOMB_PARAMS.sideSwitchAfterRound ? 0 : 1)),
-  'roles switch exactly after round six');
+check(rounds.every((row) => (row.winnerTeam === -1) === (row.reason === 'timer'
+  || (row.reason === 'elimination' && row.alive[0] === 0 && row.alive[1] === 0))),
+'a drawn round is exactly a §13.5.3 timer expiry or a mutual wipe', JSON.stringify(rounds.map((r) => [r.winnerTeam, r.reason])));
+// §13.1: home sites swap exactly after round six, and every record carries them.
+check(rounds.every((row) => {
+  const first = row.round <= BOMB_PARAMS.sideSwitchAfterRound;
+  return row.homeSites && row.homeSites[0] === (first ? 'A' : 'B') && row.homeSites[1] === (first ? 'B' : 'A');
+}), 'home sites swap exactly after round six (§13.1)', JSON.stringify(rounds.map((r) => r.homeSites)));
 const [alpha, bravo] = bomb.series?.roundWins ?? [-1, -1];
 check(Math.max(alpha, bravo) === BOMB_PARAMS.roundsToWin
-  || (rounds.length === BOMB_PARAMS.maxRounds && alpha === 6 && bravo === 6),
-  'series ends only at seven wins or the legal 6-6 draw', `${alpha}-${bravo}`);
+  || (rounds.length === BOMB_PARAMS.maxRounds
+    && ['roundWins', 'draw'].includes(bomb.series?.reason)),
+  'series ends at seven wins, or at regulation by §13.6 more-wins/equal-wins arithmetic',
+  `${alpha}-${bravo} (${bomb.series?.reason})`);
 
 // Feed the actual Game.matchEnd payload and GameServer objective evidence into the shipping
 // dedicated-server result builder. This is the real autonomous series above, not a fabricated

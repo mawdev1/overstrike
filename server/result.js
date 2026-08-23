@@ -50,15 +50,17 @@ export function buildCanonicalTerminalResult({ allocation, matchResult, match, e
     const finish = objectiveFor('roundOutcome', index);
     const plant = objectiveFor('plantComplete', index);
     const defuse = objectiveFor('defuseComplete', index);
-    const attacking = round.attackingTeam;
     return {
+      // bomb-rules §13.5.3/§13.7: `winnerTeam: -1` (a drawn round) projects to 'draw'.
       index, winner: teamName(round.winnerTeam),
       reason: ['elimination', 'defuse', 'detonation', 'timer'].includes(round.reason)
         ? round.reason : 'elimination',
       startedAt: atFrom(startedMs, start),
       endedAt: atFrom(startedMs, finish ?? { serverTimeMs: (round.endedAtTick || 0) * (1000 / 120) }),
-      roles: { alpha: attacking === 0 ? 'attacker' : 'defender',
-        bravo: attacking === 1 ? 'attacker' : 'defender' },
+      // bomb-rules §13.7 / match-result.md §4.1 (2.0.0): per-round `roles` is replaced by
+      // `homeSites` — the site each team DEFENDS this round, which is the fact that swaps
+      // at the side switch under symmetric demolition.
+      homeSites: { alpha: round.homeSites?.[0] ?? null, bravo: round.homeSites?.[1] ?? null },
       plant: plant && entityToAccount.has(plant.actorId) ? {
         accountId: entityToAccount.get(plant.actorId), site: plant.site, at: atFrom(startedMs, plant),
       } : null,
@@ -69,7 +71,6 @@ export function buildCanonicalTerminalResult({ allocation, matchResult, match, e
   });
 
   const endedIso = iso(endedAt);
-  const firstAttacker = rawRounds[0]?.attackingTeam;
   // Never-connected seats expire out of the authoritative roster at ticket TTL. They did not
   // play and must not be invented as zero-stat career participants by terminal projection.
   const players = [...allocation.roster].filter(([, seat]) => seat.joined).map(([accountId, seat]) => {
@@ -81,8 +82,9 @@ export function buildCanonicalTerminalResult({ allocation, matchResult, match, e
     const leftAt = seat.connected ? null : iso(seat.disconnectedAt || endedAt);
     return {
       accountId, displayName: seat.displayName, team: seat.team,
-      role: allocation.mode === 'bomb'
-        ? ((seat.team === 'alpha') === (firstAttacker === 0) ? 'attacker' : 'defender') : null,
+      // bomb-rules §13.7: symmetric demolition has no starting role — emitted null, which
+      // the frozen player type already admits (match-result.md §3).
+      role: null,
       ...stats, timePlayedSec: Math.floor(connectedMs / 1000),
       disconnected: !seat.connected, abandoned: false, joinedAt, leftAt,
     };

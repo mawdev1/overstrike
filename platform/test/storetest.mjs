@@ -1476,7 +1476,8 @@ function newSubmission(alpha, bravo, over = {}) {
     rounds: [{
       index: 0, winner: 'alpha', reason: 'defuse',
       startedAt: iso(-600e3), endedAt: iso(-500e3),
-      roles: { alpha: 'attacker', bravo: 'defender' },
+      // bomb-rules 2.0.0 §13.7 / match-result §4.1: per-round home-site ownership.
+      homeSites: { alpha: 'B', bravo: 'A' },
       plant: { accountId: bravo, site: 'A', at: iso(-550e3) },
       defuse: { accountId: alpha, at: iso(-520e3) },
     }],
@@ -1619,10 +1620,17 @@ async function testResultShapeRules() {
   };
   problemAt('a round that is not an object is reported at its own index',
     nestedResultProblems({ ...newSubmission(A, B), rounds: ['nope'] }), 'rounds[0]', 'type');
-  problemAt('a round winner outside the team enum is reported',
-    withRound({ winner: 'draw' }), 'rounds[0].winner', 'enum');
+  problemAt('a round winner outside the enum is reported',
+    withRound({ winner: 'charlie' }), 'rounds[0].winner', 'enum');
   noProblemAt('control: a round won by bravo is legal',
     withRound({ winner: 'bravo' }), 'rounds[0].winner', 'enum');
+  // bomb-rules 2.0.0 §13.5.3: a drawn round is a legal per-round outcome.
+  noProblemAt('a DRAWN round (winner: draw) is legal under the 2.0.0 symmetric ruleset',
+    withRound({ winner: 'draw', reason: 'timer' }), 'rounds[0].winner', 'enum');
+  problemAt('a round homeSites outside the site enum is reported',
+    withRound({ homeSites: { alpha: 'C', bravo: 'A' } }), 'rounds[0].homeSites.alpha', 'enum');
+  problemAt('both teams claiming one home site is reported',
+    withRound({ homeSites: { alpha: 'A', bravo: 'A' } }), 'rounds[0].homeSites', 'distinct');
 
   // --- rounds[].plant / .defuse: the objective ACTOR record ------------------------------
   problemAt('a round with no defuse KEY at all is reported as required',

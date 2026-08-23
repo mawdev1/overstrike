@@ -484,7 +484,7 @@ const PLAYER_KEYS = [
   'score', 'disconnected', 'abandoned', 'joinedAt', 'leftAt', 'weapons',
 ];
 const ROSTER_KEYS = ['accountId', 'team', 'joinedAt', 'leftAt'];
-const ROUND_KEYS = ['index', 'winner', 'reason', 'startedAt', 'endedAt', 'roles', 'plant', 'defuse'];
+const ROUND_KEYS = ['index', 'winner', 'reason', 'startedAt', 'endedAt', 'homeSites', 'plant', 'defuse'];
 export const TEAMS = ['alpha', 'bravo'];
 const ROLES = ['attacker', 'defender'];
 const ROUND_REASONS = ['elimination', 'defuse', 'detonation', 'timer'];
@@ -617,8 +617,10 @@ function roundProblems(round, path, problems) {
   }
   closedKeys(round, ROUND_KEYS, path, problems);
   if (!isCount(round.index)) problems.push(at(`${path}.index`, 'count', { got: round.index ?? null }));
-  if (!TEAMS.includes(round.winner)) {
-    problems.push(at(`${path}.winner`, 'enum', { allowed: TEAMS, got: round.winner ?? null }));
+  // §4.1 (2.0.0, bomb-rules §13.5.3): a symmetric-demolition round can be DRAWN — a timer
+  // expiry with no plant, or a mutual wipe — so the per-round winner admits 'draw'.
+  if (![...TEAMS, 'draw'].includes(round.winner)) {
+    problems.push(at(`${path}.winner`, 'enum', { allowed: [...TEAMS, 'draw'], got: round.winner ?? null }));
   }
   if (!ROUND_REASONS.includes(round.reason)) {
     problems.push(at(`${path}.reason`, 'enum', { allowed: ROUND_REASONS, got: round.reason ?? null }));
@@ -626,16 +628,21 @@ function roundProblems(round, path, problems) {
   for (const k of ['startedAt', 'endedAt']) {
     if (!isTimestamp(round[k])) problems.push(at(`${path}.${k}`, 'timestamp', { got: round[k] ?? null }));
   }
-  // §4.1: roles are PER ROUND because the side switch means deriving them from a starting role
-  // plus a switch point silently reinterprets every historical match when the rule changes.
-  if (!isPlainObject(round.roles)) {
-    problems.push(at(`${path}.roles`, 'type', { expected: 'object' }));
+  // §4.1 (2.0.0, bomb-rules §13.7): `roles` is replaced by `homeSites` — the site each team
+  // DEFENDS this round. Recorded PER ROUND for the same reason roles were: deriving the
+  // assignment from a starting value plus a switch point silently reinterprets every
+  // historical match when the rule changes. The two sites must be distinct.
+  if (!isPlainObject(round.homeSites)) {
+    problems.push(at(`${path}.homeSites`, 'type', { expected: 'object' }));
   } else {
-    closedKeys(round.roles, TEAMS, `${path}.roles`, problems);
+    closedKeys(round.homeSites, TEAMS, `${path}.homeSites`, problems);
     for (const team of TEAMS) {
-      if (!ROLES.includes(round.roles[team])) {
-        problems.push(at(`${path}.roles.${team}`, 'enum', { allowed: ROLES, got: round.roles[team] ?? null }));
+      if (!BOMB_SITES.includes(round.homeSites[team])) {
+        problems.push(at(`${path}.homeSites.${team}`, 'enum', { allowed: BOMB_SITES, got: round.homeSites[team] ?? null }));
       }
+    }
+    if (round.homeSites.alpha === round.homeSites.bravo && BOMB_SITES.includes(round.homeSites.alpha)) {
+      problems.push(at(`${path}.homeSites`, 'distinct', { got: round.homeSites }));
     }
   }
   for (const [k, keys] of [['plant', ['accountId', 'site', 'at']], ['defuse', ['accountId', 'at']]]) {

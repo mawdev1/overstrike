@@ -254,30 +254,37 @@ head('§2.1a first to 7: completed, and the reason is the DECIDING round’s rea
   game.dispose();
 }
 
-head('the control: the same series decided by a round TIMER reports `timer`, not `elimination`');
+head('the control: a series decided by MORE WINS after 12 (bomb-rules §13.6) reports `timer` with a winner');
 {
+  // Under the 2.0.0 symmetric ruleset a round timer expiry is a DRAWN round (§13.5.3), so
+  // a series can no longer be decided by a timer-won seventh round. The §4.0 row-2 tuple —
+  // `completed`/`timer` with a real winner — is instead produced by §13.6: draws eat
+  // regulation rounds, the team with more round wins takes the match (`reason: roundWins`),
+  // and the §4.0 projection of "regulation ran out" is `timer`.
   const game = await newGame({ seed: 777 });
   const bomb = toLive(game);
-  // Six eliminations, then the side switch puts team 0 on defence; letting the seventh
-  // round's clock run out is a DEFENDER win by `timer` — same series result, other reason.
-  for (let round = 1; round <= 6; round++) {
+  for (let round = 1; round <= 12; round++) {
     let guard = 0;
     while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
-    wipe(game, 1);
+    if (round <= 6) {
+      wipe(game, 1);                       // six team-0 elimination wins…
+    } else if (round === 7) {
+      step(game, T.round);                 // …one genuine timer DRAW, on the round clock…
+    } else {
+      wipe(game, 0); wipe(game, 1);        // …and mutual-wipe draws to fill regulation
+    }
     step(game, 1 + T.roundEnd);
   }
-  let guard = 0;
-  while (bomb.phase !== 'live' && guard < T.freeze + T.roundEnd + 4) { step(game); guard++; }
-  eq(bomb.defendingTeam, 0, 'after the side switch team 0 defends the seventh round');
-  step(game, T.round + 1);
-  eqJson(bomb.roundWins, [7, 0], 'the defenders take the seventh round on the clock');
-  eq(bomb.rounds[bomb.rounds.length - 1].reason, 'timer', 'and the round record says `timer`');
-  step(game, 1 + T.roundEnd);
+  eqJson(bomb.roundWins, [6, 0], 'six wins and six draws leave the score 6-0 after regulation');
+  eq(bomb.rounds[6].winnerTeam, -1, '§13.5.3 the seventh round drew on the round clock');
+  eq(bomb.rounds[6].reason, 'timer', 'and its round record says `timer`');
+  eq(bomb.series.reason, 'roundWins', '§13.6 the raw series reason is the new `roundWins`');
   step(game, 1);
   const r = game.match.result;
   eqJson(tuple(r), {
     terminationReason: 'completed', outcomeReason: 'timer', winnerTeam: 'alpha', aggregate: true,
   }, '§4.0 row 2: `completed`/`timer` with a real winner — the mapping is not a constant');
+  eq(r.reason, 'roundWins', 'while the raw series reason stays `roundWins` for the HUD and the log');
   game.dispose();
 }
 

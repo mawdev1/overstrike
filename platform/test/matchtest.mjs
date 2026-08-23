@@ -144,7 +144,8 @@ function bombRound(index, actor, over = {}) {
   return {
     index, winner: 'alpha', reason: 'defuse',
     startedAt: T0, endedAt: T1,
-    roles: { alpha: 'defender', bravo: 'attacker' },
+    // bomb-rules 2.0.0 §13.7 / match-result §4.1: per-round home-site ownership.
+    homeSites: { alpha: 'A', bravo: 'B' },
     plant: { accountId: actor.accountId, site: 'A', at: T0 },
     defuse: { accountId: actor.accountId, at: T1 },
     ...over,
@@ -411,8 +412,11 @@ await withApp(async ({ app, call }) => {
   await submitBad((r) => { r.rounds = [{ index: 0, winner: 'alpha', reason: 'defuse' }]; },
     'a round missing its §4.1 keys is refused', 'rounds[0].startedAt');
   await submitBad((r) => {
-    r.rounds = [bombRound(0, p1, { roles: { alpha: 'attacker' } })];
-  }, 'a round whose roles omit a team is refused', 'rounds[0].roles.bravo');
+    r.rounds = [bombRound(0, p1, { homeSites: { alpha: 'A' } })];
+  }, 'a round whose homeSites omit a team is refused', 'rounds[0].homeSites.bravo');
+  await submitBad((r) => {
+    r.rounds = [bombRound(0, p1, { homeSites: { alpha: 'A', bravo: 'A' } })];
+  }, 'both teams claiming one home site is refused', 'rounds[0].homeSites');
   await submitBad((r) => {
     r.rounds = [bombRound(0, p1, { plant: { accountId: p1.accountId, site: 'C', at: T0 } })];
   }, 'a plant on a site outside A|B is refused', 'rounds[0].plant.site');
@@ -434,7 +438,7 @@ await withApp(async ({ app, call }) => {
     rounds: [bombRound(0, p1), bombRound(1, p1)],
   }), asService);
   expect(bombOk.status === 200 && bombOk.body?.applied === true,
-    'CONTROL: a complete bomb result with rounds, roles and objectives applies', bombOk.text);
+    'CONTROL: a complete bomb result with rounds, homeSites and objectives applies', bombOk.text);
 
   // ── 5. draw implies timer ─────────────────────────────────────────────────────────────
   section('§4.0 — a draw is the regulation timer, and nothing else');

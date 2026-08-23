@@ -361,6 +361,36 @@ export function buildManifest(entry, world) {
     provenance.objectives = 'missing';
   }
 
+  // -- neutral bomb spawn (bomb-rules.md §13.2 — a new OPTIONAL §3.3 objective kind
+  // `bombSpawn`: a point `{x,y,z}`, or a box whose centre is used; at most one per map).
+  // Derived default for maps that declare none: the MIDPOINT OF THE TWO PLANT-VOLUME
+  // CENTRES — not the bounds centre, because "middle of the map" in play terms is the
+  // point equidistant from the two things being fought over. Deliberately NOT flagged as
+  // 'missing' when underivable: like `sectors`, the key is additive and optional, and a
+  // map with no plant sites cannot host Bomb at all.
+  const volumeCentre = (b) => ({
+    x: (b.min.x + b.max.x) / 2, y: (b.min.y + b.max.y) / 2, z: (b.min.z + b.max.z) / 2,
+  });
+  let bombSpawn = null;
+  if (src !== null && Array.isArray(src.objectives)) {
+    for (const v of src.objectives) {
+      if (!v || v.kind !== 'bombSpawn') continue;
+      if (isVec3Like(v.point)) { bombSpawn = { x: v.point.x, y: v.point.y, z: v.point.z }; break; }
+      const nb = normalizeBox(v.box);
+      if (nb !== null) { bombSpawn = volumeCentre(nb); break; }
+    }
+  }
+  if (bombSpawn !== null) {
+    provenance.bombSpawn = 'declared';
+  } else {
+    const plants = objectives.filter((o) => o.kind === 'plant');
+    if (plants.length === 2) {
+      const [a, b] = plants.map((o) => volumeCentre(o.box));
+      bombSpawn = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
+      provenance.bombSpawn = 'derived';
+    }
+  }
+
   // -- callouts (§3.4)
   let callouts = [];
   if (src !== null && Array.isArray(src.callouts)) {
@@ -430,6 +460,7 @@ export function buildManifest(entry, world) {
     bounds,
     spawns,
     objectives,
+    bombSpawn,
     callouts,
     sectors,
     navHints,

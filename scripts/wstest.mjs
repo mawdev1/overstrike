@@ -573,11 +573,13 @@ console.log('\ncurrent protocol message types over a real socket');
     return t;
   };
 
-  // Entities handed out in the order clients arrive: an attacker first, then defenders.
+  // Entities handed out in the order clients arrive: a team-0 player first, then team 1.
+  // bomb-rules §13.2: the round opens with a NEUTRAL bomb (carrier -1), so tests that
+  // need a carrier stage one below, fixture-not-behaviour.
   const teamMembers = (team) => game.entities.filter((e) => e.team === team);
   const pool = [
-    teamMembers(rules.attackingTeam).find((e) => e.id !== rules.bomb.carrierId),
-    ...teamMembers(rules.defendingTeam),
+    teamMembers(0)[0],
+    ...teamMembers(1),
   ];
   let handed = 0;
   const wss2 = new WebSocketServer({ port: WS_PORT, perMessageDeflate: false, maxPayload: 4096 });
@@ -621,22 +623,35 @@ console.log('\ncurrent protocol message types over a real socket');
     else bad('MSG_MATCHSTATE is 41 bytes on the wire', `${stateFrames[0].byteLength}`);
     if (ms.phase === 'live') ok('and its phase decodes as the round the ruleset is really in');
     else bad('the match state names the real phase', `${ms.phase} vs ruleset ${rules.phase}`);
-    if (ms.localRole === 'attacker') ok('and tells this recipient which side it is on');
-    else bad('the match state names the local role', `${ms.localRole}`);
-    if (ms.bombState === 'carried') ok('and what the bomb is doing');
+    if (ms.localRole === 'none') ok('and serves the §13.8 role — `none`; ownership is derived, not sent');
+    else bad('a 2.0.0 ruleset serves localRole none', `${ms.localRole}`);
+    if (ms.bombState === rules.bomb.state) ok(`and what the bomb is doing (${ms.bombState})`);
     else bad('the match state names the bomb state', `${ms.bombState} vs ${rules.bomb.state}`);
   }
 
   // ── the appended interact byte, over a real socket ────────────────────────────────
   {
-    const carrier = game.entityById(rules.bomb.carrierId);
-    const site = rules.sites.get('A');
-    carrier.position.set((site.plant.min.x + site.plant.max.x) / 2, site.plant.min.y + 0.5,
+    // §13.4: a carrier may only plant at their TARGET site (the enemy's home). Client
+    // A's entity is used — a client-attached body the bot AI does not steer, so it stays
+    // inside the volume for the whole hold (a staged bot walks itself out mid-plant).
+    const carrier = game.entityById(A.client.entityId);
+    rules.bomb.state = 'carried';
+    rules.bomb.carrierId = carrier.id;
+    carrier.maxHealth = 1e6;
+    carrier.health = 1e6;
+    const site = rules.sites.get(rules.targetSiteOf(carrier.team));
+    // A session-attached entity is released by the server's own resume path every tick
+    // unless the held flag is up — so the hold is driven through `_objectiveHeld`, the
+    // exact server-side fact a held key produces (§6.4), and the server itself asks the
+    // referee for `interactKindFor(e)` each tick.
+    carrier._objectiveHeld = true;
+    // Feet ON the volume floor, not hovering above it: re-pinning a body half a metre in
+    // the air every tick means it never lands and every request refuses `notGrounded`.
+    carrier.position.set((site.plant.min.x + site.plant.max.x) / 2, site.plant.min.y,
       (site.plant.min.z + site.plant.max.z) / 2);
     let seen = null;
-    for (let i = 0; i < 120 && !seen; i++) {
-      rules.requestInteract(carrier, 'plant');
-      carrier.grounded = true;
+    for (let i = 0; i < 200 && !seen; i++) {
+      carrier.velocity?.set?.(0, 0, 0);
       gs.tick();
       if (i % 8 === 0) await sleep(4);
       for (const sn of A.client.snapshots) {
@@ -647,12 +662,18 @@ console.log('\ncurrent protocol message types over a real socket');
       }
     }
     if (seen) ok(`the appended interact field crosses a real socket carrying a plant at ${seen.progress}/63`);
-    else bad('the interact byte carries a plant over a real socket', 'every entity read as interact 0');
+    else bad('the interact byte carries a plant over a real socket',
+      `every entity read as interact 0 — carrier ${carrier?.id} team ${carrier?.team} alive ${carrier?.alive} `
+      + `progress ${rules.progressOf?.(carrier?.id)} phase ${rules.phase} bomb ${rules.bomb.state}/${rules.bomb.carrierId} `
+      + `lastRefusal ${JSON.stringify(rules.events.filter((e) => e.kind === 'interactRefused').pop())} `
+      + `snapshots ${A.client.snapshots.length} sawCarrierEntity ${A.client.snapshots.some((sn) => sn.entities.some((x) => x.id === carrier?.id))}`);
   }
 
-  // ── the Bomb event kinds, over a real socket, with §8.8 applied ───────────────────
+  // ── the Bomb event kinds, over a real socket, with §13.3 applied ──────────────────
   {
-    const carrier = game.entityById(rules.bomb.carrierId);
+    const carrier = game.entityById(rules.bomb.carrierId) ?? teamMembers(0)[0];
+    rules.bomb.state = 'carried';
+    rules.bomb.carrierId = carrier.id;
     const sp = game.world.spawnPoints.map((p) => p.position ?? p);
     const DROP = {
       x: Math.fround(sp[0].x + 0.101563), y: Math.fround(sp[0].y + 0.302734), z: Math.fround(sp[0].z + 0.507813),
@@ -662,10 +683,10 @@ console.log('\ncurrent protocol message types over a real socket');
     for (let i = 1; i < sp.length && !blindAt; i++) {
       if (!game.world.losClear({ x: sp[i].x, y: sp[i].y + eyeH, z: sp[i].z }, DROP)) blindAt = sp[i];
     }
-    const defender = game.entityById(B.client.entityId);
-    const attacker = game.entityById(A.client.entityId);
-    defender.position.set(blindAt.x, blindAt.y, blindAt.z);
-    attacker.position.set(DROP.x, DROP.y + 1, DROP.z);      // authorised by role anyway
+    const enemyViewer = game.entityById(B.client.entityId);
+    const teammateViewer = game.entityById(A.client.entityId);
+    enemyViewer.position.set(blindAt.x, blindAt.y, blindAt.z);
+    teammateViewer.position.set(DROP.x, DROP.y + 1, DROP.z);
     carrier.position.set(DROP.x, DROP.y, DROP.z);
     A.frames.length = 0;
     B.frames.length = 0;
@@ -686,10 +707,12 @@ console.log('\ncurrent protocol message types over a real socket');
     };
     const hitsA = scan(A.frames);
     const hitsB = scan(B.frames);
-    if (hitsA.length >= 3) ok(`bombDropped crosses a real socket to an authorised recipient (${hitsA.length} float32 hits)`);
-    else bad('the drop reaches an authorised recipient over a real socket', `${hitsA.length} hits — the control failed`);
-    if (hitsB.length === 0) ok('and the coordinates appear on NO frame a blind defender received, at any offset');
-    else bad('an unauthorised recipient never receives the coordinates over a real socket', hitsB.join('; '));
+    if (hitsA.length >= 3) ok(`bombDropped crosses a real socket to a teammate (${hitsA.length} float32 hits)`);
+    else bad('the drop reaches a teammate over a real socket', `${hitsA.length} hits — the control failed`);
+    // bomb-rules §13.3: the dropped bomb is the NEUTRAL objective — the blind enemy is
+    // served the coordinates too. LOS no longer gates it.
+    if (hitsB.length >= 3) ok('and a blind ENEMY receives them too — the neutral objective is public to both teams (§13.3)');
+    else bad('a blind enemy receives the neutral drop over a real socket (§13.3)', `${hitsB.length} hits`);
     const evA = A.client.snapshots.flatMap((s) => s.events).find((e) => e.kind === 'bombDropped');
     if (evA) ok(`and the real NetClient decoded it as ${evA.kind} at (${evA.x.toFixed(2)}, ${evA.y.toFixed(2)}, ${evA.z.toFixed(2)})`);
     else bad('an authorised client decodes bombDropped from the socket', 'no event arrived');
@@ -697,8 +720,8 @@ console.log('\ncurrent protocol message types over a real socket');
 
   // ── MSG_OUTCOME, over a real socket ───────────────────────────────────────────────
   {
-    const attackingTeam = rules.attackingTeam;
-    for (const e of teamMembers(rules.defendingTeam)) {
+    // §13.5 pre-plant: wipe team 1 → team 0 (alpha) wins by elimination.
+    for (const e of teamMembers(1)) {
       game.bus.emit('kill', { victim: e, attacker: null, weaponId: 'ar_vector', headshot: false, distance: 12 });
     }
     await step(12);
@@ -711,7 +734,7 @@ console.log('\ncurrent protocol message types over a real socket');
       else bad('MSG_OUTCOME is 32 bytes on the wire', `${outFrames[0].byteLength}`);
       if (o.scope === 'round') ok('and decodes as a round outcome');
       else bad('the outcome names its scope', `${o.scope}`);
-      if (o.winnerTeam === (attackingTeam === 0 ? 'alpha' : 'bravo')) ok(`and names the winner (${o.winnerTeam})`);
+      if (o.winnerTeam === 'alpha') ok(`and names the winner (${o.winnerTeam})`);
       else bad('the outcome names the winner', `${o.winnerTeam}`);
       if (o.reason === 'elimination') ok('and why they won');
       else bad('the outcome names the reason', `${o.reason}`);

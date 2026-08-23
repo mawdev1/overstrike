@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 2.1.0 |
+| **Version** | 2.2.0 — §4.1 amended for `bomb-rules.md` 2.0.0 (symmetric demolition): per-round `roles` → `homeSites`, per-round `winner` admits `draw`, player `role` emitted `null` |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Match server, platform, profile/stats, Admin Portal, [CX] scoreboard and career screens |
 
@@ -150,7 +150,7 @@ The previous placeholder comment was not buildable. Exact, every key required:
 "players": [ {
   "accountId": "…", "displayName": "…",
   "team": "alpha|bravo",
-  "role": "attacker|defender|null",      // starting role; rounds carry per-round roles
+  "role": "attacker|defender|null",      // null under bomb-rules 2.0.0 §13 — no starting sides
   "kills": 0, "deaths": 0, "assists": 0, "suicides": 0, "teamKills": 0,
   "headshots": 0, "shotsFired": 0, "shotsHit": 0, "damageDealt": 0,
   "plants": 0, "defuses": 0,
@@ -163,10 +163,10 @@ The previous placeholder comment was not buildable. Exact, every key required:
 
 "rounds": [ {
   "index": 0,
-  "winner": "alpha|bravo",
+  "winner": "alpha|bravo|draw",          // draw: bomb-rules 2.0.0 §13.5.3 (timer expiry / mutual wipe)
   "reason": "elimination|defuse|detonation|timer",
   "startedAt": "…", "endedAt": "…",
-  "roles": { "alpha": "attacker|defender", "bravo": "attacker|defender" },
+  "homeSites": { "alpha": "A|B", "bravo": "A|B" },   // distinct; the site each team DEFENDS
   "plant":  { "accountId": "…", "site": "A|B", "at": "…" } | null,
   "defuse": { "accountId": "…", "at": "…" } | null
 } ]
@@ -181,9 +181,11 @@ this sentence used to contradict. Per-player win/loss is derived from
 `winnerTeam` and the player's team; it is not stored per player, because storing it twice
 means it can disagree with itself.
 
-`roles` is per round because the side switch means a player attacks in some rounds and defends
-in others. Deriving it from the starting role plus the switch point works right up until the
-switch rule changes, and then every historical match silently reinterprets.
+`homeSites` (2.2.0, from `bomb-rules.md` 2.0.0 §13.7 — it replaces the per-round `roles` of
+2.1.0 and earlier, since symmetric demolition has no attackers) is per round for the same
+reason roles were: the side switch swaps home sites, and deriving the assignment from a
+starting value plus the switch point works right up until the switch rule changes, and then
+every historical match silently reinterprets. The two sites must be distinct.
 
 Objective actors (`plant.accountId`, `defuse.accountId`) are always present in the stored
 record. Whether they are **returned** depends on the projection rule in §4.2.

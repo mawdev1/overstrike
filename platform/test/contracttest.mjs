@@ -192,7 +192,7 @@ function bombResult(matchId, alpha, bravo, over = {}) {
     rounds: [{
       index: 0, winner: 'alpha', reason: 'defuse',
       startedAt: T0, endedAt: T1,
-      roles: { alpha: 'attacker', bravo: 'defender' },
+      homeSites: { alpha: 'B', bravo: 'A' },
       plant: { accountId: alpha.accountId, site: 'A', at: T0 },
       defuse: { accountId: bravo.accountId, at: T1 },
     }],

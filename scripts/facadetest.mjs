@@ -230,7 +230,10 @@ equal(spectatorPolicyFor('roundEnd', false).canUseTeamChat, true, 'round-end pol
 console.log('\n── authoritative held Bomb command seam');
 const ruleCalls = [];
 const rules = {
-  attackingTeam: 0,
+  // bomb-rules §13.4/§13.10: the referee owns the meaning of the held key — the server
+  // asks `interactKindFor(entity)` instead of deriving plant/defuse from a role. This
+  // fake mimics "the enemy's plant sits at team 1's home": team 1 defuses, team 0 plants.
+  interactKindFor: (entity) => (entity.team === 1 ? 'defuse' : 'plant'),
   requestInteract: (entity, kind) => ruleCalls.push(`request:${entity.id}:${kind}`),
   releaseInteract: (entity) => ruleCalls.push(`release:${entity.id}`),
 };
@@ -255,10 +258,10 @@ const command = {
   baseYaw: 0, basePitch: 0, deltaYaw: 0, deltaPitch: 0,
 };
 server._applyCommand(serverSession, command);
-equal(ruleCalls.at(-1), 'request:44:plant', 'server derives plant from authoritative attacking team');
+equal(ruleCalls.at(-1), 'request:44:plant', 'server asks the referee for the held key\'s meaning — a plant here (§13.4)');
 entity.team = 1;
 server._applyCommand(serverSession, command);
-equal(ruleCalls.at(-1), 'request:44:defuse', 'server derives defuse from authoritative defending team');
+equal(ruleCalls.at(-1), 'request:44:defuse', 'and a defuse for the site owner, from the same seam (§13.4)');
 server._applyCommand(serverSession, { ...command, interactHeld: false });
 equal(ruleCalls.at(-1), 'release:44', 'released command cancels server progress');
 // And the edge on its own — still `true` in `command` — is not a hold and never was.

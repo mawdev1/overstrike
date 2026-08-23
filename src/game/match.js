@@ -797,8 +797,18 @@ export class Match {
 
   get roundNumber() { return this.roundIndex + 1; }
 
-  get attackingTeam() { return this.bombRules ? this.bombRules.attackingTeam : (this._bombView.attackingTeam ?? 0); }
+  /**
+   * bomb-rules §13: symmetric demolition has NO attacking team — the ruleset serves null,
+   * and consumers derive home-site ownership from `bombRules.homeSites` / the handoff's
+   * site order + round index (§13.1). The setter still stages a value for harnesses that
+   * fake pre-2.0.0 frames on a match with no ruleset loaded.
+   */
+  get attackingTeam() { return this.bombRules ? null : (this._bombView.attackingTeam ?? 0); }
   set attackingTeam(v) { this._bombView.attackingTeam = v; }
+
+  /** §13.1 this round's home-site assignment `{ '0': siteId, '1': siteId }`, or null. */
+  get homeSites() { return this.bombRules ? this.bombRules.homeSites : (this._bombView.homeSites ?? null); }
+  set homeSites(v) { this._bombView.homeSites = v; }
 
   /** True once the §2 side switch has happened, i.e. from round 7 on. */
   get sideSwitched() { return this.bombRules ? this.bombRules.sideSwitched : !!this._bombView.sideSwitched; }

@@ -1,10 +1,11 @@
-import { createRNG } from '../core/rng.js';
 import { FIXED_DT } from '../core/mathUtils.js';
 
 /**
- * OVERSTRIKE — the Bomb ruleset.
+ * OVERSTRIKE — the Bomb ruleset: SYMMETRIC demolition (bomb-rules.md v2.0.0, §13).
  *
- * Implements `docs/contracts/bomb-rules.md` v1.7.0. Every rule below cites the section it
+ * One neutral bomb spawns at the map's neutral point each round; either team may pick it
+ * up. Each team has a HOME site it defends (and alone may defuse at) and a TARGET site —
+ * the enemy's home — where alone it may plant. Every rule below cites the section it
  * comes from; if this file and the contract disagree, the contract wins and this file is
  * the bug.
  *
@@ -14,8 +15,9 @@ import { FIXED_DT } from '../core/mathUtils.js';
  *     displays what comes back. Preconditions, accumulation and interruption all happen
  *     here (§6, §7). There is no client-side prediction of objective progress.
  *  2. **Deterministic.** Every duration is an integer count of 1/120 s steps, never a
- *     float accumulated across frames, and the only randomness is a per-round stream
- *     derived from the match seed (§3). No `Math.random`, no wall clock.
+ *     float accumulated across frames, and the ruleset draws no randomness at all — the
+ *     §13.2 neutral spawn removed the old per-round carrier draw. No `Math.random`,
+ *     no wall clock.
  *  3. **One ordered resolution.** All win conditions are evaluated once per step, in the
  *     order §4 states, by `_resolve()` — never by whichever event handler happens to run
  *     first. That is the whole point of §4 having a precedence list.
@@ -62,6 +64,12 @@ export const REFUSE = Object.freeze({
   released: 'released',
   roundOver: 'roundOver',
   disconnected: 'disconnected',
+  /**
+   * §13.4 planting at your OWN home site. Internal (ruleset-local) reason only: on the
+   * wire it maps to the existing `not-eligible` (`RULESET_REFUSAL_REASON`, server.js) so
+   * the positional `REFUSAL_REASONS` enum does not grow and `PROTOCOL_VERSION` stays put.
+   */
+  wrongSite: 'wrongSite',
 });
 
 /** Pickup range for a dropped bomb (§5 "contact-range"). Metres. */
@@ -90,7 +98,7 @@ export function resolveMapManifest(game) {
     ?? null;
 }
 
-const VALID_KINDS = new Set(['plant', 'defuse', 'zone']);
+const VALID_KINDS = new Set(['plant', 'defuse', 'zone', 'bombSpawn']);
 
 function checkBox(box, where) {
   if (!box || typeof box !== 'object') throw new Error(`${where}: objective has no box`);
@@ -126,7 +134,7 @@ export function compileObjectives(manifest) {
     if (seenIds.has(o.id)) throw new Error(`bomb: duplicate objective id "${o.id}"`);
     seenIds.add(o.id);
     if (!VALID_KINDS.has(o.kind)) throw new Error(`bomb: objective "${o.id}" has unknown kind "${o.kind}"`);
-    if (o.kind === 'zone') continue;
+    if (o.kind === 'zone' || o.kind === 'bombSpawn') continue;
     if (typeof o.site !== 'string' || o.site === '') throw new Error(`bomb: objective "${o.id}" names no site`);
     const box = checkBox(o.box, `bomb: objective "${o.id}"`);
     let row = sites.get(o.site);
@@ -151,8 +159,77 @@ export function compileObjectives(manifest) {
     // §3.3: "if defuse is omitted it defaults to the plant volume".
     if (!row.defuse) { row.defuse = row.plant; row.defuseId = row.plantId; }
   }
+  // §13.1: symmetric demolition needs exactly two plant sites — one home per team. Any
+  // other count is refused at match start, loudly, same policy as no sites at all.
+  if (sites.size !== 2) {
+    throw new Error(`bomb: symmetric demolition requires exactly two plant sites, manifest declares ${sites.size} (bomb-rules §13.1)`);
+  }
   // Sorted so iteration order never depends on manifest authoring order.
   return new Map([...sites.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+}
+
+/** Full geometric centre of a §3.3 box. */
+function boxCentre(box) {
+  return {
+    x: (box.min.x + box.max.x) / 2,
+    y: (box.min.y + box.max.y) / 2,
+    z: (box.min.z + box.max.z) / 2,
+  };
+}
+
+const finiteVec3 = (p) => !!p && Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z);
+
+/**
+ * §13.2 the neutral bomb spawn point.
+ *
+ * Declared: the manifest's `bombSpawn` point (the `src/world/world.js` reader publishes it
+ * with `provenance.bombSpawn: 'declared'`), or an objective of kind `bombSpawn` (a point, or
+ * a box whose centre is used) for manifests handed to the ruleset directly by a harness.
+ *
+ * Derived default: the midpoint of the TWO PLANT-VOLUME CENTRES — not the bounds centre,
+ * because "middle of the map" in play terms is the point equidistant from the two things
+ * being fought over.
+ *
+ * @returns {{ point: {x:number,y:number,z:number}, provenance: 'declared'|'derived' }}
+ */
+export function resolveBombSpawn(manifest, sites) {
+  if (finiteVec3(manifest?.bombSpawn)) {
+    const p = manifest.bombSpawn;
+    // The world.js reader may itself have DERIVED this midpoint; its provenance rides
+    // along so the ruleset reports the §13.2 fact, not merely "the field was present".
+    const provenance = manifest.provenance?.bombSpawn === 'derived' ? 'derived' : 'declared';
+    return { point: { x: p.x, y: p.y, z: p.z }, provenance };
+  }
+  if (Array.isArray(manifest?.objectives)) {
+    for (const o of manifest.objectives) {
+      if (!o || o.kind !== 'bombSpawn') continue;
+      if (finiteVec3(o.point)) return { point: { x: o.point.x, y: o.point.y, z: o.point.z }, provenance: 'declared' };
+      if (o.box) return { point: boxCentre(checkBox(o.box, `bomb: bombSpawn "${o.id}"`)), provenance: 'declared' };
+    }
+  }
+  const [a, b] = [...sites.values()];
+  const ca = boxCentre(a.plant);
+  const cb = boxCentre(b.plant);
+  return {
+    point: { x: (ca.x + cb.x) / 2, y: (ca.y + cb.y) / 2, z: (ca.z + cb.z) / 2 },
+    provenance: 'derived',
+  };
+}
+
+/**
+ * §13.1 initial home-site assignment: sorted site ids, site[0] → team 0's home. A manifest
+ * MAY override with `homeSites: { '0': siteId, '1': siteId }` (both present, distinct,
+ * valid); a malformed override is refused loudly rather than half-honoured.
+ */
+export function resolveHomeSites(manifest, siteIds) {
+  const o = manifest?.homeSites;
+  if (o == null) return [siteIds[0], siteIds[1]];
+  const a = o['0'] ?? o[0];
+  const b = o['1'] ?? o[1];
+  if (!siteIds.includes(a) || !siteIds.includes(b) || a === b) {
+    throw new Error(`bomb: manifest homeSites override is malformed (${JSON.stringify(o)}) — needs both teams mapped to the two distinct site ids (§13.1)`);
+  }
+  return [a, b];
 }
 
 function inBox(box, p) {
@@ -182,6 +259,17 @@ export class BombRules {
     this.manifest = opts.manifest ?? resolveMapManifest(this.game);
     this.sites = compileObjectives(this.manifest);
     this.siteIds = [...this.sites.keys()];
+    /** §13.2 the neutral spawn point (+ where it came from). */
+    const spawn = resolveBombSpawn(this.manifest, this.sites);
+    this.bombSpawn = spawn.point;
+    this.bombSpawnProvenance = spawn.provenance;
+    /**
+     * §13.1 first-half home sites: `_homeBase[team]` is the site that team DEFENDS before
+     * the side switch. The published `homeSites` getter derives the current assignment from
+     * this plus `sideSwitched`, so ownership is derivable by any consumer from facts already
+     * on the wire (site order, roundIndex, sideSwitchAfterRound).
+     */
+    this._homeBase = resolveHomeSites(this.manifest, this.siteIds);
 
     /** §3 `warmup → freeze → live → [planted] → roundEnd → freeze → … → matchEnd` */
     this.phase = 'warmup';
@@ -191,15 +279,16 @@ export class BombRules {
     /** 0-based index of the round being played. `roundNumber` is this + 1. */
     this.roundIndex = 0;
     this.roundWins = [0, 0];
-    this.attackingTeam = 0;
     this.rounds = [];
     this.series = null;              // set once, at matchEnd
+    /** §13.5 which team planted THIS round's bomb, or null while nothing is planted. */
+    this.plantedByTeam = null;
 
-    /** §5 the bomb object. `state` ∈ carried | dropped | planted | defused | detonated */
+    /** §5/§13.2 the bomb object. `state` ∈ carried | dropped | planted | defused | detonated */
     this.bomb = {
-      state: 'carried', carrierId: -1, siteId: null,
-      position: { x: 0, y: 0, z: 0 },
-      lastValid: { x: 0, y: 0, z: 0 },
+      state: 'dropped', carrierId: -1, siteId: null,
+      position: { ...this.bombSpawn },
+      lastValid: { ...this.bombSpawn },
     };
 
     /** entity id → { kind, ticks, site } — server-side objective progress (§6, §7) */
@@ -243,7 +332,27 @@ export class BombRules {
 
   // ───────────────────────────────────────────────────────────────────── small accessors
 
-  get defendingTeam() { return this.attackingTeam === 0 ? 1 : 0; }
+  /**
+   * §13.1 THIS round's home-site assignment, `{ '0': siteId, '1': siteId }`. The §2 side
+   * switch after round 6 swaps home sites instead of swapping attack/defense.
+   */
+  get homeSites() {
+    const s = this.sideSwitched;
+    return { 0: this._homeBase[s ? 1 : 0], 1: this._homeBase[s ? 0 : 1] };
+  }
+
+  /** The site this team defends — and the only one it may defuse at (§13.4). */
+  homeSiteOf(team) { return this.homeSites[team]; }
+
+  /** The enemy's home — the only site this team may plant at (§13.4). */
+  targetSiteOf(team) { return this.homeSites[team === 0 ? 1 : 0]; }
+
+  /** Which team owns (defends) this site THIS round, or -1 for an unknown site. */
+  siteOwner(siteId) {
+    const h = this.homeSites;
+    return h[0] === siteId ? 0 : h[1] === siteId ? 1 : -1;
+  }
+
   get roundNumber() { return this.roundIndex + 1; }
   get planted() { return this.phase === 'planted'; }
   get liveRound() { return this.phase === 'live' || this.phase === 'planted'; }
@@ -363,17 +472,6 @@ export class BombRules {
 
   // ───────────────────────────────────────────────────────────────────────── round phases
 
-  /**
-   * Per-round RNG (§5 bomb spawn). Derived from the match seed and the round index rather
-   * than drawn from `game.rng`: the shared stream is also consumed by respawn jitter and
-   * bot behaviour, so taking a draw from it would make the carrier depend on how many
-   * bots happened to die last round. Same seed must mean the same match.
-   */
-  _roundRng() {
-    const seed = ((this.game.matchSeed >>> 0) ^ Math.imul(0x9e3779b9, this.roundIndex + 1)) >>> 0;
-    return createRNG(seed);
-  }
-
   /** §3 freeze: roster locked, movement restricted, round timer paused. */
   beginFreeze() {
     this.phase = 'freeze';
@@ -406,30 +504,31 @@ export class BombRules {
       this.match.spawner.spawnEntity(e);
     }
 
-    this._giveBombToRandomAttacker();
+    this._placeNeutralBomb();
     this._flushDeferredChat();
     this._emit('roundStart', {
-      attackingTeam: this.attackingTeam,
+      homeSites: { ...this.homeSites },
       roundWins: [this.roundWins[0], this.roundWins[1]],
     });
   }
 
-  /** §5 spawn: one random eligible attacker at freeze. */
-  _giveBombToRandomAttacker() {
-    const rng = this._roundRng();
-    const eligible = this._roster().filter((e) => e.team === this.attackingTeam && this.isConnected(e.id));
-    this.bomb.state = 'carried';
+  /**
+   * §13.2 neutral spawn: at every freeze the ONE bomb sits `dropped`, carrier-less, at the
+   * declared/derived neutral point. Nobody starts carrying it; pickup opens at `live`, so
+   * the round opens with a fair race. `lastValid` initialises to the spawn point so §5
+   * out-of-bounds recovery can never lose the bomb before first pickup.
+   */
+  _placeNeutralBomb() {
+    this.bomb.state = 'dropped';
+    this.bomb.carrierId = -1;
     this.bomb.siteId = null;
-    if (eligible.length === 0) {
-      // No attacker to carry it: it sits at the site-neutral origin until one connects.
-      this.bomb.carrierId = -1;
-      this.bomb.state = 'dropped';
-      return;
-    }
-    const carrier = eligible[rng.int(eligible.length)];
-    this.bomb.carrierId = carrier.id;
-    this._setBombPosition(carrier.position);
-    this._emit('bombPickedUp', { entityId: carrier.id, reason: 'roundStart' });
+    this.plantedByTeam = null;
+    this.bomb.position.x = this.bombSpawn.x;
+    this.bomb.position.y = this.bombSpawn.y;
+    this.bomb.position.z = this.bombSpawn.z;
+    this.bomb.lastValid.x = this.bombSpawn.x;
+    this.bomb.lastValid.y = this.bombSpawn.y;
+    this.bomb.lastValid.z = this.bombSpawn.z;
   }
 
   _setBombPosition(p) {
@@ -450,7 +549,7 @@ export class BombRules {
     this.phase = 'live';
     this.phaseTicks = 0;
     this.roundTicks = 0;
-    this._emit('liveStart', { attackingTeam: this.attackingTeam });
+    this._emit('liveStart', { homeSites: { ...this.homeSites } });
   }
 
   // ────────────────────────────────────────────────────────────────────────── the step
@@ -537,14 +636,14 @@ export class BombRules {
     }
   }
 
-  /** §5 carrier tracking, drop recovery, pickup, out-of-bounds return. */
+  /** §5/§13.3 carrier tracking, drop recovery, pickup, out-of-bounds return. */
   _updateBomb() {
     if (this.bomb.state === 'carried') {
       const carrier = this._entity(this.bomb.carrierId);
       // `_actingThisTick`: a carrier killed earlier in this tick still holds it until
       // `_commitDeaths`, so a plant completing on the tick they die is not refused for
       // `notCarrying` (§4). Their death drops it moments later, in the same tick.
-      if (!carrier || !this._actingThisTick(carrier) || carrier.team !== this.attackingTeam) {
+      if (!carrier || !this._actingThisTick(carrier)) {
         this._dropBomb(carrier, 'carrierLost');
       } else {
         this._setBombPosition(carrier.position);
@@ -559,16 +658,20 @@ export class BombRules {
       this.bomb.position.z = this.bomb.lastValid.z;
       this._emit('bombRecovered', {});
     }
-    // Pickup: any attacker, contact range, no cast time. Defenders cannot (§5).
+    // §13.3 pickup: any LIVING PLAYER OF EITHER TEAM, contact range, no cast time. A
+    // contested same-tick pickup is deterministic: the NEAREST wins, and an exact distance
+    // tie resolves to the LOWEST entity id — the roster iterates in id order and the strict
+    // `<` below keeps the first (lowest-id) equal-distance candidate.
     let best = null;
-    let bestD = PICKUP_RANGE_SQ;
+    let bestD = Infinity;
     for (const e of this._roster()) {
-      if (e.team !== this.attackingTeam || !this.isAlive(e)) continue;
+      if (!this.isAlive(e)) continue;
       const dx = e.position.x - this.bomb.position.x;
       const dy = e.position.y - this.bomb.position.y;
       const dz = e.position.z - this.bomb.position.z;
       const d = dx * dx + dy * dy + dz * dz;
-      if (d <= bestD) { bestD = d; best = e; }
+      if (d > PICKUP_RANGE_SQ) continue;
+      if (d < bestD) { bestD = d; best = e; }
     }
     if (best) {
       this.bomb.state = 'carried';
@@ -644,20 +747,36 @@ export class BombRules {
     if (kind === 'plant') {
       if (this.phase === 'planted') return { ok: false, reason: REFUSE.alreadyPlanted };
       if (this.phase !== 'live') return { ok: false, reason: REFUSE.wrongPhase };
-      if (entity.team !== this.attackingTeam) return { ok: false, reason: REFUSE.wrongTeam };
       if (this.bomb.state !== 'carried' || this.bomb.carrierId !== entity.id) {
         return { ok: false, reason: REFUSE.notCarrying };
       }
       const site = this.siteAt(entity.position, 'plant');
       if (!site) return { ok: false, reason: REFUSE.outsideVolume };
+      // §13.4: any living carrier may plant — but only at their TARGET site (the enemy's
+      // home). Planting at your own home site is `wrongSite` (wire: `not-eligible`).
+      if (site.site !== this.targetSiteOf(entity.team)) return { ok: false, reason: REFUSE.wrongSite };
       if (site.requiresGround && entity.grounded === false) return { ok: false, reason: REFUSE.notGrounded };
       return { ok: true, site: site.site };
     }
     if (this.phase !== 'planted') return { ok: false, reason: REFUSE.notPlanted };
-    if (entity.team !== this.defendingTeam) return { ok: false, reason: REFUSE.wrongTeam };
+    // §13.4: the SITE OWNER only — the team whose home the bomb is planted at, which is
+    // always exactly the team that did not plant.
+    if (entity.team !== this.siteOwner(this.bomb.siteId)) return { ok: false, reason: REFUSE.wrongTeam };
     const site = this.sites.get(this.bomb.siteId);
     if (!site || !inBox(site.defuse, entity.position)) return { ok: false, reason: REFUSE.outsideVolume };
     return { ok: true, site: site.site };
+  }
+
+  /**
+   * What a held interact key means for THIS entity right now (§13.10's context-based
+   * gating, server-side): with the enemy's plant at your home, the key is a defuse;
+   * otherwise it is a plant attempt (only ever accepted from the carrier at their target
+   * site — `_validate` still rules).
+   */
+  interactKindFor(entity) {
+    if (this.phase === 'planted' && entity
+      && entity.team === this.siteOwner(this.bomb.siteId)) return 'defuse';
+    return 'plant';
   }
 
   /** The plant volume (map-data §3.3) the point is inside, or null. */
@@ -753,33 +872,43 @@ export class BombRules {
 
   /**
    * The single ordered resolution. Called once per step, after everything that could
-   * change the outcome has been applied. Order is §4's, literally.
+   * change the outcome has been applied. Order is §4's as rewritten by §13.5, literally.
    */
   _resolve() {
     if (this.phase === 'live') {
       // 1. Bomb planted → transition to `planted`. Not a win, a phase change. It is FIRST,
-      //    so a plant completing on the same step as the last attacker's death is a plant,
-      //    and the defenders are not awarded an elimination win for it.
+      //    so a plant completing on the same step as the planter team's last death is a
+      //    plant, and the other team is not awarded an elimination win for it.
       if (this._completed && this._completed.kind === 'plant') {
         this._completePlant(this._completed);
         // fall through into the post-plant order below, on this same step
       } else {
-        if (this.aliveCount(this.attackingTeam) === 0) return this._endRound(this.defendingTeam, 'elimination');
-        if (this.aliveCount(this.defendingTeam) === 0) return this._endRound(this.attackingTeam, 'elimination');
-        if (this.roundTicks >= T.round) return this._endRound(this.defendingTeam, 'timer');
+        const a0 = this.aliveCount(0);
+        const a1 = this.aliveCount(1);
+        // 2. A team fully eliminated → the other team wins (§13.5.2, already symmetric).
+        //    Both wiped on one tick gives the rule to both teams at once, which no
+        //    precedence can break symmetrically — that collision is a drawn round.
+        if (a0 === 0 && a1 === 0) return this._endRound(-1, 'elimination');
+        if (a0 === 0) return this._endRound(1, 'elimination');
+        if (a1 === 0) return this._endRound(0, 'elimination');
+        // 3. §13.5.3 the round timer expiring with no plant is a DRAWN round: paying the
+        //    team in possession would reward grabbing the bomb and hiding.
+        if (this.roundTicks >= T.round) return this._endRound(-1, 'timer');
         return;
       }
     }
     if (this.phase === 'planted') {
-      // 1. Bomb defused → defenders win. First, so it beats both the expiring bomb timer
-      //    and the death of the last defender on the same step (§4 simultaneity).
+      const owner = this.siteOwner(this.bomb.siteId);
+      const planter = this.plantedByTeam;
+      // 1. Bomb defused → the SITE OWNER wins. First, so it beats both the expiring bomb
+      //    timer and the death of the owner's last player on the same step (§4 simultaneity).
       if (this._completed && this._completed.kind === 'defuse') return this._completeDefuse(this._completed);
-      // 2. Bomb timer expires → attackers win.
-      if (this.bombTicks >= T.bomb) return this._endRound(this.attackingTeam, 'detonation');
-      // 3. All defenders eliminated → attackers win; the bomb still detonates for show.
-      if (this.aliveCount(this.defendingTeam) === 0) return this._endRound(this.attackingTeam, 'elimination');
-      // 4. All attackers eliminated does NOT win for the defenders. Deliberate no-op —
-      //    the bomb is planted and they must defuse it (§4, the load-bearing rule).
+      // 2. Bomb timer expires → the planting team wins.
+      if (this.bombTicks >= T.bomb) return this._endRound(planter, 'detonation');
+      // 3. Site owner fully eliminated → the planting team wins; the bomb still detonates.
+      if (this.aliveCount(owner) === 0) return this._endRound(planter, 'elimination');
+      // 4. The PLANTING team fully eliminated does NOT win for the site owner. Deliberate
+      //    no-op — the bomb is planted and they must defuse it (§13.5.4, the load-bearing rule).
     }
   }
 
@@ -790,6 +919,8 @@ export class BombRules {
     this.bomb.state = 'planted';
     this.bomb.siteId = completed.site;
     const planter = this._entity(completed.actorId);
+    // §13.5: the planting team is recorded at the plant, not re-derived from a corpse later.
+    this.plantedByTeam = planter?.team === 1 ? 1 : 0;
     if (planter) this._setBombPosition(planter.position);
     this.bomb.carrierId = -1;
     this._progress.clear();
@@ -805,7 +936,7 @@ export class BombRules {
     this.statsFor(completed.actorId).defuses++;
     this.match.awardObjective?.(this._entity(completed.actorId), 'defuse');
     this._emit('defuseComplete', { entityId: completed.actorId, site: this.bomb.siteId });
-    this._endRound(this.defendingTeam, 'defuse');
+    this._endRound(this.siteOwner(this.bomb.siteId), 'defuse');
   }
 
   /** §10 clutch: a team that dropped to one living player against two or more. */
@@ -843,32 +974,36 @@ export class BombRules {
         x: this.bomb.position.x, y: this.bomb.position.y, z: this.bomb.position.z,
       });
     }
-    // 3. Record.
+    // 3. Record. A drawn round (§13.5.3 / §13.6) is `winnerTeam: -1`: it appends to
+    //    `rounds[]` and counts toward `maxRounds`, but moves no `roundWins`, pays no
+    //    `roundWin` and no clutch.
     const alive = this.aliveCounts();
-    const clutch = this._clutch[winnerTeam];
+    const clutch = winnerTeam >= 0 ? this._clutch[winnerTeam] : null;
     const record = {
       round: this.roundNumber,
       winnerTeam,
       reason,
-      attackingTeam: this.attackingTeam,
+      homeSites: { ...this.homeSites },
+      plantedByTeam: this.plantedByTeam,
       planted: this.bomb.siteId !== null,
       site: this.bomb.siteId,
-      aliveAttackers: alive[this.attackingTeam],
-      aliveDefenders: alive[this.defendingTeam],
+      alive: [alive[0], alive[1]],
       clutchBy: clutch ? clutch.id : -1,
       endedAtTick: this.match._elapsedTicks,
     };
     this.rounds.push(record);
-    this.roundWins[winnerTeam]++;
-    // The referee's team score IS the round score in Bomb — the HUD, the scoreboard and
-    // `MSG_MATCHSTATE` all read `match.scores`, and a Bomb match that left it at 0-0 would
-    // replicate a blank scoreline while the round record said 4-2.
-    this.match.scores[winnerTeam] = this.roundWins[winnerTeam];
-    // 4. Pay.
-    for (const e of this._roster()) {
-      if (e.team === winnerTeam) this.match.awardObjective?.(e, 'roundWin');
+    if (winnerTeam >= 0) {
+      this.roundWins[winnerTeam]++;
+      // The referee's team score IS the round score in Bomb — the HUD, the scoreboard and
+      // `MSG_MATCHSTATE` all read `match.scores`, and a Bomb match that left it at 0-0 would
+      // replicate a blank scoreline while the round record said 4-2.
+      this.match.scores[winnerTeam] = this.roundWins[winnerTeam];
+      // 4. Pay.
+      for (const e of this._roster()) {
+        if (e.team === winnerTeam) this.match.awardObjective?.(e, 'roundWin');
+      }
+      if (clutch) this.match.awardObjective?.(this._entity(clutch.id), 'clutch');
     }
-    if (clutch) this.match.awardObjective?.(this._entity(clutch.id), 'clutch');
     // 5. Freeze the round.
     this.phase = 'roundEnd';
     this.phaseTicks = 0;
@@ -890,11 +1025,19 @@ export class BombRules {
     if (this.roundWins[1] >= BOMB_PARAMS.roundsToWin) {
       return this._endMatch(1, 'roundsToWin', { outcomeReason: decidingReason });
     }
-    if (this.roundIndex >= BOMB_PARAMS.maxRounds) return this._endMatch(-1, 'draw');
-    // §2.1a side switch after round 6, so each side plays 6 attacking and 6 defending.
+    if (this.roundIndex >= BOMB_PARAMS.maxRounds) {
+      // §13.6: draws can eat rounds, so 7 is no longer guaranteed reachable by round 12.
+      // Unequal round wins after regulation → the team with more wins takes the match,
+      // `reason: 'roundWins'`. Equal wins (6-6, 5-5, …) → draw, as today.
+      if (this.roundWins[0] !== this.roundWins[1]) {
+        return this._endMatch(this.roundWins[0] > this.roundWins[1] ? 0 : 1, 'roundWins');
+      }
+      return this._endMatch(-1, 'draw');
+    }
+    // §2/§13.1 side switch after round 6: the teams SWAP HOME SITES (the `homeSites`
+    // getter derives it from `sideSwitched`), so each team defends each site for 6 rounds.
     if (this.roundIndex === BOMB_PARAMS.sideSwitchAfterRound) {
-      this.attackingTeam = this.defendingTeam;
-      this._emit('sideSwitch', { attackingTeam: this.attackingTeam });
+      this._emit('sideSwitch', { homeSites: { ...this.homeSites } });
     }
     this.beginFreeze();
   }
@@ -1084,7 +1227,8 @@ export class BombRules {
       phase: this.phase,
       roundNumber: this.roundNumber,
       roundIndex: this.roundIndex,
-      attackingTeam: this.attackingTeam,
+      homeSites: { ...this.homeSites },
+      plantedByTeam: this.plantedByTeam,
       roundWins: [this.roundWins[0], this.roundWins[1]],
       phaseTicks: this.phaseTicks,
       roundTicks: this.roundTicks,

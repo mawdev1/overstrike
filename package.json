@@ -61,7 +61,7 @@
     "navbake": "node scripts/navbake.mjs",
     "navbake:check": "node scripts/navbake.mjs --check",
     "mapbalance": "node scripts/mapbalance.mjs",
-    "siteoutcome": "node scripts/siteoutcome.mjs --matches=200 --strict",
+    "siteoutcome": "node scripts/siteoutcome.mjs --matches=200",
     "spawnbalance": "node scripts/mapbalance.mjs --spawn-only",
     "vertprobe": "node scripts/vertprobe.mjs",
     "feedbacktest": "node scripts/feedbacktest.mjs",

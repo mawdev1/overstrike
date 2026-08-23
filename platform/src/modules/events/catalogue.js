@@ -85,6 +85,18 @@ export const CATALOGUE = new Map([
   def('deployment.snapshot.issued',   [1], ['service'],                      ['match'],   'internal', 'standard'),
   def('deployment.snapshot.consumed', [1], ['service'],                      ['match'],   'internal', 'audit'),
   def('deployment.snapshot.rejected', [1], ['service'],                      ['match'],   'internal', 'audit'),
+
+  // progression-economy.md §10 (P4-04, additive, same pending-amendment posture as item.created/
+  // deployment.* above). `op` is deliberately its own domain, not `progression` — a consumer
+  // filtering for "every currency movement" subscribes to one prefix (§10's own reasoning,
+  // mirroring `run.*` vs `extraction.*`). `op.earned` is always service-attributed (an award is
+  // the platform crediting a run outcome, never a player action); `op.spent`/`item.repaired`/
+  // `item.upgraded` are player-attributed (a player-initiated repair/upgrade spend).
+  def('op.earned',               [1], ['service'],  ['account'], 'internal', 'audit'),
+  def('op.spent',                [1], ['player'],   ['account'], 'internal', 'audit'),
+  def('progression.xp.earned',   [1], ['service'],  ['account'], 'internal', 'standard'),
+  def('item.repaired',           [1], ['player'],   ['item'],    'internal', 'standard'),
+  def('item.upgraded',           [1], ['player'],   ['item'],    'internal', 'standard'),
 ]);
 
 /** §5: `<domain>.<entity>.<past-tense-verb>`, lowercase, dot-separated, two or three parts. */

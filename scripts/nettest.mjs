@@ -1292,12 +1292,14 @@ console.log('\nprotocol v3 — the handshake (§8.2, §8.3, §8.4)');
   eq('and never adopts an entity from it', client.entityId, 0);
 }
 
-console.log('\nprotocol v3 — the per-recipient bomb-position filter (§8.6, §8.8)');
+console.log('\nprotocol v3 — the per-recipient bomb-position filter (§8.6, §8.8, bomb-rules §13.3)');
 
 {
-  // THE high-risk part, proved the only way that means anything: by decoding the bytes two
-  // recipients actually receive and asserting they differ. Testing the function that decides
-  // visibility would pass even if the encoder wrote the coordinates for everyone anyway.
+  // bomb-rules §13.3 rewrote this filter's POLICY: a dropped bomb is the NEUTRAL shared
+  // objective, and its position is served to every recipient on a team — line of sight no
+  // longer gates it. Proved the same way the old policy was: by decoding the bytes each
+  // recipient actually receives. The blind/seeing distinction is kept in the fixture so
+  // this test still proves LOS is NOT the filter (both get the coordinates).
   const s = await makeSession({ clients: 3 });
   const [A, B, C] = s.conns;
   const g = s.game;
@@ -1359,52 +1361,43 @@ console.log('\nprotocol v3 — the per-recipient bomb-position filter (§8.6, §
     const db = decodeMatchState(fb);
     const dc = decodeMatchState(fc);
 
-    // Both recipients agree about the PUBLIC facts. This matters: if they differed here the
-    // difference below could be anything, and the filter would prove nothing.
-    eq('attacker and defender agree on the phase', db.phase, da.phase);
+    // Every recipient agrees about the PUBLIC facts.
+    eq('both teams agree on the phase', db.phase, da.phase);
     eq('...on the round index', db.roundIndex, 4);
     eq('...on the scores', `${db.scoreAlpha}-${db.scoreBravo}`, '3-2');
     eq('...on the alive counts', `${db.aliveAlpha}/${db.aliveBravo}`, '3/2');
-    eq('...and on the bomb STATE — only the coordinates are filtered', db.bombState, 'dropped');
-    eq('the attacker is told they are attacking', da.localRole, 'attacker');
-    eq('the defender is told they are defending', db.localRole, 'defender');
+    eq('...and on the bomb STATE', db.bombState, 'dropped');
+    // This is a STAGED pre-2.0.0 frame (a TDM match wearing `modeId: 'bomb'`), so the
+    // legacy role vocabulary still round-trips; a real 2.0.0 ruleset serves 'none'.
+    eq('a staged pre-2.0.0 frame still round-trips the team-0 role', da.localRole, 'attacker');
+    eq('...and the team-1 role', db.localRole, 'defender');
 
-    // The filter itself.
-    eq('the attacker sees the dropped bomb', da.bombPositionVisible, true);
-    if (da.bombPosition
-      && Math.abs(da.bombPosition.x - BOMB.x) < 1e-3
-      && Math.abs(da.bombPosition.y - BOMB.y) < 1e-3
-      && Math.abs(da.bombPosition.z - BOMB.z) < 1e-3) {
-      ok(`and the coordinates are the real ones (${BOMB.x}, ${BOMB.y.toFixed(2)}, ${BOMB.z})`);
-    } else {
-      bad('the authorised recipient gets the real coordinates', JSON.stringify(da.bombPosition));
-    }
-    eq('the defender with no sightline does NOT', db.bombPositionVisible, false);
-    eq('and gets null rather than a position that could be read as the origin', db.bombPosition, null);
-    eq('a defender who CAN see it does', dc.bombPositionVisible, true);
+    // §13.3 — the policy itself: the dropped bomb is the shared neutral objective, and
+    // its coordinates reach EVERY team recipient, sightline or not.
+    const sees = (d, who) => {
+      if (d.bombPositionVisible === true && d.bombPosition
+        && Math.abs(d.bombPosition.x - BOMB.x) < 1e-3
+        && Math.abs(d.bombPosition.y - BOMB.y) < 1e-3
+        && Math.abs(d.bombPosition.z - BOMB.z) < 1e-3) {
+        ok(`${who} is served the real dropped-bomb coordinates (§13.3)`);
+      } else {
+        bad(`${who} is served the dropped bomb`, JSON.stringify(d.bombPosition));
+      }
+    };
+    sees(da, 'a team-0 player');
+    sees(db, 'a team-1 player with NO sightline — LOS no longer gates the neutral objective');
+    sees(dc, 'a team-1 player with a sightline');
 
-    // Two frames, decoded, differing. Byte-level, so this cannot be satisfied by a decoder
-    // that hides a value it was nonetheless sent.
+    // And the two teams' frames differ ONLY where they should: the localRole byte (a
+    // staged-frame artefact), never the coordinates.
     const ba = new Uint8Array(fa);
     const bb = new Uint8Array(fb);
-    let differAt = -1;
-    for (let i = 0; i < MATCHSTATE_BYTES; i++) if (ba[i] !== bb[i]) { differAt = i; break; }
-    if (differAt >= 0) ok(`the two recipients' frames genuinely differ, first at byte ${differAt}`);
-    else bad("two recipients' frames differ", 'the attacker and the blind defender received identical bytes');
-
-    // And the strongest form: the real coordinates are NOWHERE in the unauthorised frame.
-    // Not as the visible triple, not as a stale float left over from another recipient's
-    // encode, not at any offset at all.
-    const dv = new DataView(fb);
-    const wanted = [BOMB.x, BOMB.y, BOMB.z].map((n) => Math.fround(n));
-    let leaked = null;
-    for (let off = 0; off + 4 <= MATCHSTATE_BYTES; off++) {
-      const f = dv.getFloat32(off, true);
-      if (wanted.some((w) => w !== 0 && f === w)) { leaked = { off, f }; break; }
+    let differsOutsideRole = -1;
+    for (let i = 0; i < MATCHSTATE_BYTES; i++) {
+      if (ba[i] !== bb[i] && i !== 3) { differsOutsideRole = i; break; }
     }
-    if (!leaked) ok('the bomb coordinates appear nowhere in the unauthorised frame, at any offset');
-    else bad('an unauthorised recipient never receives the coordinates',
-      `float32 ${leaked.f} at byte ${leaked.off} matches the real bomb position`);
+    if (differsOutsideRole < 0) ok('the two teams receive byte-identical bomb facts — a symmetric objective is symmetric on the wire');
+    else bad('the two teams receive the same bomb facts', `frames differ at byte ${differsOutsideRole}`);
   }
 }
 
@@ -1469,13 +1462,13 @@ console.log('\nprotocol v3 — the per-recipient bomb-position filter (§8.6, §
 }
 
 {
-  // The filter is re-evaluated every frame, not decided once at round start.
+  // The change test covers the TAIL of the frame, not just the public head.
   //
-  // A defender walking into line of sight of a dropped bomb changes NOTHING in the first
-  // twenty-four bytes — same phase, same scores, same bomb state, same everything public.
-  // The only bytes that move are the visibility flag and the three coordinates. A change
-  // test that ignored the tail of the frame would suppress that send, and the player would
-  // walk up to a bomb their client had been told nothing about.
+  // bomb-rules §13.3 made the dropped bomb team-public, so walking into sight no longer
+  // changes anything — the coordinates were never withheld. What still exercises the tail
+  // bytes is the bomb MOVING: same phase, same scores, same bomb state, only the three
+  // coordinate floats change. A change test that ignored the tail of the frame would
+  // suppress that send and the marker would freeze on a stale spot.
   const s = await makeSession({ clients: 1 });
   const c = s.conns[0];
   const g = s.game;
@@ -1498,22 +1491,28 @@ console.log('\nprotocol v3 — the per-recipient bomb-position filter (§8.6, §
   m.attackingTeam = 0;
   m.bomb = { state: 'dropped', carrierId: 0, siteId: null, position: BOMB };
   m.interaction = { kind: 'none', actorId: 0, progress: 0 };
-  c.entity.team = 1;                    // a DEFENDER: authorised only by sight
+  c.entity.team = 1;                    // §13.3: either team is served the neutral drop
   c.entity.alive = true;
 
   c.entity.position.set(blind.x, blind.y, blind.z);
   for (let i = 0; i < 5; i++) { s.server._broadcastMatchState(); c.cT.pump(0); }
-  eq('a blind defender is told nothing about the drop', c.client.matchState?.bombPositionVisible, false);
+  eq('a team viewer with NO sightline is served the neutral drop (§13.3)', c.client.matchState?.bombPositionVisible, true);
   const sentWhileBlind = c.session.stats.matchStates;
   eq('and is told it once, not every tick', sentWhileBlind, 1);
 
+  // Walking into sight now changes NOTHING — the coordinates were never withheld.
   c.entity.position.set(seeing.x, seeing.y, seeing.z);
   s.server._broadcastMatchState();
   c.cT.pump(0);
-  eq('walking into sight sends a new frame', c.session.stats.matchStates, sentWhileBlind + 1);
-  eq('and the position arrives', c.client.matchState?.bombPositionVisible, true);
+  eq('walking into sight resends nothing — sight no longer gates the neutral objective', c.session.stats.matchStates, sentWhileBlind);
+
+  // The bomb MOVING is the change confined to the tail bytes.
+  m.bomb = { state: 'dropped', carrierId: 0, siteId: null, position: { x: BOMB.x + 2, y: BOMB.y, z: BOMB.z } };
+  s.server._broadcastMatchState();
+  c.cT.pump(0);
+  eq('the bomb moving sends a new frame at once', c.session.stats.matchStates, sentWhileBlind + 1);
   if (c.client.matchState?.bombPosition
-    && Math.abs(c.client.matchState.bombPosition.x - BOMB.x) < 1e-3) {
+    && Math.abs(c.client.matchState.bombPosition.x - (BOMB.x + 2)) < 1e-3) {
     ok('with the real coordinates — the change was in the tail of the frame, and was still noticed');
   } else {
     bad('a change confined to the position bytes is detected',
@@ -1729,6 +1728,18 @@ function attach(s, entity, label = 'x') {
   return conn;
 }
 
+/**
+ * bomb-rules §13.2: the bomb now spawns NEUTRAL (`dropped`, carrier -1) at the map's
+ * neutral point — no round starts with a carrier. Tests that need one stage it, the same
+ * fixture-not-behaviour discipline `makeHeldPlantRig` has always used; pickup behaviour
+ * itself is `bombtest.mjs` coverage.
+ */
+function stageCarrier(rules, entity) {
+  rules.bomb.state = 'carried';
+  rules.bomb.carrierId = entity.id;
+  return entity;
+}
+
 /** `match-result.md` team names by index, for asserting what the evidence recorded. */
 const TEAM_NAMES_TEST = ['alpha', 'bravo'];
 
@@ -1738,16 +1749,19 @@ const killVia = (game, victim) => game.bus.emit('kill', { victim, attacker: null
 console.log('\nprotocol v3 — the bomb position on EVERY frame, not just MSG_MATCHSTATE (§8.6, §8.8)');
 
 {
-  // C1. `bombDropped` is in `EV_VEC3` and `EV_SPATIAL`, so it carries the true coordinates in
-  // the snapshot's event block; the only filter there was a 90 m distance cull on a map 88 m
-  // across, which suppresses nothing but opposite-corner pairs. The drop is produced by the
-  // REAL ruleset — a carrier is killed and `_dropBomb` fires — and every frame each recipient
-  // receives is scanned at every offset.
+  // C1, rewritten by bomb-rules §13.3: `bombDropped` still rides `EV_VEC3`/`EV_SPATIAL`
+  // with the true coordinates in the snapshot's event block — but a dropped bomb is now
+  // the NEUTRAL shared objective, so the per-recipient authorisation must serve it to
+  // BOTH teams, sightline or not. The drop is produced by the REAL ruleset and every
+  // frame each recipient receives is scanned at every offset — the same instrument that
+  // used to prove filtering now proves the deliberate publication.
   const s = await makeBombSession();
   const g = s.game;
   const rules = s.rules;
 
-  const carrier = g.entityById(rules.bomb.carrierId);
+  eq('the round opens with a NEUTRAL bomb — no carrier (§13.2)', rules.bomb.carrierId, -1);
+  eq('...lying dropped at the neutral point', rules.bomb.state, 'dropped');
+  const carrier = stageCarrier(rules, teamOf(g, 0)[0]);
   // Deliberately unique coordinates, so a hit in the scan cannot be somebody's own position
   // coinciding with the bomb's. Every value is a float32 nothing else in the world holds.
   const sp = g.world.spawnPoints.map((p) => p.position ?? p);
@@ -1768,15 +1782,15 @@ console.log('\nprotocol v3 — the bomb position on EVERY frame, not just MSG_MA
       `blocked=${!!blindAt} clear=${!!seeingAt} — this test cannot distinguish anything`);
   }
 
-  const attackers = teamOf(g, rules.attackingTeam).filter((e) => e !== carrier);
-  const defenders = teamOf(g, rules.defendingTeam);
-  if (attackers.length === 0 || defenders.length < 2) {
-    bad('the match has an attacker and two defenders to watch', `${attackers.length} / ${defenders.length}`);
+  const teammates = teamOf(g, 0).filter((e) => e !== carrier);
+  const enemies = teamOf(g, 1);
+  if (teammates.length === 0 || enemies.length < 2) {
+    bad('the match has a teammate and two enemies to watch', `${teammates.length} / ${enemies.length}`);
   }
 
-  const A = attach(s, attackers[0], 'attacker');
-  const B = attach(s, defenders[0], 'blind');
-  const C = attach(s, defenders[1], 'seeing');
+  const A = attach(s, teammates[0], 'teammate');
+  const B = attach(s, enemies[0], 'blind');
+  const C = attach(s, enemies[1], 'seeing');
 
   // The drop, from the ruleset itself. `noteDisconnect` is §9's own path into `_dropBomb`,
   // and it runs synchronously — so the bomb lands on exactly the coordinates set above,
@@ -1806,30 +1820,31 @@ console.log('\nprotocol v3 — the bomb position on EVERY frame, not just MSG_MA
   const hitsB = scanAll(B.frames, WANT);
   const hitsC = scanAll(C.frames, WANT);
 
-  // The positive control FIRST. A test that only asserts absence passes when nothing is sent
-  // at all, which is how a scan scoped to one message type proves nothing.
-  if (hitsA.length >= 3) ok(`the scan finds the coordinates when they ARE sent (${hitsA.length} float32 hits in the attacker's frames)`);
-  else bad('the scan can find the coordinates at all', `attacker frames contain ${hitsA.length} hits — the control failed, so absence below means nothing`);
+  // The positive control FIRST: the scan can find the coordinates at all.
+  if (hitsA.length >= 3) ok(`the scan finds the coordinates when they ARE sent (${hitsA.length} float32 hits in the teammate's frames)`);
+  else bad('the scan can find the coordinates at all', `teammate frames contain ${hitsA.length} hits — the control failed, so the claims below mean nothing`);
 
+  // §13.3: the dropped bomb is contestable by both teams, so BOTH enemies get it too —
+  // including the one with no sightline. LOS is no longer the filter.
   const dist = Math.hypot(B.entity.position.x - DROP.x, B.entity.position.y - DROP.y, B.entity.position.z - DROP.z);
-  if (hitsB.length === 0) {
-    ok(`the blind defender, ${dist.toFixed(1)} m away and well inside the ${EVENT_RANGE_M} m cull, receives the coordinates on NO frame at any offset`);
+  if (hitsB.length >= 3) {
+    ok(`the enemy with NO sightline, ${dist.toFixed(1)} m away, receives the drop too — the neutral objective is public to both teams (§13.3)`);
   } else {
-    bad('an unauthorised recipient never receives the bomb coordinates, on any frame',
-      `${hitsB.length} leak(s): ${hitsB.join('; ')}`);
+    bad('a blind enemy receives the neutral drop (§13.3)', `${hitsB.length} hits in their frames`);
   }
-  if (hitsC.length >= 3) ok('a defender who can SEE the drop still gets it — the filter is line of sight, not silence');
-  else bad('an authorised defender receives the drop', `${hitsC.length} hits in the seeing defender's frames`);
+  if (hitsC.length >= 3) ok('and so does the enemy who can see it');
+  else bad('a seeing enemy receives the drop', `${hitsC.length} hits in the seeing enemy's frames`);
 
-  // What the decoders actually made of it, which is what a cheat client would read.
+  // What the decoders actually made of it.
   const evB = B.client.snapshots.flatMap((sn) => sn.events).find((e) => e.kind === 'bombDropped');
-  const evC = C.client.snapshots.flatMap((sn) => sn.events).find((e) => e.kind === 'bombDropped');
-  eq('the blind defender decodes no bombDropped event at all', evB, undefined);
-  if (evC && Math.abs(evC.x - DROP.x) < 1e-6) ok('and the seeing defender decodes the real one');
-  else bad('the authorised defender decodes the drop', JSON.stringify(evC));
-  // And the public half is still public: the STATE says the bomb is down, only the place is filtered.
-  eq('the blind defender is still told the bomb is on the ground', B.client.matchState?.bombState, 'dropped');
-  eq('with no position', B.client.matchState?.bombPosition, null);
+  if (evB && Math.abs(evB.x - DROP.x) < 1e-6) ok('the blind enemy decodes the real bombDropped event');
+  else bad('the blind enemy decodes the drop event', JSON.stringify(evB));
+  eq('and the state agrees the bomb is on the ground', B.client.matchState?.bombState, 'dropped');
+  if (B.client.matchState?.bombPosition && Math.abs(B.client.matchState.bombPosition.x - DROP.x) < 1e-3) {
+    ok('with the coordinates in MSG_MATCHSTATE as well');
+  } else {
+    bad('the blind enemy state message carries the drop position', JSON.stringify(B.client.matchState?.bombPosition));
+  }
 }
 
 console.log('\nprotocol v3 — the ruleset\'s own payload reaches the wire intact (§8.7)');
@@ -1840,23 +1855,25 @@ console.log('\nprotocol v3 — the ruleset\'s own payload reaches the wire intac
   const s = await makeBombSession();
   const g = s.game;
   const rules = s.rules;
-  const carrier = g.entityById(rules.bomb.carrierId);
-  const defender = teamOf(g, rules.defendingTeam)[0];
-  const other = teamOf(g, rules.defendingTeam)[1];
+  const carrier = stageCarrier(rules, teamOf(g, 0)[0]);
+  const refusedOne = teamOf(g, 1)[0];
+  const other = teamOf(g, 1)[1];
 
-  const D = attach(s, defender, 'refused');
+  const D = attach(s, refusedOne, 'refused');
   const O = attach(s, other, 'bystander');
   const A = attach(s, carrier, 'carrier');
 
-  // A defender asking to plant. The ruleset refuses it with its own vocabulary.
-  rules.requestInteract(defender, 'plant');
+  // §13.4: a player who is not the carrier asking to plant. The ruleset refuses it with
+  // its own vocabulary — `notCarrying` now, because BOTH teams may plant and the first
+  // precondition that fails is possession, not side.
+  rules.requestInteract(refusedOne, 'plant');
   const refusal = rules.events.filter((e) => e.kind === 'interactRefused').pop();
-  eq('the ruleset refused the defender', refusal?.reason, 'wrongTeam');
-  eq('and named them with `entityId`, which is the field it has always used', refusal?.entityId, defender.id);
+  eq('the ruleset refused the non-carrier', refusal?.reason, 'notCarrying');
+  eq('and named them with `entityId`, which is the field it has always used', refusal?.entityId, refusedOne.id);
 
   const row = s.server.evidence.of('interactRefused').pop();
-  eq('the evidence row names the actor — it read `entityId`', row?.actorId, defender.id);
-  eq('and their side, looked up server-side', row?.actorTeam, TEAM_NAMES_TEST[rules.defendingTeam]);
+  eq('the evidence row names the actor — it read `entityId`', row?.actorId, refusedOne.id);
+  eq('and their side, looked up server-side', row?.actorTeam, TEAM_NAMES_TEST[1]);
   eq('and what they asked for', row?.requestedKind, 1);
   eq('and the round, converted from the 1-based `round` the producer sends', row?.roundIndex, rules.roundIndex);
 
@@ -1918,7 +1935,7 @@ console.log('\nprotocol v3 — MSG_OUTCOME actually leaves the server (§8.9)');
   const g = s.game;
   const rules = s.rules;
   s.server.evidence.identify({ matchId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' });
-  const watcher = attach(s, teamOf(g, rules.attackingTeam)[0], 'watcher');
+  const watcher = attach(s, teamOf(g, 0)[0], 'watcher');
   const types = {};
   watcher.cT.onMessage((d) => {
     const t = new DataView(d).getUint8(0);
@@ -1927,8 +1944,8 @@ console.log('\nprotocol v3 — MSG_OUTCOME actually leaves the server (§8.9)');
     watcher.client._onMessage(d);
   });
 
-  const attackingTeam = rules.attackingTeam;
-  for (const e of teamOf(g, rules.defendingTeam)) killVia(g, e);
+  // §13.5 pre-plant: a team fully eliminated → the other team wins. Wipe team 1.
+  for (const e of teamOf(g, 1)) killVia(g, e);
   for (let i = 0; i < 8; i++) { s.server.tick(); watcher.cT.pump(0); }
 
   const o = watcher.client.outcome;
@@ -1937,7 +1954,7 @@ console.log('\nprotocol v3 — MSG_OUTCOME actually leaves the server (§8.9)');
       `client saw message types ${JSON.stringify(types)} — MSG_OUTCOME is ${MSG_OUTCOME}`);
   } else {
     eq('the round outcome arrives, decoded', o.scope, 'round');
-    eq('and names the winner', o.winnerTeam, attackingTeam === 0 ? 'alpha' : 'bravo');
+    eq('and names the winner', o.winnerTeam, 'alpha');
     eq('and why', o.reason, 'elimination');
     eq('and the round it belongs to', o.roundIndex, rules.rounds.length - 1);
     eq('and carries the match id', o.matchId, '01ARZ3NDEKTSV4RRFFQ69G5FAV');
@@ -1946,7 +1963,7 @@ console.log('\nprotocol v3 — MSG_OUTCOME actually leaves the server (§8.9)');
   }
 
   // Match scope, via §9 presence: every member of one team disconnects and forfeits.
-  const loser = rules.attackingTeam;
+  const loser = 0;
   for (const e of teamOf(g, loser)) rules.noteDisconnect(e);
   for (let i = 0; i < 8; i++) { s.server.tick(); watcher.cT.pump(0); }
   const m = watcher.client.outcome;
@@ -1983,12 +2000,15 @@ console.log('\nprotocol v3 — the appended interact field carries something (§
   const s = await makeBombSession();
   const g = s.game;
   const rules = s.rules;
-  const carrier = g.entityById(rules.bomb.carrierId);
+  // §13.4: site A is somebody's HOME — only the OTHER team may plant there. Stage the
+  // carrier from the team whose TARGET site is A.
+  const planterTeam = rules.siteOwner('A') === 0 ? 1 : 0;
+  const carrier = stageCarrier(rules, teamOf(g, planterTeam)[0]);
   const site = rules.sites.get('A');
   carrier.position.set((site.plant.min.x + site.plant.max.x) / 2, site.plant.min.y + 0.5,
     (site.plant.min.z + site.plant.max.z) / 2);
   carrier.grounded = true;
-  const watcher = attach(s, teamOf(g, rules.defendingTeam)[0], 'watcher');
+  const watcher = attach(s, teamOf(g, rules.siteOwner('A'))[0], 'watcher');
 
   eq('nothing has assigned entity.objective', carrier.objective, undefined);
 
@@ -2014,7 +2034,17 @@ console.log('\nprotocol v3 — the appended interact field carries something (§
   }
   if (seen.size > 1) ok(`and it MOVES — ${seen.size} distinct values across the plant`);
   else bad('the interact byte changes as progress accumulates', `only ${[...seen].join(',')} ever appeared`);
-  eq('and it agrees with the ruleset it came from', progressed?.progress, rules.progressOf(carrier.id) || progressed?.progress);
+  // Snapshot latency: the last DECODED value can trail the live ruleset by a few ticks
+  // (and the ruleset may have completed/cancelled since), so agreement is within the
+  // snapshot cadence rather than exact.
+  {
+    const live = rules.progressOf(carrier.id) || 0;
+    if (live === 0 || Math.abs(live - (progressed?.progress ?? 0)) <= 8) {
+      ok(`and it agrees with the ruleset it came from (wire ${progressed?.progress}, ruleset ${live})`);
+    } else {
+      bad('the wire quantity tracks the ruleset', `wire ${progressed?.progress} vs ruleset ${live}`);
+    }
+  }
 }
 
 console.log('\nprotocol v3 — the handshake gates allocation (§8.2, §9.5)');
@@ -2172,17 +2202,17 @@ console.log('\nprotocol v3 — the two guards nothing was testing (§4, §8.8)')
   m.interaction = { kind: 'none', actorId: 0, progress: 0 };
 
   c.entity.alive = true;
-  eq('a living defender in line of sight sees the dropped bomb', s.server._canSee(c.entity, BOMB), true);
+  eq('a living viewer in line of sight passes _canSee', s.server._canSee(c.entity, BOMB), true);
   c.entity.alive = false;
-  eq('a DEAD one, standing in the same place, does not', s.server._canSee(c.entity, BOMB), false);
+  eq('a DEAD one, standing in the same place, does not — the guard still protects the CARRIER filter (§8.8)',
+    s.server._canSee(c.entity, BOMB), false);
   const state = readBombMatchState(g);
-  eq('and the state message hides it from them', s.server._matchStateFor(c.session, state, 0).bombPosition, null);
+  // bomb-rules §13.3: the DROPPED bomb is no longer sight-gated — its position is served
+  // to every team recipient, dead or alive; only a team-less viewer gets nothing.
+  eq('yet the state message still serves the dropped bomb to them — §13.3, team-public, not sight-gated',
+    s.server._matchStateFor(c.session, state, 0).bombPosition?.x, BOMB.x);
   c.entity.alive = true;
-  if (s.server._matchStateFor(c.session, state, 0).bombPosition === BOMB) {
-    ok('while a living one is told exactly where it is — so the check is the ONLY difference');
-  } else {
-    bad('a living defender in sight receives the position', 'the two branches are indistinguishable, so the guard proves nothing');
-  }
+  eq('and to the living alike', s.server._matchStateFor(c.session, state, 0).bombPosition?.x, BOMB.x);
 }
 
 {
@@ -2358,11 +2388,12 @@ async function makeHeldPlantRig({ bots = 7 } = {}) {
     z: (box.min.z + box.max.z) / 2,
   });
 
-  // The attacker is the carrier, standing on plant site A. Fixture, not behaviour: this
-  // section is about the KEY, and §6's other preconditions have their own coverage.
+  // The human carrier stands on plant site A — which §13.4 makes legal only for the
+  // team whose TARGET site is A (the team that does NOT own it). Fixture, not
+  // behaviour: this section is about the KEY; preconditions have their own coverage.
   const site = rules.sites.get('A');
   const attacker = await addHuman({
-    team: rules.attackingTeam, position: centreOf(site.plant), label: 'held_plant',
+    team: rules.siteOwner('A') === 0 ? 1 : 0, position: centreOf(site.plant), label: 'held_plant',
   });
   rules.bomb.state = 'carried';
   rules.bomb.carrierId = attacker.entity.id;
@@ -2531,8 +2562,9 @@ const PLANT_TICKS = Math.ceil(3.0 / FIXED_DT);
   eq('a human plant put the round into the planted phase', r.rules.phase, 'planted');
   r.down.delete('interact');
 
+  // §13.4: the defuser is the SITE OWNER — the team whose home site A is.
   const defender = await r.addHuman({
-    team: r.rules.defendingTeam, position: r.centreOf(r.site.defuse), label: 'held_defuse',
+    team: r.rules.siteOwner('A'), position: r.centreOf(r.site.defuse), label: 'held_defuse',
   });
   defender.down.add('interact');
 

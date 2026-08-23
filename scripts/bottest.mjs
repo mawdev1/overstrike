@@ -256,7 +256,10 @@ async function runMatch({ mapId, mode, seed, maxTicks }) {
  * component was not weak, it asserted nothing. `planted` and `site` were absent entirely,
  * which is how a series that planted at A and one that planted at B could digest alike.
  */
-const ROUND_DIGEST_FIELDS = ['round', 'winnerTeam', 'reason', 'attackingTeam', 'planted', 'site'];
+// 2.0.0 symmetric demolition (bomb-rules §13.7): `attackingTeam` no longer exists on the
+// round record — `plantedByTeam` replaces it as the "who was converting" fact, and the
+// digestField guard below is exactly what catches this rename happening again.
+const ROUND_DIGEST_FIELDS = ['round', 'winnerTeam', 'reason', 'plantedByTeam', 'planted', 'site'];
 
 /**
  * One digest field of one record — or a loud marker, recorded in `gaps`, if the record has

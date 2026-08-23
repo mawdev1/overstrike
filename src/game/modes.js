@@ -162,6 +162,9 @@ function seriesOutcomeReason(bomb, series) {
   if (!series) return 'timer';
   if (series.outcomeReason) return series.outcomeReason;
   if (series.reason === 'draw') return 'timer';
+  // §13.6: unequal round wins after 12 rounds (draws having eaten rounds). The fact that
+  // decided the series is regulation running out, and `timer` is the §4.0 reason for that.
+  if (series.reason === 'roundWins') return 'timer';
   if (series.reason === 'roundsToWin') {
     const last = bomb.rounds[bomb.rounds.length - 1]?.reason;
     // Unreachable while `_endRound` is the only writer — it passes one of the four. The
@@ -189,7 +192,7 @@ function seriesWinnerTeam(series, outcomeReason) {
 export const BOMB = {
   id: 'bomb',
   name: 'BOMB',
-  description: 'Attackers plant, defenders defuse. No respawns. First to 7 rounds.',
+  description: 'One neutral bomb. Grab it, plant at the enemy site, defend your own. First to 7 rounds.',
   teamBased: true,
   /**
    * Bomb has no match clock — the round timer and the bomb timer are the only clocks, and
@@ -285,7 +288,9 @@ export const BOMB = {
     result.rounds = bomb.rounds.map((r) => ({ ...r }));
     result.maxRounds = BOMB_PARAMS.maxRounds;
     result.roundsToWin = BOMB_PARAMS.roundsToWin;
-    result.attackingTeam = bomb.attackingTeam;
+    // §13.7: `attackingTeam` is gone from the record; the per-round `homeSites` in
+    // `result.rounds` carries ownership, and this is the CURRENT assignment for the HUD.
+    result.homeSites = { ...bomb.homeSites };
     result.winnerTeam = series ? series.winnerTeam : -1;
     // `reason` stays the raw series reason — the HUD, the round log and bombtest read it.
     // Everything below is the §4.0 projection of that same fact, and the two are kept

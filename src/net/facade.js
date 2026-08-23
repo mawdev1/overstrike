@@ -388,8 +388,11 @@ export class NetFacade {
     const teamIndex = wire?.team === 0 || wire?.team === 1 ? wire.team : null;
     const alive = wire ? !!(wire.flags & F_ALIVE) : false;
     const team = teamIndex === 0 ? 'alpha' : teamIndex === 1 ? 'bravo' : 'unassigned';
-    const alphaRole = handoff.mode === 'bomb' ? (raw.sideSwitched ? 'defender' : 'attacker') : null;
-    const bravoRole = handoff.mode === 'bomb' ? (raw.sideSwitched ? 'attacker' : 'defender') : null;
+    // bomb-rules §13.8: symmetric demolition has no attackers or defenders. The frozen
+    // `role` fields stay in the type and are served null; consumers derive home-site
+    // ownership from `sites` order + `series.sideSwitched` (§13.1), not from a role.
+    const alphaRole = null;
+    const bravoRole = null;
     const phaseEndsAt = raw.phaseRemainingMs > 0 ? this._serverNow + raw.phaseRemainingMs : null;
     const localRole = raw.localRole === 'attacker' || raw.localRole === 'defender'
       ? raw.localRole : null;

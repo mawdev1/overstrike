@@ -1,5 +1,25 @@
 # Contract changelog
 
+## 2026-08-23 — `bomb-rules.md` 2.0.0 (breaking, owner-directed) and `match-result.md` 2.1.0 → 2.2.0 — symmetric demolition (CCR-002)
+
+The owner directive on record ("the bomb starts in the middle of the map … each side has
+their own plant site to defend … if dropped, the other team can pick it up") replaces the
+attacker/defender bomb flow with SOCOM-style symmetric demolition. `bomb-rules.md` carries
+the full amendment as §13: one neutral bomb at a manifest/derived `bombSpawn` point, pickup
+by either team, home/target sites with `wrongSite`/owner-only-defuse eligibility, the drawn
+round on pre-plant timer expiry, and the §13.6 series arithmetic it forces (more wins after
+12 rounds → `reason: roundWins`; equal wins → draw). No mode id changes, no
+`PROTOCOL_VERSION` bump (§13.8).
+
+`match-result.md` 2.2.0 is the §13.7-mandated companion edit, no more: per-round
+`roles: { alpha, bravo }` becomes `homeSites: { alpha: siteId, bravo: siteId }` (distinct),
+per-round `winner` admits `draw`, and the per-player starting `role` is emitted `null`
+(already legal in its frozen type). Enforced by `platform/src/core/store.js`
+(`roundProblems`), produced by `server/result.js`, asserted by `platform/test/storetest.mjs`,
+`matchtest.mjs`, `contracttest.mjs` and `scripts/bombbottest.mjs`. §4.0's series-level
+matrix is untouched: a §13.6 `roundWins` decision projects to `outcomeReason: timer`
+(regulation ran out) with a real winner, a row the matrix always had.
+
 ## 2026-08-22 — `map-data.md` 1.3.0 → 1.4.0 (additive) and `feature-flags.md` 1.2.0 → 1.3.0 — MERIDIAN un-retired into the room offering, by owner decision
 
 The project owner directed that MERIDIAN — retired to a test fixture by §9 — be playable in

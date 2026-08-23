@@ -137,8 +137,6 @@ export class BotManager {
     // Bounded, deterministic evidence for H3.3. These rows describe AI intent only;
     // BombRules.events remains the authority for objective completion.
     this.objectiveLog = [];
-    this._bombPlanRound = -1;
-    this._bombPlanSite = null;
 
     /**
      * Bounded ledger of `Bot._recoverOffGraph` relocations, kept HERE rather than only on
@@ -194,8 +192,6 @@ export class BotManager {
     this._statTimer = 0;
     this.objectiveLog.length = 0;
     this.offGraphLog.length = 0;
-    this._bombPlanRound = -1;
-    this._bombPlanSite = null;
   }
 
   /**
@@ -725,21 +721,6 @@ export class BotManager {
     if (this.objectiveLog.length > OBJECTIVE_LOG_MAX) this.objectiveLog.shift();
   }
 
-  _bombSite(rules) {
-    if (this._bombPlanRound === rules.roundIndex && this._bombPlanSite) {
-      return this._bombPlanSite;
-    }
-    const ids = rules.siteIds;
-    if (!Array.isArray(ids) || ids.length === 0) return null;
-    // One deterministic choice per round. A carrier death does not make the recovering
-    // squad change its mind and run the bomb across the district.
-    const seed = this.game.matchSeed >>> 0;
-    const index = (seed + rules.roundIndex + rules.attackingTeam) % ids.length;
-    this._bombPlanRound = rules.roundIndex;
-    this._bombPlanSite = ids[index];
-    return this._bombPlanSite;
-  }
-
   _teamSlot(bot) {
     let slot = 0;
     for (let i = 0; i < this.bots.length; i++) {
@@ -751,7 +732,44 @@ export class BotManager {
   }
 
   /**
-   * Autonomous Bomb objective layer.
+   * The bot's slot among its LIVING teammates, in roster order. The §13.11 contest/defend
+   * split must be computed over the living — a split over the full roster froze every
+   * survivor into whatever duty the round started them with, and once the contest slots
+   * were all dead a dropped bomb lay untouched while both teams stood at their home sites
+   * running the clock into a §13.5.3 draw. Deterministic: roster order and elimination
+   * state are simulation facts, identical across replays of one seed.
+   */
+  _livingTeamSlot(bot, rules) {
+    let slot = 0;
+    for (let i = 0; i < this.bots.length; i++) {
+      const other = this.bots[i];
+      if (other === bot) return slot;
+      if (other.team === bot.team && other.alive && rules.isAlive(other)) slot++;
+    }
+    return slot;
+  }
+
+  /** §13.11 defend-home: hold the plant volume of the site this team must not lose. */
+  _defendHome(bot, rules) {
+    const homeId = rules.homeSiteOf(bot.team);
+    const home = rules.sites.get(homeId);
+    if (!home) { this._setObjective(bot, 'none', null); return; }
+    this._setObjective(bot, 'defend', homeId);
+    objectiveCentre(home.plant, _v1);
+    bot.moveMode = bot.targetVisible ? 'combat' : 'run';
+    bot.setDestination(_v1, 1.8);
+  }
+
+  /**
+   * Autonomous Bomb objective layer — SYMMETRIC demolition (bomb-rules §13.11).
+   *
+   * The attacker/defender split is gone: every decision derives from the bot's team's HOME
+   * site (defend, defuse) and TARGET site (the enemy's home — the only legal plant), both
+   * published per-round by BombRules (§13.1). Per-team states, all deterministic per
+   * (seed, round, team): CONTEST the neutral/dropped bomb, CARRY/ESCORT it to the one legal
+   * target, DEFEND-HOME, RETAKE/DEFUSE when the own site is planted, and POST-PLANT hold at
+   * the enemy site. Which bots contest vs defend at round start is a deterministic id-parity
+   * split (`_teamSlot`), the same discipline the old lurk split used.
    *
    * This layer chooses destinations and submits held interaction intent. It never moves an
    * actor, changes bomb state or awards a round: Bot pathing/world collision performs the
@@ -764,10 +782,9 @@ export class BotManager {
       return;
     }
 
-    const attacking = bot.team === rules.attackingTeam;
-    const plannedSiteId = this._bombSite(rules);
-    const plannedSite = plannedSiteId ? rules.sites.get(plannedSiteId) : null;
-    if (!plannedSite) {
+    const targetSiteId = rules.targetSiteOf(bot.team);
+    const targetSite = targetSiteId ? rules.sites.get(targetSiteId) : null;
+    if (!targetSite) {
       this._setObjective(bot, 'none', null);
       return;
     }
@@ -775,79 +792,94 @@ export class BotManager {
     // An objective decision outranks a stale sightseeing/climb commitment.
     bot.climbLock = 0;
 
-    if (rules.phase === 'live' && attacking) {
-      if (rules.bomb.state === 'dropped') {
-        this._setObjective(bot, 'recover', plannedSiteId);
-        bot.moveMode = 'sprint';
-        bot.setDestination(rules.bomb.position, 0.65);
-        return;
-      }
-
-      objectiveCentre(plannedSite.plant, _v1);
+    if (rules.phase === 'live') {
+      // CARRY: deliver to the fixed target site. There is exactly one legal target
+      // (§13.11), so the old per-round site memoisation is simply the target itself.
       if (rules.bomb.state === 'carried' && rules.bomb.carrierId === bot.id) {
+        objectiveCentre(targetSite.plant, _v1);
         bot.moveMode = bot.targetVisible ? 'combat' : 'sprint';
         bot.setDestination(_v1, 0.4);
-        if (rules.siteAt(bot.position, 'plant')?.site === plannedSiteId && bot.grounded !== false
+        if (rules.siteAt(bot.position, 'plant')?.site === targetSiteId && bot.grounded !== false
           && rules.requestInteract(bot, 'plant')) {
-          this._setObjective(bot, 'planting', plannedSiteId);
+          this._setObjective(bot, 'planting', targetSiteId);
         } else {
-          this._setObjective(bot, 'plant', plannedSiteId);
+          this._setObjective(bot, 'carry', targetSiteId);
         }
         return;
       }
 
-      // A whole six-player deathball crushed the split defenders in measured bot series
-      // (61–71% attack wins across 200 matches). Keep half the squad on a deterministic
-      // secondary-site lurk: it contests rotations without knowing defender positions,
-      // while the carrier still gets a plausible three-player execute rather than a 6v3.
-      // This is a role plan, not balance rubber-banding; it is fixed before contact and
-      // uses only public authored sites.
-      const slot = this._teamSlot(bot);
-      if ((slot & 1) === 1 && rules.siteIds.length > 1) {
-        const lurkId = rules.siteIds.find((id) => id !== plannedSiteId);
-        const lurk = rules.sites.get(lurkId);
-        this._setObjective(bot, 'lurk', lurkId);
-        objectiveCentre(lurk.plant, _v1);
-        bot.moveMode = bot.targetVisible ? 'combat' : 'run';
-        bot.setDestination(_v1, 3.0);
+      // Deterministic per-team split, ROTATED by round index so no bot draws home-guard
+      // duty every round (§13.11 allows any deterministic (seed, round, team) function; a
+      // fixed parity left the same bots idling at the site for a whole series, which both
+      // starves their navigation sample and wastes half the squad every round).
+      const slot = this._livingTeamSlot(bot, rules);
+      const rot = slot + rules.roundIndex;
+      // Numbers-aware pressing, from PUBLIC state only (§8 puts alive counts on the wire):
+      // a team that outnumbers the enemy stops garrisoning its home and converts — sitting
+      // on a site you already outman is how a won fight rots into a §13.5.3 timer draw.
+      const alive = rules.aliveCounts();
+      const press = alive[bot.team] > alive[bot.team === 0 ? 1 : 0];
+      const forward = press || rot % 3 !== 1;
+
+      if (rules.bomb.state === 'dropped') {
+        // CONTEST: race to the neutral/dropped bomb (§13.3 — both teams may pick it up).
+        if (forward) {
+          this._setObjective(bot, 'contest', null);
+          bot.moveMode = 'sprint';
+          bot.setDestination(rules.bomb.position, 0.65);
+        } else {
+          this._defendHome(bot, rules);
+        }
         return;
       }
 
-      // The execute group escorts the committed route.
-      this._setObjective(bot, 'escort', plannedSiteId);
-      bot.moveMode = bot.targetVisible ? 'combat' : 'run';
-      bot.setDestination(_v1, 2.2);
+      // Someone carries. Teammate → ESCORT toward the target with the bulk of the squad
+      // (a home site the enemy must retake-proof is defended by the PLANT, not by bodies
+      // left behind); enemy → the bomb is coming to OUR home: forward slots intercept the
+      // carrier, the rest fall back and defend.
+      const carrier = this.game.entityById?.(rules.bomb.carrierId) ?? null;
+      if (carrier && carrier.team === bot.team) {
+        if (!press && (rot & 3) === 1) {
+          this._defendHome(bot, rules);
+        } else {
+          this._setObjective(bot, 'escort', targetSiteId);
+          objectiveCentre(targetSite.plant, _v1);
+          bot.moveMode = bot.targetVisible ? 'combat' : 'run';
+          bot.setDestination(_v1, 2.2);
+        }
+        return;
+      }
+      if (carrier && forward) {
+        this._setObjective(bot, 'contest', null);
+        bot.moveMode = 'sprint';
+        bot.setDestination(rules.bomb.position, 0.9);
+        return;
+      }
+      this._defendHome(bot, rules);
       return;
     }
 
-    if (rules.phase === 'live') {
-      // Split defenders across both authored sites until the plant reveals the real one.
-      const heldId = rules.siteIds[this._teamSlot(bot) % rules.siteIds.length];
-      const held = rules.sites.get(heldId);
-      this._setObjective(bot, 'hold', heldId);
-      objectiveCentre(held.plant, _v1);
-      bot.moveMode = bot.targetVisible ? 'combat' : 'run';
-      bot.setDestination(_v1, 1.8);
-      return;
-    }
-
-    const plantedSite = rules.sites.get(rules.bomb.siteId);
+    // planted
+    const plantedSiteId = rules.bomb.siteId;
+    const plantedSite = rules.sites.get(plantedSiteId);
     if (!plantedSite) return;
     objectiveCentre(plantedSite.defuse, _v1);
-    if (attacking) {
-      this._setObjective(bot, 'defend', rules.bomb.siteId);
+    if (rules.siteOwner(plantedSiteId) !== bot.team) {
+      // POST-PLANT hold: we planted at the enemy's home; deny the retake.
+      this._setObjective(bot, 'postplant', plantedSiteId);
       bot.moveMode = bot.targetVisible ? 'combat' : 'run';
       bot.setDestination(_v1, 2.0);
       return;
     }
 
+    // RETAKE/DEFUSE: our own home site is planted (§13.4 — only the owner may defuse).
     bot.moveMode = bot.targetVisible ? 'combat' : 'sprint';
     bot.setDestination(_v1, 0.4);
-    if (rules.siteAt(bot.position, 'defuse')?.site === rules.bomb.siteId
+    if (rules.siteAt(bot.position, 'defuse')?.site === plantedSiteId
       && rules.requestInteract(bot, 'defuse')) {
-      this._setObjective(bot, 'defusing', rules.bomb.siteId);
+      this._setObjective(bot, 'defusing', plantedSiteId);
     } else {
-      this._setObjective(bot, 'retake', rules.bomb.siteId);
+      this._setObjective(bot, 'retake', plantedSiteId);
     }
   }
 

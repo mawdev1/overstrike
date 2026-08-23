@@ -1072,6 +1072,9 @@ export class GameServer {
   _matchStateFor(session, state, serverTimeMs) {
     const viewer = session.entity;
     const bomb = state.bomb;
+    // bomb-rules §13.8: symmetric demolition has no attacker/defender — the frozen
+    // `role` field is served `none` (facade: null), and consumers derive home-site
+    // ownership from site order + round index. `roleOf` still answers `none` here.
     const role = roleOf(viewer, state.attackingTeam);
 
     // §8.8 — the carrier. Teammates always; enemies only under line of sight.
@@ -1126,13 +1129,15 @@ export class GameServer {
    * to defenders, who have to find it to defuse it, not to everybody who is not an attacker.
    */
   _bombPositionAuthorised(viewer, bomb, role) {
+    void role; // pre-2.0.0 signature kept; roles no longer decide authorisation (§13.8)
     if (!bomb?.position) return false;
     if (bomb.state !== 'dropped' && bomb.state !== 'planted') return false;
-    if (role === 'attacker') return true;
-    if (role !== 'defender') return false;
-    // A planted bomb's position is public to the side that must defuse it. A dropped one is
-    // intel, so a defender earns it by seeing it.
-    return bomb.state === 'planted' || this._canSee(viewer, bomb.position);
+    // §13.3: a dropped/neutral bomb's position is visible to BOTH teams at all times — it
+    // is the shared objective, and hiding it rewards stalling. A planted bomb's position
+    // is likewise public: the planting team put it there and the site owner must find it
+    // to defuse it. A viewer with no team — no entity, a spectator — is authorised for
+    // nothing, exactly as before. This is filter POLICY, not a wire-shape change.
+    return !!viewer && (viewer.team === 0 || viewer.team === 1);
   }
 
   _entityById(id) {
@@ -1187,7 +1192,7 @@ export class GameServer {
     // the side decides it: only attackers plant and only defenders defuse (§6, §7).
     const kind = inter && inter.actorId === e.id && inter.kind !== 'none'
       ? inter.kind
-      : (e.team === rules.attackingTeam ? 'plant' : 'defuse');
+      : rules.interactKindFor(e);
     return { kind, progress };
   }
 
@@ -1340,8 +1345,9 @@ export class GameServer {
     if (rules) {
       e._objectiveHeld = !!cmd.interactHeld;
       if (cmd.interactHeld) {
-        const kind = e.team === rules.attackingTeam ? 'plant' : 'defuse';
-        rules.requestInteract(e, kind);
+        // §13.4/§13.10: the meaning of the held key is CONTEXT, not role — a defuse when
+        // the enemy's plant sits at this player's home site, a plant attempt otherwise.
+        rules.requestInteract(e, rules.interactKindFor(e));
       } else {
         rules.releaseInteract(e);
       }
@@ -1388,8 +1394,7 @@ export class GameServer {
     const rules = this.game.match?.bombRules;
     if (rules) {
       if (e._objectiveHeld && e.alive) {
-        const kind = e.team === rules.attackingTeam ? 'plant' : 'defuse';
-        rules.requestInteract(e, kind);
+        rules.requestInteract(e, rules.interactKindFor(e));
       } else {
         if (!e.alive) e._objectiveHeld = false;
         rules.releaseInteract(e);
@@ -1598,6 +1603,9 @@ const RULESET_REFUSAL_REASON = Object.freeze({
   dead: 'not-eligible',
   disconnected: 'not-eligible',
   released: 'not-eligible',
+  // §13.4: planting at your OWN home site. Internal reason only — the positional wire
+  // enum does not grow and PROTOCOL_VERSION does not bump; the wire says `not-eligible`.
+  wrongSite: 'not-eligible',
 });
 
 /** `bomb.js` `REFUSE` names → `CANCEL_REASONS` (§8.7), for `plantCancel` / `defuseCancel`. */
@@ -1613,6 +1621,7 @@ const RULESET_CANCEL_REASON = Object.freeze({
   notPlanted: 'round-ended',
   notCarrying: 'round-ended',
   wrongTeam: 'round-ended',
+  wrongSite: 'left-volume',
 });
 
 /** `bomb.js` round/match reasons → `OUTCOME_REASONS` (§8.9). */
@@ -1628,6 +1637,9 @@ const RULESET_OUTCOME_REASON = Object.freeze({
   // Reaching `roundsToWin` ends the series early: the loser can no longer reach it. A
   // completed match with a winner must be one of elimination/defuse/detonation/timer.
   roundsToWin: 'elimination',
+  // §13.6: unequal round wins when regulation runs out (draws ate rounds). Regulation
+  // expiring is the deciding fact, and `timer` is legal beside a real winner (§4.0 row 2).
+  roundWins: 'timer',
   forfeit: 'forfeit',
   abandon: 'abandon',
   'no-contest': 'no-contest',
@@ -1643,8 +1655,11 @@ const outcomeReason = (r) => RULESET_OUTCOME_REASON[r] ?? (OUTCOME_REASONS.inclu
 function outcomeWinner(winnerTeam, reason) {
   if (winnerTeam === 0) return 'alpha';
   if (winnerTeam === 1) return 'bravo';
-  if (reason === 'draw') return 'draw';
-  return 'none';
+  // §13.5.3/§13.6: `winnerTeam: -1` with a play reason is a DRAW (drawn round on the
+  // timer; equal wins after regulation). Only the no-play administrative reasons mean
+  // "no winner" — a fact §8.9 keeps distinct from a draw.
+  if (reason === 'no-contest' || reason === 'abandon' || reason === 'forfeit') return 'none';
+  return 'draw';
 }
 
 /** Said once per distinct message. A per-tick warning would be its own denial of service. */
@@ -1682,6 +1697,11 @@ function bombModeId(match) {
 }
 
 /** Which side this viewer is on THIS round. Sides switch, so it is derived, never stored. */
+/**
+ * bomb-rules §13.8: a 2.0.0 symmetric ruleset serves `attackingTeam` null, so this answers
+ * the frozen `role` field as `none` for every recipient — `attackingTeam` is only ever
+ * 0|1 from a harness-staged pre-2.0.0 frame, where the legacy vocabulary still holds.
+ */
 function roleOf(viewer, attackingTeam) {
   if (!viewer || viewer.team == null || attackingTeam == null) return 'none';
   return viewer.team === attackingTeam ? 'attacker' : 'defender';
@@ -1755,7 +1775,9 @@ export function readBombMatchState(game) {
     aliveAlpha: alive.alpha ?? 0,
     aliveBravo: alive.bravo ?? 0,
     sideSwitched: !!m.sideSwitched,
-    attackingTeam: m.attackingTeam ?? 0,
+    // Null on a §13 symmetric ruleset (no attackers); a staged pre-2.0.0 frame may still
+    // carry 0|1. `roleOf` treats null as `none` for every recipient.
+    attackingTeam: m.attackingTeam ?? null,
     bomb: {
       state,
       carrierId: bomb.carrierId ?? 0,

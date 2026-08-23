@@ -1,140 +1,105 @@
 /**
- * Site outcomes, measured — `map-data.md` §7.1 row "Site win rate (bot matches, ≥200)".
+ * Site outcomes, measured — REDEFINED for symmetric demolition (`bomb-rules.md` §13.9,
+ * amendment 2.0.0). The §7.1-derived "attack win rate per site, 45–55%" is dead: every
+ * round involves both sites, either team may take the neutral bomb, and each team defends
+ * its OWN site. What this harness now measures, in the order §13.9 lists it:
  *
- * The contract asks for one number per site: of the rounds fought over site A, what share
- * did the ATTACKING team win, and the same for site B, with a 45–55% band. Everything hard
- * about producing that number honestly is in three places, so they are stated up front.
+ *   1. HOME-DEFENSE WIN RATE PER SITE — of the decided (non-draw) rounds in which a plant
+ *      happened at site S or the round's fighting was attributed to S (bot commitment,
+ *      §B below), the share won by S's OWNER that round (`record.homeSites`). Balanced =
+ *      45–55% per site, Wilson-gated three-valued exactly as before. This is the direct
+ *      successor of the old attack-rate number: it answers "can each team defend its own
+ *      site", which is what the owner's design makes the balance question.
+ *   2. FIRST-POSSESSION SHARE — the share of rounds in which team 0 takes the first pickup
+ *      of the neutral bomb. Balanced = 50±5%. This measures neutral-spawn fairness
+ *      (spawn-to-bomb-spawn route symmetry), a quantity that did not exist before.
+ *   3. PLANT RATE gate, retained unchanged (≥40% of rounds reach a completed plant, hard
+ *      fail below) — plus its new sibling: DRAW RATE is printed, and a draw rate above 20%
+ *      is escalated, because a symmetric mode that mostly times out is a mode where nobody
+ *      can convert possession.
+ *   4. ATTRIBUTION reads the bots' live committed state, as before — but the old
+ *      "whole squad names one site" assertion becomes PER-TEAM: each team has exactly one
+ *      legal target (the enemy's home, `rules.targetSiteOf(team)`), so the assertion is
+ *      now "every committed attacker on team T names T's target", which is simpler and
+ *      stronger than the old memo check.
  *
- * ── 1. What a "round fought over site X" is ──────────────────────────────────────────
+ * ── What "a round attributed to site S" means now ────────────────────────────────────
  *
- * NOT "a round in which the bomb was planted at X". That definition throws away every
- * round the attackers were wiped before reaching a site, which are exactly the rounds the
- * defenders won — conditioning on the plant would report an attack win rate near 80% on a
- * map where attackers actually lose. The bias is not small and it is not subtle.
- *
- * The attacking squad COMMITS to one site per round before it moves (`botManager.js`
- * `_bombSite`: one deterministic choice per round, memoised, so a carrier death does not
- * make the squad change its mind). That commitment is the site the round was fought over
- * whether or not a plant ever happened, so that is what each round is attributed to.
- *
- * What the squad does NOT do is all go there. `_applyBombObjective` sends every ODD team
- * slot to `lurk` at the OTHER site — a deliberate anti-deathball split, not an accident —
- * so an attributed round is one in which roughly the even half of the squad executes the
- * committed site while the odd half contests the other. Measured over the full 2,085-round
- * sample: 71.4% of pre-plant sited attacker-ticks are at the committed site, and 89 of those
- * 2,085 rounds spent MORE attacker-ticks at the site the round is not booked to. That is
- * the size of the approximation the per-site win rate rests on; it is not small enough to
- * leave in prose that can go stale, so §B measures and prints it every run and hard-fails if the
- * committed site ever stops holding the majority (`PRESENCE_MIN`). This paragraph replaces
- * an earlier one that claimed non-carriers "escort it rather than choosing independently",
- * which the planner stopped doing and the harness never noticed.
+ * Still NOT "a round in which the bomb was planted at S" alone — that conditions away the
+ * rounds the defense won before a plant, which are exactly the defense's wins (the same
+ * bias §1 of the old header documented; it has not gone anywhere). A planted round is
+ * attributed to its plant site. A DECIDED round with no plant is attributed to the site
+ * that drew the majority of pre-plant committed-attacker ticks (roles `carry`/`planting`/
+ * `escort`, each of which names the actor's one legal target site). A decided round with
+ * no plant and no committed-attacker majority — a pure bomb-contest round ended by
+ * elimination mid-map, or a tie — is genuinely about neither site and is excluded from the
+ * per-site denominator, counted and printed. `contest` has no site by construction and
+ * `defend`/`retake`/`defusing`/`postplant` describe the OTHER side of the same fight, so
+ * only the carry/escort family attributes.
  *
  * The commitment is read from the bots' own live state (`bot.objectiveRole` /
- * `bot.objectiveSite` on an attacker, on the first committed tick of the round), not
- * recomputed from the seed arithmetic — a copy of the formula would keep agreeing with
- * itself after the planner changed. Because that reads ONE bot, §B separately asserts that
- * every attacker in a committed role all round named the SAME site, which is the property
- * that lets one bot's state stand for the round and is what a per-bot planner would break.
+ * `bot.objectiveSite`), never recomputed from seed arithmetic — a copy of the planner's
+ * formula would keep agreeing with itself after the planner changed. §B separately asserts
+ * the per-team target discipline (point 4) that lets any one bot's state stand for its team.
  *
- * ── 2. Do the bots actually plant? ───────────────────────────────────────────────────
+ * ── ABSENT vs PARTIAL (unchanged rule, new probe) ────────────────────────────────────
  *
- * If they cannot plant, every round ends on the round timer or on elimination and the win
- * rates measure the clock, not the sites. So the plant rate is measured and gated BEFORE
- * any distribution is reported (§B) — and since 2026-08-21 that sentence is true. Until
- * then the gate failed the run and §C printed the distribution anyway, and then escalated
- * the resulting 0%-and-16% figures as a §7.1 breach under the GEOMETRY lane's ticket, when
- * the cause was that no bot could plant. §C is now skipped whole, with the gates that
- * blocked it listed in its place. Measured on The Square over 2,085 rounds: 77.9% of rounds
- * reach a completed plant. The gate sits at 40%.
+ * ABSENCE IS DECIDED BY A CAPABILITY PROBE, NOT BY THE SAMPLE — a tree without the bots'
+ * Bomb objective layer and a tree whose layer is 100% broken produce the identical empty
+ * sample, and they are opposite verdicts (schedule vs regression; the total shape is the
+ * likely shape of a real regression). The probe now asks for `_applyBombObjective`,
+ * `_setObjective` and `_defendHome` — `_bombSite` (the old per-round site memo) was
+ * REMOVED by the symmetric rewrite, §13.11: there is exactly one legal target per team, so
+ * the memo has nothing left to memoise. The previous revision of this file probed for
+ * `_bombSite` and therefore reported the layer absent on a tree where it is alive and
+ * well; that is the failure mode this paragraph exists to prevent recurring.
  *
- * ── 3. Cost, measured rather than guessed ────────────────────────────────────────────
+ * On a tree that HAS the layer, an empty sample is a hard failure with no ticket on it.
+ * Genuine absence is PENDING, names `src/ai/botManager.js`, and is fatal under `--strict`.
  *
- * One Bomb match is a full first-to-seven / MR12 series: 7–12 rounds, ~450–700 simulated
- * seconds at 120 Hz with 12 entities. Measured on this machine: 3–7 core-seconds per
- * series depending on load, so the contract's ≥200 matches is 10–20 core-minutes — 80–145 s
- * of wall clock at 8–10 concurrent children, and roughly 5 minutes on a four-core runner.
+ * ── Envelope breaches are PENDING, not FAIL (unchanged) ──────────────────────────────
  *
- * That is the honest answer to "is 200 affordable", and it is yes. So `ci` runs the real
- * ≥200 sample rather than a token one, and the sample size stays an argument anyway:
+ * A band number outside its envelope on The Square is joint map/bots work (the geometry
+ * lane is redesigning the-square's geometry right now); every assertion about OUR OWN code
+ * (matches complete, bots plant, per-team discipline holds, replays identical) stays a
+ * hard failure at any sample size. `--strict` makes envelope breaches fatal; it is NOT
+ * used by `ci` (`npm run siteoutcome` is `--matches=200`, no strict) — it exists so the
+ * bands can be PROVEN failable (the degrade runs below) and so the gate can be switched on
+ * in one place once the-square's redesign lands and the envelope numbers settle. The
+ * previous package.json ran ci strict; with the 2.0.0 baselines void and the geometry in
+ * another worktree, that would fail every backend commit on the map lane's open work,
+ * which is the exact outcome the paragraph above exists to prevent. Wilson three-valued
+ * verdicts (INSIDE / BREACH-decisive / INCONCLUSIVE) are retained exactly as before: only
+ * a breach whose whole 95% interval clears the band escalates.
  *
- *   - `--matches=N` sets the sample; matches run one per child process, `--jobs=K` wide,
- *     so wall clock is ~(N / K) match times;
- *   - at small N the win-rate confidence interval is ±10–15 points, which cannot police a
- *     ±5 point band. This harness SAYS SO rather than pretending: a rate outside the band
- *     is only escalated when the 95% Wilson interval is decisive, and is otherwise printed
- *     as INCONCLUSIVE with the advice to run the full sample. A small run still hard-fails
- *     on everything in §B — matches complete, bots plant, attribution holds, replays are
- *     identical — because those are regressions in our code at any sample size.
+ * ── The ≥200-match result ────────────────────────────────────────────────────────────
  *
- * ── The ≥200-match result (regenerate when the map, the bots or the ruleset change) ───
+ * RESULT-200 (2026-08-20, attacker/defender ruleset) is VOID — §13.9 voids all baselines
+ * for regeneration after implementation; those figures measured a flow that no longer
+ * exists. Current baseline:
  *
- *   RESULT-200 (2026-08-20, `--matches=200`, seed0 760001, The Square v1.0.0):
+ *   RESULT-200-SYM (2026-08-23, `--matches=200`, seed0 760001, The Square v1.0.0,
+ *   symmetric demolition per bomb-rules 2.0.0):
  *
- *     200 series · 2,085 rounds · 94 s wall at 10 concurrent
- *     plant rate                    77.9%  (1625/2085 rounds reached a completed plant)
- *     site A attack win rate        46.3%  (479/1035, 95% CI 43.3–49.3)  → inside 45–55
- *     site B attack win rate        54.3%  (570/1050, 95% CI 51.3–57.3)  → inside 45–55
- *     A/B asymmetry                  8.0 points
- *     attacker presence at the committed site  71.4%  (89/2085 rounds mostly elsewhere)
+ *     200 series · 1,984 rounds · 59 s wall at 10 concurrent
+ *     plant rate                 43.0%  (853/1984)             → over the 40% floor, thinly
+ *     draw rate                   1.2%  (23/1984, all `timer`) → far under the 20% ceiling
+ *     first possession, team 0   97.9%  (1941/1983, CI 97.1–98.4) → DECISIVE BREACH of 50±5
+ *     site A home-defense        43.2%  (316/731,  CI 39.7–46.8)  → outside, INCONCLUSIVE
+ *     site B home-defense        51.4%  (632/1229, CI 48.6–54.2)  → inside 45–55
+ *     A/B asymmetry               8.2 points                      → inside 10
+ *     unattributed decided rounds 1/1961
  *
- *   Re-run in full on 2026-08-21 by `npm run siteoutcome` (200 matches, `--strict`) after
- *   the §B rewrite below, and it reproduces every figure above to the decimal — 158 s wall
- *   on a loaded machine. Nothing about WHAT is measured changed, so the row was confirmed
- *   rather than replaced; the presence line is the one addition, and it is new information
- *   about an approximation that was always there (§1), not a change to the win rate.
- *
- *   Both sites sit inside the §7.1 band, with a ±3 point interval — narrow enough that the
- *   band is genuinely being policed rather than merely not contradicted. Site B sits 0.7
- *   points under the upper edge, so this row is worth re-reading after any change to the
- *   objective planner rather than treated as settled.
- *
- *   One caveat that belongs next to the number: `src/ai/**` is this lane's own code held by
- *   another session, and was being edited while these runs were taken. The sim is deterministic
- *   at any fixed source state (proven by §D), but the win rate is a property of the map AND
- *   the bots, so this row is a joint measurement and must be regenerated when either moves.
- *
- * ── The code this measurement runs THROUGH ───────────────────────────────────────────
- *
- * The site a round was fought over is read from the bots' Bomb objective layer in
- * `src/ai/botManager.js` — this lane's own code ([CC] per `docs/lane-ownership.json`), held
- * by another session. So the `maptest.mjs` ABSENT-vs-PARTIAL rule applies, with one
- * correction that took a reproduction to see:
- *
- * ABSENCE IS DECIDED BY A CAPABILITY PROBE, NOT BY THE SAMPLE. A tree without the layer and
- * a tree whose layer is 100% broken produce the identical sample — zero commitments, zero
- * plants — and the earlier rule (`uncommitted === rounds && planted === 0` ⇒ PENDING, exit
- * 0) mapped both to "not landed yet". That is backwards: a swallowed throw, a renamed field
- * or an early return is the most likely shape of a real regression, and it is exactly the
- * TOTAL shape. Reproduced by disabling `_applyBombObjective` at runtime, the old code
- * printed `PENDING … is not present in this tree`, `plant rate 0.0%`, and exited 0.
- *
- * The child therefore probes whether `botManager` exposes `_applyBombObjective`,
- * `_bombSite` and `_setObjective` at all, and only that probe can say ABSENT. On a tree that
- * HAS them, an empty sample is a hard failure with no ticket on it, because it is our
- * regression. Genuine absence is PENDING, names `src/ai/botManager.js` rather than the
- * geometry lane's REQ-CX-008, and is fatal under `--strict`.
- *
- * Verified both ways at 2026-08-21 HEAD, which DOES carry the layer: the layer stubbed to a
- * no-op reports `113/113 rounds recorded no site commitment` and exits 1; the layer removed
- * from the prototype reports PENDING, exits 0, and exits 1 under `--strict`.
- *
- * ── Envelope breaches are PENDING, not FAIL ──────────────────────────────────────────
- *
- * Same rule as `navtest.mjs` §7.1 and `maptest.mjs`'s §3 manifest guard: a §7 envelope
- * number outside its band on The Square is the geometry lane's open work (REQ-CX-008), and
- * failing this harness on it would either block every backend commit behind another lane's
- * map edit or get the band quietly widened until nothing could trip it. So a breach is
- * printed loudly, by name, with the number and the target — while every assertion about OUR
- * OWN code (matches complete, bots plant, attribution holds, replays are identical) stays a
- * hard failure.
- *
- * This is doubly true here, because the win rate is a joint property of the MAP and the
- * BOTS, and `src/ai/**` is a third lane again. A gate that fails the build when either of
- * two other lanes moves a number by half a point is a gate that gets deleted.
- *
- * `--strict` makes envelope breaches fatal. It is not used by `ci`; it exists so the band
- * can be PROVEN failable, and so the gate can be turned on in one place when REQ-CX-008
- * closes and the objective planner settles.
+ *   The first-possession figure is the headline: team 0 reaches the neutral bomb first in
+ *   ~98% of rounds, so the spawn-to-bomb-spawn routes are grossly asymmetric — precisely
+ *   the quantity this metric was created to see, invisible under the old ruleset. It is
+ *   escalated as PENDING against the-square's geometry redesign (in flight in another
+ *   worktree; the derived midpoint bomb spawn and/or team spawn routes need to equalise).
+ *   It also poisons the per-site read: team 0 nearly always carries, so site B (team 0's
+ *   usual target before the switch) sees 735 of the 853 plants. Both per-site numbers and
+ *   the plant rate should be treated as provisional until first possession is near 50%.
+ *   Regenerate with `npm run siteoutcome` whenever the map, the bots or the ruleset move;
+ *   the numbers are a joint property of all three.
  *
  *   node scripts/siteoutcome.mjs --matches=200
  *   node scripts/siteoutcome.mjs --matches=40 --jobs=8
@@ -142,34 +107,13 @@
  *   node scripts/siteoutcome.mjs --matches=40 --jobs=8 --strict --degrade=site-a-nodefuse
  *   node scripts/siteoutcome.mjs --matches=40 --jobs=8 --strict --degrade=site-a-swallow
  *
- * Every degradation edits the REAL map manifest that the ruleset, the bots and the nav
- * layer all read (`world.manifest.objectives`). Nothing is stubbed and no second
- * implementation exists, and site B is left untouched inside the same run as a control.
- * Measured at 40 matches each on 2026-08-21, all four runs back to back on one tree state:
- *
- *   run                        plant rate  site A attack        site B (control)     exit
- *   ────────────────────────── ─────────── ──────────────────── ──────────────────── ────
- *   restored (no --degrade)    77.2%       46.3% (CI 39.6–53.2) 55.7% (CI 48.9–62.2)  0
- *   --degrade=site-a-shrink    39.7%       withheld             withheld              1
- *   --degrade=site-a-nodefuse  76.0%       84.3% (CI 79.0–88.4) 54.2% (CI 47.7–60.6)  1
- *   --degrade=site-a-swallow   47.8%       10.2% (CI  6.9–14.8) 30.8% (CI 25.1–37.1)  1
- *
- * `nodefuse` and `swallow` are the two edges of the band, high and low, each with a decisive
- * interval, and `nodefuse` leaves the control site inconclusive in the same run — so the
- * failure is attributable to site A rather than to the sample. `shrink` proves a different
- * gate: a site nobody can stand in drops the plant rate to 39.7%, under the 40% floor, and
- * §C is withheld. This row used to read `13.1% (CI 9.1–18.5)` — those numbers were §C
- * printing a distribution the plant gate had already failed, which is precisely the thing
- * §2 promised not to do. They are gone rather than corrected.
- *
- * The restored row is worth reading closely: site B's 55.7% is OUTSIDE the band, and the
- * run still exits 0, because at 212 rounds the interval straddles it. That is the
- * three-valued verdict doing its job rather than a threshold being soft — at 200 matches
- * (§ RESULT-200) the same site reports 54.3% with a ±3 point interval.
- *
- * The measurement itself is unchanged by all of this: a round is still attributed to the
- * site its attackers committed to, so RESULT-200 above still stands and was NOT re-run.
- * The restored 40-match row reproduces its 46.3% / 55.7% to the decimal on today's tree.
+ * The degradations still edit the REAL map manifest (`world.manifest.objectives`), site B
+ * untouched as the in-run control — their expected signatures under the NEW metrics:
+ * `shrink` (12 cm plant volume at A) starves the plant rate toward the 40% floor and/or
+ * the draw-rate ceiling; `nodefuse` (a defuse volume nobody can stand in at A) makes every
+ * bomb planted at A undefusable, so A's OWNER loses every planted-at-A round and A's
+ * home-defense rate craters LOW; `swallow` (plant volume = whole map at A) lets whoever
+ * targets A plant from spawn, the same collapse from the other door.
  */
 import os from 'node:os';
 import path from 'node:path';
@@ -186,27 +130,24 @@ const opt = (k, d = null) => {
   return hit ? hit.slice(k.length + 3) : d;
 };
 
-/** §7.1: 45–55% attack win rate per site. Defend is the complement, so one band covers both. */
+/** §13.9.1: 45–55% home-defense win rate per site. */
 const BAND_LO = 0.45;
 const BAND_HI = 0.55;
+/** §13.9.2: first-possession share for team 0, 50±5% over the full sample. */
+const POSSESS_LO = 0.45;
+const POSSESS_HI = 0.55;
 /**
- * Below this share of rounds reaching a completed plant, the win rates are a statement
- * about the round clock rather than about the sites, and reporting them would be a lie
- * with a number attached. Measured 77.9% on The Square; the floor is deliberately far
- * below that, because it is meant to catch "bots cannot plant at all", not to police the
- * balance between planting and being stopped, which is the thing under measurement.
+ * §13.9.3, retained: below this share of rounds reaching a completed plant, the win rates
+ * are a statement about the round clock rather than about the sites. Catches "bots cannot
+ * plant at all", not the balance between planting and being stopped.
  */
 const PLANT_RATE_MIN = 0.40;
+/** §13.9.3, new: a symmetric mode that mostly times out converts nothing. Escalated above this. */
+const DRAW_RATE_MAX = 0.20;
 /**
- * Attributing a whole round to one site is only defensible while the attacking force is
- * mostly AT that site. It is not entirely: the planner lurks odd team slots at the other
- * site on purpose (§1), which is why this is a majority test and not an equality one.
- * Measured 71.4% over 2,085 rounds (and 71.9% / 71.4% / 71.7% at 131, 629 and 417), so the
- * floor is far enough below to catch "the squad no longer goes where the round says it
- * went", not to police the size of the lurk.
+ * A legal series is 7–12 rounds: first-to-7 ends no earlier than round 7, `maxRounds` caps
+ * at 12, and §13.6's drawn rounds count toward the cap without moving `roundWins`.
  */
-const PRESENCE_MIN = 0.50;
-/** A legal series is 7–12 rounds (`BOMB_PARAMS.roundsToWin` / `maxRounds`). */
 const ROUNDS_MIN = 7;
 const ROUNDS_MAX = 12;
 
@@ -227,8 +168,9 @@ if (flag('child')) {
  * Play one full autonomous Bomb series on The Square and return its round records.
  *
  * The player entity is disconnected before the first Bomb tick (`noteDisconnect`), the same
- * thing `bombbottest.mjs` does, so every kill, plant and defuse in the sample belongs to an
- * autonomous bot and no human-shaped entity stands still in a spawn skewing a side.
+ * thing `bombbottest.mjs` does, so every kill, pickup, plant and defuse in the sample
+ * belongs to an autonomous bot and no human-shaped entity stands still in a spawn skewing
+ * a side — which matters twice as much now that first possession is itself a metric.
  */
 async function runMatch(seed, degrade) {
   const { Game } = await import('../src/core/game.js');
@@ -240,18 +182,14 @@ async function runMatch(seed, degrade) {
 
   /**
    * Does the capability this harness measures THROUGH exist in this tree at all?
-   *
-   * Structural, and deliberately not derived from the sample: "no round committed to a
-   * site" is what a tree WITHOUT the objective layer and a tree WHOSE objective layer is
-   * totally broken both look like, and those are opposite answers (see §B). This probe is
-   * the only thing allowed to say "absent"; everything else is measurement, and a
-   * measurement that comes back empty on a tree that HAS the layer is a regression.
+   * Structural, never derived from the sample (see the header). `_bombSite` is gone by
+   * design — probing for it is how the previous revision broke.
    */
   const bm = game.bots;
   const capability = {
     applyBombObjective: typeof bm?._applyBombObjective === 'function',
-    bombSite: typeof bm?._bombSite === 'function',
     setObjective: typeof bm?._setObjective === 'function',
+    defendHome: typeof bm?._defendHome === 'function',
   };
 
   const degradeNote = applyDegrade(game, degrade);
@@ -262,13 +200,15 @@ async function runMatch(seed, degrade) {
   const rules = game.match.bombRules;
   rules.noteDisconnect(game.player);
 
-  /** Roles an ATTACKER holds while it is executing the squad's committed site plan. */
-  const ATTACK_ROLES = new Set(['plant', 'planting', 'escort', 'recover']);
-  /** Every role that puts an attacker at an authored site pre-plant, INCLUDING the lurk. */
-  const SITED_ROLES = new Set(['plant', 'planting', 'escort', 'recover', 'lurk']);
-  const committedBy = new Map();          // roundIndex -> site id the attackers committed to
-  const namedBy = new Map();              // roundIndex -> Set of sites named by ATTACK_ROLES bots
-  const presenceBy = new Map();           // roundIndex -> Map(site id -> attacker-ticks, pre-plant)
+  /**
+   * Roles that name the actor's one legal TARGET site while attacking it (§13.11).
+   * `contest` carries no site by construction; `defend`/`retake`/`defusing`/`postplant`
+   * describe the other side of the same fight and must not double-count it.
+   */
+  const ATTACK_ROLES = new Set(['carry', 'planting', 'escort']);
+  const firstPickupBy = new Map();   // roundIndex -> team (0|1) that took the first pickup
+  const pressureBy = new Map();      // roundIndex -> Map(site id -> pre-plant committed-attacker ticks)
+  const namedBy = new Map();         // roundIndex -> [Set, Set] sites named by each team's ATTACK_ROLES bots
 
   // A whole series, bounded. The bound is a hang detector, not a sample cut-off: a run that
   // hits it is reported as a failure, never folded into the statistics.
@@ -279,45 +219,47 @@ async function runMatch(seed, degrade) {
     ticks++;
     if (!rules.liveRound) continue;
     const ri = rules.roundIndex;
+    // §13.9.2 first possession: the first tick the neutral bomb is carried this round.
+    if (rules.bomb.state === 'carried' && !firstPickupBy.has(ri)) {
+      const carrier = game.entityById?.(rules.bomb.carrierId);
+      if (carrier && (carrier.team === 0 || carrier.team === 1)) firstPickupBy.set(ri, carrier.team);
+    }
     // Pre-plant only. After the plant both squads converge on the bomb's site by
     // construction, so counting those ticks would report the plant back to itself.
-    const prePlant = rules.phase === 'live';
+    if (rules.phase !== 'live') continue;
+    let pressure = pressureBy.get(ri);
+    if (!pressure) { pressure = new Map(); pressureBy.set(ri, pressure); }
     let named = namedBy.get(ri);
-    if (!named) { named = new Set(); namedBy.set(ri, named); }
-    let presence = presenceBy.get(ri);
-    if (!presence) { presence = new Map(); presenceBy.set(ri, presence); }
+    if (!named) { named = [new Set(), new Set()]; namedBy.set(ri, named); }
     for (const bot of game.bots.bots) {
-      if (!bot.alive || bot.team !== rules.attackingTeam) continue;
+      if (!bot.alive || !rules.isAlive(bot)) continue;
+      if (!ATTACK_ROLES.has(bot.objectiveRole)) continue;
       if (typeof bot.objectiveSite !== 'string' || bot.objectiveSite === '') continue;
-      const role = bot.objectiveRole;
-      if (ATTACK_ROLES.has(role)) {
-        named.add(bot.objectiveSite);
-        if (!committedBy.has(ri)) committedBy.set(ri, bot.objectiveSite);
-      }
-      if (prePlant && SITED_ROLES.has(role)) {
-        presence.set(bot.objectiveSite, (presence.get(bot.objectiveSite) ?? 0) + 1);
-      }
+      pressure.set(bot.objectiveSite, (pressure.get(bot.objectiveSite) ?? 0) + 1);
+      named[bot.team === 1 ? 1 : 0].add(bot.objectiveSite);
     }
   }
 
   // Plants are read from the ROUND RECORDS, not from `rules.events`: the event log is
-  // capped at 4096 rows and shifts, so a long series silently loses its early plants and
-  // the plant rate would fall through the floor for a reason that is not about the map.
-  const rounds = rules.rounds.map((r, i) => ({
-    round: r.round,
-    winnerTeam: r.winnerTeam,
-    attackingTeam: r.attackingTeam,
-    reason: r.reason,
-    planted: r.planted === true,
-    plantSite: typeof r.site === 'string' ? r.site : null,
-    committedSite: committedBy.get(i) ?? null,
-    // Every site named by an attacker in a committed role this round. More than one means
-    // the squad did not commit as a squad, so no single site can stand for the round.
-    namedSites: [...(namedBy.get(i) ?? [])].sort(),
-    // Pre-plant attacker-ticks per site, lurks included: where the attacking force
-    // actually spent the round, as opposed to which site the round is attributed to.
-    presence: Object.fromEntries(presenceBy.get(i) ?? []),
-  }));
+  // capped and shifts, so a long series silently loses its early plants.
+  const rounds = rules.rounds.map((r, i) => {
+    const named = namedBy.get(i) ?? [new Set(), new Set()];
+    return {
+      round: r.round,
+      winnerTeam: r.winnerTeam,                    // -1 is a §13.6 drawn round
+      reason: r.reason,
+      homeSites: { 0: r.homeSites[0], 1: r.homeSites[1] },
+      plantedByTeam: r.plantedByTeam,
+      planted: r.planted === true,
+      plantSite: typeof r.site === 'string' ? r.site : null,
+      firstPickupTeam: firstPickupBy.get(i) ?? -1, // -1: nobody ever picked it up
+      // Pre-plant committed-attacker ticks per target site — the attribution evidence.
+      pressure: Object.fromEntries(pressureBy.get(i) ?? []),
+      // Sites named by each team's committed attackers. §13.9.4: each set must be a subset
+      // of { that team's one legal target }, or the attribution below is invalid.
+      namedSites: [[...named[0]].sort(), [...named[1]].sort()],
+    };
+  });
 
   const out = {
     finished: rules.series !== null,
@@ -328,7 +270,7 @@ async function runMatch(seed, degrade) {
     degradeNote,
     // The whole ordered outcome, for the replay check. A count would pass a run that
     // reached the same tally down a different road, which is what a replay would not do.
-    signature: rounds.map((r) => `${r.round}:${r.committedSite}:${r.attackingTeam}:${r.winnerTeam}:${r.reason}:${r.plantSite}`).join('|'),
+    signature: rounds.map((r) => `${r.round}:${r.homeSites[0]}>${r.homeSites[1]}:${r.firstPickupTeam}:${r.winnerTeam}:${r.reason}:${r.plantSite}:${r.plantedByTeam}`).join('|'),
   };
   game.dispose?.();
   return out;
@@ -339,8 +281,8 @@ async function runMatch(seed, degrade) {
  *
  * `world.manifest` is the normalised object every consumer reads — `BombRules` compiles its
  * site table from it, `botManager` aims at `plant`'s centre, and the HUD names it. Editing
- * the volume here is the same edit a map author would make in `level.js`, which is the
- * point: the guard has to be able to fail on a real map defect.
+ * the volume here is the same edit a map author would make, which is the point: the guard
+ * has to be able to fail on a real map defect. Site B stays the in-run control.
  */
 function applyDegrade(game, degrade) {
   if (!degrade) return null;
@@ -363,10 +305,10 @@ function applyDegrade(game, degrade) {
     return 'site A plant volume shrunk to 12 cm';
   }
   if (degrade === 'site-a-nodefuse') {
-    // The upper edge of the band. §3.3 lets a site declare a defuse volume distinct from
-    // its plant volume; this one declares a defuse volume nobody can stand in, so a bomb
-    // planted at A can never be defused and the attackers win every planted round there.
-    // Site B keeps its default (defuse = plant) and stays the control.
+    // §3.3 lets a site declare a defuse volume distinct from its plant volume; this one
+    // declares a defuse volume nobody can stand in, so a bomb planted at A can never be
+    // defused — under symmetric rules A's OWNER loses every planted-at-A round and A's
+    // home-defense rate collapses LOW (the old ruleset read this same defect as attack-high).
     objectives.push({
       id: 'site-A-defuse', kind: 'defuse', site: 'A', requiresGround: true,
       box: {
@@ -377,8 +319,8 @@ function applyDegrade(game, degrade) {
     return 'site A given a 10 cm defuse volume — a planted bomb there cannot be defused';
   }
   if (degrade === 'site-a-swallow') {
-    // The opposite defect: a plant volume so large the attackers are standing in it when
-    // the round starts, so they plant immediately and the defenders must cross the map.
+    // The opposite defect: a plant volume so large the team targeting A is standing in it
+    // at the pickup, so they plant the moment they carry and A's owner must cross the map.
     const b = game.world.manifest.bounds;
     siteA.box.min.set(b.min.x, 0, b.min.z);
     siteA.box.max.set(b.max.x, 2.4, b.max.z);
@@ -400,11 +342,11 @@ const bad = (n, d) => { failures++; console.log(`  FAIL ${n}\n       ${d}`); };
 const note = (n) => console.log(`  --   ${n}`);
 /**
  * Loud, named, non-fatal unless `--strict` — and it must SAY WHOSE work it is waiting on.
- * The owner is an argument because this harness has two of them: a §7 envelope breach is
- * [CX] geometry (REQ-CX-008), while a missing objective layer is `src/ai/**`. Stamping the
- * geometry lane's ticket on a bot-code defect is worse than printing nothing.
+ * A balance-envelope breach is joint map/bots work (the geometry lane holds the-square
+ * right now); a missing objective layer is `src/ai/botManager.js`. Stamping the wrong
+ * lane's ticket on a defect is worse than printing nothing.
  */
-const pending = (n, d, owner = 'REQ-CX-008 (geometry, [CX])') => {
+const pending = (n, d, owner = 'the-square geometry ([CX] worktree) / bots objective planner ([CC]) — joint balance envelope') => {
   if (STRICT) { failures++; console.log(`  FAIL ${n}\n       ${d}\n       owner: ${owner}`); return; }
   console.log(`  PENDING  ${n}: ${d} — ${owner}.`);
 };
@@ -436,7 +378,7 @@ async function runPool(seeds) {
       if (i >= seeds.length) return;
       out[i] = await runChild(seeds[i]);
       done++;
-        // Only on a terminal: in a CI log this would be 200 lines of carriage returns.
+      // Only on a terminal: in a CI log this would be 200 lines of carriage returns.
       if (process.stdout.isTTY) process.stdout.write(`\r  … ${done}/${seeds.length} matches`);
     }
   };
@@ -448,8 +390,7 @@ async function runPool(seeds) {
 /**
  * Wilson score interval — the reason a small sample can be reported honestly instead of
  * being dressed up as a measurement. The normal approximation collapses at the extremes a
- * degraded map produces (0 attack wins out of 60), and reporting `0% ± 0%` there would be
- * the worst possible answer.
+ * degraded map produces, and reporting `0% ± 0%` there would be the worst possible answer.
  */
 function wilson(k, n, z = 1.96) {
   if (n === 0) return { lo: 0, hi: 1 };
@@ -460,8 +401,28 @@ function wilson(k, n, z = 1.96) {
   return { lo: Math.max(0, (c - s) / d), hi: Math.min(1, (c + s) / d) };
 }
 
+/**
+ * The three-valued band verdict, shared by every envelope number in this file:
+ * INSIDE → ok; outside with the whole 95% interval clear of the band → BREACH (escalated
+ * via `pending`); outside but overlapping → INCONCLUSIVE (printed with advice, exit 0).
+ */
+function bandVerdict(label, k, n, lo, hi, describe) {
+  const p = n ? k / n : 0;
+  const ci = wilson(k, n);
+  const pct = (x) => (x * 100).toFixed(1);
+  if (p >= lo && p <= hi) { ok(`${label} ${pct(p)}% is inside ${pct(lo)}–${pct(hi)}%`); return; }
+  const decisive = ci.hi < lo || ci.lo > hi;
+  if (decisive) {
+    pending(`${label} is inside ${pct(lo)}–${pct(hi)}%`,
+      `${pct(p)}% (${k}/${n}), 95% CI ${pct(ci.lo)}–${pct(ci.hi)}% — ${describe(p)}, and the interval clears the band`);
+  } else {
+    note(`${label} ${pct(p)}% is outside ${pct(lo)}–${pct(hi)}% but INCONCLUSIVE at n=${n}`
+      + ` (95% CI ${pct(ci.lo)}–${pct(ci.hi)}%) — this sample cannot police a ±5 point band; run --matches=200`);
+  }
+}
+
 const seeds = Array.from({ length: MATCHES }, (_, i) => SEED0 + i * 7919);
-console.log(`\nsite outcomes — ${MATCHES} full Bomb series on the-square, ${JOBS} concurrent`
+console.log(`\nsite outcomes (symmetric demolition, bomb-rules §13.9) — ${MATCHES} full Bomb series on the-square, ${JOBS} concurrent`
   + `${DEGRADE ? `, DEGRADED: ${DEGRADE}` : ''}${STRICT ? ', strict' : ''}`);
 const t0 = Date.now();
 const results = await runPool(seeds);
@@ -490,91 +451,79 @@ else bad('every series is a legal length', `${badLen.length} outside ${ROUNDS_MI
 // ── B. the measurement is meaningful before any of it is reported ────────────────────
 console.log('');
 const siteIds = [...new Set(good.flatMap((r) => r.siteIds))].sort();
-if (siteIds.length >= 2) ok(`the map declares ${siteIds.length} bomb sites: ${siteIds.join(', ')}`);
-else bad('the map declares at least two bomb sites', `declared: ${siteIds.join(', ') || '(none)'} — a per-site balance figure needs two`);
-
-const uncommitted = rounds.filter((r) => r.committedSite === null);
-const planted = rounds.filter((r) => r.planted && r.plantSite !== null);
+if (siteIds.length === 2) ok(`the map declares 2 bomb sites: ${siteIds.join(', ')}`);
+else bad('the map declares exactly two bomb sites', `declared: ${siteIds.join(', ') || '(none)'} — symmetric demolition is defined over exactly two (§13.1/§13.12.19)`);
 
 /**
- * ABSENT is a schedule; PARTIAL is a defect — and ABSENT is decided by a CAPABILITY PROBE,
- * never by the measurement.
- *
- * This harness measures the map THROUGH the bots' Bomb objective layer (`botManager.js`
- * `_applyBombObjective`). A tree without that layer and a tree whose layer is 100% broken
- * produce the SAME sample — zero commitments, zero plants — and they are opposite verdicts:
- * one is work that has not landed, the other is a regression in exactly the code this
- * harness exists to measure, and the most likely shape a regression takes (a swallowed
- * throw, a renamed field, an early return) is the total one. An empty sample can therefore
- * never be allowed to mean "absent" on its own; only the probe can say that, and it reads
- * the tree, not the run.
- *
- * `src/ai/**` is this lane's own code ([CC], `docs/lane-ownership.json`: `src/**` → CC),
- * held by another session — so a present-but-broken layer is OUR regression and hard-fails
- * with no ticket stamped on it. Genuine absence is a schedule, is named as such, and is
- * fatal under `--strict`.
+ * ABSENT is a schedule; PARTIAL is a defect — decided by the capability probe, never by
+ * the sample (full rationale in the header). The probe matches the SYMMETRIC planner's
+ * surface; `_bombSite` no longer exists and is deliberately not asked for.
  */
 const capable = good.filter((r) => r.capability?.applyBombObjective === true
-  && r.capability?.bombSite === true && r.capability?.setObjective === true);
+  && r.capability?.setObjective === true && r.capability?.defendHome === true);
 const CAPABLE = capable.length === good.length;
 const ABSENT = capable.length === 0;
 
 if (!CAPABLE && !ABSENT) {
-  // Every child forks the same tree, so this cannot happen without one child having failed
-  // to construct a BotManager at all. Reported rather than folded into either branch.
   bad('every match agrees on whether the bots\' Bomb objective layer exists',
     `${capable.length}/${good.length} children found it — the sample mixes two trees and nothing below can be attributed`);
+}
+
+const planted = rounds.filter((r) => r.planted && r.plantSite !== null);
+const decided = rounds.filter((r) => r.winnerTeam === 0 || r.winnerTeam === 1);
+const draws = rounds.filter((r) => r.winnerTeam === -1);
+
+/** Attribute one round to a site per the header's rule, or null. */
+function attributeRound(r) {
+  if (r.planted && r.plantSite !== null) return r.plantSite;
+  const entries = Object.entries(r.pressure ?? {});
+  if (entries.length === 0) return null;
+  entries.sort((a, b) => b[1] - a[1]);
+  if (entries.length > 1 && entries[0][1] === entries[1][1]) return null; // tie: neither site's round
+  return entries[0][0];
 }
 
 if (rounds.length === 0) {
   bad('the sample contains rounds', '0 rounds — every statistic below would be computed over an empty set');
 } else if (ABSENT) {
   pending('the bots\' Bomb objective layer is present in this tree',
-    `botManager exposes no _applyBombObjective/_bombSite/_setObjective, so no attacker can take a Bomb`
-    + ` objective role and no site can be attributed (${rounds.length} rounds, ${planted.length} plants).`
-    + ' No win rate is reported: a distribution over zero attributed rounds is not a measurement.'
+    `botManager exposes no _applyBombObjective/_setObjective/_defendHome, so no bot can take a Bomb`
+    + ` objective role and no round can be attributed (${rounds.length} rounds, ${planted.length} plants).`
+    + ' No rate is reported: a distribution over zero attributed rounds is not a measurement.'
     + ' The moment the layer lands, an empty sample becomes a FAILURE',
     'src/ai/botManager.js ([CC], another session) — the objective layer has not landed');
-} else if (uncommitted.length === 0) {
-  ok(`every one of the ${rounds.length} rounds recorded an attacker site commitment`);
-} else {
-  bad('every round records which site the attackers committed to',
-    `${uncommitted.length}/${rounds.length} did not, on a tree that HAS the objective layer — those rounds cannot be`
-    + ' attributed to a site, and a rate computed over the rest would silently drop them');
 }
 
 /**
- * Did the squad commit as a SQUAD?
- *
- * The round's site is read off ONE attacker on its first committed tick. That is only a
- * property of the round if every other attacker in a committed role names the same site all
- * round — which is what `_bombSite`'s one-choice-per-round memo is for, and is exactly what
- * a planner rewritten to choose per-bot would break. (Lurks are excluded on purpose: the
- * planner sends odd team slots to the OTHER site by design, see §1 and the presence split
- * below. This asks about the committed group only.)
- *
- * This replaces a plant-site-vs-committed-site cross-check that could not fail: a bot only
- * REQUESTS a plant while standing in the site it planned, so both sides of that comparison
- * came from the same memoised `_bombSite` call and it was empirically 0/85, 0/61, 0/178,
- * including under `--degrade=site-a-nodefuse`. It read as an independent audit and was not
- * one, so it is gone rather than kept for the reassurance.
+ * §13.9.4 per-team target discipline: every committed attacker on team T names T's ONE
+ * legal target — the enemy's home site that round (`record.homeSites`). This replaces the
+ * old whole-squad-one-site memo assertion, and it is the property that lets a round's
+ * pressure evidence be attributed at all.
  */
-const committedRounds = rounds.filter((r) => r.committedSite !== null);
-const split = committedRounds.filter((r) => (r.namedSites?.length ?? 0) > 1);
-if (ABSENT || committedRounds.length === 0) {
-  // Nothing committed; already reported above.
-} else if (split.length === 0) {
-  ok(`in all ${committedRounds.length} attributed rounds every attacker in a committed role named one site`);
-} else {
-  bad('the attacking squad commits to one site per round',
-    `${split.length}/${committedRounds.length} rounds had attackers committed to different sites`
-    + ` (e.g. ${split[0].namedSites.join(' + ')}) — one site cannot stand for such a round, so the attribution below is invalid`);
+if (!ABSENT && rounds.length > 0) {
+  const violations = [];
+  for (const r of rounds) {
+    for (const team of [0, 1]) {
+      const target = r.homeSites[team === 0 ? 1 : 0];
+      const namedT = r.namedSites[team];
+      if (namedT.some((s) => s !== target)) {
+        violations.push(`round ${r.round}: team ${team} committed to ${namedT.join('+')}, target is ${target}`);
+      }
+    }
+  }
+  const committedRounds = rounds.filter((r) => r.namedSites[0].length > 0 || r.namedSites[1].length > 0);
+  if (violations.length === 0 && committedRounds.length > 0) {
+    ok(`in all ${committedRounds.length} rounds with committed attackers, every committed bot named its team's one legal target`);
+  } else if (committedRounds.length === 0) {
+    bad('the sample contains committed-attacker evidence',
+      `not one bot ever held a carry/planting/escort role across ${rounds.length} rounds, on a tree that HAS the objective layer`);
+  } else {
+    bad('every committed attacker names its team\'s one legal target site',
+      `${violations.length} violations, e.g. ${violations[0]} — the pressure evidence cannot attribute rounds to sites`);
+  }
 }
 
-if (!ABSENT && planted.length === 0) {
-  bad('the sample contains completed plants', '0 — see the plant-rate gate below');
-}
-
+// §13.9.3 plant-rate gate, retained unchanged — a hard failure, it is our code's job.
 const plantRate = rounds.length ? planted.length / rounds.length : 0;
 console.log(`  plant rate ${(plantRate * 100).toFixed(1)}% (${planted.length}/${rounds.length} rounds reached a completed plant)`);
 if (rounds.length === 0 || ABSENT) {
@@ -586,150 +535,109 @@ if (rounds.length === 0 || ABSENT) {
     `${(plantRate * 100).toFixed(1)}% < ${(PLANT_RATE_MIN * 100).toFixed(0)}% — with plants this rare the rounds are decided by the round clock and elimination, so the numbers below measure the timer, not the sites`);
 }
 
-/**
- * Where the attacking force actually was, printed next to the site the round is booked to.
- *
- * The attribution is one site per round, and the planner does NOT send the whole squad
- * there: odd team slots lurk at the other site (`botManager.js` `_applyBombObjective`).
- * So the size of that approximation is published every run rather than left as prose that
- * could go stale the way the old §1 rationale did — and it is gated, because below a
- * majority the round's booked site stops describing where the round was fought.
- */
-let presenceShare = 0;
-{
-  let atCommitted = 0;
-  let elsewhere = 0;
-  let roundsMostlyElsewhere = 0;
-  for (const r of rounds) {
-    const p = r.presence ?? {};
-    const here = p[r.committedSite] ?? 0;
-    let away = 0;
-    for (const [site, n] of Object.entries(p)) if (site !== r.committedSite) away += n;
-    atCommitted += here;
-    elsewhere += away;
-    if (away > here) roundsMostlyElsewhere++;
-  }
-  const total = atCommitted + elsewhere;
-  presenceShare = total > 0 ? atCommitted / total : 0;
-  if (ABSENT || rounds.length === 0) {
-    // No commitment to be present at; already reported.
-  } else if (total === 0) {
-    bad('the sample records where the attackers were',
-      'not one sited attacker-tick in the whole sample, on a tree that HAS the objective layer');
+// §13.9.3 draw rate — new. Printed always; above 20% it is escalated: a symmetric mode
+// that mostly times out is a mode where nobody can convert possession.
+const drawRate = rounds.length ? draws.length / rounds.length : 0;
+console.log(`  draw rate ${(drawRate * 100).toFixed(1)}% (${draws.length}/${rounds.length} rounds ended ${draws.length ? `drawn — reasons: ${[...new Set(draws.map((r) => r.reason))].join(', ')}` : 'drawn'})`);
+if (!ABSENT && rounds.length > 0) {
+  if (drawRate <= DRAW_RATE_MAX) {
+    ok(`the draw rate is at or under ${(DRAW_RATE_MAX * 100).toFixed(0)}%`);
   } else {
-    console.log(`  attacker presence, pre-plant: ${(presenceShare * 100).toFixed(1)}% of sited attacker-ticks were at the`
-      + ` committed site, ${(100 - presenceShare * 100).toFixed(1)}% at the other one`
-      + ` (${roundsMostlyElsewhere}/${rounds.length} rounds spent more at the site they are NOT booked to)`);
-    if (presenceShare > PRESENCE_MIN) {
-      ok(`the committed site holds the majority of sited attacker presence (> ${(PRESENCE_MIN * 100).toFixed(0)}%)`
-        + ' — the lurk half of the squad is by design, and the round is still booked to the committed site');
-    } else {
-      bad('the committed site holds the majority of sited attacker presence',
-        `${(presenceShare * 100).toFixed(1)}% ≤ ${(PRESENCE_MIN * 100).toFixed(0)}% — the attacking force spends most of the round somewhere`
-        + ' other than the site each round is booked to, so booking the round to one site no longer describes anything');
-    }
+    pending(`the draw rate is at or under ${(DRAW_RATE_MAX * 100).toFixed(0)}%`,
+      `${(drawRate * 100).toFixed(1)}% of rounds ended drawn — nobody converts possession into a plant or a wipe often enough`);
   }
 }
 
 /**
- * Everything §C needs in order to be a measurement rather than a decoration.
- *
- * §2 of the header promises the distribution is gated BEFORE it is reported. That promise
- * used to be false: the plant-rate gate called `bad()` and then §C printed the win rates
- * anyway — and, worse, escalated the resulting 0%-and-16% figures as a §7.1 GEOMETRY breach
- * under another lane's ticket, when the actual cause was that no bot could plant. A number
- * that is known to be meaningless is not improved by printing it with a caveat, and a lane
- * label attached to the wrong lane is a false accusation.
+ * Everything §C needs in order to be a measurement rather than a decoration. §2's old
+ * promise stands: the distribution is gated BEFORE it is reported, and a number known to
+ * be meaningless is not improved by printing it with a caveat.
  */
 const blockers = [];
 if (rounds.length === 0) blockers.push('the sample contains no rounds');
 if (ABSENT) blockers.push('the bots\' Bomb objective layer is not present in this tree, so no round is attributed to a site');
 if (!CAPABLE && !ABSENT) blockers.push('the children disagree about whether the objective layer exists');
-if (siteIds.length < 2) blockers.push(`the map declares ${siteIds.length} bomb site(s); a per-site figure needs 2`);
-if (!ABSENT && uncommitted.length > 0) blockers.push(`${uncommitted.length}/${rounds.length} rounds recorded no site commitment`);
-if (!ABSENT && split.length > 0) blockers.push(`${split.length} rounds had attackers committed to different sites`);
-if (!ABSENT && rounds.length > 0 && presenceShare <= PRESENCE_MIN) {
-  blockers.push(`only ${(presenceShare * 100).toFixed(1)}% of sited attacker presence was at the site its round is booked to`);
-}
+if (siteIds.length !== 2) blockers.push(`the map declares ${siteIds.length} bomb site(s); symmetric demolition needs exactly 2`);
 if (!ABSENT && rounds.length > 0 && plantRate < PLANT_RATE_MIN) {
   blockers.push(`the plant rate ${(plantRate * 100).toFixed(1)}% is under the ${(PLANT_RATE_MIN * 100).toFixed(0)}% floor,`
     + ' so the rounds were decided by the clock and elimination rather than by the sites');
 }
 
-// ── C. site win rates ────────────────────────────────────────────────────────────────
+// ── C. the §13.9 distribution ────────────────────────────────────────────────────────
 console.log('');
-const perSite = [];
 if (blockers.length > 0) {
-  console.log('  no attack/defend win rate is reported — the gates above say it would not be a measurement:');
+  console.log('  no home-defense or first-possession rate is reported — the gates above say it would not be a measurement:');
   for (const b of blockers) console.log(`     · ${b}`);
 } else {
-console.log('  attack win rate per committed site (§7.1: 45–55%)');
-for (const site of siteIds) {
-  const rs = rounds.filter((r) => r.committedSite === site);
-  const attackWins = rs.filter((r) => r.winnerTeam === r.attackingTeam).length;
-  const n = rs.length;
-  const p = n ? attackWins / n : 0;
-  const ci = wilson(attackWins, n);
-  const sitePlants = rs.filter((r) => r.planted).length;
-  perSite.push({ site, n, attackWins, p, ci, plantRate: n ? sitePlants / n : 0 });
-  console.log(`     site ${site}: attack ${(p * 100).toFixed(1)}%  defend ${((1 - p) * 100).toFixed(1)}%`
-    + `   (${attackWins}/${n} rounds, 95% CI ${(ci.lo * 100).toFixed(1)}–${(ci.hi * 100).toFixed(1)}%,`
-    + ` plant rate ${(perSite[perSite.length - 1].plantRate * 100).toFixed(0)}%)`);
-}
-
-const emptySites = perSite.filter((s) => s.n === 0);
-if (emptySites.length === 0) ok('every declared site was fought over at least once');
-else bad('every declared site was fought over', `${emptySites.map((s) => s.site).join(', ')} drew 0 rounds — a band check over 0 rounds passes vacuously`);
-
-/**
- * The verdict, three-valued on purpose.
- *
- *   INSIDE       — the point estimate is in the band.
- *   BREACH       — the point estimate is outside it AND the 95% interval is decisive, i.e.
- *                  the whole interval lies on one side of the band. This is a real finding.
- *   INCONCLUSIVE — outside the band but the interval still overlaps it. At ci sample sizes
- *                  this is the normal answer, and calling it a breach would be a coin toss
- *                  reported as a measurement.
- *
- * Only BREACH is escalated. INCONCLUSIVE is printed with the sample size needed to settle
- * it, because the honest response to a weak sample is to say how weak it is.
- */
-for (const s of perSite) {
-  if (s.n === 0) continue;
-  const inBand = s.p >= BAND_LO && s.p <= BAND_HI;
-  if (inBand) { ok(`site ${s.site} attack win rate ${(s.p * 100).toFixed(1)}% is inside 45–55%`); continue; }
-  const decisive = s.ci.hi < BAND_LO || s.ci.lo > BAND_HI;
-  const side = s.p < BAND_LO ? 'defender-favoured' : 'attacker-favoured';
-  if (decisive) {
-    pending(`site ${s.site} attack win rate is inside 45–55%`,
-      `${(s.p * 100).toFixed(1)}% (${s.attackWins}/${s.n}), 95% CI ${(s.ci.lo * 100).toFixed(1)}–${(s.ci.hi * 100).toFixed(1)}% — ${side}, and the interval clears the band`);
+  // §13.9.2 first-possession share — 50±5% for team 0, over the FULL sample (draws
+  // included: who reached the bomb first is a fact of every round that had a pickup).
+  const picked = rounds.filter((r) => r.firstPickupTeam === 0 || r.firstPickupTeam === 1);
+  const neverPicked = rounds.length - picked.length;
+  const team0First = picked.filter((r) => r.firstPickupTeam === 0).length;
+  console.log(`  first possession: team 0 took first pickup in ${team0First}/${picked.length} rounds`
+    + `${neverPicked ? ` (${neverPicked} rounds nobody ever picked the bomb up)` : ''}`);
+  if (picked.length === 0) {
+    bad('the bomb gets picked up', 'not one pickup in the whole sample, on a tree that HAS the objective layer');
   } else {
-    note(`site ${s.site} attack win rate ${(s.p * 100).toFixed(1)}% is outside 45–55% but INCONCLUSIVE at ${s.n} rounds`
-      + ` (95% CI ${(s.ci.lo * 100).toFixed(1)}–${(s.ci.hi * 100).toFixed(1)}%) — this sample cannot police a ±5 point band; run --matches=200`);
+    if (neverPicked > rounds.length * 0.05) {
+      bad('the neutral bomb is contested in (nearly) every round',
+        `${neverPicked}/${rounds.length} rounds ended with the bomb never picked up — the contest layer is not reaching it`);
+    }
+    bandVerdict('team 0 first-possession share', team0First, picked.length, POSSESS_LO, POSSESS_HI,
+      (p) => p < POSSESS_LO ? 'team 1 reaches the neutral bomb first too often — the spawn-to-bomb routes are asymmetric'
+        : 'team 0 reaches the neutral bomb first too often — the spawn-to-bomb routes are asymmetric');
   }
-}
 
-// Symmetry between the two sites is a separate question from either site's own band: two
-// sites can both sit at 44% (attackers under-performing everywhere, a timer problem) or at
-// 44% and 56% (one site broken, a geometry problem). Reported, never conflated.
-if (perSite.length === 2 && perSite[0].n > 0 && perSite[1].n > 0) {
-  const gap = Math.abs(perSite[0].p - perSite[1].p);
-  console.log(`  A/B asymmetry ${(gap * 100).toFixed(1)} points`);
-  if (gap <= 0.10) ok(`the two sites are within 10 points of each other`);
-  else pending('the two sites are within 10 points of each other', `${(gap * 100).toFixed(1)} points apart`);
-}
+  // §13.9.1 home-defense win rate per site, over DECIDED attributed rounds.
+  console.log('');
+  console.log('  home-defense win rate per site (§13.9.1: 45–55%)');
+  const attributed = decided.map((r) => ({ r, site: attributeRound(r) }));
+  const unattributed = attributed.filter((a) => a.site === null).length;
+  if (unattributed > 0) {
+    note(`${unattributed}/${decided.length} decided rounds attributed to neither site (no plant, no committed-attacker majority) — excluded from the per-site denominators`);
+  }
+  const perSite = [];
+  for (const site of siteIds) {
+    const rs = attributed.filter((a) => a.site === site);
+    const ownerWins = rs.filter(({ r }) => {
+      const owner = r.homeSites[0] === site ? 0 : r.homeSites[1] === site ? 1 : -1;
+      return owner !== -1 && r.winnerTeam === owner;
+    }).length;
+    const n = rs.length;
+    const p = n ? ownerWins / n : 0;
+    const ci = wilson(ownerWins, n);
+    const sitePlants = rs.filter(({ r }) => r.planted).length;
+    perSite.push({ site, n, ownerWins, p, ci });
+    console.log(`     site ${site}: defense ${(p * 100).toFixed(1)}%  attack ${((1 - p) * 100).toFixed(1)}%`
+      + `   (${ownerWins}/${n} decided rounds won by ${site}'s owner, 95% CI ${(ci.lo * 100).toFixed(1)}–${(ci.hi * 100).toFixed(1)}%,`
+      + ` ${sitePlants} planted)`);
+  }
+
+  const emptySites = perSite.filter((s) => s.n === 0);
+  if (emptySites.length === 0) ok('every declared site had decided rounds attributed to it');
+  else bad('every declared site was fought over', `${emptySites.map((s) => s.site).join(', ')} drew 0 attributed rounds — a band check over 0 rounds passes vacuously`);
+
+  for (const s of perSite) {
+    if (s.n === 0) continue;
+    bandVerdict(`site ${s.site} home-defense win rate`, s.ownerWins, s.n, BAND_LO, BAND_HI,
+      (p) => p < BAND_LO ? `${s.site} cannot be held by its owner` : `${s.site} cannot be broken by its attackers`);
+  }
+
+  // Symmetry between the two sites is a separate question from either site's own band:
+  // both at 44% is an everyone-attacks-too-well problem; 44% and 56% is one broken site.
+  if (perSite.length === 2 && perSite[0].n > 0 && perSite[1].n > 0) {
+    const gap = Math.abs(perSite[0].p - perSite[1].p);
+    console.log(`  A/B asymmetry ${(gap * 100).toFixed(1)} points`);
+    if (gap <= 0.10) ok(`the two sites' defense rates are within 10 points of each other`);
+    else pending('the two sites\' defense rates are within 10 points of each other', `${(gap * 100).toFixed(1)} points apart`);
+  }
 }
 
 // ── D. replay identity ───────────────────────────────────────────────────────────────
 //
-// Two matches at the same seed must produce the same ordered round outcomes. Without this
-// the sample is not reproducible and no result recorded in this file could ever be checked.
-//
-// The pair is run back to back HERE rather than by comparing against the pooled result
-// recorded a minute earlier. Each match is a fresh child process, so it re-reads the source
-// tree; on a working copy that another lane is editing while this runs, a pooled-vs-replay
-// mismatch reports the edit rather than a determinism defect. Two adjacent runs close that
-// window to a couple of seconds and still assert exactly the property that matters.
+// Two matches at the same seed must produce the same ordered round outcomes — including
+// first possession, which is new in the signature: a contested same-tick pickup resolves
+// nearest-then-lowest-id (§13.12.14) and must replay identically.
 console.log('');
 {
   const a = await runChild(seeds[0]);
@@ -739,7 +647,7 @@ console.log('');
   } else if (typeof a.signature !== 'string' || a.signature.length === 0) {
     bad('the replay pair produced round records to compare', `seed ${seeds[0]} produced none`);
   } else if (a.signature === b.signature) {
-    ok(`two runs at seed ${seeds[0]} produced an identical ${a.rounds.length}-round outcome sequence`);
+    ok(`two runs at seed ${seeds[0]} produced an identical ${a.rounds.length}-round outcome sequence (winners, plants, first possession)`);
   } else {
     const xs = a.signature.split('|');
     const ys = (b.signature ?? '').split('|');
@@ -753,7 +661,7 @@ console.log('');
 
 console.log(`\n  ${MATCHES} matches in ${wall.toFixed(0)} s wall (${JOBS} concurrent), ${rounds.length} rounds`);
 if (MATCHES < 200) {
-  note(`§7.1 asks for ≥200 matches; this run used ${MATCHES}. The band verdicts above are marked INCONCLUSIVE where the sample cannot settle them.`);
+  note(`§13.9 asks for ≥200 matches; this run used ${MATCHES}. The band verdicts above are marked INCONCLUSIVE where the sample cannot settle them.`);
 }
 console.log(failures ? `\n${failures} FAILED` : '\nsite outcome report complete');
 process.exit(failures ? 1 : 0);

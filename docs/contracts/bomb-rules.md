@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.8.0 |
+| **Version** | 2.0.0 — **§13 (symmetric demolition) supersedes the attacker/defender flow in §3–§7 and parts of §4, §5, §10–§12.** Read §13 first; earlier sections stand except where §13 names them |
 | **Owner** | [CC] Claude Code (rules), [HUMAN] (parameters) |
 | **Consumers** | `match.js`, `modes.js`, wire protocol, HUD, evidence, analytics |
 
@@ -265,3 +265,235 @@ Every rule above, each with its failing control case. Non-negotiable cases:
 11. Spectator cannot observe an enemy during a live round.
 12. **Determinism:** two identical runs from one seed produce identical round outcomes,
     identical stats, and identical evidence.
+
+---
+
+## 13. Amendment 2.0.0 — Symmetric demolition (CCR-002, owner-directed)
+
+> **Owner directive (verbatim, on record):** *"I want the bomb to start in the middle of the
+> map and players have to pick it up first. Then each side has their own plant site to defend.
+> If dropped, the other team can pick it up and plant at the other site. Much more fun that
+> way."*
+
+This is a **breaking** amendment: it replaces the attacker/defender bomb flow with symmetric
+(SOCOM-style) demolition. There is no new mode id — `bomb` changes playstyle. Everything in
+§1–§12 that this section does not name **still holds unchanged**: parameters and durations
+(§2, except the timer-expiry outcome), the phase list (§3), plant/defuse mechanics and
+server-side accumulation (§6, §7), no-respawn and spectator limits (§8), backfill and
+disconnect rules (§9), and the wire encoding (§11 — see §13.8, deliberately no
+`PROTOCOL_VERSION` bump).
+
+### 13.1 Roles: home site and target site
+
+There are no attackers and defenders. Each team has:
+
+- a **home site** — the site it defends and the only site it may defuse at;
+- a **target site** — the enemy's home site, the only site it may plant at.
+
+**Assignment is deterministic:** sites sorted by id (the order `compileObjectives` already
+fixes). Before the side switch, team 0's home is the **first** site, team 1's home the
+second. The §2 side switch after round 6 **swaps home sites** instead of swapping
+attack/defense — it stays, because map geometry may still favour one site and each team must
+defend each site for 6 rounds. A manifest MAY override the initial assignment with an
+optional `homeSites: { '0': siteId, '1': siteId }` key (additive, `map-data.md`); absent it,
+the sorted-order default applies. A map with more or fewer than **exactly two** plant sites
+cannot host symmetric Bomb — refuse at match start, loudly, same policy as no sites at all.
+
+Ownership is **derivable by any consumer** from (site order, `roundIndex`,
+`sideSwitchAfterRound`) — all already on the wire or in the handoff (`MatchHandoff.sites`).
+That is why §13.8 needs no new wire field.
+
+### 13.2 Neutral bomb spawn
+
+- **One** bomb per round. At `freeze` it is placed at the **neutral spawn point** in state
+  `dropped`, `carrierId: -1`. Nobody starts carrying it. `_giveBombToRandomAttacker` and its
+  per-round RNG draw are removed (determinism unaffected; nothing else read that stream).
+- **Manifest source:** a new OPTIONAL `map-data.md` §3.3 objective kind **`bombSpawn`**
+  (a point `{ x, y, z }`, or a box whose centre is used). At most one per map.
+- **Derived default** (maps that declare none): the **midpoint of the two plant-volume
+  centres** — not the bounds centre, because "middle of the map" in play terms is the point
+  equidistant from the two things being fought over, and the bounds centre of an asymmetric
+  bounding box can sit nearer one site. `bomb.lastValid` initialises to this point, so §5
+  out-of-bounds recovery can never lose the bomb before first pickup. If the derived point is
+  inside solid geometry, out-of-bounds recovery rules apply as for any drop; the GEOMETRY
+  lane is expected to declare an explicit `bombSpawn` for any map where the midpoint is bad.
+- The reader lives in `src/world/world.js` (CC lane) with `provenance.bombSpawn`
+  `declared` / `derived`.
+
+### 13.3 Pickup, carry, drop — both teams (§5 delta)
+
+§5's table changes exactly two rows; the rest (carrier death drops at position, out-of-bounds
+return, carrier disconnect drops, freely carryable, teammate-always/enemy-LOS carrier
+visibility) is reused verbatim:
+
+| Rule | Was | Now |
+|---|---|---|
+| Pickup | Any **attacker** | Any **living player of either team**, contact-range, no cast time |
+| Defender contact | Cannot pick up | Row deleted — there are no defenders |
+
+- **Contested pickup is deterministic:** when players of both teams are in range on the same
+  tick, the **nearest** wins; exact distance ties resolve to the **lowest entity id**. (The
+  current `_updateBomb` loop keeps the *last* equal-distance candidate — the implementation
+  must make the tie-break explicit.)
+- Pickup is possible only in `live` and `planted` phases — during `freeze` the bomb sits
+  visible at the spawn and the round opens with a fair race.
+- A **dropped/neutral** bomb's position is visible to **both** teams at all times
+  (`bombPositionVisible` set for every recipient while `state === 'dropped'`). It is the
+  shared objective; hiding it rewards stalling. This is server-side filter *policy*, not a
+  wire-shape change. Carrier visibility is unchanged (§5): teammates always, enemies by LOS.
+- Carrier death/disconnect: unchanged — drops at the body, now contestable by both teams.
+
+### 13.4 Plant and defuse eligibility (§6, §7 delta)
+
+Mechanics (server-side accumulation, hold-to-act, reset on interrupt, no stacking, 3.0 s /
+7.0 s) are unchanged. Only the *who/where* preconditions change:
+
+- **Plant:** any living player carrying the bomb, feet inside **their target site's** plant
+  volume (the enemy's home). Planting at your **own** home site is refused with the internal
+  reason **`wrongSite`**, which maps on the wire to the existing **`not-eligible`**
+  (`RULESET_REFUSAL_REASON` in `src/net/server.js`). **`REFUSAL_REASONS` does not grow** —
+  the internal `REFUSE` table is ruleset-local, the positional wire enum is untouched, and
+  `PROTOCOL_VERSION` does not bump. (If a future consumer needs to distinguish `wrongSite`
+  from other `not-eligible` refusals on the wire, THAT is a positional-enum append and a
+  `PROTOCOL_VERSION` bump — do not smuggle it in.)
+- **Defuse: the site owner only** — the team whose **home** site the bomb is planted at.
+  Since a plant can only happen at the planter's target site, this is always exactly "the
+  team that did not plant", but the rule is *stated* as ownership because that is the fact a
+  player can see on the map. Justification: symmetric demolition's defensive identity is "my
+  site, my problem" — letting the planting team defuse serves no play (they would only
+  cancel their own plant) and letting anyone defuse anywhere dissolves the meaning of a home
+  site. Wrong-team defuse attempts refuse `wrongTeam` → `not-eligible`, as today.
+
+### 13.5 Win conditions and precedence (§4 delta)
+
+The precedence *structure* survives; the team labels are rewritten and one outcome changes.
+
+**Pre-plant, in order:**
+
+1. Bomb planted → `planted`. Phase change, not a win. (Unchanged.)
+2. A team fully eliminated → **the other team wins** (`elimination`). (Already symmetric.)
+3. Round timer expires with no plant → **DRAW ROUND**: `winnerTeam: -1`, reason `timer`,
+   neither team's `roundWins` increments. *Justification:* the old rule paid defenders for
+   the clock running out, and there are no defenders. Awarding the timer to the team in
+   possession invites the carrier to grab the bomb and hide — the exact degenerate play a
+   neutral objective must not reward. A drawn round punishes passivity equally and pushes
+   both teams toward the plant. **This is the one forced change to series structure — see
+   §13.6.**
+
+**Post-plant, in order (unchanged in shape):**
+
+1. Bomb defused → **site owner wins** (`defuse`).
+2. Bomb timer expires → **planting team wins** (`detonation`).
+3. Site-owning team fully eliminated → **planting team wins** (`elimination`); the bomb
+   still detonates for presentation.
+4. **Planting team fully eliminated does NOT win the round for the site owner.** The bomb is
+   planted; they must defuse it. Still the load-bearing rule, now stated in owner terms.
+
+**Simultaneity rules (§4) carry over verbatim** — defuse beats timer expiry on the same
+tick; a defuse completing on the tick its actor dies still completes.
+
+### 13.6 Series structure — the forced delta (§2.1a)
+
+`roundsToWin: 7`, `maxRounds: 12`, side switch after round 6, round timer, freeze, round-end
+delay: **all unchanged.** What §13.5's drawn round forces:
+
+| Situation | Outcome |
+|---|---|
+| A team reaches 7 wins | Match ends immediately, that team wins (unchanged) |
+| After 12 rounds, unequal wins (draws having eaten rounds, e.g. 5–4–3 drawn) | **The team with more round wins takes the match**, `reason: 'roundWins'` — new, forced: 7 is no longer guaranteed reachable by round 12 |
+| After 12 rounds, equal wins (6–6, 5–5, …) | **Draw**, as today |
+
+Drawn rounds append to `rounds[]` with `winnerTeam: -1` and count toward `maxRounds`. No
+score, no `roundWin` award, no clutch for a drawn round. `match.scores` still mirrors
+`roundWins`.
+
+### 13.7 Round record, evidence, stats (§10 / `match-result.md` delta)
+
+- Round record: `attackingTeam` is **removed**; add `homeSites: { '0': siteId, '1': siteId }`
+  (this round's ownership) and `plantedByTeam: 0 | 1 | null`. `winnerTeam` admits `-1`.
+- `roundStart` evidence drops `attackingTeam`, carries `homeSites`. `sideSwitch` evidence
+  carries the new `homeSites`. Everything else (`plantStart`…`interactRefused`) unchanged.
+- Per-player `plants` / `defuses` definitions unchanged (completions only) — they are simply
+  now earnable by **both** teams. Team aggregates become symmetric.
+- `match-result.md` needs its own amendment (CC checklist): per-round
+  `roles: { alpha, bravo }` (`attacker|defender`) becomes
+  `homeSites: { alpha: siteId, bravo: siteId }`; the per-player starting `role` field is
+  emitted as `null` (already legal in its type). That amendment follows its own CHANGELOG
+  entry; this section is the requirement, not the edit.
+
+### 13.8 Wire and facade — deliberately no `PROTOCOL_VERSION` bump
+
+- `EV_KINDS`, `REFUSAL_REASONS`, `CANCEL_REASONS`, the `interact` byte, `MSG_MATCHSTATE`
+  layout: **untouched.** Kinds `plant`/`defuse` keep their codes; refusals reuse
+  `not-eligible` (§13.4); event headers are unchanged.
+- `net-facade.md`'s `role: 'attacker'|'defender'|null` fields are served **`null`** — already
+  legal in the frozen type. Consumers derive ownership per §13.1 from `MatchHandoff.sites`
+  order + round index; no per-tick ownership field is added.
+- Per-recipient bomb-position filtering policy changes for the `dropped` state (§13.3) —
+  policy, not shape.
+- If any implementation step finds it truly cannot avoid a wire change, that is a
+  **stop-and-flag**: it bumps `PROTOCOL_VERSION` and must come back through CHANGELOG.
+
+### 13.9 The siteoutcome harness — what "balanced" now means
+
+The §7.1-derived "attack win rate per site, 45–55%" is dead: every round involves both sites
+and both teams may attack. `scripts/siteoutcome.mjs` is redefined to measure:
+
+1. **Home-defense win rate per site:** of the *decided* (non-draw) rounds in which a plant
+   happened **or** the round's fighting was attributed to site S (bot commitment, same
+   attribution discipline the harness already documents), the share won by S's **owner**.
+   Balanced = each site's defense rate in **45–55%**, Wilson-gated exactly as today.
+   This is the direct successor of the old number: it now answers "can each team defend its
+   own site", which is what the owner's design makes the balance question.
+2. **First-possession share:** the share of rounds in which team 0 takes first pickup.
+   Balanced = **50±5%** over the full sample — this measures neutral-spawn fairness
+   (spawn-to-bomb-spawn route symmetry), a quantity that did not exist before.
+3. **Plant rate** gate: retained unchanged (≥40% of rounds reach a plant) — with a new
+   sibling: **draw rate** is printed, and a draw rate above **20%** is escalated, because a
+   symmetric mode that mostly times out is a mode where nobody can convert possession.
+4. Attribution (§B) reads the bots' live committed state as today; the "same site for the
+   whole squad" assertion becomes per-team (each team has exactly one possible target, which
+   *simplifies* it).
+
+RESULT-200 baselines are void; regenerate after implementation.
+
+### 13.10 HUD (`src/ui/bomb` model vocabulary — CX lane requirement)
+
+`bomb.state` vocabulary is unchanged (`none|carried|dropped|planted|defused|detonated`) —
+neutral-at-spawn is `dropped`. The **role** vocabulary is replaced:
+
+- `role` arrives `null`; `roleLabel` ("ATTACKER"/"DEFENDER"/"ROLE PENDING") is replaced by a
+  home-site label (e.g. "DEFEND B / HIT A"), derived per §13.1.
+- New state the HUD must speak: **neutral/dropped bomb** — "bomb up for grabs" marker,
+  visible to both teams (§13.3), plus which team currently carries (teammate vs enemy
+  carrier tint already exists; a `carrierTeam` derivation replaces the role-based one).
+- Prompt gating changes from role-based to context-based: plant prompt = local player
+  carries AND is at their target site; defuse prompt = local team's home site is planted.
+- Carrying the bomb near your **own** site must NOT show a plant prompt (that is the
+  `wrongSite` → `not-eligible` refusal, and the HUD should not invite it).
+
+### 13.11 Bots (objective AI requirements — CC lane)
+
+The planner's attacker/defender split is replaced by per-team objective states, all
+deterministic per (seed, round, team): **contest** (race to the neutral/dropped bomb),
+**escort/carry** (deliver to the fixed target site — site commitment logic simplifies: there
+is exactly one legal target), **defend-home**, **retake/defuse** (own site planted), and
+**post-plant hold** (planted at enemy site). Which bots contest vs defend at round start
+must be a deterministic split (id parity is fine, as `lurk` is today). The old
+"commit to a site" memoisation survives only as the escort route choice.
+
+### 13.12 Verification delta (`scripts/bombtest.mjs`)
+
+§12's list survives with labels rewritten, plus these new non-negotiable cases:
+
+13. Neutral spawn: bomb `dropped` at the manifest/derived point at every freeze; no carrier.
+14. Both teams can pick up; contested same-tick pickup resolves nearest-then-lowest-id,
+    identically across two seeded runs.
+15. Plant refused at own home site with `wrongSite` (wire: `not-eligible`); accepted at the
+    target site; both before AND after the side switch (ownership swap proven).
+16. Defuse accepted only for the site owner; refused `wrongTeam` for the planting team.
+17. Pre-plant timer expiry → drawn round; neither `roundWins` moves; series arithmetic with
+    draws (more-wins-after-12 victory, equal-wins draw).
+18. Post-plant: planting team wiped does NOT end the round (rule §13.5.4, both directions).
+19. Manifest `bombSpawn` honoured when declared; midpoint derived when absent; a map with
+    ≠2 sites refused at match start.

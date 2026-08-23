@@ -1435,6 +1435,20 @@ export function createMemoryStore(config = {}, deps = {}) {
         .slice(0, limit).map(clone));
     },
 
+    /**
+     * telemetry-kpi.md's read surface: every outbox row of a given `eventType`, optionally
+     * bounded to `occurredAt >= since` (ISO string). This is a read over the same durable
+     * outbox `insert`/`list` already write — no second pipeline, no new storage.
+     */
+    listByType(type, { since = null } = {}, txh) {
+      return read(txh, (st) => [...st.outbox.values()]
+        .filter((row) => row.eventType === type)
+        .filter((row) => since === null || row.occurredAt >= since)
+        .sort((a, b) => a.occurredAt === b.occurredAt
+          ? (a.eventId < b.eventId ? -1 : 1) : (a.occurredAt < b.occurredAt ? -1 : 1))
+        .map(clone));
+    },
+
     claimUnpublished(limit = 100, txh) {
       return read(txh, (st) => [...st.outbox.values()]
         .filter((e) => e.publishedAt === null && e.deadLetteredAt === null)
