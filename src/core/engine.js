@@ -601,6 +601,35 @@ export class Engine {
       alpha: false,
     });
     this.renderer.setClearColor(0x0a0d12, 1);
+
+    /**
+     * Say WHICH GPU this is, once, at boot.
+     *
+     * A player reported 19 FPS on a scene of 88 draw calls and 26k triangles — numbers any
+     * GPU of the last decade renders in single-digit milliseconds, and which measure 5.5ms
+     * frames on this same build elsewhere. That gap is the signature of a software
+     * rasteriser (SwiftShader/llvmpipe), which a browser falls back to silently when
+     * hardware acceleration is off, blocklisted, or unavailable to the process. Nothing here
+     * reported the renderer, so "the game is slow" and "this browser is not using the
+     * graphics card" were indistinguishable from a console log, and several fixes aimed at
+     * the former were spent for nothing.
+     */
+    try {
+      const gl = this.renderer.getContext();
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      const gpu = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || 'unknown');
+      const vendor = String((dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)) || 'unknown');
+      this.gpuInfo = { gpu, vendor };
+      this.softwareRenderer = /swiftshader|llvmpipe|software|basic render|microsoft basic/i.test(gpu);
+      if (this.softwareRenderer) {
+        console.warn(`[engine] SOFTWARE RENDERING — "${gpu}". The graphics card is NOT being used, `
+          + 'so the frame rate will be a fraction of what this machine can do. Turn on hardware '
+          + 'acceleration (brave://settings/system or chrome://settings/system) and check '
+          + 'brave://gpu / chrome://gpu.');
+      } else {
+        console.info(`[engine] GPU: ${gpu} (${vendor})`);
+      }
+    } catch { /* diagnostics must never break boot */ }
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     // Slightly under 1.0: ACES rolls highlights off gracefully, but a sunlit exterior
@@ -1032,8 +1061,13 @@ export class Engine {
   }
 
   _targetSize() {
-    const scale = clamp(this.game.settings.get('renderScale'), 0.4, 1.0);
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let scale = clamp(this.game.settings.get('renderScale'), 0.4, 1.0);
+    // A software rasteriser costs per PIXEL what a GPU costs per triangle, so the only lever
+    // that helps is fewer pixels: half scale is a quarter of the work. Deliberately not
+    // written back to settings — this is a floor for a machine that is not using its
+    // graphics card, not a preference, and it must evaporate if acceleration returns.
+    if (this.softwareRenderer) scale = Math.min(scale, 0.5);
+    const dpr = this.softwareRenderer ? 1 : Math.min(window.devicePixelRatio || 1, 2);
     return {
       w: Math.max(320, Math.floor(window.innerWidth * dpr * scale)),
       h: Math.max(240, Math.floor(window.innerHeight * dpr * scale)),
