@@ -237,7 +237,13 @@ export function createGameRuntime({
         candidate.progressionAuthority = networked ? 'server' : 'practice-unverified';
         if (networked) candidate.netFacade = facade;
         globalThis.__GAME__ = candidate;
-        await candidate.init((value, label) => {
+        // `Game.init` calls back as `(label, fraction)` — LABEL FIRST (see its own doc
+        // comment). Naming these `(value, label)` and forwarding them in that order fed the
+        // label string to `setProgress`'s numeric argument (`Number('compiling shaders')`
+        // is NaN, clamped to 0, so the bar never moved) and fed the raw fraction to the
+        // boot text, which rendered a live "0.1181818181818182" instead of the phase name.
+        // Both symptoms are one swap, present since the P1 shell landed.
+        await candidate.init((label, value) => {
           setProgress(value, label);
           onProgress?.(value, label);
         }, {
