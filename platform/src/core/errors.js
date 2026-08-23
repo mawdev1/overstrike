@@ -80,6 +80,12 @@ export const CODES = {
   DEPLOYMENT_SNAPSHOT_INVALID:       { status: 401, retryable: false },
   DEPLOYMENT_ALREADY_CONSUMED:       { status: 409, retryable: false },
 
+  // progression / OP ledger / repair / upgrade (progression-economy.md §8)
+  OP_INSUFFICIENT_BALANCE:           { status: 402, retryable: false },
+  ITEM_NOT_REPAIRABLE:               { status: 400, retryable: false },
+  ITEM_BROKEN:                       { status: 400, retryable: false },
+  ITEM_MAX_TIER:                     { status: 400, retryable: false },
+
   // moderation
   SANCTIONED:                        { status: 403, retryable: false },
   CHAT_RATE_LIMITED:                 { status: 429, retryable: true },

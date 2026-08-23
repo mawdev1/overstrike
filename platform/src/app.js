@@ -28,7 +28,7 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 // The modules a production process MUST have. `stubs` is deliberately absent: in production
 // it is not mounted at all, which is a stronger guarantee than mounting it disabled.
 const REQUIRED_MODULES = ['events', 'auth', 'profile', 'telemetry', 'flags', 'regions', 'mail', 'lobby',
-  'inventory', 'deployment', 'settlement'];
+  'inventory', 'deployment', 'progression', 'settlement'];
 
 export async function buildApp(config, overrides = {}) {
   const logger = overrides.logger || createLogger({ level: config.logLevel });
@@ -563,6 +563,30 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
     mounted.push('deployment');
   }
 
+  const progression = await load('progression', './modules/progression/index.js');
+  if (progression && deps.inventory) {
+    const progressionStore = overrides.progressionStore
+      || (config.storage === 'postgres'
+        ? progression.createPostgresProgressionStore(
+          { pool: { ...pgConnectionConfig(config.databaseUrl), max: 5 } },
+          { pg: await moduleStorePg() })
+        : progression.createMemoryProgressionStore());
+    deps.progression = {
+      store: progressionStore,
+      service: progression.createProgressionService({
+        store: progressionStore,
+        inventoryService: deps.inventory.service,
+        emit: emitDomainEvent,
+      }),
+    };
+    progression.registerProgressionRoutes(router, {
+      service: deps.progression.service,
+      coreStore: deps.store,
+      auth: deps.auth?.requireAuth || deps.auth?.routes?.requireAuth,
+    });
+    mounted.push('progression');
+  }
+
   const settlement = await load('settlement', './modules/settlement/index.js');
   // Requires the outbox outright (its constructor refuses to build without one): a settlement
   // applied with no event can duplicate or destroy an item, which is the state §4 of the event
@@ -574,6 +598,7 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
         inventoryService: deps.inventory.service,
         outbox: deps.events.outbox,
         clock: { now: deps.clock },
+        progression: deps.progression?.service ?? null,
       }),
     };
     settlement.registerSettlementRoutes(router, {
@@ -581,6 +606,16 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
       store: deps.store,
     });
     mounted.push('settlement');
+  }
+
+  // KPI read surface for P4-05's balance/funnel instrumentation — reads the existing
+  // event-envelope outbox, writes nothing, admin-authenticated same as other read-only
+  // aggregation endpoints.
+  const kpiModule = await load('telemetry-kpi', './modules/telemetry/kpi.js');
+  if (kpiModule && deps.events) {
+    deps.kpi = { service: kpiModule.createKpiService({ store: deps.store }) };
+    kpiModule.registerKpiRoutes(router, { service: deps.kpi.service });
+    mounted.push('telemetry-kpi');
   }
 
   // ── stubs: the fixture layer that unblocks the frontend lane ─────────────────────────

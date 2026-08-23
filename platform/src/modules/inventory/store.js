@@ -100,6 +100,7 @@ export function createMemoryInventoryStore(deps = {}) {
         itemId: row.itemId, class: row.class, slot: row.slot ?? null,
         rarityTier: row.rarityTier, stackable: !!row.stackable, maxStack: row.maxStack ?? null,
         baseStats: clone(row.baseStats ?? {}), durabilityMax: row.durabilityMax ?? null,
+        maxUpgradeTier: row.maxUpgradeTier ?? null,
         tradable: !!row.tradable, contentVersion: row.contentVersion ?? 1,
         createdAt: now, updatedAt: now,
       };
@@ -239,15 +240,22 @@ export function createMemoryInventoryStore(deps = {}) {
      * "settlement releases it, in that same transaction." Naturally idempotent at the row level
      * (§6's own text): a retry's WHERE clause matches zero rows once a row has already moved.
      */
-    async settleRun({ runId, accountId, disposition }) {
+    async settleRun({ runId, accountId, disposition, durabilityLossPerRun = 0 }) {
       const state = currentState();
       const now = new Date().toISOString();
       const settled = [];
       for (const row of state.instances.values()) {
         if (row.runId !== runId || row.ownerAccountId !== accountId) continue;
         if (row.location !== 'run' || row.status !== 'active') continue;
-        if (disposition === 'permanent') { row.location = 'permanent'; row.runId = null; }
-        else { row.status = 'lost'; }
+        if (disposition === 'permanent') {
+          row.location = 'permanent'; row.runId = null;
+          // progression-economy.md §5.1 — depletion happens exactly here, the same UPDATE
+          // that converts the row to 'permanent', for every surviving row with a durability
+          // model (durability is null for anything without one, per items-inventory.md §2).
+          if (row.durability !== null && durabilityLossPerRun > 0) {
+            row.durability = Math.max(0, row.durability - durabilityLossPerRun);
+          }
+        } else { row.status = 'lost'; }
         row.locked = false;
         row.lockedByDeploymentId = null;
         row.updatedAt = now;
@@ -362,7 +370,8 @@ function rowToDefinition(r) {
   return {
     itemId: r.item_id, class: r.class, slot: r.slot, rarityTier: r.rarity_tier,
     stackable: r.stackable, maxStack: r.max_stack, baseStats: r.base_stats,
-    durabilityMax: r.durability_max, tradable: r.tradable, contentVersion: r.content_version,
+    durabilityMax: r.durability_max, maxUpgradeTier: r.max_upgrade_tier,
+    tradable: r.tradable, contentVersion: r.content_version,
     createdAt: toIso(r.created_at), updatedAt: toIso(r.updated_at),
   };
 }
@@ -427,11 +436,11 @@ export function createPostgresInventoryStore(config = {}, deps = {}) {
         const { rows } = await q.query(
           `insert into item_definitions
              (item_id, class, slot, rarity_tier, stackable, max_stack, base_stats,
-              durability_max, tradable, content_version)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
+              durability_max, max_upgrade_tier, tradable, content_version)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`,
           [row.itemId, row.class, row.slot ?? null, row.rarityTier, !!row.stackable,
             row.maxStack ?? null, JSON.stringify(row.baseStats ?? {}), row.durabilityMax ?? null,
-            !!row.tradable, row.contentVersion ?? 1],
+            row.maxUpgradeTier ?? null, !!row.tradable, row.contentVersion ?? 1],
         );
         return rowToDefinition(rows[0]);
       } catch (err) {
@@ -555,15 +564,26 @@ export function createPostgresInventoryStore(config = {}, deps = {}) {
     },
 
     /** settlement.md §6 — see the memory adapter's identical note. */
-    async settleRun({ runId, accountId, disposition }, t) {
+    async settleRun({ runId, accountId, disposition, durabilityLossPerRun = 0 }, t) {
+      // progression-economy.md §5.1: depletion rides in the SAME UPDATE that converts a
+      // surviving row to 'permanent' — one write, not two competing writers on one row.
+      // `durability` stays null for anything without a durability model (the `is not null`
+      // guard), and GREATEST(0, …) matches §5.2's "durability never goes negative."
+      const params = [runId, accountId];
+      let durabilityClause = '';
+      if (disposition === 'permanent' && durabilityLossPerRun > 0) {
+        params.push(Number(durabilityLossPerRun));
+        durabilityClause = `, durability = case when durability is not null
+                              then greatest(0, durability - $${params.length}) else durability end`;
+      }
       const setClause = disposition === 'permanent'
-        ? "location = 'permanent', run_id = null"
+        ? `location = 'permanent', run_id = null${durabilityClause}`
         : "status = 'lost'";
       const { rows } = await runner(t).query(
         `update item_instances set ${setClause}, locked = false, locked_by_deployment_id = null, updated_at = now()
           where run_id = $1 and owner_account_id = $2 and location = 'run' and status = 'active'
           returning *`,
-        [runId, accountId],
+        params,
       );
       return rows.map(rowToInstance);
     },

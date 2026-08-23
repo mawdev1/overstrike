@@ -197,6 +197,15 @@ export function createInventoryService({ store, emit = null }) {
           details: { instanceId, slot: slotKey, definitionSlot: def?.slot ?? null },
         });
       }
+      // progression-economy.md §5.2's additive amendment to rule 1: a durability=0 instance
+      // cannot be placed in a loadout slot. Only reachable for definitions with a durability
+      // model at all (durabilityMax non-null) — every other definition is exempt, exactly as
+      // it is exempt from every other durability-shaped rule.
+      if (def.durabilityMax != null && instance.durability === 0) {
+        throw new ApiError('ITEM_BROKEN', `Instance ${instanceId} is broken and cannot be equipped.`, {
+          details: { instanceId },
+        });
+      }
     }
   }
 
@@ -287,11 +296,11 @@ export function createInventoryService({ store, emit = null }) {
    * itself decides which, per §4's matrix — this module only knows the two dispositions
    * `items-inventory.md` §4 defines, same posture `mutateInstance`'s guard already takes.
    */
-  async function settleRunInstances({ runId, accountId, disposition }) {
+  async function settleRunInstances({ runId, accountId, disposition, durabilityLossPerRun = 0 }) {
     if (disposition !== 'permanent' && disposition !== 'lost') {
       throw new ApiError('VALIDATION_FAILED', "settleRunInstances: disposition must be 'permanent' or 'lost'.");
     }
-    return store.instances.settleRun({ runId, accountId, disposition });
+    return store.instances.settleRun({ runId, accountId, disposition, durabilityLossPerRun });
   }
 
   return {

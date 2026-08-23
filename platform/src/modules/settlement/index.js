@@ -58,6 +58,7 @@
  */
 import { createHash } from 'node:crypto';
 import { ApiError } from '../../core/errors.js';
+import { DURABILITY_LOSS_PER_RUN } from '../progression/tuning.js';
 
 export const idempotencyKeyFor = (runId) => `run-result:${runId}`;
 
@@ -170,13 +171,44 @@ function dispositionFor(resolvedOutcomeValue) {
  *   and here the state being applied can duplicate or destroy an item (§1) — a stricter failure
  *   mode than a career counter that self-heals on recompute.
  */
-export function createSettlementService({ store, inventoryService, outbox, clock = Date }) {
+/**
+ * @param progression  OPTIONAL. progression-economy.md §3's OP/XP award, called once per
+ *   resolved participant disposition (never for `exception-open`, never for a `void`
+ *   resolution). A THIRD independently-committing store beyond the two `inventoryService`
+ *   already documents — see progression/index.js's own header for why this is a compensated
+ *   approximation of "the same transaction" rather than the literal thing, and progression's
+ *   own `op-award:<runId>:<accountId>:<reason>` idempotency for why calling it again on any
+ *   retry of this function is always safe. Omitting it degrades to "no OP/XP awarded" — wrong
+ *   for production, correct for every settlement test that predates this contract.
+ */
+export function createSettlementService({ store, inventoryService, outbox, clock = Date, progression = null }) {
   if (!store) throw new Error('createSettlementService: store is required');
   if (!inventoryService) throw new Error('createSettlementService: inventoryService is required');
   if (!outbox || typeof outbox.emitIn !== 'function') {
     throw new Error('createSettlementService requires an outbox (settlement.md §1/§6).');
   }
   const nowIso = () => new Date(clock.now()).toISOString();
+
+  /**
+   * progression-economy.md §3.3/§3.4 — awarded for a resolved participant disposition. Called
+   * from BOTH the first-pass settlement below and every early-return replay of an
+   * already-`settled`/`exception-resolved` participant (see `settleParticipant`'s idempotency
+   * branches). That second call site is not redundant: `progression.awardForRun` is idempotent
+   * per `op-award:<runId>:<accountId>:<reason>` (progression/index.js's own guarantee), so
+   * calling it again is always safe, and it is the ONLY way a run whose OP/XP award was lost —
+   * a crash, a transient DB error, the process dying between `outbox.commit` above and this
+   * call — can ever be paid. Without this second call site the loss is permanent: once
+   * `match_participants.stats.settlementStatus` reads `settled`, no code path ever calls
+   * `awardForRun` again (this is the exact hazard the economy review flagged).
+   */
+  async function awardProgression(runId, accountId, outcome, correlationId) {
+    if (!progression || !outcome) return;
+    const runRow = await store.matches.byId(runId);
+    const survivedSeconds = runRow?.startedAt && runRow?.endedAt
+      ? Math.max(0, (Date.parse(runRow.endedAt) - Date.parse(runRow.startedAt)) / 1000)
+      : 0;
+    await progression.awardForRun({ runId, accountId, outcome, survivedSeconds, correlationId });
+  }
 
   // ------------------------------------------------------------------------------------ §6/§7
 
@@ -201,10 +233,17 @@ export function createSettlementService({ store, inventoryService, outbox, clock
     const current = await store.matches.getParticipant(runId, accountId);
     const status = current?.stats?.settlementStatus;
     if (!resolvingExceptionId && status === 'settled') {
+      // Retry recovery (see `awardProgression`'s own note): this branch is reached whenever a
+      // prior attempt already committed the item/event transaction but never — or never
+      // successfully — reached the OP award below, and `submitRunResult`'s outer idempotency
+      // record was therefore never written (it is written LAST, after every participant), so a
+      // genuine retry lands here instead of short-circuiting at the request level.
+      await awardProgression(runId, accountId, current.stats.outcome ?? null, correlationId);
       return { accountId, settlementStatus: 'settled', outcome: current.stats.outcome ?? null,
         exceptionId: null, trigger: null };
     }
     if (!resolvingExceptionId && status === 'exception-resolved') {
+      await awardProgression(runId, accountId, current.stats.outcome ?? null, correlationId);
       return { accountId, settlementStatus: 'exception-resolved', outcome: current.stats.outcome ?? null,
         exceptionId: current.stats.exceptionId ?? null, trigger: null };
     }
@@ -236,7 +275,12 @@ export function createSettlementService({ store, inventoryService, outbox, clock
     const disposition = dispositionFor(resolved);
     let settledInstances = [];
     if (disposition) {
-      settledInstances = await inventoryService.settleRunInstances({ runId, accountId, disposition });
+      settledInstances = await inventoryService.settleRunInstances({
+        runId, accountId, disposition,
+        // progression-economy.md §5.1 — only a surviving ('permanent') disposition depletes;
+        // a 'lost' row's durability is moot (that instance's own §5's table already governs it).
+        durabilityLossPerRun: disposition === 'permanent' ? DURABILITY_LOSS_PER_RUN : 0,
+      });
     }
 
     const statsPatch = {
@@ -267,6 +311,13 @@ export function createSettlementService({ store, inventoryService, outbox, clock
           instancesConverted: disposition === 'permanent' ? settledInstances.length : 0,
           instancesLost: disposition === 'lost' ? settledInstances.length : 0,
           resolvedFromExceptionId: resolvingExceptionId,
+          // Additive (event-envelope.md §8: unknown/new fields need no version bump). Neither
+          // was on this payload before, so telemetry-kpi.md's extraction-exit and death-cause
+          // balance signals had no source field — `statsPatch` already computes both correctly
+          // (§4.1's server-failure resolution included) for the read-side stats write two lines
+          // above; this only stops the identical value from being computed and then discarded.
+          exitId: statsPatch.exitId,
+          deathCause: statsPatch.deathCause,
         },
       });
 
@@ -294,6 +345,10 @@ export function createSettlementService({ store, inventoryService, outbox, clock
         });
       }
     });
+
+    // Awarded once the disposition above has committed — see `awardProgression`'s own note for
+    // why the identical call also fires from this function's early-return replay branches.
+    await awardProgression(runId, accountId, resolved, correlationId);
 
     return { accountId, settlementStatus: statsPatch.settlementStatus, outcome: resolved,
       exceptionId: null, trigger: null };
