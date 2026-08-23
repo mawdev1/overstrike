@@ -490,7 +490,11 @@ export const WEAPONS = {
     moveSpeedMul: 0.88,
     scoped: true, scopeSwayMul: 1.2, breathHoldTime: 2.6,
     tracerEvery: 1, tracerColor: 0xfff0c0,
-    audio: { fire: 'sniper', reload: 'magIn', tail: 'outdoor' },
+    // [CX-audio] 'sniper' -> 'dmr': the marksman rifle now has its own recording
+    // (public/audio/sfx/dmr_fire.mp3). The audio engine aliases `dmr` to the sniper's
+    // synth buffer at bank build (src/audio/audio.js), so this name is never silent —
+    // including offline, and including on a headless client with no sample bank at all.
+    audio: { fire: 'dmr', reload: 'magIn', tail: 'outdoor' },
     unlockLevel: 18,
     /** All-black marksman: quad-rail handguard, skeleton stock, long steel magazine. */
     viewmodel: {
