@@ -126,6 +126,12 @@ export const SAMPLE_MANIFEST = {
    * and the shell plays them from its own context. Loading them here would be dead weight in
    * a bank that only exists once a match does.
    */
+  // Regenerated on request; gains are measured, not guessed (see the weapon block above).
+  // killstreak_ready: loud-RMS 0.306 -> target 0.12. death: loud-RMS 0.949 -> target 0.14.
+  // The previous killstreak was prompted as an "urgent military alarm chirp with radio
+  // static" — an ALARM, which is why it grated: a reward should feel earned, not warn you.
+  streakReady: { url: 'audio/ui/killstreak_ready.mp3', gain: 0.39, tier: 'extra' },
+  death: { url: 'audio/sfx/death.mp3', gain: 0.15, tier: 'extra' },
   killConfirm: { url: 'audio/ui/kill_confirm.mp3', max: 0.5, gain: 0.8 },
 
   // ── ambience beds ────────────────────────────────────────────────────────────

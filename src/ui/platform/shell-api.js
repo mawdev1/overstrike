@@ -288,14 +288,22 @@ const validObjective = (value, plant = false) => value === null || (closed(value
   plant ? ['accountId', 'site', 'at'] : ['accountId', 'at'])
   && (value.accountId === null || text(value.accountId)) && (!plant || ['A', 'B'].includes(value.site))
   && iso(value.at));
+// match-result.md 2.2.0 (bomb-rules §13.7, symmetric demolition): a round no longer has an
+// attacker and a defender — both teams can plant — so `roles` became `homeSites`, the site
+// each team DEFENDS that round, and the winner admits `draw` because a pre-plant timer
+// expiry or a mutual wipe genuinely has no winner. The server and the platform's own
+// validator were updated together; THIS one was not, so every finished Bomb match came back
+// through a validator still demanding attacker/defender and was refused as CLIENT_PROTOCOL —
+// the player saw "the platform returned an invalid success projection" instead of results.
 const validRound = (value) => closed(value,
-  ['index', 'winner', 'reason', 'startedAt', 'endedAt', 'roles', 'plant', 'defuse'])
-  && count(value.index) && ['alpha', 'bravo'].includes(value.winner)
+  ['index', 'winner', 'reason', 'startedAt', 'endedAt', 'homeSites', 'plant', 'defuse'])
+  && count(value.index) && ['alpha', 'bravo', 'draw'].includes(value.winner)
   && ['elimination', 'defuse', 'detonation', 'timer'].includes(value.reason)
   && iso(value.startedAt) && iso(value.endedAt)
-  && closed(value.roles, ['alpha', 'bravo'])
-  && ['attacker', 'defender'].includes(value.roles.alpha)
-  && ['attacker', 'defender'].includes(value.roles.bravo)
+  && closed(value.homeSites, ['alpha', 'bravo'])
+  && ['A', 'B'].includes(value.homeSites.alpha)
+  && ['A', 'B'].includes(value.homeSites.bravo)
+  && value.homeSites.alpha !== value.homeSites.bravo
   && validObjective(value.plant, true) && validObjective(value.defuse, false);
 const PLAYER_COUNT_KEYS = ['kills', 'deaths', 'assists', 'suicides', 'teamKills', 'headshots',
   'shotsFired', 'shotsHit', 'damageDealt', 'plants', 'defuses', 'roundsPlayed', 'timePlayedSec'];
