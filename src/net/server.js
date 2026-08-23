@@ -350,7 +350,21 @@ export class ObjectiveEvidence {
     return out;
   }
 
-  /** The serialisable record. What `evidenceRef` ultimately points at. */
+  /**
+   * The serialisable record. What `evidenceRef` ultimately points at.
+   *
+   * Every section is a COPY, never the live array. This returned `objectives: this.rows` (and
+   * the three siblings) while `eventTimeline` was materialised here — so the terminal record a
+   * match certified at `matchEnd` kept mutating afterwards. The reliable trigger is the most
+   * ordinary one there is: the winning player's client closes its socket seconds after the
+   * outcome, the close handler records a `disconnected` connection fact, and the ALREADY
+   * CERTIFIED result now contains a section row its own `eventTimeline` and `evidenceRef`
+   * digest have never seen. The platform then refuses the evidence as tampered
+   * (`eventTimeline section-mismatch` / digest mismatch) on every poll, and every full-length
+   * live match "ended" as an abort (overstrike-gs-iad-1, 2026-08-21..23). The rows themselves
+   * are written once at record time and never mutated, so a shallow copy per section is a
+   * true snapshot.
+   */
   toJSON() {
     const eventTimeline = [
       ...this.rows.map((row) => ({ channel: 'objective', ...row })),
@@ -364,15 +378,15 @@ export class ObjectiveEvidence {
       rulesetVersion: this.rulesetVersion,
       serverBuild: this.serverBuild,
       protocolVersion: PROTOCOL_VERSION,
-      objectives: this.rows,
+      objectives: [...this.rows],
       eventTimeline,
-      combatSamples: this.combatSamples,
+      combatSamples: [...this.combatSamples],
       combatSampling: { observed: this.combatObserved, every: 16,
         retained: this.combatSamples.length, killsAlwaysRetained: true },
       droppedCombatSamples: this.droppedCombatSamples,
-      connectionFacts: this.connectionFacts,
+      connectionFacts: [...this.connectionFacts],
       droppedConnectionFacts: this.droppedConnectionFacts,
-      antiCheatFlags: this.antiCheatFlags,
+      antiCheatFlags: [...this.antiCheatFlags],
       droppedAntiCheatFlags: this.droppedAntiCheatFlags,
       droppedRows: this.dropped,
     };

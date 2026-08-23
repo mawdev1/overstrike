@@ -704,7 +704,13 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     if (!response.ok) throw new ApiError('MATCH_SERVER_UNREACHABLE', 'The match server status is unavailable.');
     observability?.recordSpan?.({ correlationId, traceparent, tier: 'platform', name: 'match-control/status',
       durationMs: now() - startedAt, attributes: { component: 'match-control', status: response.status } });
-    const body = await response.json();
+    let body;
+    // A body that cannot be read to completion (the 2.5s deadline can fire mid-stream on a
+    // large terminal record) or does not parse is the same fact as an unreachable authority —
+    // it must count as a health miss, never leak upward as an unclassified error.
+    try { body = await response.json(); } catch (cause) {
+      throw new ApiError('MATCH_SERVER_UNREACHABLE', 'The match server status could not be read.', { cause });
+    }
     ingestRemoteSpans(body, correlationId);
     return body;
   }
@@ -781,9 +787,21 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     room.status = 'closing';
     room.countdown = null;
     await persistRoom(room);
-    if (!authorityGone) await releaseServer(match.matchId, match.serverUrl, match.serverId,
-      match.correlationId, match.traceparent);
-    else if (match.serverId) await store.matchServers.release(match.serverId);
+    if (!authorityGone) {
+      await releaseServer(match.matchId, match.serverUrl, match.serverId,
+        match.correlationId, match.traceparent);
+    } else {
+      // "Gone" is a CLASSIFICATION, not a fact. A mistaken one used to release only the store
+      // reservation, leaving a live authority bound forever: it heartbeats inUse=capacity, the
+      // registry refills, and the region reports no capacity until someone releases it by hand
+      // (overstrike-gs-iad-1, 2026-08-21..23). The remote release is idempotent and cheap, so a
+      // presumed-dead authority still gets the attempt; only the store release is guaranteed.
+      try {
+        await controlRequest('/control/release', { matchId: match.matchId }, match.correlationId,
+          match.serverUrl, match.traceparent);
+      } catch { /* a genuinely dead authority has nothing reachable to release */ }
+      if (match.serverId) await store.matchServers.release(match.serverId);
+    }
     room.status = 'open';
     const cleared = clearReady(room, 'room-change', id(), false);
     await persistRoom(room);
@@ -1841,11 +1859,34 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
         catch (error) { logger.warn('lobby.terminal_recovery_pending', { matchId: match.matchId, message: error.message }); }
         continue;
       }
+      let status;
       try {
-        const status = await controlStatus(match.serverUrl, match.correlationId, match.traceparent);
+        status = await controlStatus(match.serverUrl, match.correlationId, match.traceparent);
+      } catch {
+        // ONLY a status probe that failed is a health miss. Errors from the terminal handling
+        // below — a result the applier refuses, a validation mismatch — used to land in this
+        // same catch, which mis-filed "the authority is fine, MY completion failed" as "the
+        // authority is gone" and took the store-only release branch. Every full-length live
+        // match then ended status='aborted' with the authority still bound (2026-08-21..23).
+        match.healthMisses = (match.healthMisses || 0) + 1;
+        if (match.healthMisses >= 3) {
+          logger.debug('lobby.match_reap.start', { matchId: match.matchId });
+          await abortActiveMatch(match, 'server-unreachable', true);
+          logger.debug('lobby.match_reap.complete', { matchId: match.matchId });
+        }
+        continue;
+      }
+      match.healthMisses = 0;
+      try {
         if (status.status === 'ended' && status.matchId === match.matchId) await completeActiveMatch(match, status.result);
-        else if (status.matchId !== match.matchId) await abortActiveMatch(match, 'allocation-lost', true);
-        else if (status.status === 'allocated' && match.startedAt + tunables.unclaimedMatchMs <= at) {
+        else if (status.matchId !== match.matchId) {
+          // The authority has moved on (or self-released). If it still serves our terminal
+          // record, complete from it rather than voiding a finished match.
+          const archived = Array.isArray(status.releasedResults)
+            ? status.releasedResults.find((row) => row?.matchId === match.matchId && row.result) : null;
+          if (archived) await completeActiveMatch(match, archived.result);
+          else await abortActiveMatch(match, 'allocation-lost', true);
+        } else if (status.status === 'allocated' && match.startedAt + tunables.unclaimedMatchMs <= at) {
           /**
            * An allocation nobody ever claimed.
            *
@@ -1867,14 +1908,23 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
            */
           logger.warn('lobby.match_unclaimed', { matchId: match.matchId, correlationId: match.correlationId });
           await abortActiveMatch(match, 'never-started', false);
-        } else match.healthMisses = 0;
-      } catch {
-        match.healthMisses = (match.healthMisses || 0) + 1;
-        if (match.healthMisses >= 3) {
-          logger.debug('lobby.match_reap.start', { matchId: match.matchId });
-          await abortActiveMatch(match, 'server-unreachable', true);
-          logger.debug('lobby.match_reap.complete', { matchId: match.matchId });
         }
+      } catch (error) {
+        // The authority answered; OUR terminal handling failed. Say WHICH error, loudly — this
+        // exact failure ran silently three times per match in production and then masqueraded
+        // as an unreachable server. After three attempts the match is closed as no-contest,
+        // but with authorityGone=false: the authority is reachable, so the remote release must
+        // still be attempted (and retried by the terminal-recovery branch if it fails).
+        match.completionFailures = (match.completionFailures || 0) + 1;
+        logger.error('lobby.match_terminal_handling_failed', { matchId: match.matchId,
+          attempt: match.completionFailures, remoteStatus: status.status,
+          correlationId: match.correlationId, ...describeError(error),
+          // ApiError messages/field paths are fixed contract strings, never user data, and
+          // "VALIDATION_FAILED" alone is not a diagnosis — this ran blind for three days.
+          errorMessage: error instanceof ApiError ? error.message : undefined,
+          problems: error instanceof ApiError && Array.isArray(error.details?.fields)
+            ? error.details.fields.slice(0, 8) : undefined });
+        if (match.completionFailures >= 3) await abortActiveMatch(match, 'result-rejected', false);
       }
     }
   }

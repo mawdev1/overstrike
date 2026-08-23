@@ -132,6 +132,42 @@ const REQUIRE_MATCH_TICKETS = process.env.NODE_ENV === 'production'
   || Boolean(process.env.OVERSTRIKE_MATCH_TICKET_SECRET);
 let boundMatch = null;
 let lastReleasedMatchId = null;
+/**
+ * How long an ENDED match with nobody connected may stay bound waiting for the platform's
+ * /control/release before this authority frees itself. The platform's terminal saga normally
+ * lands the release within one or two 15 s sweeps; a bound-but-ended server past this window
+ * means that saga is failing, and staying bound turns one platform fault into a region with
+ * no capacity (the heartbeat reports an ended match as full occupancy on purpose — the seat
+ * is what protects an unfetched result). Self-release does NOT discard the result: it moves
+ * into `releasedResults`, still served by /control/status, so a late saga can still complete
+ * the match instead of voiding it.
+ *
+ * Tunable the same way every other lifecycle number here is (`arg`), because the acceptance
+ * harness has to watch this fire without holding a process for 90 real seconds. It runs on
+ * the WALL clock, not the seat clock: it guards production capacity, and must not be
+ * freezable through the test-only seat-clock control surface.
+ */
+const SELF_RELEASE_AFTER_MS = arg('selfreleasems', 90_000);
+/** Terminal records that outlived their binding, newest last. Bounded; see self-release. */
+const releasedResults = new Map();
+const RELEASED_RESULTS_MAX = 4;
+
+/** The one release path: /control/release and the ended-and-abandoned self-release share it. */
+function releaseBoundMatch() {
+  if (!boundMatch) return;
+  for (const client of [...server.clients.values()]) server.removeClient(client);
+  for (const held of heldEntities.values()) game.removeEntity(held.entity);
+  heldEntities.clear();
+  lastReleasedMatchId = boundMatch.matchId;
+  if (boundMatch.status === 'ended' && boundMatch.result) {
+    releasedResults.set(boundMatch.matchId, boundMatch.result);
+    while (releasedResults.size > RELEASED_RESULTS_MAX) {
+      releasedResults.delete(releasedResults.keys().next().value);
+    }
+  }
+  matchTicketVerifier?.releaseAllocation?.(boundMatch.matchId);
+  boundMatch = null;
+}
 const matchTicketVerifier = REQUIRE_MATCH_TICKETS ? createMatchTicketVerifier({
   secret: MATCH_TICKET_SECRET,
   matchId: process.env.OVERSTRIKE_MATCH_ID || null,
@@ -288,6 +324,7 @@ game.bus?.on('matchEnd', (result) => {
       traceparent: boundMatch.traceparent, tier: 'match-server', name: 'match.terminal',
       attributes: { component: 'match-authority', outcome: result?.reason || 'unknown' } });
     boundMatch.status = 'ended';
+    boundMatch.endedAtWall = Date.now();
     const byAccount = new Map([...server.clients.values()]
       .filter((client) => client.identity?.sub && client.entity)
       .map((client) => [client.identity.sub, client.entity]));
@@ -403,6 +440,19 @@ function pump() {
     boundMatch.startedAt = wallNow;
     serverLog('info', 'match.started', { clientCount: server.clients.size,
       botCount: BOTS, mode: activeMode, correlationId: boundMatch.correlationId });
+  }
+  // An ended match nobody is connected to, past the release grace, is a platform saga that
+  // failed. Free this authority rather than reporting a full region forever; the terminal
+  // record survives in `releasedResults` (see releaseBoundMatch), so nothing is lost if the
+  // control plane comes back for it. Uses the wall clock deliberately: this deadline guards
+  // production capacity and must not be freezable through the test-only seat clock.
+  if (boundMatch?.status === 'ended' && boundMatch.endedAtWall
+    && wallNow - boundMatch.endedAtWall >= SELF_RELEASE_AFTER_MS
+    && ![...server.clients.values()].some((client) => client.authenticated)) {
+    serverLog('error', 'match.self_released', { correlationId: boundMatch.correlationId,
+      matchId: boundMatch.matchId, outcome: boundMatch.result?.winnerTeam || 'uncertified' });
+    releaseBoundMatch();
+    restartAt = Date.now() + INTERMISSION_MS;
   }
   if (restartAt && Date.now() >= restartAt) restartMatch();
   const now = process.hrtime.bigint();
@@ -539,6 +589,9 @@ const http_ = http.createServer((req, res) => {
       draining, matchId: boundMatch?.matchId ?? null, roomId: boundMatch?.roomId ?? null,
       status: boundMatch?.status ?? 'idle', phase: game.match?.phase ?? null,
       result: boundMatch?.result ?? null,
+      // Terminal records that outlived their binding (self-release). A control plane whose
+      // release saga stalled can still complete those matches instead of voiding them.
+      releasedResults: [...releasedResults].map(([matchId, result]) => ({ matchId, result })),
       traceSpans: correlationId ? observability.timelineSpans(correlationId) : [],
       seats: boundMatch ? [...boundMatch.roster].map(([accountId, seat]) => ({
         accountId, connected: seat.connected, released: seat.released,
@@ -560,18 +613,21 @@ const http_ = http.createServer((req, res) => {
       // allocation to corrupt; returning 204 lets a platform terminal saga recover after the
       // first release succeeded but its durable room reopen did not.
       if (!boundMatch) { lastReleasedMatchId = input.matchId; res.writeHead(204); res.end(); return; }
-      if (input.matchId !== boundMatch.matchId) { res.writeHead(404); res.end(); return; }
+      // A match that already left the binding (self-release, or a release that raced a new
+      // allocation) answers 204, not 404: the caller's saga needs "released" to be a state it
+      // can reach idempotently, or its terminal recovery retries a release forever.
+      if (input.matchId !== boundMatch.matchId) {
+        if (input.matchId === lastReleasedMatchId || releasedResults.has(input.matchId)) {
+          res.writeHead(204); res.end(); return;
+        }
+        res.writeHead(404); res.end(); return;
+      }
       if (boundMatch.status !== 'ended' && [...server.clients.values()].some((client) => client.authenticated)) { res.writeHead(409); res.end(); return; }
       const correlationId = boundMatch.correlationId || correlationOf(req, input.matchId);
       observability.recordSpan({ correlationId, traceparent: boundMatch.traceparent,
         tier: 'match-server', name: 'control.release', durationMs: Date.now() - controlStartedAt,
         attributes: { component: 'match-control', status: 204 } });
-      for (const client of [...server.clients.values()]) server.removeClient(client);
-      for (const held of heldEntities.values()) game.removeEntity(held.entity);
-      heldEntities.clear();
-      lastReleasedMatchId = boundMatch.matchId;
-      matchTicketVerifier?.releaseAllocation?.(boundMatch.matchId);
-      boundMatch = null;
+      releaseBoundMatch();
       res.writeHead(204); res.end();
     });
     return;
