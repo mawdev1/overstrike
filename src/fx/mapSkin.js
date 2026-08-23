@@ -342,7 +342,31 @@ export function noteRenderer(renderer) {
 
 // ────────────────────────────────────────────────────────────────── image pipeline
 
+/**
+ * Decode OFF the main thread wherever the browser allows it.
+ *
+ * `new Image()` decodes on the main thread no matter what `decoding = 'async'` claims once
+ * the bitmap is actually touched (drawImage/texImage2D), so skinning a map used to land a
+ * burst of full-size JPEG decodes inside world construction — measured as a visible stall
+ * on join, and on a memory-tight machine a tab crash. `createImageBitmap` hands the decode
+ * to the browser's worker pool and returns something the canvas and GL can consume
+ * directly. Falls back to `Image` where it is unavailable (older Safari), because a slower
+ * decode is still infinitely better than an unskinned map.
+ */
 function loadImage(url) {
+  if (typeof createImageBitmap === 'function' && typeof fetch === 'function') {
+    return fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error(`[mapSkin] ${res.status} for ${url}`);
+        return res.blob();
+      })
+      .then((blob) => createImageBitmap(blob))
+      .catch(() => loadImageElement(url));
+  }
+  return loadImageElement(url);
+}
+
+function loadImageElement(url) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.decoding = 'async';
