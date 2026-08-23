@@ -284,11 +284,38 @@ export function buildLevel(game, world, { competitiveBoundary = true } = {}) {
   world.buildStats.colliders = world.boxes.length;
 }
 
-/** Retained comparison fixture; intentionally not part of the live Square rotation. */
+/**
+ * MERIDIAN — un-retired into the lobby offering by owner decision (map-data.md §9, 1.4.0
+ * amendment): rooms may select it explicitly for TDM and Bomb alongside 'the-square'.
+ *
+ * The manifest is deliberately PARTIAL: only `objectives` is declared. The two site boxes
+ * are the volumes `scripts/bottest.mjs` proved 65 rounds of autonomous Bomb against
+ * (plants and defuses at both) — each a 3 m box centred on a `nav.nearestWalkable`
+ * point at opposite corners of the district. Everything else (bounds, spawns) stays
+ * DERIVED from the built geometry, which keeps `provenance.spawns === 'derived'` and
+ * therefore keeps the spawner's mode-filter fallback in play — derived spawns carry
+ * `modes: ['tdm']` as a stamp, not an authored answer. Callouts, navHints and a
+ * COMPETITIVE_BOUNDARY remain unauthored and are recorded as gaps by `manifestGaps()`.
+ *
+ * Version 1.0.0-fixture → 1.1.0: declaring objective volumes is map data, not test data,
+ * and a map offered to a lobby room should not carry a '-fixture' version on the wire.
+ */
 export const MERIDIAN_FIXTURE = Object.freeze({
   MAP_ID: 'meridian',
-  MAP_VERSION: '1.0.0-fixture',
+  MAP_VERSION: '1.1.0',
   buildLevel: buildMeridianFixture,
+  MAP_MANIFEST: Object.freeze({
+    // §3.6 — the contract-default allocation, declared because geomtest requires
+    // `budgets.colliders` to be a declared, finite number (measured: 1085, comfortably in).
+    budgets: Object.freeze({
+      profileId: 'ref-integrated-1080p', drawCalls: 140, triangles: 300000,
+      materials: 48, lights: 6, colliders: 1200,
+    }),
+    objectives: Object.freeze([
+      { id: 'site-A', kind: 'plant', site: 'A', box: volume(-26.88, 0, -21.63, -23.88, 2.4, -18.63), requiresGround: true },
+      { id: 'site-B', kind: 'plant', site: 'B', box: volume(23.38, 0, 18.88, 26.38, 2.4, 21.88), requiresGround: true },
+    ]),
+  }),
 });
 
 function buildSquareGround(B) {
@@ -2766,7 +2793,10 @@ function shed(B, x0, x1, zBack, zFront, h, matName, opening, glazed = false) {
   B.box(x1 - T, 0, za, x1, h, zb, matName, 'concrete');
   const ops = [{ a0: opening[0], a1: opening[1], y0: 0, y1: opening[2], frame: glazed ? 'door' : null }];
   if (glazed) ops.push({ a0: opening[1] + 1.0, a1: opening[1] + 2.2, y0: 1.1, y1: 2.3, glass: true, frame: 'window' });
-  B.wall(x0, fa, x1, fb, 0, h, matName, 'concrete', { openings: ops });
+  // Inset the front wall to span BETWEEN the side walls. Running it x0..x1 duplicated the
+  // side-wall columns: the end segments were wholly inside the boxes above — geomtest
+  // ENTOMBED defects (§3.1 inert colliders) — with identical collision either way.
+  B.wall(x0 + T, fa, x1 - T, fb, 0, h, matName, 'concrete', { openings: ops });
   B.box(x0 - 0.25, h, za, x1 + 0.25, h + 0.35, zb, 'metal', 'metal', { receive: false });
   B.deco(x0 - 0.3, h - 0.14, fa - 0.28, x1 + 0.3, h + 0.02, fb + 0.28, 'concreteDark');
 }

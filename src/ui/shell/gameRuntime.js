@@ -240,6 +240,12 @@ export function createGameRuntime({
         await candidate.init((value, label) => {
           setProgress(value, label);
           onProgress?.(value, label);
+        }, {
+          // Build the allocation's map, not the rotation head. The platform validated
+          // MatchHandoff.mapId against its supported-map table; an id this client does not
+          // register fails loudly in World.init rather than silently loading 'the-square'
+          // under a match the server is refereeing on different geometry.
+          mapId: networked && typeof handoff?.mapId === 'string' ? handoff.mapId : null,
         });
         candidate.menu?.close?.();
         configureGame?.(candidate);

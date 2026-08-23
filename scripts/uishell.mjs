@@ -919,21 +919,38 @@ async function browserChecks(stubResults) {
     await page.locator('summary', { hasText: 'Create a room' }).click();
     check((await page.locator('#shell-room-create-map option[value="the-square"]').count()) === 1,
       "the map select offers 'the-square' under compiled defaults — the map that went missing in production");
+    check((await page.locator('#shell-room-create-map option[value="meridian"]').count()) === 1,
+      "and 'Meridian' (feature-flags.md 1.3.0, map-data.md §9 un-retirement)");
     check(!(await page.getByRole('button', { name: 'Create and join', exact: true }).isDisabled()),
       'and the submit button is enabled: an approved mode and map combination exists by default');
 
+    // Each map has its OWN kill switch. Flipping one off must remove exactly that map and
+    // leave the form usable on the other; only both off may empty the list and gate submit.
     await page.evaluate(() => {
       window.__HARNESS_FLAGS__.flags['map.the_square.enabled'] = false;
       window.__SHELL__.navigate('/play/rooms');
       window.__SHELL__.injectFixture('play.rooms', 'ready');
     });
     await page.locator('summary', { hasText: 'Create a room' }).click();
+    check((await page.locator('#shell-room-create-map option[value="the-square"]').count()) === 0
+      && (await page.locator('#shell-room-create-map option[value="meridian"]').count()) === 1,
+      "flipping the Square kill switch off removes 'the-square' and leaves 'meridian' offered");
+    check(!(await page.getByRole('button', { name: 'Create and join', exact: true }).isDisabled()),
+      'and the form still submits — one disabled map must not close room creation');
+
+    await page.evaluate(() => {
+      window.__HARNESS_FLAGS__.flags['map.meridian.enabled'] = false;
+      window.__SHELL__.navigate('/play/rooms');
+      window.__SHELL__.injectFixture('play.rooms', 'ready');
+    });
+    await page.locator('summary', { hasText: 'Create a room' }).click();
     check((await page.locator('#shell-room-create-map option').count()) === 0,
-      'flipping the map kill switch off empties the map list');
+      'flipping BOTH map kill switches off empties the map list');
     check((await page.getByRole('button', { name: 'Create and join', exact: true }).isDisabled()),
       'the submit gate still refuses when no approved map is enabled — solo does not bypass it');
     await page.evaluate(() => {
       delete window.__HARNESS_FLAGS__.flags['map.the_square.enabled'];
+      delete window.__HARNESS_FLAGS__.flags['map.meridian.enabled'];
       window.__SHELL__.navigate('/play/rooms');
       window.__SHELL__.injectFixture('play.rooms', 'ready');
     });
@@ -1627,6 +1644,7 @@ async function browserChecks(stubResults) {
             'mode.tdm.enabled': true,
             'mode.bomb.enabled': false,
             'map.the_square.enabled': false,
+            'map.meridian.enabled': false,
             'chat.text.enabled': true,
             'chat.pings.enabled': true,
             'reports.enabled': true,
@@ -1642,6 +1660,7 @@ async function browserChecks(stubResults) {
             'mode.tdm.enabled': true,
             'mode.bomb.enabled': false,
             'map.the_square.enabled': false,
+            'map.meridian.enabled': false,
             'chat.text.enabled': true,
             'chat.pings.enabled': true,
             'reports.enabled': true,

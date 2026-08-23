@@ -17,6 +17,8 @@ export const SHELL_FEATURE_DEFAULTS = Object.freeze({
   // only map from the create form whenever the flag fetch failed.
   'mode.bomb.enabled': true,
   'map.the_square.enabled': true,
+  // feature-flags.md 1.3.0: MERIDIAN un-retired into the room offering (map-data.md §9).
+  'map.meridian.enabled': true,
   'chat.text.enabled': true,
   'chat.pings.enabled': true,
   'reports.enabled': true,

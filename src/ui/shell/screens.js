@@ -623,7 +623,9 @@ function roomMap(room) {
 }
 
 function mapLabel(value) {
-  return value === 'the-square' ? 'The Square' : value;
+  if (value === 'the-square') return 'The Square';
+  if (value === 'meridian') return 'Meridian';
+  return value;
 }
 
 function modeLabel(value) {
@@ -803,6 +805,7 @@ function renderRooms({ view, actions, isFeatureEnabled }) {
   ].filter(Boolean);
   const mapOptions = [
     isFeatureEnabled?.('map.the_square.enabled') !== false ? { value: 'the-square', label: 'The Square' } : null,
+    isFeatureEnabled?.('map.meridian.enabled') !== false ? { value: 'meridian', label: 'Meridian' } : null,
   ].filter(Boolean);
   const createMapWrap = selectControl('Map', 'shell-room-create-map', mapOptions);
   const createModeWrap = selectControl('Mode', 'shell-room-create-mode', modeOptions);
