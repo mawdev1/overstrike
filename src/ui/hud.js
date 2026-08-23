@@ -1920,12 +1920,17 @@ export class HUD {
       : this._networkOverlay === 'compact'
         ? `${Math.round(net.rttMs ?? 0)} ms · ${Number(net.lossPct ?? 0).toFixed(1)}% loss`
         : `${net.region || '—'} · ${Math.round(net.rttMs ?? 0)} ms · ${Number(net.jitterMs ?? 0).toFixed(1)} ms jitter · ${Number(net.lossPct ?? 0).toFixed(1)}% loss · ${Number(net.receiveRateHz ?? 0).toFixed(1)} Hz`;
-    const sig = `${s.fps}|${s.frameMs.toFixed(1)}|${s.drawCalls}|${s.triangles}|${netText}`;
+    const sig = `${s.fps}|${(s.wallMs || s.frameMs).toFixed(1)}|${(s.bufferMPix || 0).toFixed(1)}|${s.drawCalls}|${s.triangles}|${netText}`;
     if (sig === this._c.perf) return;
     this._c.perf = sig;
     this.el.pFps.textContent = String(s.fps | 0);
     this.el.pFps.className = 'p-fps' + (s.fps < 45 ? ' worse' : s.fps < 75 ? ' bad' : '');
-    this.el.pMs.textContent = `${s.frameMs.toFixed(1)} ms`;
+    // Show the WALL time and the buffer size, not just CPU-inside-render. A fill-bound
+    // frame reads ~1.5 ms of CPU while taking 50 ms of wall — reporting only the former is
+    // how a 6x-over-budget frame looks healthy in a screenshot.
+    const wall = Number.isFinite(s.wallMs) && s.wallMs > 0 ? s.wallMs : s.frameMs;
+    const mpix = Number.isFinite(s.bufferMPix) && s.bufferMPix > 0 ? ` ${s.bufferMPix.toFixed(1)}MP` : '';
+    this.el.pMs.textContent = `${wall.toFixed(1)} ms${mpix}`;
     this.el.pDc.textContent = `${s.drawCalls | 0} dc`;
     this.el.pTri.textContent = `${formatK(s.triangles | 0)} tri`;
     this.el.pNet.textContent = netText;
