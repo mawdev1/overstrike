@@ -726,6 +726,19 @@ export function clearMapSkin(game, root) {
  * @param {THREE.Object3D} root  the built world group, walked for vertex-colour clones
  * @param {string} mapId
  */
+/**
+ * The in-flight skin, so boot can WAIT for it.
+ *
+ * Textures arriving after the shader prewarm is the worst of both worlds: three.js has to
+ * recompile every material the moment `map` goes from null to a texture, and it does that
+ * during play, one hitching frame at a time as each surface is first seen. That is exactly
+ * the "terrible for the first minute, then it sorts itself out" a player reported. Waiting
+ * for the skin before prewarming moves the whole cost into the loading screen, where a
+ * progress bar is already asking for patience.
+ */
+let _skinReady = Promise.resolve(false);
+export function mapSkinReady() { return _skinReady; }
+
 export function applyMapSkin(game, root, mapId) {
   if (!usable()) return Promise.resolve(false);
   const skin = MAP_SKINS[mapId];
@@ -793,7 +806,8 @@ export function applyMapSkin(game, root, mapId) {
 
   if (skin.sky && game?.engine) jobs.push(applySky(game, skin.sky, skin.skyGain ?? 1.4, skin.skyYaw ?? 0, gen));
 
-  return Promise.all(jobs).then(() => gen === _generation);
+  _skinReady = Promise.all(jobs).then(() => gen === _generation, () => false);
+  return _skinReady;
 }
 
 // ─────────────────────────────────────────────────────────────────────────── sky
