@@ -316,6 +316,20 @@ export class Prediction {
 
     e.position.set(wire.x, wire.y, wire.z);
     e.velocity.set(wire.vx, wire.vy, wire.vz);
+    // Re-apply the fields the SERVER owns, because the restore above just overwrote them
+    // with a locally-saved copy from before the snapshot arrived.
+    //
+    // `_syncLife` sets these on every snapshot, but a rollback runs AFTER it and
+    // `PLAYER_SNAPSHOT.restore` faithfully puts back whatever the client believed at the
+    // acked command — including the team the client invented. `startMatch` pins the local
+    // player to team 0, so a player the server dealt onto team 1 was corrected to 1 and
+    // reverted to 0 on the very next correction, forever. Since remote rigs are coloured by
+    // ABSOLUTE team, that player saw their own team in enemy colours and was shot at by
+    // people the HUD told them were hostile. Verified: wire.team stayed 1 while e.team
+    // stayed 0 across every snapshot.
+    if (typeof wire.team === 'number') e.team = wire.team;
+    e.health = wire.health;
+    e.armor = wire.armor;
     e.health = wire.health;
     e.armor = wire.armor;
     e.height = wire.height;
