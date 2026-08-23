@@ -1428,6 +1428,45 @@ async function browserChecks(stubResults) {
     check((await page.getByText('Ready request pending. The roster label remains authoritative until the server answers.', { exact: true }).count()) === 1, 'pending ready intent must not replace the authoritative ready label');
     check((await page.getByRole('button', { name: '○ GREEN UP', exact: true }).isDisabled()), 'pending ready action must stay single-flight until the server answers');
 
+    /**
+     * The way out of, and back into, a room whose match is still running.
+     *
+     * A player who launched a room of bots, left the match and came back to the shell had
+     * neither: `/match/reconnect` renders a Reconnect button that nothing in the shell ever
+     * navigated to, and "Delete room" was `disabled: !connected` — greyed out in exactly the
+     * state where the lobby socket has been closed since launch. Both are offered from the
+     * room screen now, so both are asserted from it.
+     */
+    await page.evaluate(() => window.__SHELL__.injectFixture('room.home', {
+      variant: 'ready',
+      data: {
+        status: 'reconnecting', roomId: 'fixture-room-alpha',
+        room: { roomId: 'fixture-room-alpha', name: 'Fixture Alpha', status: 'in-progress',
+          capacity: 10, playerCount: 1 },
+        roster: [{ accountId: 'fixture-local', displayName: 'Authoritative Player', team: 'alpha',
+          ready: true, isOwner: true, isLocal: true, connection: 'reconnecting', estimatedRttMs: null,
+          loadout: { primaryIdx: 0, secondaryIdx: 1 } }],
+      },
+    }));
+    check((await page.getByRole('button', { name: 'Rejoin match', exact: true }).count()) === 1,
+      'a room whose match is in progress must offer a way back into it');
+    check(!(await page.getByRole('button', { name: 'Delete room', exact: true }).isDisabled()),
+      'the owner must be able to delete their own room without a synchronized lobby socket');
+
+    await page.evaluate(() => window.__SHELL__.injectFixture('room.home', {
+      variant: 'ready',
+      data: {
+        status: 'synchronized', roomId: 'fixture-room-alpha',
+        room: { roomId: 'fixture-room-alpha', name: 'Fixture Alpha', status: 'open',
+          capacity: 10, playerCount: 1 },
+        roster: [{ accountId: 'fixture-local', displayName: 'Authoritative Player', team: 'alpha',
+          ready: false, isOwner: true, isLocal: true, connection: 'connected', estimatedRttMs: 24,
+          loadout: { primaryIdx: 0, secondaryIdx: 1 } }],
+      },
+    }));
+    check((await page.getByRole('button', { name: 'Rejoin match', exact: true }).count()) === 0,
+      'an open room with no match must not offer a rejoin that would 404');
+
     await page.evaluate(() => {
       window.__SHELL__.navigate('/room/fixture-room-alpha/loadout');
       window.__SHELL__.injectFixture('room.loadout', 'ready');

@@ -1177,6 +1177,7 @@ function lobbyControls({ route, view, actions, isFeatureEnabled }) {
   const local = members.find((member) => member.isLocal) || view.data?.you || {};
   const currentReady = view.data?.selfReady ?? local.ready === true;
   const frozen = Boolean(view.data?.countdown) || view.data?.room?.status === 'countdown';
+  const inProgress = view.data?.room?.status === 'in-progress';
   const connected = !view.data?.status || ['synchronized', 'countdown'].includes(view.data.status);
   const teamPending = pendingIntent(view, 'team');
   const readyPending = pendingIntent(view, 'ready');
@@ -1223,6 +1224,31 @@ function lobbyControls({ route, view, actions, isFeatureEnabled }) {
       local.isOwner ? actionButton('Launch when ready', () => submitIntent('launchRoom', { roomId: roomIdValue }, 'Requesting launch…', 'Launch request accepted.'), {
         className: 'os-button os-button--primary', dataset: { operation: 'launch' }, disabled: !connected || frozen,
       }) : null,
+      /**
+       * The way back INTO a match you are still in.
+       *
+       * `/match/reconnect` renders a Reconnect button, and nothing in the shell has ever
+       * navigated to that route — so a player who left a live match and came back to their
+       * room had no affordance to return, however healthy their seat was. The room screen is
+       * where they land, so the offer belongs here.
+       *
+       * `reconnectMatch` with no matchId resolves it from `GET /v1/matches/active`, which is
+       * already the authority on whether there is still a seat: it answers 204 once the match
+       * has ended or the authority released the seat, and the button then reports that rather
+       * than pretending. No new endpoint, no new state — the room's own `in-progress` status
+       * is the only thing gating whether it is worth offering.
+       */
+      inProgress ? actionButton('Rejoin match', () => actions.submit('reconnectMatch', {}, {
+        onSuccess: (result) => {
+          if (result?.handoff) { actions.enterGame(result.handoff); return; }
+          feedback.textContent = 'That match has already ended. The room reopens when it settles.';
+          feedback.focus();
+        },
+        onError: (error) => {
+          feedback.textContent = safeError(error).message;
+          feedback.focus();
+        },
+      }), { className: 'os-button os-button--primary', dataset: { operation: 'rejoin-match' } }) : null,
       actionButton('Leave room', (event) => actions.openModal({
         title: 'Leave this room?',
         message: 'Your place in the room is released only after the service confirms the request.',
@@ -1251,7 +1277,13 @@ function lobbyControls({ route, view, actions, isFeatureEnabled }) {
             feedback.focus();
           },
         }),
-      }), { className: 'os-button os-button--danger', dataset: { operation: 'delete-room' }, disabled: !connected }) : null,
+      // Deliberately NOT `disabled: !connected`, unlike every control above it. Those all act
+      // on live lobby state and are meaningless without a synchronized socket; DELETE
+      // /v1/rooms/:id is a plain authenticated HTTP call that does not need one. Gating it on
+      // the socket meant the one state where a player most wants to be rid of their room —
+      // back at the shell, socket long since closed, a match nobody is playing still running —
+      // was the exact state in which the button was greyed out.
+      }), { className: 'os-button os-button--danger', dataset: { operation: 'delete-room' } }) : null,
     ]),
     view.data?.readyUnavailableReason ? element('p', { className: 'os-warning' }, view.data.readyUnavailableReason) : null,
   ]);
