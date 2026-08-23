@@ -810,6 +810,10 @@ export function createShellApi({ client, telemetry = null, settings = null, ulid
       }, empty204);
     },
 
+    deleteRoom(payload = {}) {
+      return data(`/v1/rooms/${encode(payload.roomId)}`, { method: 'DELETE' }, empty204);
+    },
+
     setTeam(payload = {}) {
       return data(`/v1/rooms/${encode(payload.roomId)}/team`, {
         method: 'POST', body: { team: teamValue(payload.team) }, maxAttempts: 1,

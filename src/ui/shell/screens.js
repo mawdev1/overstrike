@@ -1207,6 +1207,19 @@ function lobbyControls({ route, view, actions, isFeatureEnabled }) {
           },
         }),
       }), { className: 'os-button os-button--danger', dataset: { operation: 'leave' }, disabled: !connected }),
+      local.isOwner && members.length <= 1 ? actionButton('Delete room', (event) => actions.openModal({
+        title: 'Delete this room?',
+        message: 'This closes the room permanently. There is no undo.',
+        confirmLabel: 'Delete room',
+        opener: event.currentTarget,
+        onConfirm: () => actions.submit('deleteRoom', { roomId: roomIdValue }, {
+          onSuccess: () => actions.navigate(homePath(isFeatureEnabled)),
+          onError: (error) => {
+            feedback.textContent = safeError(error).message;
+            feedback.focus();
+          },
+        }),
+      }), { className: 'os-button os-button--danger', dataset: { operation: 'delete-room' }, disabled: !connected }) : null,
     ]),
     view.data?.readyUnavailableReason ? element('p', { className: 'os-warning' }, view.data.readyUnavailableReason) : null,
   ]);
