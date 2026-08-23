@@ -1,6 +1,32 @@
 import { actionButton, definitionList, element, field, safeError, shellLink } from './dom.js';
 import { capabilityLabel } from './capabilities.js';
+import { HERO_ART, loadingArt } from './keyart.js';
 import { createSettingsScreen, SETTINGS_BY_KEY } from './settings/index.js';
+
+/**
+ * A decorative key-art panel: an `<img>` under a CSS scrim, `aria-hidden` and `alt=""` so it
+ * is never the only carrier of anything. The image is a child rather than a CSS
+ * `background-image` so the browser can prioritise/lazy it and so a failed load collapses to
+ * the panel's own background instead of leaving a black rectangle. `data-art` is what the
+ * acceptance harness asserts against — it names the file that was actually chosen.
+ */
+function keyArtPanel(src, { className = '', children = [] } = {}) {
+  if (!src) return element('div', { className: `os-keyart-panel ${className}`.trim() }, children);
+  const image = element('img', { className: 'os-keyart__image', src, alt: '', decoding: 'async' });
+  image.addEventListener('error', () => {
+    // A missing or blocked image must degrade to the panel's flat treatment, not a hole.
+    image.remove();
+    panel.dataset.artFailed = 'true';
+  });
+  const panel = element('div', {
+    className: `os-keyart-panel ${className}`.trim(),
+    dataset: { art: src },
+  }, [
+    element('div', { className: 'os-keyart', 'aria-hidden': 'true' }, image),
+    element('div', { className: 'os-keyart-panel__body' }, children),
+  ]);
+  return panel;
+}
 
 const FORM_EMPTY_ROUTES = new Set([
   'auth.signIn',
@@ -117,7 +143,13 @@ function renderWelcome({ capabilities, actions }) {
     ]));
   }
   return element('section', {}, [
-    element('p', { className: 'os-lede' }, 'Sign in to browse rooms, manage your account, and prepare for a match.'),
+    keyArtPanel(HERO_ART, {
+      className: 'os-keyart-panel--hero',
+      children: [
+        element('p', { className: 'os-keyart-panel__kicker' }, 'Browser-native tactical FPS'),
+        element('p', { className: 'os-lede' }, 'Sign in to browse rooms, manage your account, and prepare for a match.'),
+      ],
+    }),
     element('h2', {}, 'Compatibility'),
     list,
     capabilities?.supported
@@ -1918,8 +1950,18 @@ function renderSessions({ view, actions }) {
 
 function renderMatchLoading({ view, actions, capabilities, isFeatureEnabled }) {
   const data = view.data || {};
+  // The HANDOFF names the map, not the rotation. Reading the rotation head here is exactly the
+  // bug that showed players the wrong map's loading screen while the server had allocated
+  // another one; `loadingArt` takes the handoff first for that reason.
+  const mapId = data.handoff?.mapId || data.mapId || null;
   return element('section', {}, [
-    element('p', { role: 'status' }, data.stage || 'Waiting for an authoritative match handoff.'),
+    keyArtPanel(loadingArt(data.handoff, data), {
+      className: 'os-keyart-panel--loading',
+      children: [
+        element('p', { className: 'os-keyart-panel__kicker' }, mapId ? `Map · ${mapId}` : 'Map · pending allocation'),
+        element('p', { role: 'status' }, data.stage || 'Waiting for an authoritative match handoff.'),
+      ],
+    }),
     capabilities?.supported
       ? null
       : element('p', { className: 'os-warning' }, 'Match entry is blocked because this device did not pass the capability check.'),

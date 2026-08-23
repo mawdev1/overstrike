@@ -6,6 +6,7 @@ import { Minimap } from './minimap.js';
 import { Scoreboard, modeLabel, formatClock } from './scoreboard.js';
 import { createLocalBombHud } from './bomb/index.js';
 import { createRaidHud } from './raid/index.js';
+import { getShellAudio } from './shell/audio.js';
 
 /**
  * HUD — DOM overlay mounted under `#hud`, per ARCHITECTURE §10.
@@ -54,7 +55,8 @@ const LONGSHOT_M = 45;
 const CAPTION_LABELS = Object.freeze({
   matchStart: 'Match started', matchEnd: 'Match ended', streakReady: 'Killstreak ready',
   killConfirm: 'Kill confirmed', explosion: 'Explosion', rifle: 'Rifle fire', smg: 'SMG fire',
-  lmg: 'LMG fire', sniper: 'Sniper fire', shotgun: 'Shotgun fire', pistol: 'Pistol fire',
+  lmg: 'LMG fire', sniper: 'Sniper fire', dmr: 'Marksman fire',
+  shotgun: 'Shotgun fire', pistol: 'Pistol fire',
   grenadeBounce: 'Grenade bouncing', footstepConcrete: 'Footsteps', footstepDirt: 'Footsteps',
   hurt: 'Player hurt', death: 'Player eliminated', lowAmmo: 'Low ammunition',
 });
@@ -167,6 +169,12 @@ export class HUD {
      * `kill` directly, so it must stay true or every line would render twice.
      */
     this.killfeedFromBus = true;
+
+    // Progression stingers are coalesced across a single `award()` burst — see
+    // `_queueProgressionStinger`.
+    this._pendingStinger = null;
+    this._stingerQueued = false;
+    this._disposed = false;
 
     // ---- cached last-written values (never write the DOM twice) ----
     this._c = {
@@ -670,7 +678,50 @@ export class HUD {
     progression.onLevelUp = (level, prev, self) => {
       try { prevLevelUp?.(level, prev, self); } catch { /* not ours to police */ }
       this.notice(`RANK ${level}`, progression.getRankName(level), 3.2);
+      this._queueProgressionStinger('levelUp');
     };
+    const prevUnlock = progression.onUnlock;
+    this._prevUnlock = prevUnlock;
+    progression.onUnlock = (id, level) => {
+      try { prevUnlock?.(id, level); } catch { /* not ours to police */ }
+      this._queueProgressionStinger('unlock');
+    };
+  }
+
+  /**
+   * One stinger per progression event, however many callbacks it fires.
+   *
+   * `progression.award()` calls `onLevelUp` once and then `onUnlock` ONCE PER UNLOCKED ID,
+   * synchronously, in a single tick — a rank that hands over two weapons is an ordinary
+   * event. Playing each callback would put three buffer sources on the UI bus in the same
+   * millisecond, two of them the identical file: that is not three sounds, it is one sound
+   * with a flam and partial phase cancellation, the same defect the `error` cue is throttled
+   * for. So the callbacks only mark intent, and one cue is voiced after the burst has
+   * finished. `unlock` wins over `levelUp` when both land, which is the rule the after-action
+   * report in menu.js already states: a new weapon is bigger news than the rank that gave it
+   * to you.
+   *
+   * A microtask is the right deferral: `award()`'s loop is synchronous, so the queue drains
+   * once it returns, and unlike a timer it cannot be throttled in a background tab or land
+   * after the player has already left the screen.
+   *
+   * The stingers themselves belong to the shell's UI player, not the match mix: they are
+   * interface feedback, they follow the interface volume, and routing them there means one
+   * AudioContext serves both sides of the boundary. `?.` throughout — in a headless run
+   * nothing ever created a controller and this is a no-op.
+   */
+  _queueProgressionStinger(cue) {
+    if (cue === 'unlock') this._pendingStinger = 'unlock';
+    else if (!this._pendingStinger) this._pendingStinger = 'levelUp';
+    if (this._stingerQueued) return;
+    this._stingerQueued = true;
+    queueMicrotask(() => {
+      this._stingerQueued = false;
+      const pending = this._pendingStinger;
+      this._pendingStinger = null;
+      if (!pending || this._disposed) return;
+      getShellAudio()?.play?.(pending);
+    });
   }
 
   /* ======================================================================
@@ -1121,10 +1172,14 @@ export class HUD {
   }
 
   dispose() {
+    // A stinger queued in the tick the HUD was torn down has nothing left to announce.
+    this._disposed = true;
+    this._pendingStinger = null;
     window.removeEventListener('resize', this._onResize);
     for (const u of this._unsubs) { try { u(); } catch { /* ignore */ } }
     this._unsubs.length = 0;
     progression.onLevelUp = this._prevLevelUp ?? null;
+    progression.onUnlock = this._prevUnlock ?? null;
     this.killfeedUI.dispose();
     this.minimap.dispose();
     this.scoreboard.dispose();

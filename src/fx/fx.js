@@ -5,6 +5,7 @@ import { ParticleSystem } from './particles.js';
 import { DecalSystem, DECAL_CAP } from './decals.js';
 import { TracerSystem, TRACER_NORMAL, TRACER_SNIPER, TRACER_SPEED } from './tracers.js';
 import { SiteRings } from './siteRings.js';
+import { loadDecalSkins } from './mapSkin.js';
 
 /**
  * OVERSTRIKE — FX facade (ARCHITECTURE §8).
@@ -366,6 +367,18 @@ export class FX {
 
     this.particles.init(scene);
     this.particles.quality = this.quality;
+
+    // The decal atlas is blitted ONCE from `assets.tex(...)` and never re-read, so the
+    // photographic sources have to be in the texture library before `init` runs — this
+    // is the one place in the asset wiring that cannot be deferred.
+    //
+    // It is still not allowed to hold up the boot: a slow or dead CDN would otherwise
+    // stall the loading screen indefinitely. The race gives it a bounded budget and then
+    // builds the atlas from whatever is there, which on a timeout is the procedural set.
+    await Promise.race([
+      loadDecalSkins().catch(() => false),
+      new Promise((r) => setTimeout(r, 2500)),
+    ]);
     this.decals.init(scene);
     this.tracers.init(scene);
     this.siteRings.init(scene);

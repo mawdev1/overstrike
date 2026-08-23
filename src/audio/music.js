@@ -63,6 +63,22 @@ export class Music {
     this._nextBeat = 0;
     this._beat = 0;
 
+    /**
+     * Recorded stings, handed over by `AudioEngine` as `public/audio/music/**` decodes.
+     *
+     * Only the ROUND stings live here. The menu bed, the victory theme and the defeat theme
+     * are the SHELL's (`ui/shell/audio.js`) — the shell is on screen for all three and it
+     * stops its own music on the way into a match, so playing them here too would be two
+     * copies of the same file, slightly out of phase. What the shell cannot cover is a round
+     * ending mid-match, which is exactly what is left.
+     *
+     * The match bed stays procedural on purpose: it tightens with combat intensity, which is
+     * what `update()` spends its time on, and a fixed loop cannot do that.
+     *
+     * @type {Map<string, AudioBuffer>}
+     */
+    this.tracks = new Map();
+
     this._unsubs = [];
     this._bindBus();
   }
@@ -119,6 +135,45 @@ export class Music {
       g.setValueAtTime(g.value, now);
       g.linearRampToValueAtTime(this._level(), now + 0.12);
     } catch { /* ignore */ }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Recorded stings                                                   */
+  /* ---------------------------------------------------------------- */
+
+  /** @param {'roundWin'|'roundLoss'} key */
+  setTrack(key, buffer) {
+    if (key && buffer) this.tracks.set(key, buffer);
+  }
+
+  hasTrack(key) { return this.tracks.has(key); }
+
+  /**
+   * A short recorded sting on the music bus, over whatever bed is running. Deliberately not
+   * registered in `_bed`: a state change during it must not cut it off, and it ends on its
+   * own in a few seconds either way.
+   *
+   * @returns {boolean} false when there is no such recording — the caller then stays silent,
+   *   which is what round ends did before there was one.
+   */
+  playSting(key, volume = 1) {
+    const buf = this.tracks.get(key);
+    const ctx = this.ctx;
+    if (!buf || !ctx || !this.out) return false;
+    try {
+      const now = ctx.currentTime;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = volume;
+      src.connect(gain);
+      gain.connect(this.out);
+      src.start(now + 0.01);
+      src.onended = () => { try { src.disconnect(); gain.disconnect(); } catch { /* ignore */ } };
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /* ---------------------------------------------------------------- */

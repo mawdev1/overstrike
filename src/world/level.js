@@ -5,6 +5,11 @@ import { Builder } from './props.js';
 // (sector-interest.md §5.1's "one relevant sector set" rule) — never a second,
 // renderer-local notion of nearby. The module is CC-owned; importing it is the point.
 import { SectorInterest, SECTOR_COOLDOWN_S } from '../game/sectorInterest.js';
+// Photographic albedo/sky skins. Purely presentational and entirely optional: every
+// entry point below no-ops unless there is a DOM and a built material library, so the
+// headless sim, the determinism harness and the nav baker never touch it. It runs AFTER
+// the geometry is finished and only ever writes `material.map`/`material.color`.
+import { applyMapSkin } from '../fx/mapSkin.js';
 
 /**
  * MERIDIAN — a Mediterranean coastal military compound.
@@ -344,6 +349,7 @@ export function buildLevel(game, world, { competitiveBoundary = true } = {}) {
   world.buildStats.drawCalls = stats.meshes + stats.instanced;
   world.buildStats.triangles = Math.round(stats.triangles);
   world.buildStats.colliders = world.boxes.length;
+  applyMapSkin(game, world.group, MAP_ID);
 }
 
 /**
@@ -385,10 +391,16 @@ function buildSquareGround(B) {
   // road beds for the two crossing roads so the skeleton reads from the air.
   B.groundPlane(-42, -42, 42, 42, 0, 'dirt', 'dirt');
   B.floorFinish(-16, -16, 16, 16, 0.02, 'tile', { cast: false });
-  B.floorFinish(-6, -42, 6, -16, 0.025, 'concreteDark', { cast: false });
-  B.floorFinish(-6, 16, 6, 42, 0.025, 'concreteDark', { cast: false });
-  B.floorFinish(-42, -6, -16, 6, 0.025, 'concreteDark', { cast: false });
-  B.floorFinish(16, -6, 42, 6, 0.025, 'concreteDark', { cast: false });
+  // The four road beds move off 'concreteDark' and onto 'asphalt' — the material the
+  // comment above already describes them as. They are the only *ground* users of
+  // concreteDark, which otherwise means building shells, plinths, parapets and trim, and
+  // one name cannot be both a road surface and a cornice once a photographic skin is
+  // resolving names to real materials. Same geometry, same colliders, same four boxes:
+  // they merge into a bucket of their own instead of into the concreteDark bucket.
+  B.floorFinish(-6, -42, 6, -16, 0.025, 'asphalt', { cast: false });
+  B.floorFinish(-6, 16, 6, 42, 0.025, 'asphalt', { cast: false });
+  B.floorFinish(-42, -6, -16, 6, 0.025, 'asphalt', { cast: false });
+  B.floorFinish(16, -6, 42, 6, 0.025, 'asphalt', { cast: false });
 }
 
 /**
@@ -925,6 +937,7 @@ export function buildExtractionLevel(game, world, opts = {}) {
   // Client-side streaming controller, driven per-frame from the FX facade (CX-owned
   // frame hook). Hangs off the THREE group's userData so no CC-owned object grows a
   // new property. Inert headlessly: colliders-only builds produce no sector groups.
+  applyMapSkin(game, world.group, XM_ID);
   world.group.userData.sectorStreaming = createSectorStreaming({
     sectors: EXTRACTION_SECTORS,
     groups: B.sectorGroups,
@@ -1400,6 +1413,7 @@ export function buildMeridianFixture(game, world) {
   world.buildStats.drawCalls = stats.meshes + stats.instanced;
   world.buildStats.triangles = Math.round(stats.triangles);
   world.buildStats.colliders = world.boxes.length;
+  applyMapSkin(game, world.group, MERIDIAN_FIXTURE.MAP_ID);
 }
 
 // ──────────────────────────────────────────────────────────────────────── ground

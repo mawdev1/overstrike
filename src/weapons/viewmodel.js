@@ -215,6 +215,8 @@ export class Viewmodel {
     this.reloadDur = 1;
     this.reloadP = 0;
     this._reloadStage = 0;
+    /** True while a recorded whole-reload take is covering the per-stage handling sounds. */
+    this._reloadComposite = false;
 
     this.switchT = 0; this.switchDur = 0; this.switchDir = 0;   // -1 lower, +1 raise
     this.inspectT = 0; this.inspectDur = 2.1;
@@ -1390,27 +1392,45 @@ export class Viewmodel {
     const audio = this.game.audio;
     const drops = parts.magDrops !== false;
 
+    /*
+     * A recorded reload is ONE take of the whole handling sequence — mag out, mag in, tap,
+     * bolt — so when the sample bank has one it plays at stage 1 and the per-stage synth
+     * clicks that would otherwise double it are skipped. Without it (offline, still
+     * loading, decode failed) `composite` is null and every stage below fires exactly as
+     * it always has.
+     *
+     * The class split is here because this is the only place that knows it: `weaponSystem`
+     * plays reloads by name for entities with no viewmodel (bots), where a pistol and a
+     * rifle sound the same from thirty metres and nobody can tell.
+     */
+    let composite = null;
+    if (this._reloadStage < 1 && p >= 0.18 && typeof audio?.isSampled === 'function') {
+      const name = c.def?.class === 'pistol' ? 'reloadPistol' : 'reloadRifle';
+      if (audio.isSampled(name)) composite = name;
+    }
+
     // Stage 1 — mag release and drop.
     if (this._reloadStage < 1 && p >= 0.18) {
       this._reloadStage = 1;
-      audio?.play?.('magOut', { position: pos, volume: 0.85 });
+      this._reloadComposite = !!composite;
+      audio?.play?.(composite || 'magOut', { position: pos, volume: 0.85 });
       if (drops) this._spawnDropMag();
     }
     // Stage 2 — new mag seated.
     if (this._reloadStage < 2 && p >= 0.52) {
       this._reloadStage = 2;
-      audio?.play?.('magIn', { position: pos, volume: 0.9 });
+      if (!this._reloadComposite) audio?.play?.('magIn', { position: pos, volume: 0.9 });
     }
     // Stage 3 — mag tap.
     if (this._reloadStage < 3 && p >= 0.72) {
       this._reloadStage = 3;
-      audio?.play?.('magIn', { position: pos, volume: 0.4, rate: 1.5 });
+      if (!this._reloadComposite) audio?.play?.('magIn', { position: pos, volume: 0.4, rate: 1.5 });
     }
     // Stage 4 — bolt release (empty reloads only).
     if (this._reloadStage < 4 && p >= 0.84) {
       this._reloadStage = 4;
       if (this.reloadEmpty) {
-        audio?.play?.('boltForward', { position: pos, volume: 0.9 });
+        if (!this._reloadComposite) audio?.play?.('boltForward', { position: pos, volume: 0.9 });
         this.boltLocked = false;
         this.boltT = 1;
         this.boltDur = 0.12;

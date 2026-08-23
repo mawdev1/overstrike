@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
+import { PNG } from 'pngjs';
 
 import { BRIDGED_KEYS, SETTING_BRIDGE, toGameValue, toShellValue } from '../src/ui/shell/settingsBridge.js';
 import { mouseCode } from '../src/core/mouseCodes.js';
@@ -29,6 +30,8 @@ import {
   validateSettingValue,
 } from '../src/ui/shell/settings/index.js';
 import { SHELL_ROUTES, matchShellRoute } from '../src/ui/shell/router.js';
+import { FALLBACK_LOADING_ART, MAP_ART, loadingArt } from '../src/ui/shell/keyart.js';
+import { SHELL_CUES, SHELL_TRACKS } from '../src/ui/shell/audio.js';
 import { SETTLEMENT_RESULT_FIXTURES, SHELL_SCREEN_FIXTURES, SHELL_VARIANT_MATRIX } from '../src/ui/shell/fixtures.js';
 import { Input } from '../src/core/input.js';
 import { createShellApi } from '../src/ui/platform/shell-api.js';
@@ -61,6 +64,81 @@ const equal = (actual, expected, message) => {
   assert.deepEqual(actual, expected, message);
   checks++;
 };
+
+/**
+ * Worst-case WCAG contrast of a text node against what is ACTUALLY COMPOSITED behind it.
+ *
+ * `getComputedStyle().backgroundColor` is useless here: the key-art panels put text over a
+ * photograph under a gradient scrim, so the effective background is per-pixel and depends on
+ * the image. This blanks the text, screenshots the page, and takes the darkest-vs-lightest
+ * pixel under the glyph run — `Range.getClientRects()` rather than the element box, so the
+ * measurement follows the glyphs across wrapped lines instead of averaging in empty margin.
+ *
+ * A blocker this catches: the hero kicker measured 3.43:1 at a 320px viewport (AA wants 4.5)
+ * because the scrim thins toward its far edge and, once the panel narrows, the copy ran out
+ * into the thin end over a bright sunset. Nothing else in this harness looks below 1280px.
+ */
+const SRGB = (channel) => {
+  const value = channel / 255;
+  return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+};
+const luminance = ([r, g, b]) => 0.2126 * SRGB(r) + 0.7152 * SRGB(g) + 0.0722 * SRGB(b);
+
+async function worstTextContrast(page, selector) {
+  const node = await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return null;
+    const style = getComputedStyle(el);
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const rects = [...range.getClientRects()]
+      .map((r) => ({ x: r.x, y: r.y, w: r.width, h: r.height }))
+      .filter((r) => r.w > 0 && r.h > 0);
+    return {
+      text: el.textContent.trim(),
+      color: (style.color.match(/[\d.]+/g) || []).slice(0, 3).map(Number),
+      fontSize: parseFloat(style.fontSize),
+      weight: Number(style.fontWeight) || 400,
+      rects,
+    };
+  }, selector);
+  if (!node || !node.rects.length) return null;
+
+  // Blank the glyphs (and the text-shadow, which WCAG gives no credit for) so the screenshot
+  // shows only what sits behind them.
+  const mark = `os-contrast-${Math.random().toString(36).slice(2)}`;
+  const style = await page.addStyleTag({
+    content: `/*${mark}*/ ${selector} { color: transparent !important; -webkit-text-fill-color: transparent !important; text-shadow: none !important; }`,
+  });
+  const png = PNG.sync.read(await page.screenshot({ type: 'png' }));
+  await style.evaluate((el) => el.remove());
+
+  const fg = luminance(node.color);
+  let worst = Infinity;
+  let background = null;
+  for (const rect of node.rects) {
+    const x0 = Math.max(0, Math.floor(rect.x));
+    const y0 = Math.max(0, Math.floor(rect.y));
+    const x1 = Math.min(png.width - 1, Math.ceil(rect.x + rect.w));
+    const y1 = Math.min(png.height - 1, Math.ceil(rect.y + rect.h));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const i = (png.width * y + x) << 2;
+        const pixel = [png.data[i], png.data[i + 1], png.data[i + 2]];
+        const bg = luminance(pixel);
+        const ratio = (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+        if (ratio < worst) {
+          worst = ratio;
+          background = pixel;
+        }
+      }
+    }
+  }
+  const large = node.fontSize >= 24 || (node.fontSize >= 18.66 && node.weight >= 700);
+  return {
+    text: node.text, ratio: worst, required: large ? 3 : 4.5, background, fontSize: node.fontSize,
+  };
+}
 
 class MemoryStorage {
   constructor(seed = {}) {
@@ -114,6 +192,22 @@ async function modelChecks() {
   equal(LOCAL_SETTINGS_SCHEMA_VERSION, 2, 'local repair schema must remain independently versioned');
   equal(ROAMING_SETTINGS_SCHEMA_VERSION, 1, 'HTTP roaming schema must match RoamingSettingsV1');
   equal(SHELL_ROUTES.length, 30, 'the shell route inventory must contain 30 addressable routes');
+
+  /* ---- key art and audio inventory ---- */
+  equal(Object.keys(MAP_ART).sort(), ['meridian', 'square-extraction', 'the-square'],
+    'every shipped map must have loading art');
+  equal(loadingArt({ mapId: 'meridian' }, { mapId: 'the-square' }), MAP_ART.meridian,
+    'the handoff decides the loading art, never a map id sitting beside it');
+  equal(loadingArt(null, { mapId: 'square-extraction' }), MAP_ART['square-extraction'],
+    'with no handoff the view data is the next-best map authority');
+  equal(loadingArt(null, null), FALLBACK_LOADING_ART, 'a missing map must fall back, not blank');
+  equal(loadingArt({ mapId: 'a-map-added-after-this-art' }), FALLBACK_LOADING_ART,
+    'a map shipped after the art must fall back rather than render nothing');
+
+  for (const [name, definition] of Object.entries({ ...SHELL_CUES, ...SHELL_TRACKS })) {
+    check(/^\/audio\/(ui|sfx|music|vo)\/[a-z0-9_]+\.mp3$/.test(definition.src),
+      `shell cue ${name} must name a committed audio file`);
+  }
 
   const keys = SETTINGS_INVENTORY.map((item) => item.key);
   equal(new Set(keys).size, keys.length, 'setting keys must be unique');
@@ -827,6 +921,340 @@ async function browserChecks(stubResults) {
     equal(await page.evaluate(() => window.__HARNESS_GL_CALLS__.length), 0, 'shell boot must not create a WebGL context');
     check(!requests.some((url) => /\/src\/(core\/game|game)\.js|\/three(?:\.module)?\.js|node_modules\/\.vite\/deps\/three/i.test(url)), 'shell boot loaded game/three code');
 
+    /* ==================================================================
+     * Key art and shell audio.
+     *
+     * Art is asserted as DECORATION that is nonetheless CORRECT: it must be
+     * out of the accessibility tree, it must never be the sole carrier of
+     * anything, it must carry a scrim so text contrast does not depend on
+     * which pixels a generator produced, and the loading art must follow the
+     * handoff's map rather than any other map id in scope.
+     *
+     * Audio cannot be listened to from a headless browser, so what is proven
+     * here is the WIRING: that nothing is fetched or played before a trusted
+     * gesture, that the right file decodes and is routed on the right event,
+     * that music never stacks, and that the volume settings are obeyed.
+     * ================================================================== */
+    // The backdrop attaches on idle rather than at mount (a megabyte of decoration must not
+    // compete with the module graph), so this waits for it instead of assuming it is there.
+    await page.waitForFunction(() => document.querySelector('.os-shell__backdrop img')?.getAttribute('src'));
+    equal(await page.locator('.os-shell__backdrop img').getAttribute('src'), '/art/menu_backdrop.jpg',
+      'the shell menus must sit on the generated backdrop');
+    equal(await page.locator('.os-shell__backdrop').getAttribute('aria-hidden'), 'true',
+      'the backdrop is decoration and must stay out of the accessibility tree');
+    equal(await page.locator('main .os-keyart-panel').getAttribute('data-art'), '/art/hero_welcome.jpg',
+      'the welcome screen must show the hero key art');
+    equal(await page.locator('main .os-keyart-panel img').getAttribute('alt'), '',
+      'key art must be marked decorative with an empty alt');
+    equal(await page.locator('main .os-keyart').getAttribute('aria-hidden'), 'true',
+      'the art layer must be hidden from assistive technology');
+    check(await page.locator('main .os-keyart-panel .os-lede').isVisible(),
+      'the welcome lede must remain visible over the hero art');
+    check(/gradient/.test(await page.evaluate(() => getComputedStyle(
+      document.querySelector('main .os-keyart'), '::after').backgroundImage)),
+      'key art must carry a scrim so text contrast does not depend on the image');
+    equal(await page.evaluate(() => getComputedStyle(
+      document.querySelector('.os-shell__backdrop img')).animationName), 'none',
+      'the backdrop drift must be off under reduced motion');
+
+    /*
+     * Key-art contrast at PHONE widths. The rest of this harness runs at 1280x720, where the
+     * copy sits in the opaque left end of the scrim and everything measures 15:1+. The
+     * `width <= 40rem` branch is a different layout — the copy block spans the panel — and it
+     * shipped once with the kicker at 3.43:1 (320px) and 4.48:1 (390px) over the hero's
+     * sunset. Measured against the real composited pixels, not against a declared background.
+     */
+    await page.locator('main .os-keyart-panel img').evaluate((img) => (img.complete
+      ? null
+      : new Promise((resolve) => { img.addEventListener('load', resolve, { once: true }); img.addEventListener('error', resolve, { once: true }); })));
+    for (const width of [320, 360, 390]) {
+      await page.setViewportSize({ width, height: 720 });
+      await page.waitForFunction(() => document.querySelector('main .os-keyart-panel__kicker'));
+      for (const selector of ['main .os-keyart-panel__kicker', 'main .os-keyart-panel .os-lede']) {
+        const measured = await worstTextContrast(page, selector);
+        check(measured !== null, `${selector} must be measurable at ${width}px`);
+        check(measured.ratio >= measured.required,
+          `key art copy must clear WCAG AA at ${width}px — ${selector} measured ${measured.ratio.toFixed(2)}:1 `
+          + `against ${measured.required}:1 over rgb(${measured.background}) (raise the narrow-width scrim in shell.css)`);
+      }
+    }
+    /*
+     * The same measurement with the panel collapsed to its content height, which is where the
+     * bottom-anchored narrow-width wash is thinnest: it proves the TOP stop of that gradient
+     * is high enough for copy that outgrows `min-height` (longer strings, larger text).
+     */
+    await page.setViewportSize({ width: 320, height: 720 });
+    const collapsed = await page.addStyleTag({
+      content: '.os-keyart-panel--hero .os-keyart-panel__body { min-height: 0 !important; padding-top: .2rem !important; }',
+    });
+    const outgrown = await worstTextContrast(page, 'main .os-keyart-panel__kicker');
+    await collapsed.evaluate((el) => el.remove());
+    check(outgrown.ratio >= outgrown.required,
+      'key art copy that outgrows the reserved height must still clear AA at 320px — measured '
+      + `${outgrown.ratio.toFixed(2)}:1 against ${outgrown.required}:1 over rgb(${outgrown.background})`);
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    // handoff.mapId is the authority. Each fixture below carries a DIFFERENT `data.mapId`
+    // beside the handoff, so a regression that reads the rotation head instead of the
+    // handoff — which is exactly the bug that shipped once — fails here rather than showing
+    // a player the wrong map while the server loads another one.
+    for (const [mapId, art] of [
+      ['the-square', '/art/loading_square.jpg'],
+      ['meridian', '/art/loading_meridian.jpg'],
+      ['square-extraction', '/art/loading_extraction.jpg'],
+    ]) {
+      await page.evaluate((id) => {
+        window.__SHELL__.navigate('/match/loading');
+        window.__SHELL__.injectFixture('match.loading', {
+          variant: 'ready',
+          data: {
+            stage: 'Allocating a server',
+            mapId: 'a-decoy-map-id',
+            handoff: { matchId: 'art-fixture', mapId: id, mode: 'tdm' },
+          },
+        });
+      }, mapId);
+      equal(await page.locator('main .os-keyart-panel').getAttribute('data-art'), art,
+        `match loading art must follow handoff.mapId (${mapId})`);
+      // `innerText` reflects the kicker's uppercase text-transform, so the comparison is
+      // case-insensitive rather than against the raw id.
+      check((await page.locator('main').innerText()).toLowerCase().includes(mapId),
+        `the map named by the handoff must also be readable as text (${mapId})`);
+    }
+    await page.evaluate(() => {
+      window.__SHELL__.injectFixture('match.loading', {
+        variant: 'ready',
+        data: { stage: 'Allocating a server', handoff: { matchId: 'art-fixture', mapId: 'a-map-shipped-after-this-art', mode: 'tdm' } },
+      });
+    });
+    equal(await page.locator('main .os-keyart-panel').getAttribute('data-art'), '/art/loading_square.jpg',
+      'a map with no art must fall back rather than render a hole');
+    await page.evaluate(() => window.__SHELL__.clearFixture('match.loading'));
+
+    /*
+     * `resultOutcomeFor` decides which theme the results screen plays. Exercised in the
+     * browser rather than in the node model phase because the shell module graph imports its
+     * own stylesheet, which node cannot load.
+     */
+    const outcomeCases = await page.evaluate(async () => {
+      const { resultOutcomeFor } = await import('/src/ui/shell/index.js');
+      const team = (accountId) => resultOutcomeFor({
+        winnerTeam: 'alpha',
+        players: [{ accountId: 'a', team: 'alpha' }, { accountId: 'b', team: 'bravo' }],
+      }, accountId);
+      const raid = (outcome) => resultOutcomeFor({ settlement: { participants: [{ isLocal: true, outcome }] } });
+      return {
+        none: resultOutcomeFor(null),
+        pending: resultOutcomeFor({ status: 'pending', winnerTeam: 'alpha' }),
+        draw: resultOutcomeFor({ winnerTeam: 'draw' }),
+        winner: team('a'),
+        loser: team('b'),
+        stranger: team('someone-else'),
+        extracted: raid('extracted'),
+        aborted: raid('aborted'),
+        unsettled: raid(null),
+      };
+    });
+    equal(outcomeCases, {
+      none: null, pending: null, draw: null,
+      winner: 'victory', loser: 'defeat', stranger: null,
+      extracted: 'victory', aborted: 'defeat', unsettled: null,
+    }, 'the results theme must follow the local player\'s own disposition, and stay silent when there is not one');
+
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().armed), false,
+      'shell audio must not arm itself');
+    check(!requests.some((url) => /\/audio\//.test(url)),
+      'an untouched shell must not fetch a single audio file');
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/play/rooms');
+      window.__SHELL__.injectFixture('play.rooms', 'ready');
+      window.__SHELL__.navigate('/welcome');
+    });
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().events
+      .filter((event) => event.source === 'sample' || event.source === 'fallback').length), 0,
+      'programmatic navigation must be silent — the harness drives the shell this way');
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getMusicTrack()), null,
+      'music must not start before a gesture permits it');
+
+    // A trusted click on the brand link: same route, so it proves the CUE without moving the
+    // shell somewhere the following assertions do not expect.
+    await page.locator('.os-brand').click();
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().armed === true);
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().events
+      .some((event) => event.cue === 'click' && event.source === 'sample'), null, { timeout: 15_000 });
+    check((await page.evaluate(() => window.__SHELL_AUDIO__.getState().decoded))
+      .includes('/audio/sfx/ui_click.mp3'),
+      'the click cue must resolve to the decoded ui_click sample, not to the fallback tone');
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().failed), [],
+      'no shell audio file may fail to load or decode');
+
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicTrack === 'menu');
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicPlaying === true);
+    check((await page.evaluate(() => window.__SHELL_AUDIO__.getState().decoded))
+      .includes('/audio/music/menu_theme.mp3'), 'the menu theme must actually decode');
+    // Re-rendering the same screen must not start a second copy of the bed.
+    await page.evaluate(() => { window.__SHELL__.render(); window.__SHELL__.render(); });
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().events
+      .filter((event) => event.cue === 'music:menu' && event.source === 'sample').length), 1,
+      'music must never be started twice over itself');
+
+    await page.evaluate(() => {
+      window.__SHELL__.navigate('/match/loading');
+      window.__SHELL__.injectFixture('match.loading', 'ready');
+    });
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicTrack === 'tension');
+    check((await page.evaluate(() => window.__SHELL_AUDIO__.getState().events))
+      .some((event) => event.cue === 'matchFound'),
+      'an arriving handoff must announce itself');
+
+    await page.evaluate(() => window.__SHELL__.clearFixture('match.loading'));
+    await page.evaluate(() => { window.__SHELL__.navigate('/welcome'); });
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === 'menu');
+
+    /*
+     * The volume sliders must control the music that is ALREADY PLAYING.
+     *
+     * The mute test below proves a mute at start time — it stops the music first and then
+     * lowers the volumes, so it never touched the case that shipped broken: a looping bed
+     * started once, `reactAudioToScreen` short-circuiting on "the wanted track is already
+     * playing", and therefore nothing re-reading the settings for as long as the bed ran. A
+     * player who dragged master to zero on the audio screen kept hearing menu_theme. This
+     * drives the REAL settings screen and the real range input (a range dispatches `input`,
+     * never a click on a button/link, which is why the cue path could not carry it) and
+     * asserts against the live gain nodes.
+     */
+    await page.evaluate(() => window.__SHELL__.navigate('/settings/audioCaptions'));
+    await page.waitForSelector('#os-setting-musicVolume');
+    const dragVolume = async (id, value) => {
+      await page.locator(`#${id}`).evaluate((element, next) => {
+        element.value = String(next);
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      }, value);
+    };
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicPlaying === true);
+    await dragVolume('os-setting-musicVolume', 20);
+    await page.waitForFunction(() => Math.abs(window.__SHELL_AUDIO__.getState().volumes.music - 0.2) < 1e-6,
+      null, { timeout: 5_000 });
+    check(await page.evaluate(() => window.__SHELL_AUDIO__.getState().musicPlaying),
+      'a mid-range drag changes the live gain without interrupting the bed');
+    await dragVolume('os-setting-musicVolume', 0);
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicPlaying === false,
+      null, { timeout: 5_000 });
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().volumes.music), 0,
+      'dragging the music slider to zero must reach the gain node of a running bed');
+    await dragVolume('os-setting-musicVolume', 45);
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicPlaying === true,
+      null, { timeout: 5_000 });
+    check(await page.evaluate(() => window.__SHELL_AUDIO__.getMusicTrack() === 'menu'),
+      'raising the slider again restores the bed in place, with no navigation');
+    // Master is the one a player reaches for to silence the game outright.
+    await dragVolume('os-setting-masterVolume', 0);
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicPlaying === false,
+      null, { timeout: 5_000 });
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().volumes.master), 0,
+      'a player who mutes everything must stop hearing the menu theme');
+    await dragVolume('os-setting-masterVolume', 80);
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().musicPlaying === true,
+      null, { timeout: 5_000 });
+    // An explicit stop is the shell withdrawing the request, not a mute deferring it: the
+    // volume watcher must never restart a track entering a match has stopped.
+    await page.evaluate(() => window.__SHELL_AUDIO__.stopMusic());
+    await page.waitForTimeout(600);
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().musicPlaying), false,
+      'a stopped bed is not resurrected by the volume watcher');
+    await page.evaluate(() => { window.__SHELL__.navigate('/welcome'); });
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === 'menu');
+
+    // A rank that unlocks two weapons fires onLevelUp once and onUnlock once per id, all in
+    // one synchronous tick. Three sources on the UI bus in the same millisecond, two of them
+    // the same file, is one flammed sound — the cue is throttled so it cannot happen.
+    const stingerSources = await page.evaluate(() => {
+      const audio = window.__SHELL_AUDIO__;
+      const before = audio.getState().events.length;
+      audio.play('unlock');
+      audio.play('unlock');
+      return audio.getState().events.slice(before).map((event) => `${event.cue}:${event.source}`);
+    });
+    check(stingerSources.includes('unlock:throttled'),
+      'a repeated progression stinger in the same tick must be collapsed, not stacked');
+
+    // Muting is a real mute — not a quiet gain. Nothing is even constructed.
+    // Read back the event this exact call produced rather than the tail of the ring buffer:
+    // an in-flight decode from an earlier cue can land between the two evaluations.
+    const mutedSource = await page.evaluate(() => {
+      window.__SETTINGS__.set('uiVolume', 0);
+      window.__SETTINGS__.set('musicVolume', 0);
+      window.__SHELL_AUDIO__.stopMusic();
+      window.__SHELL_AUDIO__.play('click', { force: true });
+      return window.__SHELL_AUDIO__.getState().events.filter((event) => event.cue === 'click').at(-1)?.source;
+    });
+    equal(mutedSource, 'muted', 'a zero interface volume must refuse the cue outright');
+    await page.evaluate(() => window.__SHELL__.render());
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getMusicTrack()), null,
+      'a zero music volume must leave the music voice unbuilt');
+    await page.evaluate(() => {
+      window.__SETTINGS__.set('uiVolume', 80);
+      window.__SETTINGS__.set('musicVolume', 45);
+    });
+
+    // Hover is a CROSSING, not a re-render. `pointerover` is trusted and fires for real when
+    // the node under a stationary cursor is replaced, and `render()` replaces every node it
+    // draws — so a lobby countdown or a roster push ticked once a second at any player whose
+    // cursor happened to rest on a control. Wrapping createBufferSource measured five hover
+    // samples from five renders with the mouse held still, one per render; the cue's 45ms
+    // throttle cannot help at a ~1Hz cadence. The pointer is parked on a control here and
+    // never moved again for the rest of the block.
+    const brandBox = await page.locator('.os-brand').boundingBox();
+    await page.mouse.move(brandBox.x + brandBox.width / 2, brandBox.y + brandBox.height / 2);
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().events
+      .some((event) => event.cue === 'hover'), null, { timeout: 15_000 });
+    check(true, 'entering a control with the pointer plays the hover cue');
+    const sinceRenders = await page.evaluate(async () => {
+      const mark = Date.now();
+      for (let i = 0; i < 4; i++) {
+        window.__SHELL__.render();
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      }
+      return window.__SHELL_AUDIO__.getState().events.filter((event) => event.cue === 'hover' && event.at >= mark);
+    });
+    equal(sinceRenders, [], 'a re-render under a stationary cursor must not re-cue hover');
+    // ...and the guard must not have deafened the cue: crossing to a different control still ticks.
+    const otherBox = await page.evaluate(() => {
+      const control = [...document.querySelectorAll('header a[href], header button:not([disabled])')]
+        .find((node) => !node.classList.contains('os-brand')
+          && node.getBoundingClientRect().width > 8 && node.getBoundingClientRect().top > 0);
+      if (!control) return null;
+      const box = control.getBoundingClientRect();
+      window.__HOVER_MARK__ = Date.now();
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    });
+    check(Boolean(otherBox), 'the header offers a second control to cross onto');
+    await page.mouse.move(otherBox.x, otherBox.y, { steps: 8 });
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getState().events
+      .some((event) => event.cue === 'hover' && event.at >= window.__HOVER_MARK__), null, { timeout: 15_000 });
+    check(true, 'moving the pointer to a different control still cues hover');
+
+    // One refusal is one sound. Two owners voice it — `submit()`'s catch (so an inline
+    // `onError` that never flips the view is still audible) and the ready->error variant
+    // transition (so a failure with no submit behind it is still audible) — and neither can
+    // see the other's decision. Measured before the throttle existed: a single refused sign-in
+    // started ui_error.mp3 twice in the SAME millisecond, which is one sound with a flam and
+    // partial phase cancellation, not two. This reproduces both owners firing back to back.
+    const refusal = await page.evaluate(async () => {
+      const mark = Date.now();
+      window.__SHELL_AUDIO__.play('error');           // submit()'s catch
+      window.__SHELL__.setView({ variant: 'error', error: { code: 'HARNESS_REFUSED' } }); // the transition
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return window.__SHELL_AUDIO__.getState().events
+        .filter((event) => event.cue === 'error' && event.at >= mark)
+        .map((event) => event.source);
+    });
+    equal(refusal.filter((source) => source === 'sample' || source === 'fallback').length, 1,
+      'a single refusal must start the error cue once, however many owners voice it');
+    check(refusal.length > 1, 'the second owner must still have been refused by the throttle, not by luck');
+    await page.evaluate(() => { window.__SHELL__.navigate('/welcome'); });
+
     for (const route of SHELL_ROUTES) {
       const pathValue = routePath(route);
       for (const variant of SHELL_VARIANT_MATRIX[route.id]) {
@@ -1137,12 +1565,46 @@ async function browserChecks(stubResults) {
       'protection is stated honestly: none exists, said in words rather than implied');
     check((await page.locator('.os-settlement-card[data-settlement="lost"]').count()) === 1,
       'a squadmate who died is presented as lost on the same screen — outcomes are per-participant');
+    // The results theme follows the LOCAL player's disposition, not the run's. A squadmate
+    // died in this same fixture and the local player still hears victory.
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === 'victory');
+    check(true, 'an extracted local player gets the victory theme even when a squadmate was lost');
+
+    // The outcome themes do not loop: when one reaches its end it releases the music voice and
+    // `getMusicTrack()` goes null, while the screen still WANTS victory. Deriving intent from
+    // the live voice therefore restarted the whole twelve seconds on the next re-render, and
+    // this screen re-renders on connection-banner changes and the pending-result refresh timer
+    // — measured as a second victory_theme.mp3 start ~1.9s after the first one ended. The end
+    // is simulated by releasing the voice, which leaves exactly the state `onended` leaves.
+    const afterTheThemeEnds = await page.evaluate(async () => {
+      window.__SHELL_AUDIO__.stopMusic({ fade: 0.01 });
+      const mark = Date.now();
+      for (let i = 0; i < 3; i++) {
+        window.__SHELL__.render();
+        await new Promise((resolve) => setTimeout(resolve, 80));
+      }
+      return {
+        started: window.__SHELL_AUDIO__.getState().events
+          .filter((event) => event.cue === 'music:victory' && event.at >= mark).length,
+        track: window.__SHELL_AUDIO__.getMusicTrack(),
+      };
+    });
+    equal(afterTheThemeEnds.started, 0,
+      'a finished outcome theme must not be restarted by the next re-render of the same screen');
+    equal(afterTheThemeEnds.track, null, 'and nothing must silently claim the freed music voice');
+    // Leaving the screen releases the latch: the menu bed comes back, and a later visit to a
+    // results screen is a new delivery rather than a permanently muted one.
+    await page.evaluate(() => { window.__SHELL__.navigate('/welcome'); });
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === 'menu');
+    check(true, 'leaving a settled results screen hands the music voice back to the menu bed');
 
     await showSettlement(SETTLEMENT_RESULT_FIXTURES.lost);
     check((await page.locator('[data-local-settlement="lost"]').count()) === 1,
       'a killed local player gets the lost headline state');
     check((await page.locator('main').innerText()).includes('Every item carried was lost'),
       'lost copy states the full-loss disposition without euphemism');
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === 'defeat');
+    check(true, 'a killed local player gets the defeat theme');
 
     await showSettlement(SETTLEMENT_RESULT_FIXTURES.pendingReview);
     check((await page.locator('[data-local-settlement="pending-review"]').count()) === 1,
@@ -1158,6 +1620,9 @@ async function browserChecks(stubResults) {
       'a received-but-unsettled participant is presented as retry-safe settling');
     check((await page.locator('main').innerText()).includes('a retry can never settle the same items twice'),
       'retry-safe copy states the §5 idempotency guarantee that makes leaving safe');
+    // An unsettled participant has no disposition yet, so guessing a theme would be a lie.
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === 'menu');
+    check(true, 'an undecided settlement plays neither theme');
     check((await page.locator('.os-settlement-card[data-settlement="extracted"]').count()) === 1,
       'a squadmate already settled renders alongside the still-settling one');
 
@@ -1336,6 +1801,14 @@ async function browserChecks(stubResults) {
     await page.waitForFunction(() => performance.getEntriesByType('resource').some((entry) => /\/src\/core\/game\.js/.test(entry.name)));
     equal(await page.evaluate(() => window.__HARNESS_RUNTIME_LOADS__), 1, 'match runtime loader must be single-flight');
     equal(requests.filter((url) => /\/src\/core\/game\.js(?:\?|$)/.test(url)).length, 1, 'game module must be requested exactly once');
+
+    // Entering a match hands the mix to the runtime: the shell's bed has to STOP, not duck.
+    // Asserted on the harness's own single-flight entry so this does not load the game twice.
+    await page.waitForFunction(() => window.__SHELL_AUDIO__.getMusicTrack() === null);
+    equal(await page.evaluate(() => window.__SHELL_AUDIO__.getState().musicPlaying), false,
+      'shell music must stop when a match is entered');
+    check((await page.evaluate(() => window.__SHELL_AUDIO__.getState().events))
+      .some((event) => event.cue === 'deploy'), 'entering a match must play the deploy cue');
 
     const liveSettingAdapters = await page.evaluate(async () => {
       const { HUD } = await import('/src/ui/hud.js');

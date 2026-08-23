@@ -705,7 +705,7 @@ export class Menu {
     save.addEventListener('click', () => {
       this._saveLoadout();
       this._equipLoadout();
-      this._sfx('uiClick');
+      this._sfx('uiEquip', 'uiClick');
       this._toast('LOADOUT EQUIPPED');
     });
     foot.appendChild(save);
@@ -764,7 +764,7 @@ export class Menu {
       if (!open) row.setAttribute('aria-disabled', 'true');
       row.addEventListener('click', () => {
         if (!open) {
-          this._sfx('uiBack');
+          this._sfx('uiError', 'uiBack');
           this._toast(`${w.name} UNLOCKS AT RANK ${w.unlockLevel | 0}`);
           return;
         }
@@ -773,7 +773,7 @@ export class Menu {
         this._slotBtns[this._slot].querySelector('.sv').textContent = String(w.name).toUpperCase();
         this._renderWeaponCard(w);
         this._saveLoadout();
-        this._sfx('uiClick');
+        this._sfx('uiEquip', 'uiClick');
       });
       row.addEventListener('mouseenter', () => { this._renderWeaponCard(w); this._sfx('uiHover'); });
       row.addEventListener('focus', () => this._renderWeaponCard(w));
@@ -1348,6 +1348,13 @@ export class Menu {
     const sum = progression.getSummary();
     const lvlUp = prog.levelUp?.leveledUp;
 
+    // The two moments the after-action report exists for. `uiUnlock` wins when both land
+    // on the same match — a new weapon is the bigger news than the rank that gave it to
+    // you, and two stingers on top of each other is neither.
+    const unlocked = prog.levelUp?.unlocked?.length ? true : false;
+    if (unlocked) this._sfx('uiUnlock', 'streakReady');
+    else if (lvlUp) this._sfx('uiLevelup', 'streakReady');
+
     let bars = '';
     let max = 1;
     for (const [k] of XP_ROWS) max = Math.max(max, prog.breakdown[k] | 0);
@@ -1528,7 +1535,8 @@ export class Menu {
     const back = this._confirmReturn;
     this._confirmCb = null;
     this._confirmReturn = null;
-    this._sfx(yes ? 'uiClick' : 'uiBack');
+    if (yes) this._sfx('uiConfirm', 'uiClick');
+    else this._sfx('uiBack');
     if (yes && cb) cb();
     if (back && this.el.root.contains(back) && back.isConnected) back.focus?.({ preventScroll: true });
     else this._focusFirst();
@@ -1713,8 +1721,28 @@ export class Menu {
     }
   }
 
-  _sfx(name) {
-    try { this.game?.audio?.playUI?.(name); } catch { /* audio may not be up yet */ }
+  /**
+   * Play `name`, or `fallback` when the bank cannot voice it.
+   *
+   * Half of the menu's vocabulary — equip, error, confirm, unlock, levelup — exists only as a
+   * downloaded sample (`SAMPLE_MANIFEST`); the procedural bank renders no spec for those
+   * names, and `AudioEngine.play()` on a name with no buffer returns null. So offline, or
+   * behind a 404, or after a decode failure, equipping a loadout and being refused a locked
+   * weapon were SILENT — the synth is supposed to be the floor under the samples, not
+   * something they replace. Every such call passes a name the synth bank guarantees
+   * (ARCHITECTURE.md §9's REQUIRED_SOUNDS) as `fallback`; the sample is used when it is
+   * genuinely there, and the blip carries the same meaning when it is not. Same shape as
+   * `killstreaks._sfx`, which already had to solve this for `streakReady`.
+   */
+  _sfx(name, fallback) {
+    try {
+      const a = this.game?.audio;
+      if (!a?.playUI) return;
+      // `has` is the engine's own "can this be voiced at all" test — it is true for a synth
+      // spec and for a decoded sample alike, which is exactly the question here.
+      const playable = fallback && typeof a.has === 'function' && !a.has(name) ? fallback : name;
+      a.playUI(playable);
+    } catch { /* audio may not be up yet */ }
   }
 
   reset() {

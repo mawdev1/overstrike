@@ -877,3 +877,165 @@
 .os-shell.os-flag-no-diagnostics .os-diagnostics {
   display: none !important;
 }
+
+/* ------------------------------------------------------------------ *
+ * Key art
+ *
+ * Every image here is decoration. The rules below are written so that the
+ * text over them keeps the contrast it had BEFORE any art existed:
+ *
+ *  - the backdrop sits behind everything at low opacity under a near-opaque
+ *    scrim, so the shell's own gradient still supplies the background colour
+ *    the palette was contrast-checked against;
+ *  - panel copy sits on a gradient scrim that is opaque at the text edge and
+ *    only transparent where there is no text;
+ *  - a failed image simply removes itself (see index.js / screens.js) and the
+ *    panel falls back to the flat --os-panel treatment it inherits.
+ *
+ * The only motion is a slow backdrop drift, and it is off under either
+ * reduced-motion signal (OS media query or the shell's own setting class).
+ * ------------------------------------------------------------------ */
+
+.os-shell__backdrop {
+  position: fixed;
+  /* Below the shell's scanline/grid overlays (z-index -1) but above its base
+     gradient, which `isolation: isolate` on .os-shell makes well-defined. */
+  z-index: -2;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  contain: strict;
+}
+
+.os-shell__backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgb(4 6 10 / .55), rgb(4 6 10 / .86) 72%),
+    linear-gradient(180deg, rgb(4 6 10 / .62), rgb(4 6 10 / .9));
+}
+
+.os-shell__backdrop .os-keyart__image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: .68;
+  filter: saturate(.7) contrast(1.02);
+  transform: scale(1.06);
+  animation: os-backdrop-drift 64s ease-in-out infinite alternate;
+}
+
+@keyframes os-backdrop-drift {
+  from { transform: scale(1.06) translate3d(-1.1%, -.7%, 0); }
+  to { transform: scale(1.1) translate3d(1.1%, .7%, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .os-shell__backdrop .os-keyart__image { animation: none; }
+}
+
+.os-shell.os-reduced-motion .os-shell__backdrop .os-keyart__image { animation: none; }
+
+/* Nothing of the shell is on screen during a match; the backdrop must not keep
+   decoding/compositing behind the canvas either. */
+.os-shell[data-runtime="active"] .os-shell__backdrop { display: none; }
+
+.os-keyart-panel {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--os-border);
+  border-radius: 2px;
+  background: var(--os-panel);
+}
+
+.os-keyart {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+}
+
+.os-keyart__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  object-fit: cover;
+}
+
+/* The scrim. Opaque where the copy is, clearing toward the far edge so the art
+   is still readable as art. Two stops rather than a flat wash so a bright sky
+   in the top-right of a generated image cannot wash out the kicker. */
+.os-keyart::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(100deg, rgb(4 6 10 / .95) 0%, rgb(4 6 10 / .86) 38%, rgb(4 6 10 / .5) 78%, rgb(4 6 10 / .38) 100%),
+    linear-gradient(0deg, rgb(4 6 10 / .82), transparent 62%);
+}
+
+.os-keyart-panel__body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: .4rem;
+  min-height: 13rem;
+  padding: 1.5rem 1.4rem 1.3rem;
+}
+
+.os-keyart-panel--hero .os-keyart-panel__body {
+  min-height: 20rem;
+}
+
+.os-keyart-panel--loading .os-keyart-panel__body {
+  min-height: 16rem;
+}
+
+.os-keyart-panel__kicker {
+  margin: 0;
+  color: var(--os-accent);
+  font-size: .74rem;
+  font-weight: 600;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+}
+
+.os-keyart-panel__body .os-lede,
+.os-keyart-panel__body p {
+  margin: 0;
+  color: var(--os-text);
+  text-shadow: 0 1px 3px rgb(0 0 0 / .85);
+}
+
+/* No art available (or the image failed): keep the layout, drop the reserved
+   height so the panel does not become a large empty box. */
+.os-keyart-panel:not([data-art]) .os-keyart-panel__body,
+.os-keyart-panel[data-art-failed] .os-keyart-panel__body {
+  min-height: 0;
+  padding: 1rem 1.1rem;
+}
+
+@media (width <= 40rem) {
+  .os-keyart-panel--hero .os-keyart-panel__body { min-height: 14rem; }
+  .os-keyart-panel--loading .os-keyart-panel__body { min-height: 11rem; }
+
+  /* The scrim above clears toward the far edge because on a wide panel the copy sits in the
+     left ~40% and the rest is there to be looked at. Below 40rem there is no far edge: the
+     copy block spans the whole panel, so its tail ran out over the .38-alpha end and, on a
+     bright image (hero_welcome's sunset), the kicker measured 3.43:1 at 320px and 4.48:1 at
+     390px against an AA floor of 4.5:1. Rather than flatten the art everywhere, the copy
+     carries its own backdrop at these widths — the copy is bottom-anchored, so a
+     bottom-anchored wash covers every glyph while the top of the image still reads as art.
+     The .55 top stop is not cosmetic: it is the floor for the degenerate case where the copy
+     grows past `min-height` and the first line lands at the gradient's weakest point — 11.7:1
+     measured on this art, and ~7:1 even against a hypothetical pure-white image. `uishell`
+     measures both the real layout and that degenerate one at 320/360/390px; do not lower
+     these alphas without re-running it. */
+  .os-keyart-panel[data-art]:not([data-art-failed]) .os-keyart-panel__body {
+    background: linear-gradient(0deg, rgb(4 6 10 / .92) 0%, rgb(4 6 10 / .9) 68%, rgb(4 6 10 / .55) 100%);
+  }
+}
