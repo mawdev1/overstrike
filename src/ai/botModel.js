@@ -406,6 +406,23 @@ function composeAtlas(team, images) {
   const [fc, fr] = ATLAS_CELLS.flat;
   ctx.fillRect(fc * ATLAS_CELL_PX, fr * ATLAS_CELL_PX, ATLAS_CELL_PX, ATLAS_CELL_PX);
 
+  // DESATURATE THE CLOTH. The two team palettes are built to be told apart instantly —
+  // desert tan + amber against urban slate + red — and the material multiplies this atlas
+  // by that vertex tint. Both generated camo sources are *desert* camo, so team 1's slate
+  // tint multiplied by sandy imagery came out tan, and a player reported the enemy team
+  // looking identical to their own. In a shooter that is not a cosmetic bug.
+  //
+  // Stripping the atlas's own hue keeps every thread of pattern and wear while handing hue
+  // back to the tint, which is the thing that carries team identity. Luma-preserving so the
+  // value structure (near-black carrier inside light fatigues) survives intact.
+  const px = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = px.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const y = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    d[i] = d[i + 1] = d[i + 2] = y;
+  }
+  ctx.putImageData(px, 0, 0);
+
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.ClampToEdgeWrapping;

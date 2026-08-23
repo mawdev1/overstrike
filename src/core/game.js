@@ -168,7 +168,7 @@ export class Game {
   async init(onProgress = () => {}, { mapId = null } = {}) {
     const prof = this.bootProfile;
     const tBoot = performance.now();
-    const TOTAL = 10;
+    const TOTAL = 11;   // keep in step with the number of `step()` calls below
     let done = 0;
     const report = (label, frac) => {
       try { onProgress(label, (done + frac) / TOTAL); } catch { /* never let the UI break boot */ }
@@ -240,6 +240,19 @@ export class Game {
       await this.match.init();
       this.menu = new Menu(this);
       await this.menu.init();
+    });
+    // Wait for the map's photographic skin BEFORE compiling. A material whose `map` goes
+    // from null to a texture forces three.js to rebuild its program, and if the textures
+    // land after the prewarm that rebuild happens mid-match, one stalled frame per surface
+    // as it is first seen — reported from production as "terribly laggy, then it sorts
+    // itself out after a minute or two". Bounded: a slow or dead CDN must not hold the
+    // loading screen hostage, and an unskinned map is a fully playable map.
+    await step('dressing the map', async () => {
+      const { mapSkinReady } = await import('../fx/mapSkin.js');
+      await Promise.race([
+        mapSkinReady().catch(() => false),
+        new Promise((r) => setTimeout(r, 8000)),
+      ]);
     });
     await step('compiling shaders', () => this._prewarmShaders());
 
