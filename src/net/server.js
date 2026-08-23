@@ -1457,6 +1457,14 @@ export class GameServer {
         : wire;
       const events = this._pendingEvents.filter((ev) => {
         if (ev.to != null) return ev.to === mine;        // private: routing decides it
+        // A detonation is a map-wide fact, exempt from BOTH gates below: EVENT_RANGE_M is
+        // 90 m but the 88 m map's DIAGONAL is ~124 m, so a corner-to-corner client would
+        // silently miss the round-deciding explosion; and on a sectored map the blast must
+        // reach every sector — a raid player two sectors away still sees the column and
+        // feels the shock (the client's own bombDetonation effect scales by distance).
+        // No §8.8 privacy question applies: detonation coordinates are the round outcome,
+        // announced to everyone by the same tick's MSG_MATCHSTATE/MSG_OUTCOME anyway.
+        if (ev.kind === 'bombDetonated') return true;
         // §5.2 — sector relevance is checked before the distance cull below, specifically
         // for the case a flat distance cull cannot catch: two sectors close in raw distance
         // but not neighbours (across a wall/floor/chasm). Non-spatial events carry no
