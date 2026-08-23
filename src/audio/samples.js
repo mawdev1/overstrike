@@ -363,10 +363,11 @@ function decode(ctx, arrayBuffer) {
 export async function loadSampleBank(ctx, opts) {
   const manifest = opts.manifest || SAMPLE_MANIFEST;
   const onSound = opts.onSound;
-  // 2, not 6. Each worker's decode+shape is main-thread work; six in parallel produced a
-  // burst long enough to starve the match handshake (see AudioEngine._deferSampleLoad).
-  // The bank has no deadline, so a slower, gentler fill is strictly the right trade.
-  const concurrency = opts.concurrency || 2;
+  // Back to 4. Dropping this to 2 to protect the handshake doubled the fill to 84 s
+  // without fixing anything — the handshake is protected by NOT STARTING (the bank is
+  // opt-in now, see AudioEngine._deferSampleLoad), which is the correct place for that
+  // guarantee. Concurrency should serve throughput.
+  const concurrency = opts.concurrency || 4;
   const tiers = opts.tiers || null;
   const base = baseUrl();
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());

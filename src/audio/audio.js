@@ -251,6 +251,15 @@ const _occTo = new THREE.Vector3();
  * Engine
  * ---------------------------------------------------------------- */
 
+/** Opt-in switch for the recorded sample bank — see `AudioEngine._deferSampleLoad`. */
+function samplesRequested() {
+  try {
+    const q = new URLSearchParams(globalThis.location?.search || '');
+    if (q.get('samples') === '1') return true;
+    return globalThis.localStorage?.getItem('overstrike.audio.samples') === '1';
+  } catch { return false; }
+}
+
 export class AudioEngine {
   constructor(game) {
     this.game = game;
@@ -707,6 +716,20 @@ export class AudioEngine {
 
   /** Start the sample bank at the first idle moment, never on the critical path. */
   _deferSampleLoad() {
+    // OFF BY DEFAULT, and that is a deliberate retreat rather than a tuning choice.
+    //
+    // Shipped, this system has hurt players four separate ways: it starved the match
+    // handshake so joining a game failed outright; it took 38 s, then 84 s after I lowered
+    // its concurrency, to fill; roughly half its files report `decoded silent` in the
+    // browser even though the same mp3s decode to real audio (`ar_fire` peaks at 0.16 full
+    // scale through afconvert); and its main-thread work is part of the first-minute stall.
+    // The procedural synth bank it was meant to improve on is complete, instant, free and
+    // has never broken a match.
+    //
+    // So the samples become opt-in (`?samples=1`) until the decode failure is understood
+    // OFFLINE and the fill is provably invisible. A feature that is still being diagnosed
+    // does not belong in the path of someone trying to play.
+    if (!samplesRequested()) return;
     if (this._sampleLoad || this._sampleLoadQueued) return;
     this._sampleLoadQueued = true;
     const go = () => { this._sampleLoadQueued = false; this._startSampleLoad(); };
