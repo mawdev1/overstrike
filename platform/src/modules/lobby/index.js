@@ -51,11 +51,16 @@ const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
  */
 const ROOM_MAPS = Object.freeze({
   'the-square': Object.freeze({
-    mapVersion: '1.0.0',
+    // 3.0.0 "THE CROSSING": the district was rebuilt as a Crossroads homage (site
+    // volumes moved into the Fish Market / Red House halls) — these must track
+    // level.js's real MAP_MANIFEST.objectives boxes, not the pre-redesign Fountain/
+    // Market coordinates, or the client renders site rings and HUD callouts in the
+    // wrong place while the sim enforces the real ones.
+    mapVersion: '3.0.0',
     flag: 'map.the_square.enabled',
     sites: Object.freeze([
-      { id: 'site-A', site: 'A', callout: 'Fountain', center: { x: -25, y: 0, z: 0 }, box: { min: { x: -29, y: 0, z: -4 }, max: { x: -21, y: 3, z: 4 } } },
-      { id: 'site-B', site: 'B', callout: 'Market', center: { x: 25, y: 0, z: 0 }, box: { min: { x: 21, y: 0, z: -4 }, max: { x: 29, y: 3, z: 4 } } },
+      { id: 'site-A', site: 'A', callout: 'Fish Market', center: { x: -24.5, y: 0, z: -15 }, box: { min: { x: -27, y: 0, z: -17.5 }, max: { x: -22, y: 2.4, z: -12.5 } } },
+      { id: 'site-B', site: 'B', callout: 'Red House', center: { x: 27, y: 0, z: 16 }, box: { min: { x: 25, y: 0, z: 14 }, max: { x: 29, y: 2.4, z: 18 } } },
     ]),
   }),
   meridian: Object.freeze({
