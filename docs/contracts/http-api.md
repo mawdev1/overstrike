@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 2.2.0 |
+| **Version** | 2.3.0 |
 | **Scope** | Phases P1–P4. Extraction, agent, economy, creator surfaces are later contracts |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | [CX] client HTTP layer, match server, Admin Portal |
@@ -390,6 +390,7 @@ the initial load only; **polling it is a contract violation** and will be rate l
 | POST | `/v1/rooms` | A | Create. Idempotency key required |
 | POST | `/v1/rooms/:id/join` | A | Reserves a slot, returns a reservation with a TTL |
 | POST | `/v1/rooms/:id/leave` | A | Idempotent by nature |
+| DELETE | `/v1/rooms/:id` | A | Owner-only. `409 ROOM_NOT_EMPTY` unless the owner is the only member; `409 ROOM_IN_PROGRESS` if a match is live. Closing a room with other members still in it requires them to leave first — no live-connected member is ever force-disconnected by another party's action anywhere in this contract, and this endpoint does not introduce the first one |
 | POST | `/v1/rooms/:id/team` | A | `{ team: "alpha"\|"bravo"\|"auto" }`. Server decides |
 | POST | `/v1/rooms/:id/ready` | A | `{ ready: bool }`. Cleared by roster/team/loadout change |
 | POST | `/v1/rooms/:id/loadout` | A | `{ primaryIdx, secondaryIdx }` |

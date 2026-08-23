@@ -54,6 +54,7 @@ export const CODES = {
   ROOM_PASSWORD_REQUIRED:            { status: 401, retryable: false },
   ROOM_PASSWORD_INVALID:             { status: 403, retryable: false },
   ROOM_REMOVED:                      { status: 403, retryable: false },
+  ROOM_NOT_EMPTY:                    { status: 409, retryable: false },
   TEAM_FULL:                         { status: 409, retryable: false },
   TEAM_SWITCH_FORBIDDEN:             { status: 403, retryable: false },
   SLOT_RESERVATION_EXPIRED:          { status: 409, retryable: false },

@@ -1,5 +1,15 @@
 # Contract changelog
 
+## 2026-08-23 — `http-api.md` 2.2.0 → 2.3.0 (additive) — an owner can delete a room they created
+
+`DELETE /v1/rooms/:id`, owner-only. Scoped deliberately: no connection in this contract is
+ever force-closed by another party's action (`removeMember`'s own `room.left` broadcast
+already skips the removed member's own socket, since its connection is deleted before the
+broadcast runs), so this endpoint stays inside what the existing empty-room-destroy path
+already covers — the owner must be the room's only member. `409 ROOM_NOT_EMPTY` otherwise,
+`409 ROOM_IN_PROGRESS` if a match is live. Building an actual kick/notify-other-members
+feature is separate future work, not folded into this endpoint.
+
 ## 2026-08-23 — `bomb-rules.md` 2.0.0 (breaking, owner-directed) and `match-result.md` 2.1.0 → 2.2.0 — symmetric demolition (CCR-002)
 
 The owner directive on record ("the bomb starts in the middle of the map … each side has

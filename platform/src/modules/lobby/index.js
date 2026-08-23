@@ -1631,6 +1631,28 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       return body;
     },
     async leave(ctx) { await ensureHydrated(); const room = assertRoom(ctx.params.id); await removeMember(room, ctx.actor.accountId, ctx.correlationId, true); return raw(204, null); },
+    async deleteRoom(ctx) {
+      await ensureHydrated();
+      const room = assertRoom(ctx.params.id);
+      if (room.ownerAccountId !== ctx.actor.accountId) {
+        throw new ApiError('AUTH_FORBIDDEN', 'Only the room owner can delete this room.');
+      }
+      if (room.status === 'in-progress') {
+        throw new ApiError('ROOM_IN_PROGRESS', 'This room has an active match. Wait for it to end, or leave instead.');
+      }
+      // No connection in this codebase is ever force-closed by another party's action — a
+      // kicked member's own socket is never told, only bystanders' via broadcastRoster (see
+      // removeMember: `connections.delete(accountId)` runs BEFORE the broadcast that would
+      // have reached them). Building that notification path is real, separate work, so this
+      // stays inside what removeMember's tested empty-room-destroy branch already covers:
+      // deleting your own room requires it to have no one else in it. Owners with company
+      // still have `leave`, which empties the room the same way once everyone's gone.
+      if (room.members.size > 1) {
+        throw new ApiError('ROOM_NOT_EMPTY', 'Other players are still in this room. Wait for them to leave, then delete it.');
+      }
+      await removeMember(room, ctx.actor.accountId, ctx.correlationId, false);
+      return raw(204, null);
+    },
     async reconnect(ctx) {
       await ensureHydrated();
       const room = assertRoom(ctx.params.id);
@@ -1858,6 +1880,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
     router.post('/v1/rooms', handlers.create, ROOM);
     router.post('/v1/rooms/:id/join', handlers.join, ROOM);
     router.post('/v1/rooms/:id/leave', handlers.leave, ROOM);
+    router.delete('/v1/rooms/:id', handlers.deleteRoom, ROOM);
     router.post('/v1/rooms/:id/team', handlers.team, ROOM);
     router.post('/v1/rooms/:id/ready', handlers.ready, ROOM);
     router.post('/v1/rooms/:id/loadout', handlers.loadout, ROOM);
