@@ -692,7 +692,26 @@ export class AudioEngine {
 
     try { this.music.attach(ctx, musicBus); } catch (err) { console.warn('[audio] music attach failed', err); }
     this._armVisibility();
-    this._startSampleLoad();
+    // NOT immediately. The gesture that creates this context is, in production, the same
+    // click that enters a match — so starting 3.6 MB of fetch+decode+shape here put ~38 s
+    // of main-thread work directly on top of the match handshake, and the client's 10 s
+    // "no welcome from the game server" timer lost the race. Reported from production as
+    // "super lagging then it crashes back to the lobby"; the console showed the WebSocket
+    // closing before it was established while the sample bank was still loading.
+    //
+    // The bank has no deadline — every sound plays on the synth until its buffer lands —
+    // so it yields to whatever else the tab is doing and only starts once the main thread
+    // is genuinely idle. The timeout is the backstop for a tab that is never idle.
+    this._deferSampleLoad();
+  }
+
+  /** Start the sample bank at the first idle moment, never on the critical path. */
+  _deferSampleLoad() {
+    if (this._sampleLoad || this._sampleLoadQueued) return;
+    this._sampleLoadQueued = true;
+    const go = () => { this._sampleLoadQueued = false; this._startSampleLoad(); };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(go, { timeout: 20000 });
+    else setTimeout(go, 6000);
   }
 
   /* -------------------------------------------------------------- *

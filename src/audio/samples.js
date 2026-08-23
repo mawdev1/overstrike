@@ -363,7 +363,10 @@ function decode(ctx, arrayBuffer) {
 export async function loadSampleBank(ctx, opts) {
   const manifest = opts.manifest || SAMPLE_MANIFEST;
   const onSound = opts.onSound;
-  const concurrency = opts.concurrency || 6;
+  // 2, not 6. Each worker's decode+shape is main-thread work; six in parallel produced a
+  // burst long enough to starve the match handshake (see AudioEngine._deferSampleLoad).
+  // The bank has no deadline, so a slower, gentler fill is strictly the right trade.
+  const concurrency = opts.concurrency || 2;
   const tiers = opts.tiers || null;
   const base = baseUrl();
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
@@ -400,9 +403,17 @@ export async function loadSampleBank(ctx, opts) {
           buffers = [shape(ctx, decoded, spec)];
         }
 
-        // A buffer that decoded to silence is not a usable sound; leaving the synth in
-        // place is strictly better than swapping in nothing.
-        if (!buffers.length || peakOf(buffers[0]) < 1e-4) throw new Error('decoded silent');
+        // A buffer that decoded to silence is not a usable sound. But before giving up on
+        // the file, try the UNSHAPED decode: production reported a dozen weapon samples
+        // failing as 'decoded silent' while the same files served byte-identical and played
+        // fine elsewhere, which points at the trim rather than the audio. Falling back to
+        // the raw buffer costs a slightly longer sample; discarding it costs the sound
+        // entirely. Only if the raw decode is silent too is the file genuinely unusable,
+        // and then the synth stays — which is still a working game.
+        if (!buffers.length || peakOf(buffers[0]) < 1e-4) {
+          if (peakOf(decoded) >= 1e-4) buffers = [decoded];
+          else throw new Error('decoded silent');
+        }
 
         for (const b of buffers) stats.seconds += b.duration;
         stats.loaded++;
