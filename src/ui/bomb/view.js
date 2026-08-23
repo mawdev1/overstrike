@@ -22,9 +22,11 @@ function teamMarkup(team) {
 
 function sitesMarkup(sites) {
   if (!sites.length) return '<p class="bomb-hud__secondary">SITE DATA UNAVAILABLE</p>';
-  return `<ul class="bomb-sites" aria-label="Bomb sites">${sites.map((site) => `<li class="bomb-site${site.active ? ' bomb-site--active' : ''}${site.occluded ? ' bomb-site--occluded' : ''}${site.offscreen ? ' bomb-site--offscreen' : ''}" data-site="${site.site}" data-direction="${attr(site.direction || '')}" data-site-x="${site.center.x}" data-site-y="${site.center.y}" data-site-z="${site.center.z}">
+  // §13.10 ownership vocabulary: each site is labelled DEFEND (your home) or HIT (the
+  // enemy's home, your only legal plant site) — text, never colour alone.
+  return `<ul class="bomb-sites" aria-label="Bomb sites">${sites.map((site) => `<li class="bomb-site${site.active ? ' bomb-site--active' : ''}${site.occluded ? ' bomb-site--occluded' : ''}${site.offscreen ? ' bomb-site--offscreen' : ''}${site.ownership ? ` bomb-site--${site.ownership}` : ''}" data-site="${site.site}" data-ownership="${attr(site.ownership || '')}" data-direction="${attr(site.direction || '')}" data-site-x="${site.center.x}" data-site-y="${site.center.y}" data-site-z="${site.center.z}">
     <span class="bomb-token bomb-token--${site.shape}" aria-hidden="true">${site.glyph}</span>
-    <strong>${site.label}</strong>
+    <strong>${site.label}</strong>${site.ownershipLabel ? `<span class="bomb-site__ownership">${escapeHtml(site.ownershipLabel)}</span>` : ''}
     <span>${escapeHtml(site.callout)}${site.distanceM === null ? '' : ` · ${Math.round(site.distanceM)} M`}${site.offscreen && site.direction ? ` · ${site.direction.toUpperCase()}` : ''}</span>
   </li>`).join('')}</ul>`;
 }

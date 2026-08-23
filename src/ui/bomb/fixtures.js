@@ -25,9 +25,12 @@ export function baseBombMatchState(overrides = {}) {
     protocolVersion: 3,
     phase: 'live',
     phaseEndsAt: SERVER_NOW + 105_000,
+    // bomb-rules §13.8: role fields arrive null from a symmetric-demolition server;
+    // ownership is derived from site order + sideSwitched (§13.1). Alpha defends A,
+    // bravo defends B, until the side switch swaps home sites.
     teams: {
-      alpha: { score: 2, alive: 5, role: 'attacker' },
-      bravo: { score: 1, alive: 5, role: 'defender' },
+      alpha: { score: 2, alive: 5, role: null },
+      bravo: { score: 1, alive: 5, role: null },
     },
     killLimit: null,
     series: { roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, sideSwitched: false, overtime: false },
@@ -38,7 +41,7 @@ export function baseBombMatchState(overrides = {}) {
     localPlayer: {
       entityId: 101,
       team: 'alpha',
-      role: 'attacker',
+      role: null,
       alive: true,
       isSpectating: false,
       spectatingId: null,
@@ -94,19 +97,25 @@ const fixture = (name, matchState, extra = {}, expect = {}) => Object.freeze({
 });
 
 const interaction = (kind, progress) => ({ kind, actorId: 101, progress });
+// §13.4: a plant can only sit at the planter's TARGET site. Alpha plants at B (bravo's
+// home, so BRAVO defuses there); bravo plants at A.
 const planted = { phase: 'planted', phaseEndsAt: SERVER_NOW + 40_000, bomb: { state: 'planted', siteId: 'A', position: { x: -21, y: 0, z: -15 } } };
+const plantedAtB = { phase: 'planted', phaseEndsAt: SERVER_NOW + 40_000, bomb: { state: 'planted', siteId: 'B', position: { x: 23, y: 0, z: 17 } } };
 
 export const BOMB_FIXTURES = Object.freeze([
-  fixture('freeze-attacker', baseBombMatchState({ phase: 'freeze', phaseEndsAt: SERVER_NOW + 8_000 }), {}, { phase: 'freeze' }),
-  fixture('freeze-defender', baseBombMatchState({
+  fixture('freeze-home-alpha', baseBombMatchState({ phase: 'freeze', phaseEndsAt: SERVER_NOW + 8_000 }), {}, { phase: 'freeze', siteLabel: 'DEFEND A / HIT B' }),
+  fixture('freeze-home-bravo', baseBombMatchState({
     phase: 'freeze', phaseEndsAt: SERVER_NOW + 8_000,
-    localPlayer: { team: 'bravo', role: 'defender', entityId: 202 },
-  }), {}, { localRole: 'defender' }),
-  fixture('carrier-self', baseBombMatchState(), {}, { localCarrier: true }),
-  fixture('carrier-teammate', baseBombMatchState({ bomb: { carrierId: 102 } }), {}, { localCarrier: false }),
+    localPlayer: { team: 'bravo', role: null, entityId: 202 },
+  }), {}, { siteLabel: 'DEFEND B / HIT A' }),
+  fixture('carrier-self', baseBombMatchState(), { carrierTeam: 'alpha' }, { localCarrier: true }),
+  fixture('carrier-teammate', baseBombMatchState({ bomb: { carrierId: 102 } }), { carrierTeam: 'alpha' }, { localCarrier: false, carrierRelationship: 'teammate' }),
   fixture('carrier-enemy-visible', baseBombMatchState({
-    localPlayer: { entityId: 202, team: 'bravo', role: 'defender' },
-  }), {}, { carrierRelationship: 'enemy' }),
+    localPlayer: { entityId: 202, team: 'bravo', role: null },
+  }), { carrierTeam: 'alpha' }, { carrierRelationship: 'enemy' }),
+  fixture('neutral-bomb-contestable', baseBombMatchState({
+    bomb: { state: 'dropped', carrierId: null, position: { x: 1, y: 0, z: 1 } },
+  }), {}, { bombLabel: 'BOMB UP FOR GRABS', markerVisible: true }),
   fixture('carrier-hidden-malformed-position', baseBombMatchState({ bomb: { carrierId: null, position: { x: 999, y: 999, z: 999 } } }), {}, { markerVisible: false }),
   fixture('bomb-dropped-visible', baseBombMatchState({ bomb: { state: 'dropped', carrierId: null, position: { x: 4, y: 0, z: 8 } } }), {}, { markerVisible: true }),
   fixture('bomb-dropped-hidden', baseBombMatchState({ bomb: { state: 'dropped', carrierId: null, position: null } }), {}, { markerVisible: false }),
@@ -116,9 +125,9 @@ export const BOMB_FIXTURES = Object.freeze([
   fixture('plant-interrupted', baseBombMatchState({ bomb: { siteId: 'A' } }), { typedEvent: { type: 'plantCancel', reason: 1 } }, { status: 'PLANT INTERRUPTED' }),
   fixture('plant-complete-authoritative', baseBombMatchState(planted), { cue: { type: 'plantComplete' } }, { bombState: 'planted' }),
   fixture('planted-idle', baseBombMatchState(planted), {}, { phase: 'planted' }),
-  fixture('defuse-0', baseBombMatchState({ ...planted, localPlayer: { entityId: 202, team: 'bravo', role: 'defender' }, interaction: { kind: 'defuse', actorId: 202, progress: 0 } }), {}, { progress: 0 }),
-  fixture('defuse-50', baseBombMatchState({ ...planted, localPlayer: { entityId: 202, team: 'bravo', role: 'defender' }, interaction: { kind: 'defuse', actorId: 202, progress: 0.5 } }), {}, { progress: 0.5 }),
-  fixture('defuse-99', baseBombMatchState({ ...planted, localPlayer: { entityId: 202, team: 'bravo', role: 'defender' }, interaction: { kind: 'defuse', actorId: 202, progress: 0.99 } }), {}, { progress: 0.99 }),
+  fixture('defuse-0', baseBombMatchState({ ...plantedAtB, localPlayer: { entityId: 202, team: 'bravo', role: null }, interaction: { kind: 'defuse', actorId: 202, progress: 0 } }), {}, { progress: 0 }),
+  fixture('defuse-50', baseBombMatchState({ ...plantedAtB, localPlayer: { entityId: 202, team: 'bravo', role: null }, interaction: { kind: 'defuse', actorId: 202, progress: 0.5 } }), {}, { progress: 0.5 }),
+  fixture('defuse-99', baseBombMatchState({ ...plantedAtB, localPlayer: { entityId: 202, team: 'bravo', role: null }, interaction: { kind: 'defuse', actorId: 202, progress: 0.99 } }), {}, { progress: 0.99 }),
   fixture('defuse-interrupted', baseBombMatchState(planted), { typedEvent: { type: 'defuseCancel', reason: 0 } }, { status: 'DEFUSE INTERRUPTED' }),
   fixture('defuse-complete-authoritative', baseBombMatchState({ ...planted, phase: 'roundEnd', bomb: { state: 'defused' } }), {
     outcomeEvent: { type: 'roundEnded', winner: 'bravo', reason: 'defuse' }, cue: { type: 'defuseComplete' },
@@ -133,7 +142,8 @@ export const BOMB_FIXTURES = Object.freeze([
   fixture('round-lost-defuse', baseBombMatchState({ phase: 'roundEnd' }), { outcomeEvent: { type: 'roundEnded', winner: 'bravo', reason: 'defuse' } }, { outcome: 'ROUND LOST' }),
   fixture('round-won-detonation', baseBombMatchState({ phase: 'roundEnd' }), { outcomeEvent: { type: 'roundEnded', winner: 'alpha', reason: 'detonation' } }, { outcome: 'ROUND WON' }),
   fixture('round-draw-timer', baseBombMatchState({ phase: 'roundEnd' }), { outcomeEvent: { type: 'roundEnded', winner: 'draw', reason: 'timer' } }, { outcome: 'ROUND DRAW' }),
-  fixture('side-switch', baseBombMatchState({ series: { sideSwitched: true }, teams: { alpha: { role: 'defender' }, bravo: { role: 'attacker' } } }), { cue: { type: 'sideSwitch' } }, { roles: ['defender', 'attacker'] }),
+  // §13.1: the side switch swaps HOME SITES, not roles — alpha now defends B.
+  fixture('side-switch', baseBombMatchState({ series: { sideSwitched: true } }), { cue: { type: 'sideSwitch' } }, { homeSites: ['B', 'A'], siteLabel: 'DEFEND B / HIT A' }),
   fixture('regulation-round-12', baseBombMatchState({ round: { index: 11 } }), {}, { roundLabel: 'ROUND 12' }),
   fixture('degraded-estimating', baseBombMatchState(), { nowMs: SAMPLED_AT + 500, netStats: { sampledAt: SAMPLED_AT + 500, windowMs: 5_000, snapshotAgeMs: 500 } }, { clockStatus: 'estimating' }),
   fixture('stale-syncing', baseBombMatchState({ interaction: interaction('plant', 0.5) }), { nowMs: SAMPLED_AT + 5_000, netStats: { sampledAt: SAMPLED_AT + 5_000, windowMs: 5_000, snapshotAgeMs: 5_000 } }, { clockStatus: 'syncing' }),

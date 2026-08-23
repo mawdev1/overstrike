@@ -32,7 +32,8 @@ const PHASE_LABELS = Object.freeze({
 const BOMB_LABELS = Object.freeze({
   none: 'BOMB NOT ASSIGNED',
   carried: 'BOMB CARRIED',
-  dropped: 'BOMB DROPPED',
+  // §13.2/§13.3: `dropped` is the NEUTRAL state — one bomb, contestable by both teams.
+  dropped: 'BOMB UP FOR GRABS',
   planted: 'BOMB PLANTED',
   defused: 'BOMB DEFUSED',
   detonated: 'BOMB DETONATED',
@@ -130,19 +131,41 @@ function vector(value) {
   return Object.freeze({ x: value.x, y: value.y, z: value.z });
 }
 
-function teamProjection(id, source = {}) {
+/**
+ * bomb-rules §13.1 — this round's home-site assignment, derived from facts already in the
+ * frozen facade view: the sorted site letters and `series.sideSwitched`. Before the switch
+ * alpha defends the first site; the §2 side switch swaps home sites, not roles.
+ *
+ * @returns {{ alpha: string|null, bravo: string|null }}
+ */
+export function homeSitesFor(sites, sideSwitched) {
+  const letters = [];
+  for (const source of Array.isArray(sites) ? sites : []) {
+    const site = source?.site === 'A' || source?.site === 'B' ? source.site : null;
+    if (site && !letters.includes(site)) letters.push(site);
+  }
+  letters.sort();
+  if (letters.length !== 2) return Object.freeze({ alpha: null, bravo: null });
+  return Object.freeze(sideSwitched
+    ? { alpha: letters[1], bravo: letters[0] }
+    : { alpha: letters[0], bravo: letters[1] });
+}
+
+function teamProjection(id, source = {}, homeSiteId = null) {
   const token = TEAM_TOKENS[id];
-  const role = source?.role === 'attacker' || source?.role === 'defender' ? source.role : null;
   return Object.freeze({
     ...token,
     score: integer(source?.score) && source.score >= 0 ? source.score : null,
     alive: integer(source?.alive) && source.alive >= 0 ? source.alive : null,
-    role,
-    roleLabel: role ? role.toUpperCase() : 'ROLE PENDING',
+    // §13.8: there are no attackers or defenders; the wire serves the role null. The
+    // team's identity in symmetric demolition is the site it defends.
+    role: null,
+    homeSiteId,
+    roleLabel: homeSiteId ? `DEFENDS ${homeSiteId}` : 'SITE PENDING',
   });
 }
 
-function projectSites(state, markerProjection) {
+function projectSites(state, markerProjection, localHomeSite = null, localTargetSite = null) {
   if (!Array.isArray(state?.sites)) return Object.freeze([]);
   const markers = new Map();
   if (Array.isArray(markerProjection)) {
@@ -174,6 +197,10 @@ function projectSites(state, markerProjection) {
       ...token,
       id,
       site,
+      // §13.10 ownership vocabulary: your HOME site is the one you defend (and defuse
+      // at); your TARGET site is the enemy's home, the only one you may plant at.
+      ownership: site === localHomeSite ? 'home' : site === localTargetSite ? 'target' : null,
+      ownershipLabel: site === localHomeSite ? 'DEFEND' : site === localTargetSite ? 'HIT' : null,
       callout: text(source.callout, token.label),
       center,
       active: state?.bomb?.siteId === site,
@@ -236,7 +263,7 @@ function projectClock(state, nowMs, freshness) {
   });
 }
 
-function projectBomb(state, localEntityId, localRole) {
+function projectBomb(state, localEntityId, localTeam, carrierTeam) {
   const source = state?.bomb;
   const bombState = VALID_BOMB_STATES.has(source?.state) ? source.state : 'none';
   const carrierId = bombState === 'carried' && integer(source?.carrierId) && source.carrierId > 0
@@ -254,11 +281,13 @@ function projectBomb(state, localEntityId, localRole) {
     carrierId,
     carrierVisible: carrierId !== null,
     isLocalCarrier: carrierId !== null && carrierId === localEntityId,
+    // §13.10: either team may carry, so the relationship comes from the CARRIER'S team
+    // (adapter-supplied `carrierTeam`), not from a role that no longer exists.
     carrierRelationship: carrierId === null ? null
       : carrierId === localEntityId ? 'self'
-      : localRole === 'attacker' ? 'teammate'
-      : localRole === 'defender' ? 'enemy'
-      : 'visible',
+      : carrierTeam === 'alpha' || carrierTeam === 'bravo'
+        ? (carrierTeam === localTeam ? 'teammate' : 'enemy')
+        : 'visible',
     siteId,
     markerPosition,
     markerVisible: markerPosition !== null,
@@ -277,16 +306,19 @@ function bindingLabel(bindings, action) {
  * value fails closed, and hides the prompt while syncing — a stale snapshot cannot prove
  * present-tense eligibility.
  */
-function projectPrompt(eligibleAction, phase, localRole, bomb, bindings, freshnessStatus) {
+function projectPrompt(eligibleAction, phase, localHomeSite, bomb, bindings, freshnessStatus) {
   const kind = eligibleAction === 'plant' || eligibleAction === 'defuse' ? eligibleAction : null;
   if (!kind) return null;
   if (freshnessStatus === 'syncing' || freshnessStatus === 'unknown') return null;
+  // §13.10 context-based gating, not role-based: plant = local player carries the bomb
+  // (the adapter asserts they stand in their TARGET site — never their own, §13.4);
+  // defuse = the enemy's plant sits at the LOCAL TEAM'S HOME site.
   if (kind === 'plant') {
-    if (phase !== 'live' || localRole !== 'attacker') return null;
+    if (phase !== 'live') return null;
     if (bomb.state !== 'carried' || !bomb.isLocalCarrier) return null;
   } else {
-    if (phase !== 'planted' || localRole !== 'defender') return null;
-    if (bomb.state !== 'planted') return null;
+    if (phase !== 'planted' || bomb.state !== 'planted') return null;
+    if (!localHomeSite || bomb.siteId !== localHomeSite) return null;
   }
   return Object.freeze({
     kind,
@@ -473,6 +505,7 @@ export function projectBombPresentation({
   siteMarkers = null,
   localAuthority = false,
   eligibleAction = null,
+  carrierTeam = null,
 } = {}) {
   if (!finite(nowMs)) throw new TypeError('nowMs must be a finite client-monotonic timestamp.');
   if (!localAuthority && (!finite(freshnessThresholdMs) || freshnessThresholdMs <= 0)) {
@@ -504,13 +537,18 @@ export function projectBombPresentation({
     : series?.overtime === true ? 'UNAPPROVED OVERTIME STATE'
     : !teamsValid ? 'INVALID OR MISSING BOMB SCORE' : null;
 
+  // §13.1: home-site ownership, derived from the sorted site letters + the side switch —
+  // the same facts every other consumer derives it from. No role field is consulted.
+  const homeSites = homeSitesFor(state.sites, series?.sideSwitched === true);
   const teams = Object.freeze([
-    teamProjection('alpha', state.teams?.alpha),
-    teamProjection('bravo', state.teams?.bravo),
+    teamProjection('alpha', state.teams?.alpha, homeSites.alpha),
+    teamProjection('bravo', state.teams?.bravo, homeSites.bravo),
   ]);
-  const localRole = local.role === 'attacker' || local.role === 'defender' ? local.role : null;
-  const bomb = projectBomb(state, localEntityId, localRole);
-  const prompt = projectPrompt(eligibleAction, phase, localRole, bomb, bindings, freshness.status);
+  const localHomeSite = localTeam === 'alpha' || localTeam === 'bravo' ? homeSites[localTeam] : null;
+  const localTargetSite = localTeam === 'alpha' ? homeSites.bravo
+    : localTeam === 'bravo' ? homeSites.alpha : null;
+  const bomb = projectBomb(state, localEntityId, localTeam, carrierTeam);
+  const prompt = projectPrompt(eligibleAction, phase, localHomeSite, bomb, bindings, freshness.status);
   const interaction = projectInteraction(state, localEntityId, bindings, typedEvent, freshness.status, prompt);
   const spectator = projectSpectator(state, bindings);
   const connection = projectConnection(netState, reconnect, nowMs, syncing, stats, localAuthority);
@@ -533,12 +571,19 @@ export function projectBombPresentation({
     series,
     teams,
     localTeam,
-    localRole,
+    // §13.8: the wire serves role null; the HUD speaks home/target sites instead.
+    localRole: null,
+    homeSites,
+    localHomeSite,
+    localTargetSite,
+    // e.g. "DEFEND B / HIT A" (§13.10) — the replacement for the old role label.
+    siteLabel: localHomeSite && localTargetSite
+      ? `DEFEND ${localHomeSite} / HIT ${localTargetSite}` : 'SITES PENDING',
     clock,
     freshness,
     // Marker geometry is supplied by an authorized world/camera adapter. The presentation
     // never derives LOS or reconstructs hidden positions from entities or prior samples.
-    sites: projectSites(state, siteMarkers),
+    sites: projectSites(state, siteMarkers, localHomeSite, localTargetSite),
     bomb,
     interaction,
     spectator,

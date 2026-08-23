@@ -171,6 +171,11 @@ function bombObjective(match) {
 }
 
 function teamRole(match, team) {
+  // bomb-rules §13.1: symmetric demolition has no attackers or defenders — each team is
+  // named by the site it DEFENDS. The referee (or a staged view) publishes `homeSites`.
+  const home = match?.homeSites?.[team];
+  if (home === 'A' || home === 'B') return `DEFENDS ${home}`;
+  // Pre-2.0.0 staged views may still speak the old vocabulary.
   const projected = match?.teams?.[team === 0 ? 'alpha' : 'bravo']?.role;
   if (projected === 'attacker') return 'ATTACKERS';
   if (projected === 'defender') return 'DEFENDERS';

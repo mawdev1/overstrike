@@ -2,6 +2,7 @@ export {
   BOMB_PRESENTATION_VERSION,
   SITE_TOKENS,
   TEAM_TOKENS,
+  homeSitesFor,
   projectBombPresentation,
 } from './model.js';
 
@@ -25,6 +26,7 @@ export {
   createLocalBombHud,
   buildFacadeBombSample,
   deriveEligibleInteraction,
+  homeSiteOfTeam,
   projectLocalSiteMarker,
   resolveManifestCallout,
   sitesFromManifest,

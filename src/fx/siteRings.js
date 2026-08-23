@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { sitesFromManifest } from '../ui/bomb/local.js';
+import { homeSiteOfTeam, sitesFromManifest } from '../ui/bomb/local.js';
 
 /**
  * OVERSTRIKE — bomb-site ground rings.
@@ -12,8 +12,9 @@ import { sitesFromManifest } from '../ui/bomb/local.js';
  * site vanishes down every long approach (Civic Archive doorway). The wall gives
  * the site vertical presence that survives grazing angles without occluding
  * anything — additive, depthWrite off, fading to nothing by WALL_HEIGHT so it
- * stays a floor cue, not a curtain. Both parts pulse together in the site's
- * team-readable colour — the exact hues the minimap already stamps.
+ * stays a floor cue, not a curtain. Both parts pulse together in an OWNERSHIP
+ * colour (bomb-rules §13.10): your home site in the friendly team hue, the
+ * enemy's — your plant target — in the hostile accent.
  *
  * States: idle (slow soft pulse) vs bomb-planted-here (fast, brighter pulse).
  * Reduced motion (the `os-prefer-reduced-motion` root class the HUD honours)
@@ -23,8 +24,12 @@ import { sitesFromManifest } from '../ui/bomb/local.js';
  * cache); per-frame work is three uniform writes per site, zero allocation.
  */
 
-// Same colours as minimap.js site glyphs — the one place players learn them.
-const SITE_COLORS = Object.freeze({ A: 0x86ddd3, B: 0xffd07d });
+// bomb-rules §13.10: the rings speak OWNERSHIP, not site identity — "your site to
+// defend" renders in the friendly team hue the minimap uses for teammates, "the enemy
+// site to hit" in the hostile accent it uses for enemies. Ownership can change at the
+// §2 side switch, so the colour is a per-frame uniform write, not baked geometry.
+const OWN_SITE_COLOR = 0x58c9ff;    // minimap teammate hue — mine, defend it
+const ENEMY_SITE_COLOR = 0xff4433;  // minimap hostile hue — theirs, hit it
 const MARGIN = 1.0;        // metres of plane past the box edge for the band falloff
 const LIFT = 0.04;         // metres above the site floor — no z-fighting, no step
 const WALL_HEIGHT = 1.15;  // metres of edge glow — knee height, under every sightline
@@ -166,7 +171,8 @@ export class SiteRings {
       const geo = new THREE.PlaneGeometry((hw + MARGIN) * 2, (hd + MARGIN) * 2);
       const mat = new THREE.ShaderMaterial({
         uniforms: {
-          uColor: { value: new THREE.Color(SITE_COLORS[site.site] ?? 0xffffff) },
+          // Recoloured every update() by ownership; white only until the first frame.
+          uColor: { value: new THREE.Color(0xffffff) },
           uHalf: { value: new THREE.Vector2(hw, hd) },
           uTime: { value: 0 },
           uPulseSpeed: { value: IDLE_SPEED },
@@ -198,7 +204,7 @@ export class SiteRings {
       // The distance component: same colour, same pulse, standing on the same outline.
       const wallMat = new THREE.ShaderMaterial({
         uniforms: {
-          uColor: { value: new THREE.Color(SITE_COLORS[site.site] ?? 0xffffff) },
+          uColor: { value: new THREE.Color(0xffffff) },
           uHeight: { value: WALL_HEIGHT },
           uTime: { value: 0 },
           uPulseSpeed: { value: IDLE_SPEED },
@@ -244,9 +250,17 @@ export class SiteRings {
     const plantedSite = bomb?.state === 'planted' ? bomb.siteId : null;
     const motion = globalThis.document?.documentElement?.classList
       ?.contains('os-prefer-reduced-motion') ? 0 : 1;
+    // §13.1/§13.10 ownership: prefer the referee's own assignment (honours a manifest
+    // homeSites override), else derive from site order + sideSwitched — the same facts
+    // a networked client has. Falls back to team 0 when there is no local player.
+    const team = g.player?.team === 1 ? 1 : 0;
+    const homeSite = match.homeSites?.[team]
+      ?? homeSiteOfTeam(team, match.sideSwitched === true);
     for (let i = 0; i < this.meshes.length; i++) {
       const u = this.meshes[i].material.uniforms;
-      const urgent = this.meshes[i].userData.site === plantedSite;
+      const site = this.meshes[i].userData.site;
+      const urgent = site === plantedSite;
+      u.uColor.value.setHex(site === homeSite ? OWN_SITE_COLOR : ENEMY_SITE_COLOR);
       u.uTime.value = this.time;
       u.uPulseSpeed.value = urgent ? URGENT_SPEED : IDLE_SPEED;
       u.uBoost.value = urgent ? URGENT_BOOST : IDLE_BOOST;

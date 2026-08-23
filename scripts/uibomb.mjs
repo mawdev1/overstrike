@@ -56,6 +56,9 @@ function expectedFixtureChecks(item, projected) {
     switch (key) {
       case 'phase': actual = projected.phase; break;
       case 'localRole': actual = projected.localRole; break;
+      case 'siteLabel': actual = projected.siteLabel; break;
+      case 'homeSites': actual = projected.teams.map((team) => team.homeSiteId); break;
+      case 'bombLabel': actual = projected.bomb.label; break;
       case 'localCarrier': actual = projected.bomb.isLocalCarrier; break;
       case 'carrierRelationship': actual = projected.bomb.carrierRelationship; break;
       case 'markerVisible': actual = projected.bomb.markerVisible; break;
@@ -78,11 +81,11 @@ function expectedFixtureChecks(item, projected) {
 
 // ── catalogue completeness ───────────────────────────────────────────────────────────
 
-equal(BOMB_FIXTURES.length, 36, 'fixture count is deliberate and reviewable');
+equal(BOMB_FIXTURES.length, 37, 'fixture count is deliberate and reviewable');
 equal(new Set(BOMB_FIXTURE_NAMES).size, BOMB_FIXTURE_NAMES.length, 'fixture names are unique');
 for (const required of [
-  'freeze-attacker', 'freeze-defender', 'carrier-self', 'carrier-teammate', 'carrier-enemy-visible',
-  'bomb-dropped-visible', 'bomb-dropped-hidden',
+  'freeze-home-alpha', 'freeze-home-bravo', 'carrier-self', 'carrier-teammate', 'carrier-enemy-visible',
+  'neutral-bomb-contestable', 'bomb-dropped-visible', 'bomb-dropped-hidden',
   'plant-0', 'plant-50', 'plant-99', 'plant-interrupted', 'plant-complete-authoritative',
   'planted-idle', 'defuse-0', 'defuse-50', 'defuse-99', 'defuse-interrupted',
   'defuse-complete-authoritative', 'one-versus-one', 'spectator-eligible',
@@ -221,11 +224,15 @@ equal(hiddenCarrier.bomb.carrierVisible, false, 'null carrier is treated as filt
 check(!renderBombHudHtml(hiddenCarrier).includes('TEAM CARRIER'), 'hidden carrier has no fallback identity');
 
 const defenderVisibleCarrier = model({ matchState: baseBombMatchState({
-  localPlayer: { entityId: 202, team: 'bravo', role: 'defender' },
-}) });
-equal(defenderVisibleCarrier.bomb.carrierRelationship, 'enemy', 'authorized defender LOS identifies the carrier relationship without identity');
-check(renderBombHudHtml(defenderVisibleCarrier).includes('ENEMY BOMB CARRIER VISIBLE'), 'defender is never told an enemy carrier is a teammate');
+  localPlayer: { entityId: 202, team: 'bravo', role: null },
+}), carrierTeam: 'alpha' });
+equal(defenderVisibleCarrier.bomb.carrierRelationship, 'enemy', 'LOS on an opposing carrier identifies the relationship by the CARRIER team (§13.10)');
+check(renderBombHudHtml(defenderVisibleCarrier).includes('ENEMY BOMB CARRIER VISIBLE'), 'a viewer is never told an enemy carrier is a teammate');
 check(!renderBombHudHtml(defenderVisibleCarrier).includes('TEAMMATE HAS'), 'enemy carrier copy cannot imply teammate ownership');
+equal(model({ matchState: baseBombMatchState({ bomb: { carrierId: 102 } }), carrierTeam: 'alpha' }).bomb.carrierRelationship,
+  'teammate', 'a same-team carrier reads as a teammate — either team may carry the neutral bomb (§13.3)');
+equal(model({ matchState: baseBombMatchState({ bomb: { carrierId: 102 } }) }).bomb.carrierRelationship,
+  'visible', 'an unknown carrier team fails closed to the neutral relationship');
 
 const teammatePlant = model({ matchState: baseBombMatchState({ interaction: { kind: 'plant', actorId: 102, progress: 0.87 } }) });
 equal(teammatePlant.interaction.progress, null, 'non-local interaction progress is removed from the presentation model');
@@ -392,7 +399,8 @@ const hiddenLocalCarrier = buildLocalBombSample(localGame, 50_100);
 equal(hiddenLocalCarrier.matchState.bomb.carrierId, null, 'defender local view filters a carried bomb without current LOS');
 equal(hiddenLocalCarrier.matchState.bomb.position, null, 'defender local view never discloses carried coordinates');
 localGame.match.bomb = { state: 'dropped', carrierId: null, siteId: null, position: { x: 3, y: 0, z: -2 } };
-equal(buildLocalBombSample(localGame, 50_200).matchState.bomb.position, null, 'defender local view filters an occluded dropped bomb');
+check(buildLocalBombSample(localGame, 50_200).matchState.bomb.position !== null,
+  'a dropped/neutral bomb position is public to BOTH teams — the shared objective (§13.3)');
 localGame.match.bomb = { state: 'planted', carrierId: null, siteId: 'A', position: { x: 8, y: 0, z: -12 } };
 check(buildLocalBombSample(localGame, 50_300).matchState.bomb.position !== null, 'planted location remains public to defenders');
 localPlayer.team = 0;
@@ -424,8 +432,8 @@ check(renderBombHudHtml(promptWhilePlanting).includes('PLANTING')
 // interaction the referee (§6/§7) would refuse.
 equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ phase: 'freeze', phaseEndsAt: SERVER_NOW + 8_000 }) }).interaction.prompt, null,
   'PLANT prompt refuses a non-live phase');
-equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ localPlayer: { entityId: 202, team: 'bravo', role: 'defender' } }) }).interaction.prompt, null,
-  'PLANT prompt refuses a defender');
+equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ localPlayer: { entityId: 202, team: 'bravo', role: null } }) }).interaction.prompt, null,
+  'PLANT prompt refuses a player who is not the carrier, whichever team they are on');
 equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ bomb: { carrierId: 102 } }) }).interaction.prompt, null,
   'PLANT prompt refuses a non-carrier');
 equal(model({ eligibleAction: 'defuse', matchState: baseBombMatchState() }).interaction.prompt, null,
@@ -436,52 +444,65 @@ equal(model({
   netStats: { sampledAt: SAMPLED_AT + 5_000, windowMs: 5_000, snapshotAgeMs: 5_000 },
 }).interaction.prompt, null, 'a stale snapshot cannot prove present-tense eligibility');
 
+// §13.4: bravo's HOME is B (site order, no switch) — a plant at B is at bravo's door.
 const promptDefuse = model({
   eligibleAction: 'defuse',
   matchState: baseBombMatchState({
     phase: 'planted', phaseEndsAt: SERVER_NOW + 40_000,
-    bomb: { state: 'planted', carrierId: null, siteId: 'A', position: { x: -21, y: 0, z: -15 } },
-    localPlayer: { entityId: 202, team: 'bravo', role: 'defender' },
+    bomb: { state: 'planted', carrierId: null, siteId: 'B', position: { x: 23, y: 0, z: 17 } },
+    localPlayer: { entityId: 202, team: 'bravo', role: null },
   }),
 });
 equal(promptDefuse.interaction.prompt, { kind: 'defuse', actionLabel: 'DEFUSE', binding: 'E' },
-  'defender in the planted circle projects a DEFUSE prompt');
+  'the site OWNER in the planted circle projects a DEFUSE prompt (§13.4)');
 check(renderBombHudHtml(promptDefuse).includes('<strong>DEFUSE</strong>'), 'DEFUSE prompt renders');
+equal(model({
+  eligibleAction: 'defuse',
+  matchState: baseBombMatchState({
+    phase: 'planted', phaseEndsAt: SERVER_NOW + 40_000,
+    bomb: { state: 'planted', carrierId: null, siteId: 'A', position: { x: -21, y: 0, z: -15 } },
+    localPlayer: { entityId: 202, team: 'bravo', role: null },
+  }),
+}).interaction.prompt, null, 'no DEFUSE prompt at the ENEMY home site — only the owner defuses (§13.4)');
 
 // Sample-level: the derivation mirrors the referee's §6/§7 preconditions exactly.
 const eligibilitySites = sitesFromManifest(localManifest);
 equal(eligibilitySites[0].requiresGround, true, 'manifest plant volume defaults to requiresGround');
 equal(eligibilitySites[0].defuseBox, eligibilitySites[0].box, 'omitted defuse volume defaults to the plant volume (§3.3)');
+// §13.1 with these two sites and no side switch: the local team's home is A, target B.
 const eligibility = (overrides = {}) => deriveEligibleInteraction({
-  phase: 'live', role: 'attacker', alive: true, localEntityId: 101,
+  phase: 'live', homeSite: 'A', targetSite: 'B', alive: true, localEntityId: 101,
   bomb: { state: 'carried', carrierId: 101, siteId: null },
-  sites: eligibilitySites, position: { x: 8, y: 1, z: -12 }, grounded: true,
+  sites: eligibilitySites, position: { x: -12, y: 1, z: 10 }, grounded: true,
   ...overrides,
 });
-equal(eligibility(), 'plant', 'attacker carrying inside site A plant box is plant-eligible');
+equal(eligibility(), 'plant', 'the carrier inside their TARGET site plant box is plant-eligible (§13.4)');
+equal(eligibility({ position: { x: 8, y: 1, z: -12 } }), null,
+  'carrying the bomb at your OWN home site never prompts a plant — the wrongSite refusal (§13.10)');
 equal(eligibility({ position: { x: 0, y: 0, z: 0 } }), null, 'outside every plant volume is ineligible');
 equal(eligibility({ grounded: false }), null, 'airborne in a requiresGround volume is ineligible (§6)');
 equal(eligibility({ grounded: undefined }), 'plant', 'only an explicit grounded === false refuses, as in the referee');
-equal(eligibility({ bomb: { state: 'carried', carrierId: 102, siteId: null } }), null, 'a non-carrier attacker is ineligible');
+equal(eligibility({ bomb: { state: 'carried', carrierId: 102, siteId: null } }), null, 'a non-carrier is ineligible');
 equal(eligibility({ bomb: { state: 'dropped', carrierId: null, siteId: null } }), null, 'a dropped bomb prompts nobody');
 equal(eligibility({ phase: 'freeze' }), null, 'plant needs the live phase');
 equal(eligibility({ alive: false }), null, 'the dead are not prompted');
 equal(eligibility({
-  phase: 'planted', role: 'defender',
-  bomb: { state: 'planted', carrierId: null, siteId: 'A' },
-}), 'defuse', 'defender inside the planted site defuse volume is defuse-eligible');
+  phase: 'planted',
+  bomb: { state: 'planted', carrierId: null, siteId: 'A' }, position: { x: 8, y: 1, z: -12 },
+}), 'defuse', 'the site OWNER inside their planted home defuse volume is defuse-eligible (§13.4)');
 equal(eligibility({
-  phase: 'planted', role: 'defender',
-  bomb: { state: 'planted', carrierId: null, siteId: 'B' },
-}), null, 'defender in the WRONG circle is not defuse-eligible');
-equal(eligibility({ phase: 'planted', role: 'defender', bomb: { state: 'planted', carrierId: null, siteId: 'A' }, position: { x: 0, y: 0, z: 0 } }),
-  null, 'defender outside the planted defuse volume is ineligible');
+  phase: 'planted',
+  bomb: { state: 'planted', carrierId: null, siteId: 'B' }, position: { x: -12, y: 1, z: 10 },
+}), null, 'a plant at the ENEMY home never offers this team a defuse (§13.4)');
+equal(eligibility({ phase: 'planted', bomb: { state: 'planted', carrierId: null, siteId: 'A' }, position: { x: 0, y: 0, z: 0 } }),
+  null, 'the owner outside the planted defuse volume is ineligible');
 
-// End-to-end through the local-practice sample builder.
-localPlayer.position = { x: 8, y: 1, z: -12 };
+// End-to-end through the local-practice sample builder. The local player is alpha
+// (team 0): home A, target B — the plant circle that counts is SITE B (§13.4).
+localPlayer.position = { x: -12, y: 1, z: 10 };
 localPlayer.grounded = true;
 const inCircleSample = buildLocalBombSample(localGame, 51_000);
-equal(inCircleSample.eligibleAction, 'plant', 'local sample derives plant eligibility in the circle');
+equal(inCircleSample.eligibleAction, 'plant', 'local sample derives plant eligibility in the TARGET circle');
 const inCircleHtml = renderBombHudHtml(projectBombPresentation(inCircleSample));
 check(inCircleHtml.includes('bomb-prompt') && inCircleHtml.includes('<strong>PLANT</strong>') && inCircleHtml.includes('<kbd>E</kbd>'),
   'local practice renders PLANT — [E] inside the circle');

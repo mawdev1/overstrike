@@ -85,37 +85,50 @@ export function sitesFromManifest(manifest) {
 }
 
 /**
- * Mirror of the referee's §6/§7 interaction preconditions (`_validate` in
+ * bomb-rules §13.1: this round's home site for a team index, derived from the sorted site
+ * letters + the side switch — the same facts every consumer derives ownership from. A
+ * manifest `homeSites` override travels through `match.homeSites`; callers should prefer
+ * that when a referee is in-process and fall back to this derivation on the pure client.
+ */
+export function homeSiteOfTeam(teamIndex, sideSwitched, siteLetters = ['A', 'B']) {
+  const letters = [...siteLetters].sort();
+  if (letters.length !== 2 || (teamIndex !== 0 && teamIndex !== 1)) return null;
+  const first = teamIndex === 0;
+  return (sideSwitched ? !first : first) ? letters[0] : letters[1];
+}
+
+/**
+ * Mirror of the referee's §6/§7/§13.4 interaction preconditions (`_validate` in
  * `src/game/bomb.js`), computed only from facts the client already learns: its own
  * predicted body, the public site volumes, and the privacy-filtered bomb view. It is
  * deliberately NOT looser — every server check observable client-side is repeated —
  * so the prompt never advertises an interaction the referee would refuse for a
- * client-knowable reason. Server-only facts (disconnection, same-tick death ordering)
- * stay with the server's refusal events.
+ * client-knowable reason (§13.10: carrying the bomb at your OWN site must not show a
+ * plant prompt — that is the `wrongSite` refusal). Server-only facts (disconnection,
+ * same-tick death ordering) stay with the server's refusal events.
  *
  * @returns {'plant'|'defuse'|null}
  */
 export function deriveEligibleInteraction({
-  phase, role, alive, localEntityId, bomb, sites, position, grounded,
+  phase, homeSite, targetSite, alive, localEntityId, bomb, sites, position, grounded,
 } = {}) {
   if (alive !== true || !position || !finite(position.x)) return null;
-  if (role === 'attacker') {
-    // §6: live phase only (a planted phase refuses as already-planted), carrier only.
-    if (phase !== 'live') return null;
+  if (phase === 'live') {
+    // §6/§13.4: live phase, carrier only, and ONLY inside the TARGET site (enemy home).
     if (bomb?.state !== 'carried' || !localEntityId || bomb.carrierId !== localEntityId) return null;
-    for (const site of sites || []) {
-      const box = site?.box;
-      if (!box || !pointInBox(position, box)) continue;
-      // §6 notGrounded: only an explicit `grounded === false` refuses, as in the referee.
-      if (site.requiresGround !== false && grounded === false) return null;
-      return 'plant';
-    }
-    return null;
+    if (targetSite !== 'A' && targetSite !== 'B') return null;
+    const site = (sites || []).find((row) => row?.site === targetSite);
+    const box = site?.box;
+    if (!box || !pointInBox(position, box)) return null;
+    // §6 notGrounded: only an explicit `grounded === false` refuses, as in the referee.
+    if (site.requiresGround !== false && grounded === false) return null;
+    return 'plant';
   }
-  if (role === 'defender') {
-    // §7: planted phase only, inside the PLANTED site's defuse volume.
-    if (phase !== 'planted') return null;
+  if (phase === 'planted') {
+    // §7/§13.4: defuse belongs to the SITE OWNER — only when the plant sits at the local
+    // team's HOME site, inside its defuse volume.
     if (bomb?.siteId !== 'A' && bomb?.siteId !== 'B') return null;
+    if (bomb.siteId !== homeSite) return null;
     const site = (sites || []).find((row) => row?.site === bomb.siteId);
     const box = site?.defuseBox || site?.box;
     return box && pointInBox(position, box) ? 'defuse' : null;
@@ -195,17 +208,18 @@ export function projectLocalSiteMarker(game, site) {
   });
 }
 
-function visibleBomb(game, match, localTeam, attackingTeam) {
+function visibleBomb(game, match, localTeam) {
   const source = match?.bomb || {};
   const state = ['none', 'carried', 'dropped', 'planted', 'defused', 'detonated'].includes(source.state)
     ? source.state : 'none';
-  const attacker = localTeam === attackingTeam;
+  // §5 carrier visibility is unchanged by §13: teammates always, enemies by line of sight.
   const carrier = source.carrierId > 0 ? game?.entityById?.(source.carrierId) : null;
-  const carrierVisible = attacker || (carrier?.position && hasLineOfSight(game, carrier.position));
+  const carrierVisible = (carrier && carrier.team === localTeam)
+    || (carrier?.position && hasLineOfSight(game, carrier.position));
   const carrierId = state === 'carried' && carrierVisible ? source.carrierId : null;
-  const positionMeaningful = state === 'dropped' || state === 'planted';
-  const positionVisible = positionMeaningful && source.position
-    && (attacker || state === 'planted' || hasLineOfSight(game, source.position));
+  // §13.3: a dropped/neutral bomb's position is public to BOTH teams at all times — it is
+  // the shared objective. A planted bomb's position is likewise public (§8.6).
+  const positionVisible = (state === 'dropped' || state === 'planted') && source.position;
   return Object.freeze({
     state,
     carrierId,
@@ -253,7 +267,6 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
   const sites = sitesFromManifest(manifest);
   const player = game?.player;
   const localTeamNumber = player?.team === 1 ? 1 : 0;
-  const attackingTeam = match.attackingTeam === 1 ? 1 : 0;
   const alive = match.aliveCounts || {};
   const phase = ['warmup', 'freeze', 'live', 'planted', 'roundEnd', 'matchEnd'].includes(match.roundPhase)
     ? match.roundPhase : 'warmup';
@@ -261,7 +274,14 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
   const isAlive = rules?.isAlive ? rules.isAlive(player) : player?.alive !== false;
   const liveRound = phase === 'live' || phase === 'planted';
   const localTeam = TEAM_IDS[localTeamNumber];
-  const localRole = localTeamNumber === attackingTeam ? 'attacker' : 'defender';
+  // §13.1 ownership: prefer the referee's own assignment (it honours a manifest
+  // `homeSites` override); derive from site order + side switch otherwise.
+  const sideSwitched = match.sideSwitched === true;
+  const refereeHome = match.homeSites || null;
+  const homeOf = (teamIndex) => refereeHome?.[teamIndex]
+    ?? homeSiteOfTeam(teamIndex, sideSwitched, sites.map((s) => s.site));
+  const localHomeSite = homeOf(localTeamNumber);
+  const localTargetSite = homeOf(localTeamNumber === 0 ? 1 : 0);
   const matchState = Object.freeze({
     version: 1,
     matchId: null,
@@ -274,10 +294,9 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
     phase,
     phaseEndsAt: nowMs + remainingMs,
     teams: Object.freeze({
-      alpha: Object.freeze({ score: match.scores?.[0] ?? 0, alive: alive.alpha ?? null,
-        role: attackingTeam === 0 ? 'attacker' : 'defender' }),
-      bravo: Object.freeze({ score: match.scores?.[1] ?? 0, alive: alive.bravo ?? null,
-        role: attackingTeam === 1 ? 'attacker' : 'defender' }),
+      // §13.8: no attackers or defenders — the frozen `role` fields are served null.
+      alpha: Object.freeze({ score: match.scores?.[0] ?? 0, alive: alive.alpha ?? null, role: null }),
+      bravo: Object.freeze({ score: match.scores?.[1] ?? 0, alive: alive.bravo ?? null, role: null }),
     }),
     series: Object.freeze({
       roundsToWin: Number.isInteger(match.mode?.roundsToWin) ? match.mode.roundsToWin : null,
@@ -287,13 +306,13 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
       overtime: false,
     }),
     round: Object.freeze({ index: Number.isInteger(match.roundIndex) ? match.roundIndex : 0, endsAt: nowMs + remainingMs }),
-    bomb: visibleBomb(game, match, localTeamNumber, attackingTeam),
+    bomb: visibleBomb(game, match, localTeamNumber),
     interaction: match.interaction || Object.freeze({ kind: 'none', actorId: null, progress: 0 }),
     sites,
     localPlayer: Object.freeze({
       entityId: Number.isInteger(player?.id) ? player.id : null,
       team: localTeam,
-      role: localRole,
+      role: null,
       alive: isAlive,
       isSpectating: !isAlive,
       spectatingId: null,
@@ -309,7 +328,8 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
   // referee, so a hidden carrier can never light the prompt for the wrong player.
   const eligibleAction = deriveEligibleInteraction({
     phase,
-    role: localRole,
+    homeSite: localHomeSite,
+    targetSite: localTargetSite,
     alive: isAlive === true,
     localEntityId: matchState.localPlayer.entityId,
     bomb: matchState.bomb,
@@ -317,6 +337,10 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
     position: player?.position,
     grounded: player?.grounded,
   });
+  // §13.10: either team may carry — the HUD tints the carrier by the carrier's TEAM.
+  const visibleCarrier = matchState.bomb.carrierId > 0
+    ? game?.entityById?.(matchState.bomb.carrierId) : null;
+  const carrierTeam = visibleCarrier?.team === 0 ? 'alpha' : visibleCarrier?.team === 1 ? 'bravo' : null;
   return Object.freeze({
     matchState,
     netState: 'idle',
@@ -324,6 +348,7 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
     nowMs,
     localAuthority: true,
     eligibleAction,
+    carrierTeam,
     bindings: bindingMap(game),
     preferences: localPreferences(game),
     siteMarkers,
@@ -338,11 +363,20 @@ export function buildFacadeBombSample(game, facade, nowMs = performance.now(), t
   const state = facade?.matchState;
   if (!state || state.mode !== 'bomb') return null;
   const sites = Array.isArray(state.sites) ? state.sites : [];
-  // Same §6/§7 mirror as local practice, from the client's own predicted body and the
-  // facade's public views. The wire's handoff sites carry one public box per site.
+  // §13.1 ownership on the pure client: derived from the handoff's site letters + the
+  // side switch — the role field arrives null on a 2.0.0 server and decides nothing.
+  const teamIndex = state.localPlayer?.team === 'alpha' ? 0
+    : state.localPlayer?.team === 'bravo' ? 1 : null;
+  const letters = sites.map((s) => s?.site).filter((s) => s === 'A' || s === 'B');
+  const sideSwitched = state.series?.sideSwitched === true;
+  const homeSite = teamIndex === null ? null : homeSiteOfTeam(teamIndex, sideSwitched, letters);
+  const targetSite = teamIndex === null ? null : homeSiteOfTeam(teamIndex === 0 ? 1 : 0, sideSwitched, letters);
+  // Same §6/§7/§13.4 mirror as local practice, from the client's own predicted body and
+  // the facade's public views. The wire's handoff sites carry one public box per site.
   const eligibleAction = deriveEligibleInteraction({
     phase: state.phase,
-    role: state.localPlayer?.role,
+    homeSite,
+    targetSite,
     alive: state.localPlayer?.alive === true,
     localEntityId: state.localPlayer?.entityId,
     bomb: state.bomb,
@@ -350,7 +384,15 @@ export function buildFacadeBombSample(game, facade, nowMs = performance.now(), t
     position: game?.player?.position,
     grounded: game?.player?.grounded,
   });
+  // Carrier tint by the carrier's team (§13.10): self is decided by id in the model;
+  // otherwise the facade's replicated remotes carry the team of any visible carrier.
+  const carrierId = state.bomb?.carrierId;
+  const remoteCarrier = carrierId > 0 ? facade?.remoteEntities?.get?.(carrierId) : null;
+  const carrierTeam = carrierId > 0 && carrierId === state.localPlayer?.entityId
+    ? state.localPlayer?.team ?? null
+    : remoteCarrier?.team === 0 ? 'alpha' : remoteCarrier?.team === 1 ? 'bravo' : null;
   return Object.freeze({
+    carrierTeam,
     matchState: state,
     netState: facade.state,
     netStats: facade.netStats,
@@ -455,7 +497,9 @@ export function createLocalBombHud({ game, root, facade = game?.netFacade ?? nul
       && player.alive !== false
       && player._held?.interactHeld === true;
     if (held) {
-      rules.requestInteract(player, player.team === rules.attackingTeam ? 'plant' : 'defuse');
+      // §13.4/§13.10: the held key's meaning is context, not role — the referee's own
+      // `interactKindFor` says whether this player would be defusing or planting.
+      rules.requestInteract(player, rules.interactKindFor?.(player) ?? 'plant');
     } else {
       rules.releaseInteract(player);
     }

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { resolveManifestCallout, sitesFromManifest } from './bomb/local.js';
+import { homeSiteOfTeam, resolveManifestCallout, sitesFromManifest } from './bomb/local.js';
 
 /**
  * Minimap — canvas radar.
@@ -619,12 +619,17 @@ export class Minimap {
 
     // --- bomb-site emphasis -------------------------------------------------
     // The baked layer already stamps both site glyphs; while the bomb is PLANTED
-    // the armed site additionally pulses in its own colour with a red core, and
-    // clamps to the ring edge when out of view, so "where is it armed" is always
-    // one glance at the radar (the projected DOM markers this replaces are gone).
+    // the armed site additionally pulses with a red core, and clamps to the ring
+    // edge when out of view, so "where is it armed" is always one glance at the
+    // radar. The pulse colour is OWNERSHIP (bomb-rules §13.10): your home site in
+    // the friendly hue — the enemy's plant is at YOUR door — the enemy's home in
+    // the hostile accent, matching the ground rings (src/fx/siteRings.js).
     if (g.match?.modeId === 'bomb' && this._sites?.length) {
       const bomb = g.match.bomb;
       const plantedSite = bomb?.state === 'planted' ? bomb.siteId : null;
+      const team = me.team === 1 ? 1 : 0;
+      const homeSite = g.match.homeSites?.[team]
+        ?? homeSiteOfTeam(team, g.match.sideSwitched === true);
       if (plantedSite) {
         for (const site of this._sites) {
           if (site.site !== plantedSite) continue;
@@ -639,7 +644,7 @@ export class Minimap {
           const y = cy + sy;
           ctx.beginPath();
           ctx.arc(x, y, W * (0.045 + 0.028 * pulse), 0, Math.PI * 2);
-          ctx.strokeStyle = site.site === 'A' ? '#86ddd3' : '#ffd07d';
+          ctx.strokeStyle = site.site === homeSite ? '#58c9ff' : '#ff4433';
           ctx.lineWidth = Math.max(1.5, W * 0.010);
           ctx.globalAlpha = 0.45 + 0.55 * pulse;
           ctx.stroke();
