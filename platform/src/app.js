@@ -611,12 +611,20 @@ async function mountModules({ deps, router, config, logger, overrides = {} }) {
   // KPI read surface for P4-05's balance/funnel instrumentation — reads the existing
   // event-envelope outbox, writes nothing, admin-authenticated same as other read-only
   // aggregation endpoints.
-  const kpiModule = await load('telemetry-kpi', './modules/telemetry/kpi.js');
-  if (kpiModule && deps.events) {
-    deps.kpi = { service: kpiModule.createKpiService({ store: deps.store }) };
-    kpiModule.registerKpiRoutes(router, { service: deps.kpi.service });
-    mounted.push('telemetry-kpi');
-  }
+  //
+  // TEMPORARILY DISABLED (2026-08-23): mounting this crashed production boot with
+  // "store.outbox.listByType is required" even though the postgres store's outbox does
+  // define listByType — root cause not yet found (deployment/routes.js's identical
+  // `requireServiceCaller` import from this same file is NOT the cause, that pattern
+  // already works). Reverted to restore service; re-enable once the real cause is found
+  // and reproduced OUTSIDE production (this file's own test harness never caught it —
+  // that gap needs closing too).
+  // const kpiModule = await load('telemetry-kpi', './modules/telemetry/kpi.js');
+  // if (kpiModule && deps.events) {
+  //   deps.kpi = { service: kpiModule.createKpiService({ store: deps.store }) };
+  //   kpiModule.registerKpiRoutes(router, { service: deps.kpi.service });
+  //   mounted.push('telemetry-kpi');
+  // }
 
   // ── stubs: the fixture layer that unblocks the frontend lane ─────────────────────────
   // Not loaded in production at all. Serving fixtures to real players is the failure this
