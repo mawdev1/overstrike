@@ -124,12 +124,12 @@ export const LOOT_TABLES = deepFreeze({
  * positional container truth is the map entry's `LOOT_CONTAINERS` (REQ-CC-075 note below).
  */
 export const POI_TAGS = deepFreeze([
-  { poiId: 'poi-fountain', calloutId: 'plaza-fountain', tags: ['landmark', 'open', 'contested'], lootTier: 1 },
-  { poiId: 'poi-arcade', calloutId: 'market-arcade', tags: ['interior', 'lanes'], lootTier: 1 },
-  { poiId: 'poi-alley', calloutId: 'market-alley', tags: ['route', 'exit-adjacent'], lootTier: 1 },
-  { poiId: 'poi-tunnel', calloutId: 'service-tunnel', tags: ['route', 'exit-adjacent'], lootTier: 1 },
-  { poiId: 'poi-archive', calloutId: 'civic-archive', tags: ['interior', 'loot-dense'], lootTier: 2 },
-  { poiId: 'poi-transit', calloutId: 'transit-control', tags: ['interior', 'vertical', 'loot-dense'], lootTier: 2 },
+  { poiId: 'poi-fountain', calloutId: 'the-crossing', tags: ['landmark', 'open', 'contested'], lootTier: 1 },
+  { poiId: 'poi-arcade', calloutId: 'bakery', tags: ['interior', 'lanes'], lootTier: 1 },
+  { poiId: 'poi-alley', calloutId: 'net-alley', tags: ['route', 'exit-adjacent'], lootTier: 1 },
+  { poiId: 'poi-tunnel', calloutId: 'lantern-alley', tags: ['route', 'exit-adjacent'], lootTier: 1 },
+  { poiId: 'poi-archive', calloutId: 'fish-market', tags: ['interior', 'loot-dense'], lootTier: 2 },
+  { poiId: 'poi-transit', calloutId: 'red-house', tags: ['interior', 'vertical', 'loot-dense'], lootTier: 2 },
 ]);
 
 // ─────────────────────────────────────── positional exit/container data lives on the MAP entry

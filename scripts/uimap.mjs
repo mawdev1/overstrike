@@ -31,23 +31,42 @@ const contains = (box, x, y, z) => x >= box.min.x && x <= box.max.x
 // same hazard §3.3 spells out for objective ids. Changing a name must be a deliberate edit
 // here as well as in level.js.
 const SQUARE_CALLOUT_NAMES = Object.freeze({
-  district: 'District',
-  'alpha-court': 'South Court',
-  'bravo-court': 'North Court',
-  'plaza-fountain': 'Fountain',
-  'plaza-east': 'Plaza East',
-  'plaza-west': 'Plaza West',
-  'civic-archive': 'Civic Archive',
-  'civic-court': 'Archive Court',
-  'market-arcade': 'Market Arcade',
-  'market-alley': 'Delivery Alley',
-  'transit-control': 'Transit Control',
-  'transit-platform': 'Platform',
-  'service-tunnel': 'Service Tunnel',
-  'upper-walk': 'Upper Walk',
+  town: 'Town',
+  'the-crossing': 'Crossing',
+  'old-well': 'Well',
+  'fish-market': 'Fish Market',
+  'market-gallery': 'Gallery',
+  minaret: 'Minaret',
+  'red-house': 'Red House',
+  'red-gallery': 'Red Gallery',
+  clocktower: 'Clocktower',
+  'north-road': 'North Road',
+  'south-road': 'South Road',
+  'west-road': 'West Road',
+  'east-road': 'East Road',
+  'north-gate': 'North Gate',
+  'south-gate': 'South Gate',
+  'west-arch': 'West Arch',
+  'east-arch': 'East Arch',
+  'bravo-yard': 'North Yard',
+  'alpha-yard': 'South Yard',
+  'north-back': 'North Back',
+  'south-back': 'South Back',
+  'net-alley': 'Net Alley',
+  'lantern-alley': 'Lantern Alley',
+  'dye-alley': 'Dye Alley',
+  'spice-alley': 'Spice Alley',
+  bakery: 'Bakery',
+  'tea-house': 'Tea House',
+  saddlery: 'Saddlery',
+  barber: 'Barber',
+  'dye-house': 'Dye House',
+  'spice-house': 'Spice House',
 });
-// Sampling coverage at a hardcoded y = 0 meant the `upper-walk` band (y 3.5–8) — the whole
-// second storey of the vocabulary — was exercised by nothing.
+const VOCAB_SIZE = Object.keys(SQUARE_CALLOUT_NAMES).length;
+// Sampling coverage at a hardcoded y = 0 meant the elevated band (the galleries at y 3.6,
+// the tower decks at y 7.6) — the whole upper storey of the vocabulary — was exercised by
+// nothing. y 4 lands in the gallery band and y 6 in the tall building volumes.
 const COVERAGE_Y = [0, 4, 6];
 
 function manifestProblems(manifest, boundary = COMPETITIVE_BOUNDARY, anchors = COMMERCIAL_ANCHORS,
@@ -165,42 +184,42 @@ check(manifestProblems(noCallouts).some((problem) => problem.startsWith('callout
 
 // The four degradations the audit drove straight through: every name undefined, every name
 // empty, every name replaced wholesale, and thirteen of fourteen regions deleted.
-check(manifestProblems(renameAll(undefined)).includes('callout-name:district'),
+check(manifestProblems(renameAll(undefined)).includes('callout-name:town'),
   'callouts with no name at all are rejected');
-check(manifestProblems(renameAll('')).includes('callout-name:plaza-fountain'),
+check(manifestProblems(renameAll('')).includes('callout-name:old-well'),
   'callouts with a blank name are rejected');
 const banana = degrade({
   callouts: MAP_MANIFEST.callouts.map((callout) => ({ ...callout, name: `BANANA ${callout.id}` })),
 });
-check(manifestProblems(banana).includes('callout-renamed:upper-walk')
-  && manifestProblems(banana).filter((problem) => problem.startsWith('callout-renamed:')).length === 14,
+check(manifestProblems(banana).includes('callout-renamed:market-gallery')
+  && manifestProblems(banana).filter((problem) => problem.startsWith('callout-renamed:')).length === VOCAB_SIZE,
   'wholesale renaming of the callout vocabulary is rejected');
 const oneRenamed = degrade({
-  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'plaza-fountain'
+  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'old-well'
     ? { ...callout, name: 'Water Feature' } : callout)),
 });
-check(manifestProblems(oneRenamed).includes('callout-renamed:plaza-fountain'),
+check(manifestProblems(oneRenamed).includes('callout-renamed:old-well'),
   'renaming a single callout is rejected');
 const thirteenDeleted = degrade({
-  callouts: MAP_MANIFEST.callouts.filter((callout) => callout.id === 'district'),
+  callouts: MAP_MANIFEST.callouts.filter((callout) => callout.id === 'town'),
 });
-check(manifestProblems(thirteenDeleted).includes('callout-missing:upper-walk')
-  && manifestProblems(thirteenDeleted).includes('callout-count:1/14'),
-  'deleting thirteen of fourteen callouts is rejected despite the district catch-all covering them');
+check(manifestProblems(thirteenDeleted).includes('callout-missing:market-gallery')
+  && manifestProblems(thirteenDeleted).includes(`callout-count:1/${VOCAB_SIZE}`),
+  'deleting all but the catch-all is rejected despite the town catch-all covering them');
 const nameCollision = degrade({
-  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'plaza-east'
-    ? { ...callout, name: 'Plaza West' } : callout)),
+  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'north-road'
+    ? { ...callout, name: 'South Road' } : callout)),
 });
 check(manifestProblems(nameCollision).includes('callout-name-collision'),
   'two regions sharing one name is rejected');
-// `upper-walk` is the only region above y = 3.5, so sampling coverage at a hardcoded y = 0
-// left the entire second storey of the vocabulary exercised by nothing. Drop its priority
-// onto the district catch-all's and the upper band becomes ambiguous — two names for one
+// `market-gallery` exists only above y = 3.4, so sampling coverage at a hardcoded y = 0
+// would leave the elevated band of the vocabulary exercised by nothing. Drop its priority
+// onto its enclosing hall's and the gallery band becomes ambiguous — two names for one
 // standing point, which §3.4 says nobody can talk about. Nothing at y = 0 changes, which
-// is exactly why the old single-band sampling could not see it.
+// is exactly why single-band sampling could not see it.
 const ambiguousUpper = degrade({
-  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'upper-walk'
-    ? { ...callout, priority: -100 } : callout)),
+  callouts: MAP_MANIFEST.callouts.map((callout) => (callout.id === 'market-gallery'
+    ? { ...callout, priority: 30 } : callout)),
 });
 const upperProblems = manifestProblems(ambiguousUpper);
 check(upperProblems.some((problem) => /^callout-tie:-?\d+,(4|6),/.test(problem))
