@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.2.0 |
+| **Version** | 1.3.0 |
 | **Owner** | [CC] Claude Code |
 | **Consumers** | Platform, match server, [CX] client, Admin Portal |
 
@@ -102,6 +102,7 @@ its existence is information about unshipped work.
 | `mode.tdm.enabled` | `true` | TDM hidden in room creation; **live TDM matches finish** |
 | `mode.bomb.enabled` | `true` (1.2.0 — §4's "on at P3" executed) | Bomb hidden in room creation; live Bomb matches finish |
 | `map.the_square.enabled` | `true` (1.2.0 — §4's "on at P3" executed) | Map hidden in room creation; live matches finish |
+| `map.meridian.enabled` | `true` (1.3.0 — MERIDIAN un-retired into the room offering, map-data.md §9) | Map hidden in room creation; live matches finish |
 | `chat.text.enabled` | `true` | Chat input hidden, history retained, pings unaffected |
 | `chat.pings.enabled` | `true` | Ping control hidden |
 | `reports.enabled` | `true` | Report entry points hidden |
@@ -128,6 +129,7 @@ built for that job.
 | `mode.tdm.enabled` | yes | on | TDM unavailable |
 | `mode.bomb.enabled` | yes | off → on at P3 (flipped, 1.2.0) | Bomb unavailable |
 | `map.the_square.enabled` | yes | off → on at P3 (flipped, 1.2.0) | Map unavailable |
+| `map.meridian.enabled` | yes | on (born on, 1.3.0 — the map already passed 65 autonomous Bomb rounds in CI before being offered) | Map unavailable |
 | `chat.text.enabled` | **yes** | on | Chat disabled globally; pings remain |
 | `chat.pings.enabled` | yes | on | Pings disabled |
 | `room.backfill.tdm` | no | on | TDM rooms do not backfill |

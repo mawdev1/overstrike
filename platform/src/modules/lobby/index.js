@@ -36,6 +36,38 @@ const PING_CATALOG = Object.freeze({ version: 1, kinds: [...PING_KINDS] });
 const LOADOUT_CATALOG = Object.freeze(publicLoadoutCatalog());
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 
+/**
+ * The maps a room may play, with the wire `mapVersion` the allocation handshake and match
+ * results carry for each, the flag that gates offering it, and the Bomb site projection the
+ * MatchHandoff serves (bomb-mode HUD site markers; ids/boxes mirror each map's
+ * MAP_MANIFEST.objectives in src/world/level.js).
+ *
+ * One table on purpose — the create-form allowlist, the refusal message, the flag gate,
+ * the room's stored mapVersion and the handoff sites previously lived as five separate
+ * literals that could drift. 'meridian' joins by owner decision (map-data.md §9, 1.4.0):
+ * the retained fixture is un-retired into the room offering for TDM and Bomb.
+ * 'square-extraction' stays out — extraction's delivery path is /v1/deployments and the
+ * raid runtime, and the allocation handshake accepts only tdm|bomb (server/index.js).
+ */
+const ROOM_MAPS = Object.freeze({
+  'the-square': Object.freeze({
+    mapVersion: '1.0.0',
+    flag: 'map.the_square.enabled',
+    sites: Object.freeze([
+      { id: 'site-A', site: 'A', callout: 'Fountain', center: { x: -25, y: 0, z: 0 }, box: { min: { x: -29, y: 0, z: -4 }, max: { x: -21, y: 3, z: 4 } } },
+      { id: 'site-B', site: 'B', callout: 'Market', center: { x: 25, y: 0, z: 0 }, box: { min: { x: 21, y: 0, z: -4 }, max: { x: 29, y: 3, z: 4 } } },
+    ]),
+  }),
+  meridian: Object.freeze({
+    mapVersion: '1.1.0',
+    flag: 'map.meridian.enabled',
+    sites: Object.freeze([
+      { id: 'site-A', site: 'A', callout: 'Old Town', center: { x: -25.38, y: 0, z: -20.13 }, box: { min: { x: -26.88, y: 0, z: -21.63 }, max: { x: -23.88, y: 2.4, z: -18.63 } } },
+      { id: 'site-B', site: 'B', callout: 'Harbour', center: { x: 24.88, y: 0, z: 20.38 }, box: { min: { x: 23.38, y: 0, z: 18.88 }, max: { x: 26.38, y: 2.4, z: 21.88 } } },
+    ]),
+  }),
+});
+
 const iso = (ms) => new Date(ms).toISOString();
 const token = () => randomBytes(32).toString('base64url');
 export const roomPasswordHash = (value, secret) => value === null || value === undefined ? null
@@ -632,10 +664,10 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
         ? { roundsToWin: 7, maxRounds: 12, sideSwitchAfter: 6, overtime: false }
         : { roundsToWin: 1, maxRounds: 1, sideSwitchAfter: 1, overtime: false },
       spectatorPolicyVersion: 1,
-      sites: room.mode === 'bomb' ? [
-        { id: 'site-A', site: 'A', callout: 'Fountain', center: { x: -25, y: 0, z: 0 }, box: { min: { x: -29, y: 0, z: -4 }, max: { x: -21, y: 3, z: 4 } } },
-        { id: 'site-B', site: 'B', callout: 'Market', center: { x: 25, y: 0, z: 0 }, box: { min: { x: 21, y: 0, z: -4 }, max: { x: 29, y: 3, z: 4 } } },
-      ] : [],
+      // Per-map, not a Square literal: a Bomb room on 'meridian' must not hand every
+      // client The Square's site markers. Sourced from ROOM_MAPS, the same table that
+      // admitted the room's mapId at creation.
+      sites: room.mode === 'bomb' ? clone([...(ROOM_MAPS[room.mapId]?.sites ?? [])]) : [],
     };
     return { record, projection, cached: { accountId, roomId: room.roomId, matchId, expiresAt, used: false } };
   }
@@ -1483,7 +1515,8 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
           details: { reason: 'region-unavailable', region },
         });
       }
-      // Rooms are TDM/Bomb on 'the-square' — deliberately NOT 'square-extraction'. Extraction
+      // Rooms are TDM/Bomb on the ROOM_MAPS table ('the-square', and 'meridian' since its
+      // map-data.md §9 un-retirement) — deliberately NOT 'square-extraction'. Extraction
       // is a registered map and a bootable mode, but its delivery path is /v1/deployments and
       // the raid runtime, not a room: the allocation handshake accepts only tdm|bomb
       // (server/index.js), tickets/stats/results are PvP-shaped, and an extraction room would
@@ -1491,11 +1524,13 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
       // pairing rather than the two lists independently — extraction has no business on
       // 'the-square' (no sectors) and tdm/bomb none on 'square-extraction'.
       if (!['tdm', 'bomb'].includes(mode)) throw failValidation('Unsupported mode. Rooms support tdm and bomb; extraction raids start from a deployment, not a room.', 'mode');
-      if (mapId !== 'the-square') throw failValidation("Unsupported map. Rooms play 'the-square'.", 'mapId');
+      if (!Object.hasOwn(ROOM_MAPS, mapId)) {
+        throw failValidation(`Unsupported map. Rooms play ${Object.keys(ROOM_MAPS).map((m) => `'${m}'`).join(' or ')}.`, 'mapId');
+      }
       const evaluated = flags?.evaluate?.().flags || {};
       if ((mode === 'tdm' && evaluated['mode.tdm.enabled'] !== true)
         || (mode === 'bomb' && evaluated['mode.bomb.enabled'] !== true)
-        || (mapId === 'the-square' && evaluated['map.the_square.enabled'] !== true)) {
+        || evaluated[ROOM_MAPS[mapId].flag] !== true) {
         throw new ApiError('FEATURE_DISABLED', 'That map or mode is not currently enabled.', {
           details: { reason: 'feature-disabled', mode, mapId },
         });
@@ -1518,7 +1553,7 @@ export function createLobbyModule({ store, config, logger, clock = Date.now, aut
           }
           const roomId = id();
           const room = {
-            roomId, name: name.trim(), region, mapId, mapVersion: '1.0.0', mode,
+            roomId, name: name.trim(), region, mapId, mapVersion: ROOM_MAPS[mapId].mapVersion, mode,
             rulesetVersion: mode === 'bomb' ? 'bomb-1.0.0' : 'tdm-1.0.0', build: '1.0.0',
             status: 'open', capacity, passwordHash: roomPasswordHash(password, config.tokenSecret), ownerAccountId: ctx.actor.accountId,
             settings: roomSettings(mode, capacity, ctx.body.settings || {}), members: new Map(),

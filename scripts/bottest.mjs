@@ -76,27 +76,13 @@ const DIFFICULTY = 'regular';
 
 // ─────────────────────────────────────────────────────────────────── measurement
 
-/**
- * Site volumes injected into the MERIDIAN fixture so it can host Bomb at all.
- *
- * MERIDIAN publishes NO objective volumes — its whole manifest is derived from geometry
- * (`provenance.objectives === 'missing'`), which is exactly what `map-data.md` §9 retains it
- * for: a stable collision and performance comparison target, not a competitive Bomb map. The
- * two boxes below are therefore test fixture data, not map data: each is a 3 m box centred on
- * a point `nav.nearestWalkable(..., reachableOnly)` returned for the fixture, at opposite
- * corners of the district. They exist to answer one question the-square alone cannot — is the
- * bot objective layer general, or has it been fitted to The Square's two site coordinates?
- */
-const MERIDIAN_FIXTURE_SITES = Object.freeze([
-  Object.freeze({
-    id: 'fixture-A', kind: 'plant', site: 'A', requiresGround: true,
-    box: Object.freeze({ min: { x: -26.88, y: 0, z: -21.63 }, max: { x: -23.88, y: 2.4, z: -18.63 } }),
-  }),
-  Object.freeze({
-    id: 'fixture-B', kind: 'plant', site: 'B', requiresGround: true,
-    box: Object.freeze({ min: { x: 23.38, y: 0, z: 18.88 }, max: { x: 26.38, y: 2.4, z: 21.88 } }),
-  }),
-]);
+// MERIDIAN's Bomb sites used to be injected here as test fixture data because the map
+// published no objective volumes at all. The map-data.md §9 (1.4.0) un-retirement moved
+// those exact two boxes into the producer: `MERIDIAN_FIXTURE.MAP_MANIFEST.objectives` in
+// src/world/level.js now declares them, so the Bomb series below runs on the map's own
+// data — which is also what a lobby room on 'meridian' plays. The general-vs-fitted
+// question the injection existed to answer is still answered: the coordinates remain ones
+// the bot objective layer never saw during The Square's tuning.
 
 /**
  * A bot counts as trying-and-failing only while it HAS somewhere to be. A bot holding an
@@ -119,12 +105,10 @@ const OFFGRAPH_DROP_M = 1.5;
  * @param {'tdm'|'bomb'} opts.mode
  * @param {number} opts.seed
  * @param {number} opts.maxTicks
- * @param {object[]} [opts.injectSites] objective volumes to publish (MERIDIAN Bomb only)
  */
-async function runMatch({ mapId, mode, seed, maxTicks, injectSites = null }) {
+async function runMatch({ mapId, mode, seed, maxTicks }) {
   const game = new Game({ headless: true });
   await game.initHeadless({ presenter: new NullPresenter(), mapId });
-  if (injectSites) game.mapManifest = { ...game.world.manifest, objectives: injectSites };
 
   // A high kill limit for TDM: the point of a TDM run here is a LONG navigation sample, and
   // a round that ends on the kill limit at t=40 s measures nothing about a four-minute match.
@@ -541,34 +525,31 @@ for (const run of squareBomb.slice(0, 2)) assertNavigation(run, `square/bomb#${r
 
 // ── 4. MERIDIAN and Bomb ───────────────────────────────────────────────────────────────
 //
-// FINDING, reported rather than worked around: the retained fixture publishes no objective
-// volumes at all (`provenance.objectives === 'missing'`), so it cannot host Bomb. That is
-// the contract behaving correctly — `bombtest.mjs` fixes it in place, and `menu.js` asks
-// `bombAvailable` before offering the mode — but it does mean "Bomb on MERIDIAN" cannot be
-// demonstrated on the fixture's own data. Both halves are asserted: the refusal is loud and
-// by name, and with fixture site volumes supplied the bot objective layer still works, which
-// is what rules out the AI having been fitted to The Square's coordinates.
+// Until the map-data.md §9 (1.4.0) un-retirement, this section asserted the OPPOSITE: the
+// fixture published no objective volumes, `bombAvailable` said so, and starting Bomb on it
+// failed loudly by name. The owner's decision to offer MERIDIAN in lobby rooms moved the
+// two proven site boxes into `MERIDIAN_FIXTURE.MAP_MANIFEST.objectives`, so the map now
+// hosts Bomb on its own declared data — and this section asserts that, plus the shape of
+// the declaration the room/allocation chain depends on.
 heading('4. MERIDIAN — Bomb');
 {
   const game = new Game({ headless: true });
   await game.initHeadless({ presenter: new NullPresenter(), mapId: 'meridian' });
-  check(game.world.manifest?.provenance?.objectives === 'missing',
-    'the MERIDIAN fixture publishes no objective volumes',
+  check(game.world.manifest?.provenance?.objectives === 'declared',
+    'MERIDIAN declares its objective volumes (map-data.md §9 un-retirement)',
     String(game.world.manifest?.provenance?.objectives));
-  check(bombAvailable(game) === false, 'so Bomb reports unavailable on it');
-  // The control for that pair: The Square must answer the opposite, or `bombAvailable`
-  // returning a constant `false` would satisfy both assertions above.
-  const square = new Game({ headless: true });
-  await square.initHeadless({ presenter: new NullPresenter(), mapId: 'the-square' });
-  check(bombAvailable(square) === true, 'while The Square, which does publish them, reports available');
-  square.dispose();
-
-  let message = '<no throw>';
-  try {
-    game.startMatch({ mode: 'bomb', botCount: 1, difficulty: DIFFICULTY, seed: 1 });
-  } catch (err) { message = err.message; }
-  check(message.includes('declares no bomb site'),
-    'and starting Bomb on it fails loudly, naming the missing map data', message);
+  check(game.world.manifest?.objectives?.length === 2
+    && new Set(game.world.manifest.objectives.map((o) => o.site)).size === 2,
+    'two plant sites, A and B',
+    JSON.stringify(game.world.manifest?.objectives?.map((o) => `${o.id}:${o.site}`)));
+  // Spawns stay DERIVED on purpose: derived spawns are stamped `modes: ['tdm']` as a
+  // default, and the spawner only honours the mode filter on a DECLARED spawn set — a
+  // partial manifest that declared spawns without authoring bomb-mode tags would leave
+  // Bomb with zero candidates. This assertion is what notices that trap being stepped on.
+  check(game.world.manifest?.provenance?.spawns === 'derived',
+    'spawns remain derived, so the mode filter fallback keeps Bomb spawnable',
+    String(game.world.manifest?.provenance?.spawns));
+  check(bombAvailable(game) === true, 'Bomb reports available on it');
   game.dispose();
 }
 
@@ -590,7 +571,7 @@ const MERIDIAN_BOMB_SEEDS = [20260101, 20260202, 20260303, 20260404, 20260505, 2
 const meridianBomb = [];
 for (const seed of MERIDIAN_BOMB_SEEDS) {
   meridianBomb.push(await runMatch({
-    mapId: 'meridian', mode: 'bomb', seed, maxTicks: BOMB_MAX_TICKS, injectSites: MERIDIAN_FIXTURE_SITES,
+    mapId: 'meridian', mode: 'bomb', seed, maxTicks: BOMB_MAX_TICKS,
   }));
 }
 {
@@ -599,7 +580,7 @@ for (const seed of MERIDIAN_BOMB_SEEDS) {
   const plants = objs.reduce((a, o) => a + o.plants.length, 0);
   const defuses = objs.reduce((a, o) => a + o.defuses.length, 0);
   const sites = new Set(objs.flatMap((o) => o.plants.map((p) => p.site)));
-  note(`meridian/bomb (fixture sites): ${rounds} rounds, ${plants} plants (${fixed(plants / rounds, 2)}/round), `
+  note(`meridian/bomb (declared sites): ${rounds} rounds, ${plants} plants (${fixed(plants / rounds, 2)}/round), `
     + `${defuses} defuses (${fixed(defuses / rounds, 2)}/round), sites ${[...sites].sort().join('+')}`);
 
   check(allOf(objs, (o) => o.finished && o.phase === 'matchEnd'),
@@ -614,7 +595,7 @@ for (const seed of MERIDIAN_BOMB_SEEDS) {
   check(rounds > 0 && defuses / rounds >= MIN_DEFUSES_PER_ROUND,
     'and defuses there too, so neither behaviour is fitted to The Square',
     `${defuses}/${rounds} = ${fixed(defuses / Math.max(rounds, 1), 3)}`);
-  check(sites.size === 2, 'both fixture sites are used', [...sites].join(','));
+  check(sites.size === 2, 'both declared sites are used', [...sites].join(','));
   const gaps = new Set(meridianBomb.flatMap((r) => r.digestGaps));
   check(gaps.size === 0,
     'every round field the digest fingerprints exists on the fixture\'s records too',

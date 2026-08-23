@@ -1,5 +1,30 @@
 # Contract changelog
 
+## 2026-08-22 — `map-data.md` 1.3.0 → 1.4.0 (additive) and `feature-flags.md` 1.2.0 → 1.3.0 — MERIDIAN un-retired into the room offering, by owner decision
+
+The project owner directed that MERIDIAN — retired to a test fixture by §9 — be playable in
+lobby rooms for TDM and Bomb ("Meridian was a better map — make it playable in TDM and bomb
+mode"). Recorded as a decision, not re-derived: §9's retirement rationale (baselines,
+comparison data) still stands, so the amendment narrows the retirement instead of reversing
+it. `map-data.md` §9 now carries the 1.4.0 note: MERIDIAN is *offered* to rooms by explicit
+id (`ROOM_MAPS` in `platform/src/modules/lobby/index.js`, `SUPPORTED_MAPS` in
+`server/index.js`, the shell create form) while staying OUT of the competitive rotation list
+that the strict in-rotation manifest guards key on. The producer half:
+`MERIDIAN_FIXTURE.MAP_MANIFEST` (src/world/level.js) declares `objectives` only — the two
+plant volumes `scripts/bottest.mjs` had proven as injected fixture data over 65 autonomous
+Bomb rounds, promoted verbatim — with `MAP_VERSION` 1.0.0-fixture → 1.1.0 and the nav-bake
+artifact re-recorded (identical node data, new header). Callouts, navHints and a COMPETITIVE_BOUNDARY
+remain honestly owed as `manifestGaps()`; budgets fall back to the contract defaults. `feature-flags.md` 1.3.0 adds
+`map.meridian.enabled` to §3.2/§4 (default **true**, kill switch, same off-behaviour as
+`map.the_square.enabled`), bound in code by `CLIENT_FLAG_DEFAULTS`, the stub
+`clientFlags()`, and the shell's `SHELL_FEATURE_DEFAULTS`; asserted by
+`platform/test/apptest.mjs` (now eleven client-visible keys) and `scripts/uishell.mjs`
+(per-map kill-switch probes). The gameserver allocation handshake accepts the
+(mapId, mapVersion) pairs of the same table and rebuilds the world for a cross-map
+allocation (`Game.loadMap`); the browser client builds `MatchHandoff.mapId` instead of
+always the rotation head; `MatchHandoff.sites` is now served per-map instead of as a Square
+literal.
+
 ## 2026-08-22 — `feature-flags.md` 1.1.0 → 1.2.0 — §4's "off → on at P3" executed for `mode.bomb.enabled` and `map.the_square.enabled`
 
 §4 always said both flip on at P3; P3 closed (extraction bootable, both maps in CI) without

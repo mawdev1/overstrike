@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `FROZEN` — amendments follow CHANGELOG.md |
-| **Version** | 1.3.0 |
+| **Version** | 1.4.0 |
 | **Owner** | [CC] Claude Code (contract) |
 | **Producer** | [CX] Codex — `src/world/level.js`, `src/world/props.js` |
 | **Consumers** | `world.js`, `navGrid.js`, `spawner.js`, `match.js`, Bomb ruleset, minimap, evidence |
@@ -329,3 +329,25 @@ exceeds **22 s**, the timer moves rather than the geometry — see `REQ-CX-002`.
 MERIDIAN leaves rotation when The Square passes every guard, and is **retained as a test
 fixture**. The existing harnesses have years of comparison data against it; deleting it throws
 away every performance and collision baseline in the repository.
+
+**Amendment (1.4.0) — MERIDIAN un-retired into the room offering, by owner decision.**
+The project owner directed that MERIDIAN be playable in lobby rooms for TDM and Bomb
+("Meridian was a better map"). This section's retirement is therefore narrowed, not
+reversed:
+
+- **Offered, not rotated.** Rooms may select `mapId: 'meridian'` explicitly (platform
+  `ROOM_MAPS` table, gameserver `SUPPORTED_MAPS`, shell create form behind
+  `map.meridian.enabled`). The map stays OUT of the client's competitive rotation list —
+  the rotation is what the strict in-rotation §3-completeness and §5-boundary guards key
+  on, and MERIDIAN does not yet meet them.
+- **Manifest is honestly partial.** `MERIDIAN_FIXTURE.MAP_MANIFEST` declares exactly one
+  §3 key: `objectives` — the two plant volumes (`site-A` / `site-B`) that
+  `scripts/bottest.mjs` had proven as injected fixture data over 65 autonomous Bomb
+  rounds, promoted verbatim into map data. `MAP_VERSION` 1.0.0-fixture → 1.1.0. Still
+  owed and recorded as gaps by `manifestGaps()`: callouts (§3.4), navHints (§3.5), and a
+  removable `COMPETITIVE_BOUNDARY` (§5); budgets fall back to the §3.6 contract defaults. Spawns and bounds stay DERIVED
+  deliberately — a declared spawn set without authored per-mode tags would empty the Bomb
+  spawn candidate list (see `spawner.js`'s provenance-gated mode filter).
+- **Fixture role unchanged.** Every baseline comparison use of the map continues; the
+  nav bake artifact (`src/world/navdata/meridian.json`) is re-recorded for the new
+  version/provenance header, with identical node data.

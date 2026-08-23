@@ -43,6 +43,10 @@ export const CLIENT_FLAG_DEFAULTS = Object.freeze({
   // production actually serves; overrides remain the kill switch, not the enable switch.
   'mode.bomb.enabled': true,
   'map.the_square.enabled': true,
+  // feature-flags.md 1.3.0: MERIDIAN un-retired into the room offering by owner decision
+  // (map-data.md §9, 1.4.0). Default true — the map ships offered; the flag is its kill
+  // switch, same shape as map.the_square.enabled.
+  'map.meridian.enabled': true,
   'chat.text.enabled': true,
   'chat.pings.enabled': true,
   'reports.enabled': true,

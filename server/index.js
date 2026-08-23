@@ -6,6 +6,7 @@
  * and empty rather than dying.
  *
  * Run:  node server/index.js [--port=8080] [--bots=8] [--killlimit=75] [--mode=tdm|bomb]
+ *                            [--map=the-square|meridian]
  */
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
@@ -47,6 +48,17 @@ const PORT = arg('port', Number(process.env.PORT) || 8080);
  */
 const MODE = argStr('mode', 'tdm');
 let activeMode = MODE;
+/**
+ * Which map this process boots with before any allocation arrives. Allocations may then
+ * switch it: the handshake accepts any (mapId, mapVersion) pair in SUPPORTED_MAPS and the
+ * server rebuilds the world for the allocated map (`game.loadMap`) before binding.
+ * Mirrors the platform's ROOM_MAPS table (platform/src/modules/lobby/index.js) — kept in
+ * lockstep by hand like every other cross-package literal here. 'meridian' joins by owner
+ * decision (map-data.md §9, 1.4.0).
+ */
+const MAP = argStr('map', 'the-square');
+const SUPPORTED_MAPS = Object.freeze({ 'the-square': '1.0.0', meridian: '1.1.0' });
+if (!Object.hasOwn(SUPPORTED_MAPS, MAP)) throw new Error(`--map=${MAP} is not a supported match map (${Object.keys(SUPPORTED_MAPS).join(', ')})`);
 const BOTS = arg('bots', 8);
 const MAX_CLIENTS = arg('maxclients', 12);
 const GAME_REGION = process.env.OVERSTRIKE_REGION || 'iad';
@@ -57,7 +69,7 @@ const KILL_LIMIT = normalizeKillLimit(arg('killlimit', 75));
 const TIME_LIMIT = arg('timelimit', 0);
 const DEBUG_CONTROL_SECRET = process.env.OVERSTRIKE_DEBUG_CONTROL_SECRET || null;
 const opsLogger = createLogger({ service: 'match-server', level: process.env.OVERSTRIKE_LOG_LEVEL || 'info' });
-const SERVER_LOG_FIELDS = new Set(['correlationId', 'matchId', 'mode', 'colliders', 'spawns',
+const SERVER_LOG_FIELDS = new Set(['correlationId', 'matchId', 'mode', 'mapId', 'colliders', 'spawns',
   'botCount', 'clientCount', 'capacity', 'tickHz', 'tick', 'ticksDropped', 'outcome',
   'restartInMs', 'errorCode', 'networkClass', 'port', 'signal']);
 const serverLog = (level, event, fields = {}) => opsLogger[level](event,
@@ -105,7 +117,7 @@ function controlAuthorized(req) {
 const game = new Game({ headless: true });
 // Not a NullPresenter: the server has no screen, but its clients do, and the feedback
 // it generates is theirs. See `RecordingPresenter`.
-await game.initHeadless({ presenter: new RecordingPresenter() });
+await game.initHeadless({ presenter: new RecordingPresenter(), mapId: MAP });
 game.startMatch({ mode: MODE, killLimit: KILL_LIMIT, botCount: BOTS, difficulty: 'regular' });
 game.match.phase = 'live';
 game.match.countdown = 0;
@@ -132,6 +144,8 @@ const REQUIRE_MATCH_TICKETS = process.env.NODE_ENV === 'production'
   || Boolean(process.env.OVERSTRIKE_MATCH_TICKET_SECRET);
 let boundMatch = null;
 let lastReleasedMatchId = null;
+/** True while an allocation is being activated (possibly rebuilding the world). */
+let allocating = false;
 /**
  * How long an ENDED match with nobody connected may stay bound waiting for the platform's
  * /control/release before this authority frees itself. The platform's terminal saga normally
@@ -182,7 +196,15 @@ const matchTicketVerifier = REQUIRE_MATCH_TICKETS ? createMatchTicketVerifier({
     return response.status === 204;
   } : null,
 }) : null;
-function activateAllocation(allocation, trace = {}) {
+async function activateAllocation(allocation, trace = {}) {
+  // The allocated map, not whatever the process happened to boot with. A no-op when the
+  // ids already match; otherwise the world/nav/sector systems are rebuilt before the
+  // match starts, and startMatch below re-rosters bots and spawns onto the new geometry.
+  if (game.world?.mapId !== allocation.mapId) {
+    await game.loadMap(allocation.mapId);
+    serverLog('info', 'server.map_ready', { matchId: allocation.matchId, mapId: game.world.mapId,
+      colliders: game.world.boxes.length, spawns: game.world.spawnPoints.length, mode: allocation.mode });
+  }
   boundMatch = {
     matchId: allocation.matchId, roomId: allocation.roomId, mode: allocation.mode,
     mapId: allocation.mapId, mapVersion: allocation.mapVersion,
@@ -216,7 +238,7 @@ const server = new GameServer(game, {
       && seat.secondaryIdx === identity.secondaryIdx);
   } : null,
 });
-serverLog('info', 'server.map_ready', { colliders: game.world.boxes.length,
+serverLog('info', 'server.map_ready', { mapId: game.world.mapId, colliders: game.world.boxes.length,
   spawns: game.world.spawnPoints.length, botCount: BOTS, mode: MODE });
 
 // ── debug accounting ──────────────────────────────────────────────────────────────────
@@ -545,7 +567,8 @@ const http_ = http.createServer((req, res) => {
         || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(allocation.matchId)
         || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(allocation.roomId)
         || !['tdm', 'bomb'].includes(allocation.mode)
-        || allocation.mapId !== 'the-square' || allocation.mapVersion !== '1.0.0'
+        || SUPPORTED_MAPS[allocation.mapId] === undefined
+        || allocation.mapVersion !== SUPPORTED_MAPS[allocation.mapId]
         || allocation.rulesetVersion !== `${allocation.mode}-1.0.0`
         || allocation.serverBuild !== '1.0.0'
         || allocation.region !== GAME_REGION || !validRoster) {
@@ -565,13 +588,30 @@ const http_ = http.createServer((req, res) => {
       }
       const correlationId = correlationOf(req, allocation.matchId);
       const traceparent = traceOf(req, correlationId);
-      activateAllocation(allocation, { correlationId, traceparent });
-      observability.recordSpan({ correlationId, traceparent, tier: 'match-server',
-        name: 'control.allocate', durationMs: Date.now() - controlStartedAt,
-        attributes: { component: 'match-control', status: 201 } });
-      res.writeHead(201, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, matchId: boundMatch.matchId, capacity: MAX_CLIENTS,
-        region: GAME_REGION, traceSpans: observability.timelineSpans(correlationId) }));
+      // Activation is async only because a cross-map allocation rebuilds the world before
+      // binding. The guards above (no live bound match, no authenticated client) make the
+      // rebuild safe; `allocating` closes the interleaving window they cannot see —
+      // a second allocate arriving during the rebuild must not race the first.
+      if (allocating) { res.writeHead(409); res.end(); return; }
+      allocating = true;
+      void (async () => {
+        try {
+          await activateAllocation(allocation, { correlationId, traceparent });
+        } catch (error) {
+          matchTicketVerifier?.releaseAllocation?.(allocation.matchId);
+          serverLog('error', 'control.allocate_failed', { correlationId,
+            matchId: allocation.matchId, mapId: allocation.mapId, errorCode: safeErrorCode(error) });
+          res.writeHead(500); res.end(); return;
+        } finally {
+          allocating = false;
+        }
+        observability.recordSpan({ correlationId, traceparent, tier: 'match-server',
+          name: 'control.allocate', durationMs: Date.now() - controlStartedAt,
+          attributes: { component: 'match-control', status: 201 } });
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, matchId: boundMatch.matchId, capacity: MAX_CLIENTS,
+          region: GAME_REGION, traceSpans: observability.timelineSpans(correlationId) }));
+      })();
     });
     return;
   }

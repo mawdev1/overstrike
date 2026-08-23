@@ -734,6 +734,8 @@ export function clientFlags() {
     // platform compiles in, or the dev shell hides 'the-square' that production offers.
     'mode.bomb.enabled': true,
     'map.the_square.enabled': true,
+    // Mirrors CLIENT_FLAG_DEFAULTS (feature-flags.md 1.3.0): MERIDIAN offered by default.
+    'map.meridian.enabled': true,
     'chat.text.enabled': true,
     'chat.pings.enabled': true,
     'reports.enabled': true,

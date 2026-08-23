@@ -602,7 +602,7 @@ await withApp(async ({ call }) => {
 
   const flags = res.body?.flags || {};
   const keys = Object.keys(flags);
-  check(keys.length === 10, '§3.2 exactly: ten client-visible keys', `${keys.length}: ${keys.join(' ')}`);
+  check(keys.length === 11, '§3.2 exactly: eleven client-visible keys (1.3.0 adds map.meridian.enabled)', `${keys.length}: ${keys.join(' ')}`);
   check(keys.every((k) => typeof flags[k] === 'boolean'),
     '§3.1: values are BOOLEANS — the answer, never the rule',
     JSON.stringify(flags));
@@ -614,6 +614,9 @@ await withApp(async ({ call }) => {
   check(flags['mode.bomb.enabled'] === true && flags['map.the_square.enabled'] === true,
     'P3-shipped work is ON by compiled default (bomb, the_square)',
     JSON.stringify({ bomb: flags['mode.bomb.enabled'], square: flags['map.the_square.enabled'] }));
+  check(flags['map.meridian.enabled'] === true,
+    'the un-retired MERIDIAN (feature-flags.md 1.3.0) is ON by compiled default',
+    JSON.stringify({ meridian: flags['map.meridian.enabled'] }));
 
   check(!keys.some((k) => k.startsWith('match.allocation') || k.startsWith('platform.')),
     'no server-side flag is exposed — a key\'s existence is information about unshipped work',

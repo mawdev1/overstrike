@@ -206,10 +206,14 @@ export function selectMap(id) {
 // so both are read from it and the fallbacks below are never used.
 registerMap(MERIDIAN, { fallbackId: 'the-square', fallbackVersion: '0.0.0-underived' });
 
-// map-data.md §9: MERIDIAN is RETAINED as a test fixture and is NOT in rotation. Every
-// performance and collision baseline in this repository was measured against it, and a
-// comparison against a map you have deleted is not a comparison. `inRotation: false` is
-// the whole retirement: registered, selectable by name from a harness, never matched on.
+// map-data.md §9 (1.4.0): MERIDIAN is registered, OUT of the default competitive rotation,
+// and — by owner decision — offered to lobby rooms by explicit id selection for TDM and
+// Bomb, exactly like 'square-extraction' is selected by id for raids. `inRotation: false`
+// is retained deliberately: the rotation list is what the strict in-rotation manifest
+// guards key on (maptest's §3 completeness, the boundary-layer requirement), and MERIDIAN's
+// manifest is honestly partial (objectives declared; callouts/navHints/boundary still
+// gaps). Every performance and collision baseline in this repository was measured against
+// this map, so it also remains the comparison fixture it always was.
 if (Object.hasOwn(MERIDIAN, 'MERIDIAN_FIXTURE')) {
   registerMap(MERIDIAN.MERIDIAN_FIXTURE, { fallbackId: 'meridian', inRotation: false });
 }

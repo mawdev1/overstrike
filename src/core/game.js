@@ -165,7 +165,7 @@ export class Game {
    * `onProgress(label, fraction)` — `fraction` is 0..1 and advances *within* the long
    * phases too, not just between them.
    */
-  async init(onProgress = () => {}) {
+  async init(onProgress = () => {}, { mapId = null } = {}) {
     const prof = this.bootProfile;
     const tBoot = performance.now();
     const TOTAL = 10;
@@ -196,7 +196,10 @@ export class Game {
     await step('building world', async () => {
       setCollidersOnly(false);
       this.world = new World(this);
-      await this.world.init();
+      // `mapId` is the allocation's map (MatchHandoff.mapId, threaded by gameRuntime).
+      // Without it the client always built the rotation head — correct for 'the-square'
+      // matches by coincidence, and the wrong geometry for any other allocated map.
+      await this.world.init({ mapId });
       this.engine.fitShadowCamera(this.world.bounds);
       // sector-interest.md §3 — inert (`hasSectors() === false`) until a map declares
       // `MAP_MANIFEST.sectors` (P3-06); every method degrades to "everything relevant".
@@ -317,6 +320,31 @@ export class Game {
     this.state = 'menu';
     this.bus.emit('ready', {});
     return this;
+  }
+
+  /**
+   * Swap the loaded map between matches on a headless authority.
+   *
+   * A dedicated server boots once (initHeadless) and is then handed allocations for the
+   * life of the process; when an allocation names a different registered map than the one
+   * built at boot, the world and everything derived from it must be rebuilt. This replaces
+   * exactly the map-derived systems — World, SectorInterest, NavGrid — and nothing else:
+   * weapons, projectiles, bots and the match referee all read `game.world` / `game.nav`
+   * through the game at use time and are rebuilt for the new geometry by the
+   * `startMatch()` the caller performs next. Callers must NOT switch maps under a live
+   * match; the allocation handshake already refuses that (`boundMatch` guard).
+   *
+   * `_systems` is invalidated because the cached list would otherwise keep resetting and
+   * updating the map that was just replaced.
+   */
+  async loadMap(mapId) {
+    if (!mapId || this.world?.mapId === mapId) return;
+    this.world = new World(this);
+    await this.world.init({ mapId });
+    this.sectorInterest = new SectorInterest(this.world.manifest?.sectors);
+    this.nav = new NavGrid(this);
+    await this.nav.init();
+    this._systems = null;
   }
 
   /**
