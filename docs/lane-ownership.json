@@ -1,81 +1,222 @@
 {
-  "$comment": "Machine-readable form of Build Plan v2.0 §1.4. This file is the authority the CI guard enforces. Patterns are matched most-specific-first: the LAST matching rule wins, so order general -> specific. Lane 'CC' = Claude Code (backend), 'CX' = Codex (frontend), 'SHARED' = either lane may touch (docs, single-writer files are enforced separately).",
+  "$comment": "Machine-readable form of Build Plan v2.0 \u00a71.4. This file is the authority the CI guard enforces. Patterns are matched most-specific-first: the LAST matching rule wins, so order general -> specific. Lane 'CC' = Claude Code (backend), 'CX' = Codex (frontend), 'SHARED' = either lane may touch (docs, single-writer files are enforced separately).",
   "owner": "CC",
   "rules": [
-    { "pattern": "src/**", "lane": "CC" },
-
-    { "pattern": "src/core/input.js", "lane": "CX" },
-    { "pattern": "src/core/settings.js", "lane": "CX" },
-    { "pattern": "src/core/assets.js", "lane": "CX" },
-
-    { "pattern": "src/player/playerCamera.js", "lane": "CX" },
-    { "pattern": "src/weapons/viewmodel.js", "lane": "CX" },
-
-    { "pattern": "src/world/level.js", "lane": "CX" },
-    { "pattern": "src/world/props.js", "lane": "CX" },
-    { "$comment": "The committed nav bake (map-data.md §4). The TOOL is [CC] (scripts/navbake.mjs); the OUTPUT is committed by whoever moved the geometry, which is [CX] for a level.js change and [CC] when the baker itself changes. Neither lane can own it: a CX rule would block CC from re-baking after a baker change, and a CC rule would make every CX geometry PR span both lanes and be rejected by the split guard - which would make §4's arrangement impossible to obey. SHARED is safe here for a reason that does not apply to hand-written files: nobody authors this, and `npm run navtest` fails unless its bytes are exactly what the tool produces from the geometry in the same tree, so a bad write cannot survive.", "pattern": "src/world/navdata/**", "lane": "SHARED" },
-
-    { "pattern": "src/fx/**", "lane": "CX" },
-    { "pattern": "src/audio/**", "lane": "CX" },
-    { "pattern": "src/ui/**", "lane": "CX" },
-    { "pattern": "src/main.js", "lane": "CX" },
-    { "pattern": "src/styles.css", "lane": "CX" },
-    { "pattern": "index.html", "lane": "CX" },
-    { "pattern": "web/**", "lane": "CX" },
-
-    { "pattern": "server/**", "lane": "CC" },
-    { "pattern": "platform/**", "lane": "CC" },
-
-    { "pattern": "scripts/**", "lane": "CC" },
-    { "pattern": "scripts/ui*.mjs", "lane": "CX" },
-    { "pattern": "scripts/beauty.mjs", "lane": "CX" },
-    { "pattern": "scripts/scopeshot.mjs", "lane": "CX" },
-    { "pattern": "scripts/opticglass.mjs", "lane": "CX" },
-    { "pattern": "scripts/audioprobe.mjs", "lane": "CX" },
-
-    { "pattern": "package.json", "lane": "CC" },
-    { "pattern": "package-lock.json", "lane": "CC" },
-    { "pattern": "vite.config.js", "lane": "CC" },
-    { "$comment": "Deployment descriptors are backend-owned as a CLASS, not file by file. Dockerfile.platform and fly.platform.toml were both UNOWNED when written, and the guard refused them - correctly, but the third app should not have needed a fourth and fifth rule. A pattern means the next service is owned the moment it exists.", "pattern": "Dockerfile*", "lane": "CC" },
-    { "pattern": "fly*.toml", "lane": "CC" },
-    { "pattern": "nginx.conf", "lane": "CC" },
-    { "pattern": ".github/**", "lane": "CC" },
-
-    { "pattern": "ARCHITECTURE.md", "lane": "CC" },
-    { "pattern": "README.md", "lane": "CC" },
-
-    { "pattern": "docs/**", "lane": "SHARED" },
-    { "pattern": "docs/contracts/**", "lane": "CC" },
-    { "pattern": "docs/decisions/**", "lane": "CC" },
-    { "pattern": "docs/lane-ownership.json", "lane": "CC" },
-    { "pattern": "docs/design/**", "lane": "CX" },
-    { "pattern": "docs/handoff/requests-to-backend.md", "lane": "CX" },
-    { "pattern": "docs/handoff/requests-to-frontend.md", "lane": "CC" },
-    { "pattern": "docs/status/backend.md", "lane": "CC" },
-    { "pattern": "docs/status/frontend.md", "lane": "CX" },
-
-    { "pattern": "shots/**", "lane": "SHARED" },
-    { "pattern": "perf/**", "lane": "SHARED" },
-    { "pattern": "dist/**", "lane": "SHARED" },
-    { "pattern": ".gitignore", "lane": "SHARED" }
+    {
+      "pattern": "src/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "src/core/input.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/core/settings.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/core/assets.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/player/playerCamera.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/weapons/viewmodel.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/world/level.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/world/props.js",
+      "lane": "CX"
+    },
+    {
+      "$comment": "The committed nav bake (map-data.md \u00a74). The TOOL is [CC] (scripts/navbake.mjs); the OUTPUT is committed by whoever moved the geometry, which is [CX] for a level.js change and [CC] when the baker itself changes. Neither lane can own it: a CX rule would block CC from re-baking after a baker change, and a CC rule would make every CX geometry PR span both lanes and be rejected by the split guard - which would make \u00a74's arrangement impossible to obey. SHARED is safe here for a reason that does not apply to hand-written files: nobody authors this, and `npm run navtest` fails unless its bytes are exactly what the tool produces from the geometry in the same tree, so a bad write cannot survive.",
+      "pattern": "src/world/navdata/**",
+      "lane": "SHARED"
+    },
+    {
+      "pattern": "src/fx/**",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/audio/**",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/ui/**",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/main.js",
+      "lane": "CX"
+    },
+    {
+      "pattern": "src/styles.css",
+      "lane": "CX"
+    },
+    {
+      "pattern": "index.html",
+      "lane": "CX"
+    },
+    {
+      "pattern": "web/**",
+      "lane": "CX"
+    },
+    {
+      "$comment": "Static runtime assets (audio, textures, key art) served by Vite's publicDir. Client-facing content is CX territory, same as src/fx and src/audio which consume it.",
+      "pattern": "public/**",
+      "lane": "CX"
+    },
+    {
+      "pattern": "server/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "platform/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "scripts/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "scripts/ui*.mjs",
+      "lane": "CX"
+    },
+    {
+      "pattern": "scripts/beauty.mjs",
+      "lane": "CX"
+    },
+    {
+      "pattern": "scripts/scopeshot.mjs",
+      "lane": "CX"
+    },
+    {
+      "pattern": "scripts/opticglass.mjs",
+      "lane": "CX"
+    },
+    {
+      "pattern": "scripts/audioprobe.mjs",
+      "lane": "CX"
+    },
+    {
+      "pattern": "package.json",
+      "lane": "CC"
+    },
+    {
+      "pattern": "package-lock.json",
+      "lane": "CC"
+    },
+    {
+      "pattern": "vite.config.js",
+      "lane": "CC"
+    },
+    {
+      "$comment": "Deployment descriptors are backend-owned as a CLASS, not file by file. Dockerfile.platform and fly.platform.toml were both UNOWNED when written, and the guard refused them - correctly, but the third app should not have needed a fourth and fifth rule. A pattern means the next service is owned the moment it exists.",
+      "pattern": "Dockerfile*",
+      "lane": "CC"
+    },
+    {
+      "pattern": "fly*.toml",
+      "lane": "CC"
+    },
+    {
+      "pattern": "nginx.conf",
+      "lane": "CC"
+    },
+    {
+      "pattern": ".github/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "ARCHITECTURE.md",
+      "lane": "CC"
+    },
+    {
+      "pattern": "README.md",
+      "lane": "CC"
+    },
+    {
+      "pattern": "docs/**",
+      "lane": "SHARED"
+    },
+    {
+      "pattern": "docs/contracts/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "docs/decisions/**",
+      "lane": "CC"
+    },
+    {
+      "pattern": "docs/lane-ownership.json",
+      "lane": "CC"
+    },
+    {
+      "pattern": "docs/design/**",
+      "lane": "CX"
+    },
+    {
+      "pattern": "docs/handoff/requests-to-backend.md",
+      "lane": "CX"
+    },
+    {
+      "pattern": "docs/handoff/requests-to-frontend.md",
+      "lane": "CC"
+    },
+    {
+      "pattern": "docs/status/backend.md",
+      "lane": "CC"
+    },
+    {
+      "pattern": "docs/status/frontend.md",
+      "lane": "CX"
+    },
+    {
+      "pattern": "shots/**",
+      "lane": "SHARED"
+    },
+    {
+      "pattern": "perf/**",
+      "lane": "SHARED"
+    },
+    {
+      "pattern": "dist/**",
+      "lane": "SHARED"
+    },
+    {
+      "pattern": ".gitignore",
+      "lane": "SHARED"
+    }
   ],
   "statusLineException": {
-    "$comment": "Build Plan §0.4: the receiving lane may edit ONLY the `- Status:` line of a request it did not write. The guard allows a cross-lane edit to a request file when every changed line starts with '- Status:' or '- Response:'.",
+    "$comment": "Build Plan \u00a70.4: the receiving lane may edit ONLY the `- Status:` line of a request it did not write. The guard allows a cross-lane edit to a request file when every changed line starts with '- Status:' or '- Response:'.",
     "files": [
       "docs/handoff/requests-to-backend.md",
       "docs/handoff/requests-to-frontend.md"
     ],
-    "allowedLinePrefixes": ["- Status:", "- Response:"]
+    "allowedLinePrefixes": [
+      "- Status:",
+      "- Response:"
+    ]
   },
   "protocolVersionGuard": {
-    "$comment": "Build Plan §0.6 and §5.3: any change to the wire format must bump the version constant in the same commit.",
+    "$comment": "Build Plan \u00a70.6 and \u00a75.3: any change to the wire format must bump the version constant in the same commit.",
     "watch": "src/net/protocol.js",
     "constantFile": "src/net/protocol.js",
     "constantName": "PROTOCOL_VERSION"
   },
   "mapGuard": {
-    "$comment": "Build Plan §3.3: geometry changes must ship a fresh nav bake and pass the map guards. `npm run navbake` writes src/world/navdata/<map>.json and `npm run navtest` FAILS when the committed artifact is not the bake of the current geometry — that pair is what makes \"commit the bake with the change\" a rule rather than a request (map-data.md §4).",
-    "watch": ["src/world/level.js", "src/world/props.js"],
+    "$comment": "Build Plan \u00a73.3: geometry changes must ship a fresh nav bake and pass the map guards. `npm run navbake` writes src/world/navdata/<map>.json and `npm run navtest` FAILS when the committed artifact is not the bake of the current geometry \u2014 that pair is what makes \"commit the bake with the change\" a rule rather than a request (map-data.md \u00a74).",
+    "watch": [
+      "src/world/level.js",
+      "src/world/props.js"
+    ],
     "requiredHarnesses": [
       "npm run navbake",
       "npm run maptest",
