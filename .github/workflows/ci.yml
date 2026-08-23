@@ -102,6 +102,6 @@ jobs:
       - name: simulation and mode harnesses
         run: npm run simtest && npm run tdmtest && npm run bombtest && npm run bombbottest && npm run extractiontest && npm run raidtest && npm run nettest && npm run facadetest && npm run wstest && npm run servertest
       - name: deterministic nav artifact and all P3 map guards (both maps)
-        run: npm run maptest && npm run maptest:extraction && npm run navbake:check && npm run navtest && npm run navtest:extraction && npm run collisiontest && npm run collisiontest:extraction && npm run stairtest && npm run stairtest:extraction && npm run vertprobe && npm run vertprobe:extraction && npm run mapbalance && npm run geomtest && npm run geomtest:extraction && npm run siteoutcome
+        run: npm run maptest && npm run mapversiontest && npm run maptest:extraction && npm run navbake:check && npm run navtest && npm run navtest:extraction && npm run collisiontest && npm run collisiontest:extraction && npm run stairtest && npm run stairtest:extraction && npm run vertprobe && npm run vertprobe:extraction && npm run mapbalance && npm run geomtest && npm run geomtest:extraction && npm run siteoutcome
       - name: P2/P3 client acceptance
         run: npm run viteproxytest && npm run uishell && npm run uiraid && npm run uistream && npm run browserlivetest && npm run uimap && npm run mapperf && npm run uistreamperf && npm run uibomb && npm run uilobby

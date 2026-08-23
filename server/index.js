@@ -12,6 +12,7 @@ import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { Game } from '../src/core/game.js';
+import { getMapEntry } from '../src/world/world.js';
 import { RecordingPresenter } from '../src/core/presenter.js';
 import { GameServer } from '../src/net/server.js';
 import { Player } from '../src/player/player.js';
@@ -52,12 +53,23 @@ let activeMode = MODE;
  * Which map this process boots with before any allocation arrives. Allocations may then
  * switch it: the handshake accepts any (mapId, mapVersion) pair in SUPPORTED_MAPS and the
  * server rebuilds the world for the allocated map (`game.loadMap`) before binding.
- * Mirrors the platform's ROOM_MAPS table (platform/src/modules/lobby/index.js) — kept in
- * lockstep by hand like every other cross-package literal here. 'meridian' joins by owner
- * decision (map-data.md §9, 1.4.0).
+ *
+ * Which maps this server will HOST is policy and stays an explicit list here (raid maps are
+ * selected by the deployment path, not by room allocation). Each map's VERSION, however, is
+ * READ FROM THE REGISTRY rather than restated — a hand-kept copy silently drifted the moment
+ * `the-square` became 3.0.0 (THE CROSSING), and since `/control/allocate` refuses on a version
+ * mismatch, that typo made the game's main map unallocatable in production: every launch died
+ * with MATCH_ALLOCATION_FAILED. Deriving it means the guard can never disagree with the map
+ * it is guarding. The platform's ROOM_MAPS table is still a separate copy (different package)
+ * and `scripts/mapversiontest.mjs` fails if the two ever disagree.
  */
 const MAP = argStr('map', 'the-square');
-const SUPPORTED_MAPS = Object.freeze({ 'the-square': '1.0.0', meridian: '1.1.0' });
+const HOSTABLE_MAPS = ['the-square', 'meridian'];
+const SUPPORTED_MAPS = Object.freeze(Object.fromEntries(HOSTABLE_MAPS.map((mapId) => {
+  const entry = getMapEntry(mapId);
+  if (!entry) throw new Error(`server: '${mapId}' is hostable but not a registered map`);
+  return [mapId, entry.version];
+})));
 if (!Object.hasOwn(SUPPORTED_MAPS, MAP)) throw new Error(`--map=${MAP} is not a supported match map (${Object.keys(SUPPORTED_MAPS).join(', ')})`);
 const BOTS = arg('bots', 8);
 const MAX_CLIENTS = arg('maxclients', 12);
