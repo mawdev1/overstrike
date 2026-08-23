@@ -59,11 +59,42 @@ const PALETTES = [
 
 const _c = new THREE.Color();
 
-/** Appends axis-aligned boxes with baked vertex colours into flat arrays. */
-class BoxBuilder {
-  constructor() { this.pos = []; this.nrm = []; this.col = []; }
+/**
+ * Cloth/gear textures live in one ATLAS per team (three columns x two rows of one
+ * shared CanvasTexture), so every bone mesh keeps a single material and the
+ * 12-meshes-x-2-teams = 24 draw-call structure is untouched — the atlas swaps flat
+ * colour for texture detail without adding a single call. The camo cell differs per
+ * team (camo_alpha vs camo_bravo); the rest are shared imagery.
+ *
+ * Cell key -> [column, row]. Row 0 is the TOP half of the canvas (v in [0.5, 1] with
+ * the default flipY), row 1 the bottom (v in [0, 0.5]). 'flat' is a white cell for
+ * parts that stay pure vertex colour (skin, visor, gun metal, accent patches).
+ */
+const ATLAS_CELLS = {
+  camo: [0, 0], gear: [1, 0], helmet: [2, 0],
+  boot: [0, 1], glove: [1, 1], flat: [2, 1],
+};
+/** World metres covered by one full atlas cell of texture. */
+const ATLAS_TILE_M = 0.9;
+/** UV inset per cell edge so mip bleeding across cells stays off the body. */
+const ATLAS_INSET = 0.03;
 
-  box(cx, cy, cz, sx, sy, sz, hex) {
+/** Deterministic 0..1 hash so identical boxes on both teams crop the atlas alike. */
+function uvHash(x, y, z, f) {
+  const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + f * 4.581) * 43758.5453;
+  return s - Math.floor(s);
+}
+
+/** Appends axis-aligned boxes with baked vertex colours + atlas UVs into flat arrays. */
+class BoxBuilder {
+  constructor() { this.pos = []; this.nrm = []; this.col = []; this.uv = []; }
+
+  /**
+   * @param {number} hex  vertex colour; with a textured cell this multiplies the
+   *   texel, so it doubles as the part's tint.
+   * @param {string} [tex] atlas cell name; omitted = the flat white cell.
+   */
+  box(cx, cy, cz, sx, sy, sz, hex, tex) {
     // setHex() already converts from sRGB into the renderer's working space
     // when ColorManagement is enabled (three >= r152), so no manual convert.
     _c.setHex(hex);
@@ -72,21 +103,38 @@ class BoxBuilder {
     const x0 = cx - hx, x1 = cx + hx;
     const y0 = cy - hy, y1 = cy + hy;
     const z0 = cz - hz, z1 = cz + hz;
+    const cell = ATLAS_CELLS[tex] || ATLAS_CELLS.flat;
+    // Per-face UV rect inside the cell: sized by the face's world extent (so texel
+    // density matches across parts), anchored by a hashed offset for variety. Faces
+    // never wrap — every face here is far smaller than ATLAS_TILE_M.
+    const uvr = (w, h, f) => {
+      const cu = cell[0] / 3, cv = cell[1] === 0 ? 0.5 : 0.0;
+      const span = Math.max(0.0001, 1 - 2 * ATLAS_INSET);
+      const fw = Math.min(w / ATLAS_TILE_M, span), fh = Math.min(h / ATLAS_TILE_M, span);
+      const ju = uvHash(cx, cy, cz, f) * (span - fw);
+      const jv = uvHash(cy, cz, cx, f + 7) * (span - fh);
+      const u0 = cu + (ATLAS_INSET + ju) / 3, v0 = cv + (ATLAS_INSET + jv) / 2;
+      return [u0, v0, u0 + fw / 3, v0 + fh / 2];
+    };
     // 6 faces, CCW when viewed from outside.
-    this._quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, r, g, b);   // +Z
-    this._quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, r, g, b);  // -Z
-    this._quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b);   // +X
-    this._quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b);  // -X
-    this._quad(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b);   // +Y
-    this._quad(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b);  // -Y
+    this._quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, r, g, b, uvr(sx, sy, 0));   // +Z
+    this._quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, r, g, b, uvr(sx, sy, 1));  // -Z
+    this._quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, uvr(sz, sy, 2));   // +X
+    this._quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, uvr(sz, sy, 3));  // -X
+    this._quad(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b, uvr(sx, sz, 4));   // +Y
+    this._quad(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b, uvr(sx, sz, 5));  // -Y
     return this;
   }
 
-  _quad(ax, ay, az, bx, by, bz, cx2, cy2, cz2, dx, dy, dz, nx, ny, nz, r, g, b) {
-    const p = this.pos, n = this.nrm, c = this.col;
+  _quad(ax, ay, az, bx, by, bz, cx2, cy2, cz2, dx, dy, dz, nx, ny, nz, r, g, b, uvq) {
+    const p = this.pos, n = this.nrm, c = this.col, t = this.uv;
     p.push(ax, ay, az, bx, by, bz, cx2, cy2, cz2);
     p.push(ax, ay, az, cx2, cy2, cz2, dx, dy, dz);
     for (let i = 0; i < 6; i++) { n.push(nx, ny, nz); c.push(r, g, b); }
+    const [u0, v0, u1, v1] = uvq;
+    // Corner order matches the quad's a,b,c,d winding above.
+    t.push(u0, v0, u1, v0, u1, v1);
+    t.push(u0, v0, u1, v1, u0, v1);
   }
 
   build() {
@@ -94,10 +142,32 @@ class BoxBuilder {
     g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
     g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nrm, 3));
     g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
     g.computeBoundingSphere();
     return g;
   }
 }
+
+/**
+ * Brighten `hex` by 1/luma of the texture that will multiply it, so a textured part
+ * keeps roughly the VALUE the flat palette was designed around (the near-black
+ * carrier inside light fatigues must survive the texturing — see the palette note).
+ */
+function lift(hex, k) {
+  _c.setHex(hex);
+  const r = Math.min(255, Math.round(_c.r * 255 * k));
+  const g = Math.min(255, Math.round(_c.g * 255 * k));
+  const b = Math.min(255, Math.round(_c.b * 255 * k));
+  return (r << 16) | (g << 8) | b;
+}
+// Approximate average luma of each atlas cell's imagery, measured off the sources.
+const LIFT_GEAR = 1.35;     // vest_webbing.jpg is a bright khaki weave (~0.74)
+const LIFT_HELMET = 1.7;    // helmet_cover.jpg fabric crop (~0.59)
+const LIFT_BOOT = 2.1;      // boots_leather.jpg interior (~0.48)
+const LIFT_GLOVE = 2.1;     // gloves_fabric.jpg (~0.47)
+// Camo tints are neutral greys: the camo imagery itself carries the team hue.
+const CAMO_TINT = 0xf0f0f0;
+const CAMO_TINT_DARK = 0xbdbdbd;
 
 /**
  * 49 boxes = 588 triangles per soldier, laid out for readability at range.
@@ -125,30 +195,31 @@ function buildBoneGeometries(p) {
 
   // ---- hips: pelvis, a wide belt line, dump pouch and holster (4)
   out.hips = new BoxBuilder()
-    .box(0, -0.04, 0, 0.34, 0.22, 0.24, p.fatigue)
-    .box(0, 0.075, 0, 0.38, 0.09, 0.28, p.webbing)
-    .box(-0.20, -0.06, 0.03, 0.11, 0.16, 0.13, p.webbing)
+    .box(0, -0.04, 0, 0.34, 0.22, 0.24, CAMO_TINT, 'camo')
+    .box(0, 0.075, 0, 0.38, 0.09, 0.28, lift(p.webbing, LIFT_GEAR), 'gear')
+    .box(-0.20, -0.06, 0.03, 0.11, 0.16, 0.13, lift(p.webbing, LIFT_GEAR), 'gear')
     .box(0.20, -0.08, -0.01, 0.10, 0.17, 0.11, p.gun)
     .build();
 
   // ---- torso: abdomen, chest, four-sided plate carrier, mag pouches, pack,
   //      shoulder yoke, neck, chest accent (13)
+  const vestT = lift(p.vest, LIFT_GEAR), webT = lift(p.webbing, LIFT_GEAR);
   out.torso = new BoxBuilder()
-    .box(0, 0.10, 0, 0.33, 0.24, 0.23, p.fatigue)
-    .box(0, 0.35, 0, 0.44, 0.32, 0.25, p.fatigue)
+    .box(0, 0.10, 0, 0.33, 0.24, 0.23, CAMO_TINT, 'camo')
+    .box(0, 0.35, 0, 0.44, 0.32, 0.25, CAMO_TINT, 'camo')
     // plate carrier — proud of the chest so it casts its own edge
-    .box(0, 0.33, -0.155, 0.38, 0.40, 0.075, p.vest)
-    .box(0, 0.33, 0.155, 0.38, 0.40, 0.075, p.vest)
-    .box(0.215, 0.33, 0, 0.06, 0.36, 0.24, p.vest)
-    .box(-0.215, 0.33, 0, 0.06, 0.36, 0.24, p.vest)
+    .box(0, 0.33, -0.155, 0.38, 0.40, 0.075, vestT, 'gear')
+    .box(0, 0.33, 0.155, 0.38, 0.40, 0.075, vestT, 'gear')
+    .box(0.215, 0.33, 0, 0.06, 0.36, 0.24, vestT, 'gear')
+    .box(-0.215, 0.33, 0, 0.06, 0.36, 0.24, vestT, 'gear')
     // three mag pouches read as one horizontal band across the belly
-    .box(-0.115, 0.19, -0.205, 0.105, 0.16, 0.10, p.webbing)
-    .box(0.005, 0.19, -0.205, 0.105, 0.16, 0.10, p.webbing)
-    .box(0.125, 0.19, -0.205, 0.105, 0.16, 0.10, p.webbing)
+    .box(-0.115, 0.19, -0.205, 0.105, 0.16, 0.10, webT, 'gear')
+    .box(0.005, 0.19, -0.205, 0.105, 0.16, 0.10, webT, 'gear')
+    .box(0.125, 0.19, -0.205, 0.105, 0.16, 0.10, webT, 'gear')
     // rear pack, in team colour — the back view needs an ID too
     .box(0, 0.31, 0.235, 0.30, 0.28, 0.10, p.accent)
     // shoulder yoke squares off the top of the silhouette
-    .box(0, 0.47, 0, 0.48, 0.09, 0.23, p.vest)
+    .box(0, 0.47, 0, 0.48, 0.09, 0.23, vestT, 'gear')
     .box(0, 0.51, 0, 0.13, 0.09, 0.13, p.skin)
     // chest stripe
     .box(0, 0.455, -0.16, 0.32, 0.07, 0.075, p.accent)
@@ -158,24 +229,25 @@ function buildBoneGeometries(p) {
   //      band, nape pad (7). Everything stays within the head hitbox.
   out.head = new BoxBuilder()
     .box(0, -0.01, 0.01, 0.20, 0.22, 0.21, p.skin)
-    .box(0, 0.055, 0, 0.275, 0.155, 0.285, p.helmet)
-    .box(0, -0.03, 0, 0.29, 0.055, 0.30, p.helmet)
+    .box(0, 0.055, 0, 0.275, 0.155, 0.285, lift(p.helmet, LIFT_HELMET), 'helmet')
+    .box(0, -0.03, 0, 0.29, 0.055, 0.30, lift(p.helmet, LIFT_HELMET), 'helmet')
     .box(0, -0.005, -0.125, 0.215, 0.075, 0.055, p.visor)
     .box(0, 0.075, -0.155, 0.055, 0.055, 0.06, p.gun)
     .box(0, 0.132, 0, 0.245, 0.035, 0.255, p.accent)
-    .box(0, -0.08, 0.095, 0.19, 0.09, 0.09, p.webbing)
+    .box(0, -0.08, 0.095, 0.19, 0.09, 0.09, lift(p.webbing, LIFT_GEAR), 'gear')
     .build();
 
   // ---- arms: sleeve + a big accent shoulder cap (2 each)
   const upperArm = () => new BoxBuilder()
-    .box(0, -0.15, 0, 0.115, 0.30, 0.125, p.fatigue)
+    .box(0, -0.15, 0, 0.115, 0.30, 0.125, CAMO_TINT, 'camo')
     .box(0, -0.02, 0, 0.15, 0.11, 0.16, p.accent)
     .build();
   const foreArm = () => new BoxBuilder()
-    .box(0, -0.13, 0, 0.10, 0.26, 0.10, p.fatigueDark)
+    .box(0, -0.13, 0, 0.10, 0.26, 0.10, CAMO_TINT_DARK, 'camo')
     // elbow pad caps the joint so the bend reads as a bend, not a gap
-    .box(0, -0.005, -0.005, 0.105, 0.09, 0.115, p.webbing)
-    .box(0, -0.29, 0, 0.095, 0.11, 0.115, p.boot)
+    .box(0, -0.005, -0.005, 0.105, 0.09, 0.115, lift(p.webbing, LIFT_GEAR), 'gear')
+    // hand — gloves_fabric, tinted down toward the palette's dark leather
+    .box(0, -0.29, 0, 0.095, 0.11, 0.115, lift(p.boot, LIFT_GLOVE), 'glove')
     .build();
   out.upperArmL = upperArm();
   out.upperArmR = upperArm();
@@ -185,13 +257,13 @@ function buildBoneGeometries(p) {
   // ---- legs: thigh, shin, and a boot that flares at the sole so the figure
   //      plants on the ground instead of tapering into it (1 + 2 each)
   const thigh = () => new BoxBuilder()
-    .box(0, -0.20, 0, 0.15, 0.40, 0.17, p.fatigue)
+    .box(0, -0.20, 0, 0.15, 0.40, 0.17, CAMO_TINT, 'camo')
     .build();
   const shin = () => new BoxBuilder()
-    .box(0, -0.18, 0, 0.125, 0.36, 0.145, p.fatigueDark)
+    .box(0, -0.18, 0, 0.125, 0.36, 0.145, CAMO_TINT_DARK, 'camo')
     // knee pad — sits proud of the shin's front face and caps the hinge
-    .box(0, -0.035, -0.075, 0.13, 0.13, 0.06, p.webbing)
-    .box(0, -0.40, -0.03, 0.14, 0.10, 0.26, p.boot)
+    .box(0, -0.035, -0.075, 0.13, 0.13, 0.06, lift(p.webbing, LIFT_GEAR), 'gear')
+    .box(0, -0.40, -0.03, 0.14, 0.10, 0.26, lift(p.boot, LIFT_BOOT), 'boot')
     .build();
   out.thighL = thigh();
   out.thighR = thigh();
@@ -235,7 +307,7 @@ const BOUND_MARGIN = 0.25;
 const BOUND_UNBOUNDED = 1e6;
 
 const RIG = {
-  material: null,
+  material: [null, null],
   // Monotonic counter, purely for deriving each model's decoration RNG. It must NOT be
   // `live`, which is a live *count*: releasing one model and building another reuses the
   // number, and two models sharing a seed means two soldiers walking in perfect lockstep
@@ -296,26 +368,114 @@ function applyCount(team) {
   for (let i = 0; i < BONE_COUNT; i++) meshes[i].count = n;
 }
 
-function rigMaterial() {
-  if (RIG.material) return RIG.material;
+// ------------------------------------------------------- texture atlas loading
+
+const ATLAS_DIR = '/textures/character/';
+/**
+ * Source crops: helmet_cover.jpg is a photographed helmet (not a tile) and
+ * boots_leather.jpg has a stitched border, so only their usable fabric/leather
+ * regions are drawn into the atlas. Everything else is a full seamless tile.
+ */
+const ATLAS_SOURCES = {
+  gear: { file: 'vest_webbing.jpg', crop: [0, 0, 1024, 1024] },
+  helmet: { file: 'helmet_cover.jpg', crop: [260, 130, 440, 440] },
+  boot: { file: 'boots_leather.jpg', crop: [120, 120, 700, 700] },
+  glove: { file: 'gloves_fabric.jpg', crop: [100, 100, 824, 824] },
+};
+const ATLAS_CAMO = ['camo_alpha.jpg', 'camo_bravo.jpg'];
+const ATLAS_CELL_PX = 512;
+
+const ATLAS_STATE = { started: false, tex: [null, null] };
+
+/** Compose one 1536x1024 canvas atlas for `team` from the loaded images. */
+function composeAtlas(team, images) {
+  const canvas = document.createElement('canvas');
+  canvas.width = ATLAS_CELL_PX * 3;
+  canvas.height = ATLAS_CELL_PX * 2;
+  const ctx = canvas.getContext('2d');
+  const drawCell = (name, img, crop) => {
+    const [col, row] = ATLAS_CELLS[name];
+    ctx.drawImage(img, crop[0], crop[1], crop[2], crop[3],
+      col * ATLAS_CELL_PX, row * ATLAS_CELL_PX, ATLAS_CELL_PX, ATLAS_CELL_PX);
+  };
+  drawCell('camo', images[ATLAS_CAMO[team]], [0, 0, 1024, 1024]);
+  for (const [name, src] of Object.entries(ATLAS_SOURCES)) {
+    drawCell(name, images[src.file], src.crop);
+  }
+  ctx.fillStyle = '#ffffff';
+  const [fc, fr] = ATLAS_CELLS.flat;
+  ctx.fillRect(fc * ATLAS_CELL_PX, fr * ATLAS_CELL_PX, ATLAS_CELL_PX, ATLAS_CELL_PX);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/** Push any composed atlases onto any existing materials (either may arrive first). */
+function applyAtlases() {
+  for (let t = 0; t < 2; t++) {
+    const m = RIG.material[t];
+    const tex = ATLAS_STATE.tex[t];
+    if (m && tex && m.map !== tex) { m.map = tex; m.needsUpdate = true; }
+  }
+}
+
+/**
+ * Kick off the one-time async load of the character textures. Fire-and-forget:
+ * until the atlases land the rigs render their vertex-colour tints, which are the
+ * old readability palette, so a slow network never shows an untinted soldier.
+ * No-ops headless (a server import of this module must not touch the DOM).
+ */
+function ensureAtlases() {
+  if (ATLAS_STATE.started || typeof document === 'undefined') return;
+  ATLAS_STATE.started = true;
+  const files = [...new Set([...ATLAS_CAMO, ...Object.values(ATLAS_SOURCES).map((s) => s.file)])];
+  const loader = new THREE.ImageLoader();
+  const images = {};
+  let left = files.length;
+  for (const f of files) {
+    loader.load(ATLAS_DIR + f, (img) => {
+      images[f] = img;
+      if (--left === 0) {
+        for (let t = 0; t < 2; t++) {
+          ATLAS_STATE.tex[t] = composeAtlas(t, images);
+          assets.textures.set(`botAtlas${t}`, ATLAS_STATE.tex[t]);
+        }
+        applyAtlases();
+      }
+    }, undefined, () => {
+      // A missing texture leaves the flat palette in place — degraded, not broken.
+      console.warn(`[botModel] character texture failed to load: ${f}`);
+    });
+  }
+}
+
+function rigMaterial(team) {
+  if (RIG.material[team]) return RIG.material[team];
   // Registered in the shared assets cache so nothing here is per-object and
   // assets.dispose() sweeps it up with everything else.
-  let m = assets.materials.get('botBody');
+  const key = `botBody${team}`;
+  let m = assets.materials.get(key);
   if (!m) {
     m = new THREE.MeshStandardMaterial({
       vertexColors: true, roughness: 0.86, metalness: 0.06,
     });
     m.userData.surface = 'flesh';
-    assets.materials.set('botBody', m);
+    assets.materials.set(key, m);
   }
-  RIG.material = m;
+  RIG.material[team] = m;
+  ensureAtlases();
+  applyAtlases();
   return m;
 }
 
 function ensureTeam(game, team) {
   if (RIG.meshes[team]) return;
   const geos = buildBoneGeometries(PALETTES[team] || PALETTES[0]);
-  const mat = rigMaterial();
+  const mat = rigMaterial(team);
   // How far a vertex can be from its bone origin, over every bone in this colourway.
   // Bone matrices are rigid (position + quaternion, never scale), so a local radius is
   // also a world radius and this bound is exact before BOUND_MARGIN is added.
@@ -425,7 +585,7 @@ export function disposeBotRigs() {
     RIG.reach[t] = 0;
     RIG.stamp[t] = -1;
   }
-  RIG.material = null;
+  RIG.material = [null, null];
   RIG.scene = null;
   RIG.live = 0;
 }
@@ -666,40 +826,51 @@ export class BotModel {
     const breathAmp = (1 - gaitAmp) * (1 - air) * (1 - this.flinch);
     const br = Math.sin(this.breath) * breathAmp;
 
-    // ---- hips
+    // SIGN CONVENTION for everything below: the rig faces LOCAL -Z (visor and muzzle
+    // both sit at negative z), so a positive rotation.x tips the top of a bone toward
+    // +Z — i.e. it leans torso/head BACKWARD, and it swings a limb that hangs in -Y
+    // FORWARD. The pose terms here were once authored with the opposite assumption,
+    // which mirrored the whole upper body: arms raised behind the shoulders, crouch
+    // leaning backward, muzzle dipping when the aim pitched up. Phase-relative gait
+    // terms (arm counter-swing vs the same-side leg) are convention-independent and
+    // keep their literal signs.
+
+    // ---- hips: forward tilt into the crouch, the run and the landing dip
     bones.hips.position.y = lerp(HIP_Y_STAND, HIP_Y_CROUCH, cr)
       + s2 * lerp(0.032, 0.05, spr) * gaitAmp
       - dip * 0.16 + air * 0.06;
     bones.hips.rotation.set(
-      lerp(0, 0.28, cr) + gaitAmp * lerp(0.05, 0.14, spr) + dip * 0.10,
+      -(lerp(0, 0.28, cr) + gaitAmp * lerp(0.05, 0.14, spr) + dip * 0.10),
       0,
       s * lerp(0.045, 0.07, spr) * gaitAmp,
     );
 
-    // ---- torso: twist + aim pitch + sprint lean + bob + breath + flinch
+    // ---- torso: twist + aim pitch (up-aim leans it back) + forward sprint/crouch
+    //      lean + bob + breath + a backward flinch snap
     const pitch = bot.pitch || 0;
     bones.torso.rotation.y = twist;
-    bones.torso.rotation.x = -pitch * 0.42 * aim + lerp(0.06, 0.30, cr)
-      + gaitAmp * 0.10 + spr * 0.22 + air * 0.10 + dip * 0.18
-      + br * 0.022 - this.flinch * 0.22;
+    bones.torso.rotation.x = pitch * 0.42 * aim - lerp(0.06, 0.30, cr)
+      - gaitAmp * 0.10 - spr * 0.22 - air * 0.10 - dip * 0.18
+      - br * 0.022 + this.flinch * 0.22;
     bones.torso.rotation.z = -s * lerp(0.05, 0.08, spr) * gaitAmp
       + this.flinch * 0.09 * Math.sin(this.flinchDir);
 
     // ---- head: remaining pitch (counter the sprint lean so the eyes stay level)
     bones.head.position.y = lerp(HEAD_Y_STAND, HEAD_Y_CROUCH, cr);
-    bones.head.rotation.x = -pitch * lerp(0.88, 0.55, aim) - spr * 0.18
-      - br * 0.015 - this.flinch * 0.25;
+    bones.head.rotation.x = pitch * lerp(0.88, 0.55, aim) + spr * 0.18
+      + br * 0.015 + this.flinch * 0.25;
     bones.head.rotation.y = 0;
     bones.head.rotation.z = 0;
 
     // ---- legs
     const kneeIdle = lerp(0.12, 0.95, cr) + dip * 0.85;
-    const thighIdle = lerp(-0.04, -0.62, cr) - dip * 0.35;
+    // Crouch drives the thighs FORWARD (positive x) into the squat.
+    const thighIdle = lerp(0.04, 0.62, cr) + dip * 0.35;
     const swingAmp = lerp(0.72, 0.98, spr) * gaitAmp;
     const swing = s * swingAmp;
     const swingOff = Math.sin(this.gait + Math.PI) * swingAmp;
     // In the air the legs split into a trail pose — lead leg reaches, rear leg tucks.
-    const airLead = air * -0.55, airTrail = air * 0.35;
+    const airLead = air * 0.55, airTrail = air * -0.35;
     const airKnee = air * 0.75;
     bones.thighL.rotation.set(thighIdle + swing + airLead, 0, lerp(0, -0.18, cr));
     bones.thighR.rotation.set(thighIdle + swingOff + airTrail, 0, lerp(0, 0.18, cr));
@@ -713,19 +884,21 @@ export class BotModel {
     const rl = this.reloadBlend;
     const rlWave = Math.sin(rl * Math.PI);
 
-    // right arm keeps the grip in every pose; sprinting pumps it with the stride
-    const ruX = lerp(-0.35 - swingOff * 0.55, -0.62, aim)
-      + spr * (0.10 - swingOff * 0.45) + air * -0.25 + br * 0.02;
+    // right arm keeps the grip in every pose (positive x raises it forward, and the
+    // gait term counter-swings it against the right leg); sprinting pumps the stride
+    const ruX = lerp(0.35 - swingOff * 0.55, 0.62, aim)
+      + spr * (-0.10 - swingOff * 0.45) + air * 0.25 - br * 0.02;
     const ruZ = lerp(0.10, 0.34, aim) + spr * 0.06 + air * 0.20;
     bones.upperArmR.rotation.set(ruX, 0, ruZ);
-    bones.foreArmR.rotation.set(lerp(-0.75, -1.32, aim) - spr * 0.35 - air * 0.20, 0, 0);
+    // elbows bend forward: the forearm rotates up toward the chest, never past straight
+    bones.foreArmR.rotation.set(lerp(0.75, 1.32, aim) + spr * 0.35 + air * 0.20, 0, 0);
 
     // left arm supports the handguard, and drops to the magwell on reload
-    const luX = lerp(-0.35 - swing * 0.55, -0.95, aim)
-      + spr * (0.10 - swing * 0.45) + air * -0.25 + br * 0.02;
+    const luX = lerp(0.35 - swing * 0.55, 0.95, aim)
+      + spr * (-0.10 - swing * 0.45) + air * 0.25 - br * 0.02;
     const luZ = lerp(-0.10, -0.55, aim) - spr * 0.06 - air * 0.20;
-    bones.upperArmL.rotation.set(luX + rlWave * 0.55, rlWave * 0.35, luZ + rlWave * 0.30);
-    bones.foreArmL.rotation.set(lerp(-0.75, -1.15, aim) - spr * 0.30 - rlWave * 0.85, 0, 0);
+    bones.upperArmL.rotation.set(luX - rlWave * 0.55, rlWave * 0.35, luZ + rlWave * 0.30);
+    bones.foreArmL.rotation.set(lerp(0.75, 1.15, aim) + spr * 0.30 + rlWave * 0.85, 0, 0);
 
     // ---- weapon: shouldered vs slung-low vs the sprint carry (muzzle down and
     //      across the chest), plus the reload tilt. Outside ADS the muzzle still
@@ -735,8 +908,10 @@ export class BotModel {
     const wz = lerp(-0.10, -0.26, aim) + spr * 0.06;
     bones.weapon.position.set(wx, wy, wz - rlWave * 0.05);
     bones.weapon.rotation.set(
-      lerp(0.55, 0, aim) + spr * 0.45 - pitch * lerp(0.22, 0.55, aim) * (1 - spr)
-        + rlWave * 0.30 + s2 * 0.03 * gaitAmp,
+      // negative x drops the muzzle (it points down -Z): low-ready at rest, further
+      // down in the sprint carry, and it RISES with the aim pitch, not against it
+      -lerp(0.55, 0, aim) - spr * 0.45 + pitch * lerp(0.22, 0.55, aim) * (1 - spr)
+        - rlWave * 0.30 - s2 * 0.03 * gaitAmp,
       lerp(-0.32, 0, aim) - spr * 0.35 + rlWave * 0.22,
       lerp(0.25, 0, aim) + spr * 0.15 - rlWave * 0.45,
     );
@@ -763,8 +938,9 @@ export class BotModel {
 
     bones.upperArmL.rotation.set(lerp(0, 0.9 + r * 0.6, limp), 0, lerp(0, -0.7, limp));
     bones.upperArmR.rotation.set(lerp(0, 0.7 + (1 - r) * 0.7, limp), 0, lerp(0, 0.75, limp));
-    bones.foreArmL.rotation.set(lerp(0, -0.45, limp), 0, 0);
-    bones.foreArmR.rotation.set(lerp(0, -0.60, limp), 0, 0);
+    // Elbows bend forward (positive x) — negative here hyperextended the joint.
+    bones.foreArmL.rotation.set(lerp(0, 0.45, limp), 0, 0);
+    bones.foreArmR.rotation.set(lerp(0, 0.60, limp), 0, 0);
 
     bones.thighL.rotation.set(lerp(0, -0.55 - r * 0.4, limp), 0, lerp(0, -0.30, limp));
     bones.thighR.rotation.set(lerp(0, -0.30 - (1 - r) * 0.4, limp), 0, lerp(0, 0.34, limp));
