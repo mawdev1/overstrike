@@ -4,6 +4,7 @@ import { clamp } from '../core/mathUtils.js';
 import { ParticleSystem } from './particles.js';
 import { DecalSystem, DECAL_CAP } from './decals.js';
 import { TracerSystem, TRACER_NORMAL, TRACER_SNIPER, TRACER_SPEED } from './tracers.js';
+import { SiteRings } from './siteRings.js';
 
 /**
  * OVERSTRIKE — FX facade (ARCHITECTURE §8).
@@ -313,6 +314,7 @@ export class FX {
     this.particles = new ParticleSystem(game);
     this.decals = new DecalSystem(game);
     this.tracers = new TracerSystem(game);
+    this.siteRings = new SiteRings(game);
 
     /** Public knobs — other systems may tune these, nothing here reads settings keys. */
     this.quality = 1;            // scales particle counts
@@ -330,6 +332,20 @@ export class FX {
     this._lightMax = new Float32Array(MAX_LIGHTS);
     this._lightI0 = new Float32Array(MAX_LIGHTS);
     this._lightPow = new Float32Array(MAX_LIGHTS);
+
+    // --- bomb detonation sequencer (see `bombDetonation()`)
+    //
+    // One live detonation at a time is plenty: Bomb has one bomb, and the round ends on
+    // it. Stages are driven from `update()` so the column keeps building for ~2 s after
+    // the round-end whistle rather than being one single-frame burst.
+    this._deto = {
+      active: false, t: 0, next: 0,
+      x: 0, y: 0, z: 0, groundY: 0, grounded: false,
+    };
+    this._ring = null;        // ground shockwave ring mesh (built in init)
+    this._ringLife = 0;
+    this._ringMax = 1.15;
+    this._busUnsubs = [];
 
     // --- shell casing pool
     this._shellPos = new Float32Array(SHELL_CAP * 3);
@@ -352,6 +368,7 @@ export class FX {
     this.particles.quality = this.quality;
     this.decals.init(scene);
     this.tracers.init(scene);
+    this.siteRings.init(scene);
 
     const glow = assets.tex('glow');
     this.flashWorld = new BillboardBatch(FLASH_CAP_WORLD, glow, 12);
@@ -400,6 +417,47 @@ export class FX {
     if (shells.instanceColor) shells.instanceColor.needsUpdate = true;
     this.shells = shells;
     scene.add(shells);
+
+    // --- bomb detonation shockwave ring
+    //
+    // A flat, additive, ground-aligned ring that expands from the site. Camera-facing
+    // billboards cannot express "a pressure wave racing along the ground", and the
+    // composite pass has no distortion buffer for a true refraction shockwave (see
+    // `explosion()`), so this one always-resident mesh is the honest substitute. It is
+    // scaled to ~0 and invisible except during the ~1.1 s it plays; toggling MESH
+    // visibility is safe — the light-pool recompile hazard is specific to lights.
+    const ringGeo = new THREE.RingGeometry(0.82, 1, 48, 1);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0xffc887, transparent: true, opacity: 0, depthWrite: false,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
+    });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.visible = false;
+    ring.renderOrder = 11;
+    scene.add(ring);
+    this._ring = ring;
+    this._ringGeo = ringGeo;
+    this._ringMat = ringMat;
+
+    // --- bomb detonation trigger
+    //
+    // Single player: `game/bomb.js` `_emit('bombDetonated', …)` lands on the bus as an
+    // `objective` row with raw x/y/z. Online: `net/session.js` re-emits the wire event
+    // as the same bus kind with a `position` object. Both shapes are accepted here, so
+    // the one detonation presentation cannot drift between local and networked play.
+    const bus = this.game.bus;
+    if (bus?.on) {
+      const un = bus.on('objective', (row) => {
+        if (!row || row.kind !== 'bombDetonated') return;
+        const p = row.position
+          ?? (typeof row.x === 'number' ? row : null);
+        if (!p) return;
+        _v4.set(p.x, p.y, p.z);
+        this.bombDetonation(_v4);
+      });
+      if (un) this._busUnsubs.push(un);
+    }
   }
 
   // ================================================================ §8 API
@@ -678,6 +736,174 @@ export class FX {
     }
   }
 
+  /**
+   * The bomb going off — a round-ending landmark event, deliberately NOT `explosion()`
+   * at a bigger radius. §8's explosion is tuned to be fair mid-combat; this one is tuned
+   * to be WITNESSED: every player on the 88 m map must see it and feel it, wherever they
+   * are and whatever is between them and the site.
+   *
+   *   at the site   — everything `explosion()` does, plus a much larger core flash,
+   *                   a ground shockwave ring racing outward, and a debris fountain.
+   *   from anywhere — a horizon flash (a huge additive card that reads over rooftops),
+   *                   a fire-then-smoke column climbing ~30 m for several seconds,
+   *                   a distance-attenuated but never-zero screen shake, and a brief
+   *                   white screen flash (the HUD's flashbang layer, which already
+   *                   honours the `flashIntensity` / `screenEffectIntensity` settings).
+   *
+   * The column and late smoke are staged from `update()` over ~2.2 s, so the plume keeps
+   * building through the round-end banner instead of popping for one frame. Nothing here
+   * reads `game.rng` or mutates sim state — this is presentation only, triggered off the
+   * `bombDetonated` objective event.
+   */
+  bombDetonation(point) {
+    if (!this.enabled || !this.particles.groups) return;
+    const x = point.x, y = point.y, z = point.z;
+
+    // The full near-field recipe first: fireball, embers, dust ring, scorch, near shake.
+    this.explosion(point, 11);
+
+    // Ground probe for the ring / column base (explosion() probed too, but keeps the
+    // result to itself — one extra raycast per round is nothing).
+    let groundY = y;
+    let grounded = false;
+    const world = this.game.world;
+    if (world?.raycast) {
+      _v2.set(x, y + 0.1, z);
+      const hit = world.raycast(_v2, _down, 18);
+      if (hit) { groundY = hit.point.y; grounded = true; }
+    }
+
+    // Camera distance drives every "felt" channel below.
+    const cam = this.game.camera;
+    let camDist = 0;
+    if (cam) {
+      _camPos.setFromMatrixPosition(cam.matrixWorld);
+      camDist = _camPos.distanceTo(point);
+    }
+    const settings = this.game.settings;
+    const reduceMotion = settings?.get?.('reduceMotion') === true;
+
+    // 1. Core: white-hot cards that grow to ~46 m — the horizon flash. The second card
+    //    sits WELL above roof height (sites can be indoors — Civic Archive is), so a
+    //    viewer with the site itself fully occluded still sees the sky over it light up.
+    this.flashWorld.spawn(x, y + 2.5, z, 7, 46, 0.5, 12, 11, 8.5, 4.2, 1.6, 0.5, 3, 0);
+    this.flashWorld.spawn(x, y + 16, z, 6, 40, 0.6, 10, 9, 7, 3.5, 1.3, 0.4, 3, 0);
+    // A slower fire dome that hangs for over a second where the site was.
+    this.flashWorld.spawn(x, y + 3.5, z, 6, 20, 1.25, 7.5, 3.2, 0.8, 1.2, 0.2, 0.03, 2,
+      rnd() < 0.5 ? -1.2 : 1.2);
+    // Site-lighting kick, thrown across most of the map.
+    this._light(x, y + 3, z, 1.0, 0.82, 0.55, 55, 1.0, 2, 120);
+
+    // 2. Ground shockwave ring.
+    if (this._ring) {
+      this._ring.position.set(x, (grounded ? groundY : y) + 0.18, z);
+      this._ring.visible = true;
+      this._ringLife = this._ringMax;
+    }
+
+    // 3. Debris fountain + first column burst, immediately.
+    _v3.set(x, grounded ? groundY : y, z);
+    const floorY = grounded ? groundY : -Infinity;
+    this.particles.emit('explosionEmbers', point, _up, 3.2, floorY);
+    this.particles.emit('concreteChips', point, _up, 3.0, floorY);
+    this.particles.emit('bombFireColumn', _v3, _up, 1, -Infinity);
+    this.particles.emit('bombSmokeColumn', _v3, _up, 1, -Infinity);
+
+    // 4. Stage the rest of the column from update().
+    const d = this._deto;
+    d.active = true;
+    d.t = 0;
+    d.next = 0.12;
+    d.x = x; d.y = y; d.z = z;
+    d.groundY = grounded ? groundY : y;
+    d.grounded = grounded;
+
+    // 5. Screen feel — attenuated by distance but PRESENT at any distance on the map.
+    //    (The far corner of the 88 m map is ~120 m from a site; the floor terms below
+    //    are what keep the event felt there.) `reduceMotion` keeps the information —
+    //    a short, small shake and a dimmer flash — without the violence.
+    if (cam) {
+      const far = clamp(1 - camDist / 150, 0, 1);          // 1 near … ~0.2 far corner
+      const shakeAmt = Math.max(0.3, 2.3 * far);
+      const shakeDur = 0.5 + 0.6 * far;
+      const motionScale = reduceMotion ? 0.3 : 1;
+      this.screenShake(shakeAmt * motionScale, shakeDur * (reduceMotion ? 0.6 : 1));
+
+      // Brief white flash via the HUD's flashbang layer (never a real blind: even at
+      // point blank this stays far below a flashbang's amount/duration).
+      const flashAmt = clamp(0.18 + 0.5 * far, 0, 0.7) * (reduceMotion ? 0.5 : 1);
+      this.game.bus?.emit?.('flashbang', {
+        amount: flashAmt,
+        duration: 0.35 + 0.45 * far,
+        position: point,
+      });
+
+      // Near the blast: a dust kick right at the camera, so the world — not just the
+      // HUD — goes briefly thick with the site's dust.
+      if (camDist < 22 && !reduceMotion) {
+        _v1.set(_camPos.x, _camPos.y - 0.4, _camPos.z);
+        this.particles.emitTinted('dust', _v1, _up, 2.2, -Infinity, 1.3, 1.22, 1.1);
+      }
+    }
+  }
+
+  /** Per-frame driver for the staged bomb-detonation column + shockwave ring. */
+  _updateDetonation(dt) {
+    // Ring: expand fast, fade out. Scale is metres of radius (geometry is unit radius).
+    if (this._ringLife > 0 && this._ring) {
+      this._ringLife -= dt;
+      if (this._ringLife <= 0) {
+        this._ringLife = 0;
+        this._ring.visible = false;
+        this._ringMat.opacity = 0;
+      } else {
+        const t = 1 - this._ringLife / this._ringMax;   // 0 → 1
+        const radius = 1.5 + 52 * t;                     // ~48 m/s pressure front
+        this._ring.scale.set(radius, radius, 1);
+        this._ringMat.opacity = 0.85 * (1 - t) * (1 - t);
+      }
+    }
+
+    const d = this._deto;
+    if (!d.active) return;
+    d.t += dt;
+    if (d.t >= 3.2) { d.active = false; return; }
+    if (d.t < d.next) return;
+    d.next += 0.14;
+
+    // The column is STACKED up a height ramp rather than left to buoyancy alone: the
+    // emission head climbs to ~+32 m over the first ~1.8 s, so the plume clears any
+    // roof over an indoor site within a second and then keeps drifting up on its own
+    // lift. This is the piece that makes the detonation legible from the far corner —
+    // a viewer whose sightline to the site is walled off still gets a 30 m tower of
+    // fire-then-smoke over the skyline.
+    const head = 3 + 33 * clamp(d.t / 1.8, 0, 1);
+    // Low churn at the base…
+    _v3.set(d.x + (rnd() - 0.5) * 2, d.groundY + 1 + rnd() * 3, d.z + (rnd() - 0.5) * 2);
+    this.particles.emit('bombSmokeColumn', _v3, _up, d.t < 1.2 ? 0.7 : 0.4, -Infinity);
+    // …a mid-column fill so the tower is continuous rather than a bead chain…
+    _v3.set(d.x + (rnd() - 0.5) * 2.5, d.groundY + head * (0.3 + rnd() * 0.35),
+      d.z + (rnd() - 0.5) * 2.5);
+    this.particles.emit('bombSmokeColumn', _v3, _up, 0.8, -Infinity);
+    // …and the rising head, with fire licking up it. The head is the densest part —
+    // above the roofline it is all a distant viewer gets of the smoke tower.
+    _v3.set(d.x + (rnd() - 0.5) * 2.5, d.groundY + head * (0.75 + rnd() * 0.25),
+      d.z + (rnd() - 0.5) * 2.5);
+    this.particles.emit('bombSmokeColumn', _v3, _up, 1.5, -Infinity);
+    if (d.t < 1.7) {
+      this.particles.emit('bombFireColumn', _v3, _up, 1.0, -Infinity);
+      // A big hot card at the head: this is the part of the climbing fire that BLOOMS,
+      // and at 60-plus metres it is most of what sells the column as burning.
+      this.flashWorld.spawn(_v3.x, _v3.y + 1.5, _v3.z, 6, 14, 0.4 + rnd() * 0.25,
+        7.5, 3.2, 0.8, 1.3, 0.28, 0.05, 2, rnd() < 0.5 ? -2 : 2);
+    }
+    if (d.t < 0.6 && rnd() < 0.6) {
+      _v3.set(d.x, d.groundY + 0.3, d.z);
+      this.particles.emit('explosionEmbers', _v3, _up, 1.2,
+        d.grounded ? d.groundY : -Infinity);
+    }
+  }
+
   /** §8 `smokeTrail(from, to)` — puffs along a segment (grenade / rocket trails). */
   smokeTrail(from, to) {
     if (!this.enabled || !this.particles.groups) return;
@@ -773,6 +999,9 @@ export class FX {
     // last-alive-sector rule, and a missing player fails open inside the controller.
     const streaming = this.game.world?.group?.userData?.sectorStreaming;
     if (streaming) streaming.update(dtFrame, this.game.player?.position ?? null);
+    // Bomb-site ground rings: world-space objective markers (replaces the old
+    // projected DOM markers). Guarded internally; independent of the pools below.
+    this.siteRings.update(dtFrame);
     if (!this.particles.groups) return;
     const dt = dtFrame > 0.1 ? 0.1 : dtFrame;
 
@@ -784,16 +1013,21 @@ export class FX {
     this.flashView.update(dt);
     this._updateLights(dt);
     this._updateShells(dt);
+    this._updateDetonation(dt);
   }
 
   reset() {
     this.particles.clear();
     this.decals.clear();
     this.tracers.clear();
+    this.siteRings.reset();
     this.flashWorld?.clear();
     this.flashView?.clear();
     this._shellCount = 0;
     if (this.shells) this.shells.count = 0;
+    this._deto.active = false;
+    this._ringLife = 0;
+    if (this._ring) { this._ring.visible = false; this._ringMat.opacity = 0; }
     if (this.lights) {
       for (let i = 0; i < MAX_LIGHTS; i++) {
         this.lights[i].intensity = 0;
@@ -806,6 +1040,7 @@ export class FX {
     this.particles.dispose();
     this.decals.dispose();
     this.tracers.dispose();
+    this.siteRings.dispose();
     if (this.flashWorld) { this.game.scene?.remove(this.flashWorld.mesh); this.flashWorld.dispose(); }
     if (this.flashView) { this.game.engine?.viewScene?.remove(this.flashView.mesh); this.flashView.dispose(); }
     if (this.shells) {
@@ -815,6 +1050,14 @@ export class FX {
     }
     if (this.lights) for (let i = 0; i < MAX_LIGHTS; i++) this.game.scene?.remove(this.lights[i]);
     this.lights = null;
+    for (const un of this._busUnsubs) { try { un(); } catch { /* ignore */ } }
+    this._busUnsubs.length = 0;
+    if (this._ring) {
+      this.game.scene?.remove(this._ring);
+      this._ringGeo?.dispose();
+      this._ringMat?.dispose();
+      this._ring = null;
+    }
   }
 
   /** Live pool occupancy — handy for the debug overlay. */
@@ -838,7 +1081,9 @@ export class FX {
       + (this.tracers?.vapour ? 1 : 0)
       + (this.flashWorld ? 1 : 0)
       + (this.flashView ? 1 : 0)
-      + (this.shells ? 1 : 0);
+      + (this.shells ? 1 : 0)
+      + (this.siteRings?.meshes?.length || 0)
+      + (this._ring ? 1 : 0);
     return out;
   }
 

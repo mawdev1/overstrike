@@ -178,6 +178,24 @@ export const PARTICLE_PRESETS = Object.freeze({
     drag: 1.1, gravity: 0.9, curve: 4, bounce: 0.3, scatter: 0.1,
   }),
 
+  // --- bomb detonation ------------------------------------------------------
+  //
+  // The site column. Both presets are authored for LANDMARK scale: metres-wide sprites,
+  // multi-second lives and a strong buoyancy term (negative gravity => lift against
+  // WORLD_GRAVITY, terminal rise ≈ 22·|g|/drag m/s), so the plume climbs 25-35 m and
+  // stays readable from the far corner of the 88 m map. Deliberately NOT reused for
+  // frags — `fx.bombDetonation()` is the only caller.
+  bombFireColumn: def({
+    group: 'add', count: [16, 22], life: [0.8, 1.7], speed: [8, 20], cone: 0.32,
+    size: [1.6, 3.2], sizeEnd: 2.8, color: [7.5, 3.1, 0.7], colorEnd: [1.7, 0.28, 0.04],
+    drag: 1.2, gravity: -0.45, curve: 3, spin: 2.2, scatter: 1.2, upBias: 2.6,
+  }),
+  bombSmokeColumn: def({
+    group: 'smoke', count: [16, 24], life: [5, 8.5], speed: [6, 13], cone: 0.26,
+    size: [2.2, 4.0], sizeEnd: 4.6, color: [0.2, 0.19, 0.18], colorEnd: [0.5, 0.49, 0.47],
+    drag: 0.75, gravity: -0.28, curve: 2, spin: 0.7, scatter: 1.6, upBias: 2.4,
+  }),
+
   // --- weapon / ambient ----------------------------------------------------
   muzzleSmoke: def({
     group: 'smoke', count: [2, 4], life: [0.35, 0.8], speed: [1.2, 3.2], cone: 0.35,

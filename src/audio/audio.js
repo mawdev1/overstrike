@@ -91,7 +91,7 @@ const LISTENER_EPS_DIR = 2e-4;
  */
 const MIN_STEAL_AGE = 0.15;
 const MAX_DEFEND = 1.2;
-const VOICE_LIMIT = { explosion: 6 };
+const VOICE_LIMIT = { explosion: 6, bombDetonation: 2, bombRumble: 2 };
 
 /**
  * What a voice's priority is worth once it is past `defendUntil`. Scaled rather than
@@ -118,6 +118,7 @@ const DEFAULT_PRIORITY = 40;
 
 /** Higher wins a voice-stealing contest. Player weapons get +20 via `opts.self`. */
 const PRIORITY = {
+  bombDetonation: 110, bombRumble: 104,
   explosion: 100, matchStart: 96, matchEnd: 96, streakReady: 94, killConfirm: 92,
   uiClick: 88, uiBack: 88, uiHover: 84,
   headshot: 90, hitmarker: 90, hitmarkerHeadshot: 90,
@@ -146,7 +147,8 @@ const COOLDOWN = {
 /** How much of each sound goes to the reverb send before distance is factored in. */
 const SEND_BASE = {
   rifle: 0.42, smg: 0.38, sniper: 0.5, shotgun: 0.46, pistol: 0.36, lmg: 0.46,
-  explosion: 0.55, headshot: 0.2, fleshHit: 0.16, whizby: 0.2,
+  explosion: 0.55, bombDetonation: 0.75, bombRumble: 0.3,
+  headshot: 0.2, fleshHit: 0.16, whizby: 0.2,
   impactConcrete: 0.22, impactMetal: 0.26, impactWood: 0.2, impactDirt: 0.14,
   impactSand: 0.12, impactGlass: 0.28,
   footstepConcrete: 0.12, footstepDirt: 0.08, land: 0.2, jump: 0.08,
@@ -1166,6 +1168,14 @@ export class AudioEngine {
 
     on('explosion', (e) => this._onExplosion(e));
 
+    // The bomb detonation rides the objective bus (game/bomb.js locally, net/session.js
+    // online — both re-emit `bombDetonated` as an `objective` row), NOT the `explosion`
+    // damage event: the bomb ends the round without an `applyExplosionDamage` pass, so
+    // `_onExplosion` never fires for it.
+    on('objective', (e) => {
+      if (e && e.kind === 'bombDetonated') this._onBombDetonated(e);
+    });
+
     on('kill', (e) => {
       if (e && e.attacker && e.attacker.isPlayer) {
         this.playUI('killConfirm', { volume: e.headshot ? 1 : 0.9 });
@@ -1203,6 +1213,42 @@ export class AudioEngine {
     }
     this.duck(0.3 + 0.35 * close, 0.55 + 0.7 * close);
     if (close > 0.4) this.deafen(close, 2.2 + close * 3.4);
+  }
+
+  /**
+   * The bomb detonation is authored to be HEARD MAP-WIDE, in two layers:
+   *
+   *   `bombDetonation` — the full crack+blast+tail, positional. The engine's existing
+   *     distance treatment does the heavy lifting: inverse rolloff, the air-absorption
+   *     lowpass past 26 m (the "muffled far away"), and the long `concrete` convolution
+   *     picked automatically past 45 m (the echo tail).
+   *   `bombRumble` — lows only, NON-positional, mixed IN as the positional layer
+   *     attenuates OUT with distance. This is what keeps the far corner of the map —
+   *     ~120 m out, where inverse rolloff leaves almost nothing — with a felt, muffled
+   *     boom instead of silence. Sub-bass carries no useful direction anyway.
+   *
+   * Plus the moment-ownership treatment: a hard duck of everything else, and the
+   * deafen/tinnitus ring when it goes off close.
+   */
+  _onBombDetonated(e) {
+    const p = e.position
+      ?? (typeof e.x === 'number' ? { x: e.x, y: e.y, z: e.z } : null);
+
+    this.play('bombDetonation', { position: p, volume: 1.6, scatter: 0.01 });
+
+    let close = 1;
+    if (p && this.ctx) {
+      const dx = p.x - this._lx, dy = p.y - this._ly, dz = p.z - this._lz;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      close = clamp(1 - d / 60, 0, 1);
+    }
+
+    // Crossfade: barely-there at the site (the positional layer owns it), dominant far.
+    const farVol = 0.2 + 0.7 * (1 - close);
+    this.play('bombRumble', { volume: farVol, priority: PRIORITY.bombRumble, scatter: 0.01 });
+
+    this.duck(0.45 + 0.35 * close, 1.1 + 1.4 * close);
+    if (close > 0.3) this.deafen(close, 2.6 + close * 3.2);
   }
 
   _onMatchEnd(e) {

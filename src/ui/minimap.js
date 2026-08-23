@@ -75,6 +75,8 @@ export class Minimap {
     this._orientation = 'playerUp';
     this._uav = false;
     this._callout = '';
+    /** Manifest bomb sites, cached by `_bake()` for the planted-state emphasis. */
+    this._sites = null;
 
     /**
      * Everything below is derived from the backing-store size and therefore only
@@ -325,7 +327,8 @@ export class Minimap {
     c.textAlign = 'center';
     c.textBaseline = 'top';
     c.font = `700 ${Math.max(12, Math.round(ppm * 1.65))}px system-ui, sans-serif`;
-    for (const site of sitesFromManifest(world.manifest)) {
+    this._sites = sitesFromManifest(world.manifest);
+    for (const site of this._sites) {
       const x = toX(site.center.x);
       const y = toZ(site.center.z);
       const size = Math.max(7, ppm * 0.8);
@@ -611,6 +614,44 @@ export class Minimap {
           ? `rgba(255, 47, 36, ${0.4 + 0.5 * pulse})`
           : `rgba(255, 179, 71, ${0.35 + 0.5 * pulse})`;
         ctx.fill();
+      }
+    }
+
+    // --- bomb-site emphasis -------------------------------------------------
+    // The baked layer already stamps both site glyphs; while the bomb is PLANTED
+    // the armed site additionally pulses in its own colour with a red core, and
+    // clamps to the ring edge when out of view, so "where is it armed" is always
+    // one glance at the radar (the projected DOM markers this replaces are gone).
+    if (g.match?.modeId === 'bomb' && this._sites?.length) {
+      const bomb = g.match.bomb;
+      const plantedSite = bomb?.state === 'planted' ? bomb.siteId : null;
+      if (plantedSite) {
+        for (const site of this._sites) {
+          if (site.site !== plantedSite) continue;
+          const dx = site.center.x - px;
+          const dz = site.center.z - pz;
+          let sx = (dx * cosY - dz * sinY) * s;
+          let sy = (dx * sinY + dz * cosY) * s;
+          const d = Math.hypot(sx, sy);
+          if (d > edge) { const k = edge / (d || 1); sx *= k; sy *= k; }
+          const pulse = 0.5 + 0.5 * Math.sin(this._pulse * 7);
+          const x = cx + sx;
+          const y = cy + sy;
+          ctx.beginPath();
+          ctx.arc(x, y, W * (0.045 + 0.028 * pulse), 0, Math.PI * 2);
+          ctx.strokeStyle = site.site === 'A' ? '#86ddd3' : '#ffd07d';
+          ctx.lineWidth = Math.max(1.5, W * 0.010);
+          ctx.globalAlpha = 0.45 + 0.55 * pulse;
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.beginPath();
+          ctx.arc(x, y, W * 0.020, 0, Math.PI * 2);
+          ctx.fillStyle = '#ff4433';
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(4, 6, 10, 0.85)';
+          ctx.lineWidth = Math.max(1, W * 0.005);
+          ctx.stroke();
+        }
       }
     }
 

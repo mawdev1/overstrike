@@ -1374,7 +1374,9 @@ html.os-prefer-reduced-motion *::after {
 #hud[data-hud-text-size="small"] { font-size: .86em; }
 #hud[data-hud-text-size="large"] { font-size: 1.16em; }
 #hud[data-hud-text-size="extraLarge"] { font-size: 1.32em; }
-#hud[data-objective-markers="minimal"] .bomb-world-markers { display: none; }
+/* The projected .bomb-world-markers cards are gone (ground rings + minimap carry
+   objective location); "minimal" now collapses the edge sites list instead. */
+#hud[data-objective-markers="minimal"] .bomb-sites { display: none; }
 
 html[data-color-vision="deuteranopia"] { --team-a:#66c2ff;--team-b:#ffcf66;--dmg:#ff9f43; }
 html[data-color-vision="protanopia"] { --team-a:#4fc3f7;--team-b:#ffd166;--dmg:#ffb347; }

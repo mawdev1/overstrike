@@ -43,6 +43,20 @@ export function resolveManifestCallout(manifest, point) {
 export function sitesFromManifest(manifest) {
   const sites = [];
   const seen = new Set();
+  const frozenBox = (min, max) => Object.freeze({
+    min: Object.freeze({ x: min.x, y: min.y, z: min.z }),
+    max: Object.freeze({ x: max.x, y: max.y, z: max.z }),
+  });
+  // §3.3: a site may carry a separate defuse volume; when omitted it defaults to the
+  // plant volume (mirrors compileObjectives in the referee — no looser, no tighter).
+  const defuseBoxes = new Map();
+  for (const objective of manifest?.objectives || []) {
+    if (objective?.kind !== 'defuse' || !['A', 'B'].includes(objective.site)) continue;
+    const min = objective.box?.min;
+    const max = objective.box?.max;
+    if (![min?.x, min?.y, min?.z, max?.x, max?.y, max?.z].every(finite)) continue;
+    if (!defuseBoxes.has(objective.site)) defuseBoxes.set(objective.site, frozenBox(min, max));
+  }
   for (const objective of manifest?.objectives || []) {
     if (objective?.kind !== 'plant' || !['A', 'B'].includes(objective.site)
       || typeof objective.id !== 'string' || seen.has(objective.site)) continue;
@@ -54,19 +68,59 @@ export function sitesFromManifest(manifest) {
       y: (min.y + max.y) / 2,
       z: (min.z + max.z) / 2,
     });
+    const box = frozenBox(min, max);
     sites.push(Object.freeze({
       id: objective.id,
       site: objective.site,
       callout: resolveManifestCallout(manifest, center) || `Site ${objective.site}`,
       center,
-      box: Object.freeze({
-        min: Object.freeze({ x: min.x, y: min.y, z: min.z }),
-        max: Object.freeze({ x: max.x, y: max.y, z: max.z }),
-      }),
+      box,
+      defuseBox: defuseBoxes.get(objective.site) || box,
+      // Same default the referee compiles: absent means the plant demands ground contact.
+      requiresGround: objective.requiresGround !== false,
     }));
     seen.add(objective.site);
   }
   return Object.freeze(sites.sort((left, right) => left.site.localeCompare(right.site)));
+}
+
+/**
+ * Mirror of the referee's §6/§7 interaction preconditions (`_validate` in
+ * `src/game/bomb.js`), computed only from facts the client already learns: its own
+ * predicted body, the public site volumes, and the privacy-filtered bomb view. It is
+ * deliberately NOT looser — every server check observable client-side is repeated —
+ * so the prompt never advertises an interaction the referee would refuse for a
+ * client-knowable reason. Server-only facts (disconnection, same-tick death ordering)
+ * stay with the server's refusal events.
+ *
+ * @returns {'plant'|'defuse'|null}
+ */
+export function deriveEligibleInteraction({
+  phase, role, alive, localEntityId, bomb, sites, position, grounded,
+} = {}) {
+  if (alive !== true || !position || !finite(position.x)) return null;
+  if (role === 'attacker') {
+    // §6: live phase only (a planted phase refuses as already-planted), carrier only.
+    if (phase !== 'live') return null;
+    if (bomb?.state !== 'carried' || !localEntityId || bomb.carrierId !== localEntityId) return null;
+    for (const site of sites || []) {
+      const box = site?.box;
+      if (!box || !pointInBox(position, box)) continue;
+      // §6 notGrounded: only an explicit `grounded === false` refuses, as in the referee.
+      if (site.requiresGround !== false && grounded === false) return null;
+      return 'plant';
+    }
+    return null;
+  }
+  if (role === 'defender') {
+    // §7: planted phase only, inside the PLANTED site's defuse volume.
+    if (phase !== 'planted') return null;
+    if (bomb?.siteId !== 'A' && bomb?.siteId !== 'B') return null;
+    const site = (sites || []).find((row) => row?.site === bomb.siteId);
+    const box = site?.defuseBox || site?.box;
+    return box && pointInBox(position, box) ? 'defuse' : null;
+  }
+  return null;
 }
 
 function eyePosition(game) {
@@ -251,12 +305,25 @@ export function buildLocalBombSample(game, nowMs = performance.now(), transient 
     }),
   });
   const siteMarkers = sites.map((site) => projectLocalSiteMarker(game, site)).filter(Boolean);
+  // Derived from the already privacy-filtered view (`matchState.bomb`), never the raw
+  // referee, so a hidden carrier can never light the prompt for the wrong player.
+  const eligibleAction = deriveEligibleInteraction({
+    phase,
+    role: localRole,
+    alive: isAlive === true,
+    localEntityId: matchState.localPlayer.entityId,
+    bomb: matchState.bomb,
+    sites,
+    position: player?.position,
+    grounded: player?.grounded,
+  });
   return Object.freeze({
     matchState,
     netState: 'idle',
     netStats: null,
     nowMs,
     localAuthority: true,
+    eligibleAction,
     bindings: bindingMap(game),
     preferences: localPreferences(game),
     siteMarkers,
@@ -271,6 +338,18 @@ export function buildFacadeBombSample(game, facade, nowMs = performance.now(), t
   const state = facade?.matchState;
   if (!state || state.mode !== 'bomb') return null;
   const sites = Array.isArray(state.sites) ? state.sites : [];
+  // Same §6/§7 mirror as local practice, from the client's own predicted body and the
+  // facade's public views. The wire's handoff sites carry one public box per site.
+  const eligibleAction = deriveEligibleInteraction({
+    phase: state.phase,
+    role: state.localPlayer?.role,
+    alive: state.localPlayer?.alive === true,
+    localEntityId: state.localPlayer?.entityId,
+    bomb: state.bomb,
+    sites,
+    position: game?.player?.position,
+    grounded: game?.player?.grounded,
+  });
   return Object.freeze({
     matchState: state,
     netState: facade.state,
@@ -279,6 +358,7 @@ export function buildFacadeBombSample(game, facade, nowMs = performance.now(), t
     nowMs,
     freshnessThresholdMs: LIVE_FRESHNESS_MS,
     localAuthority: false,
+    eligibleAction,
     bindings: bindingMap(game),
     preferences: localPreferences(game),
     siteMarkers: sites.map((site) => projectLocalSiteMarker(game, site)).filter(Boolean),
@@ -358,6 +438,29 @@ export function createLocalBombHud({ game, root, facade = game?.netFacade ?? nul
   };
   mount.addEventListener('click', onClick);
 
+  // §6.4 held-intent driver for local practice. On the wire, `net/server.js` turns the
+  // command's `interactHeld` bit into `requestInteract` every tick and `releaseInteract`
+  // the moment it drops — but without a server nothing performed that step for the local
+  // human, so the prompt advertised a key the referee never heard ("PLANT — E" did
+  // nothing). This mirrors the server's loop 1:1 through the same public referee API the
+  // in-process bots use: request every frame while the bound key is held (the referee
+  // re-validates every step and dedupes refusals itself), release otherwise. Pausing
+  // counts as release — opening the menu mid-plant is an interruption (player.js clears
+  // `interactHeld` for the same reason).
+  const driveLocalInteract = () => {
+    const rules = game?.match?.bombRules;
+    const player = game?.player;
+    if (!rules || !player) return;
+    const held = game.state === 'playing'
+      && player.alive !== false
+      && player._held?.interactHeld === true;
+    if (held) {
+      rules.requestInteract(player, player.team === rules.attackingTeam ? 'plant' : 'defuse');
+    } else {
+      rules.releaseInteract(player);
+    }
+  };
+
   const update = (dt = LOCAL_RENDER_INTERVAL) => {
     const networkBomb = facade?.descriptor?.mode === 'bomb';
     const active = (networkBomb || game?.match?.modeId === 'bomb')
@@ -371,6 +474,9 @@ export function createLocalBombHud({ game, root, facade = game?.netFacade ?? nul
       else child.removeAttribute('aria-hidden');
     }
     if (!active) return null;
+    // Every frame, ahead of the 20 Hz render throttle — held intent is a per-tick fact,
+    // not a presentation detail. Networked matches keep the real wire path untouched.
+    if (!networkBomb) driveLocalInteract();
     accumulator += Math.max(0, Number(dt) || 0);
     if (accumulator < LOCAL_RENDER_INTERVAL) return null;
     accumulator %= LOCAL_RENDER_INTERVAL;

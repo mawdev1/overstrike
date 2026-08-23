@@ -24,6 +24,7 @@ export {
   buildLocalBombSample,
   createLocalBombHud,
   buildFacadeBombSample,
+  deriveEligibleInteraction,
   projectLocalSiteMarker,
   resolveManifestCallout,
   sitesFromManifest,

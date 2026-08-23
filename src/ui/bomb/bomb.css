@@ -91,38 +91,8 @@
 .bomb-state { flex-wrap: wrap; }
 .bomb-carrier, .bomb-marker { width: 100%; color: var(--bomb-focus); }
 
-.bomb-world-markers {
-  position: absolute;
-  inset: 0;
-  padding: 0;
-  margin: 0;
-  list-style: none;
-  pointer-events: none;
-}
-.bomb-world-marker {
-  position: absolute;
-  left: var(--bomb-marker-x);
-  top: var(--bomb-marker-y);
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: 2px 7px;
-  align-items: center;
-  max-width: min(260px, 32vw);
-  padding: 6px 8px;
-  transform: translate(-50%, -50%);
-  border: 1px solid #718b87;
-  background: var(--bomb-bg);
-  text-align: left;
-}
-.bomb-world-marker > span:not(.bomb-token) {
-  grid-column: 1 / -1;
-  color: var(--bomb-muted);
-  font-size: 0.75em;
-}
-.bomb-world-marker--active { outline: 3px solid var(--bomb-focus); outline-offset: 2px; }
-.bomb-world-marker--occluded { border-style: dashed; opacity: 0.82; }
-.bomb-world-marker--offscreen { border-width: 2px; }
-.bomb-world-marker__edge { color: var(--bomb-focus) !important; font-weight: 900; letter-spacing: 0.06em; }
+/* The projected world-marker cards were removed (see view.js): the ground rings in
+   src/fx/siteRings.js and the minimap now carry world-space objective location. */
 
 .bomb-interaction {
   position: absolute;
@@ -136,6 +106,10 @@
   text-align: center;
 }
 .bomb-interaction__action, .bomb-interaction__status { margin: 0 0 8px; }
+/* Idle in-circle prompt: same panel language, one line, reads at a glance mid-fight. */
+.bomb-prompt { margin: 0; font-size: 1.2em; letter-spacing: 0.06em; }
+.bomb-prompt:not(:last-child) { margin-bottom: 8px; }
+.bomb-prompt kbd { font-size: 0.95em; }
 .bomb-interaction__status { color: var(--bomb-focus); }
 .bomb-interaction__progress { display: grid; gap: 5px; }
 .bomb-interaction progress { width: 100%; height: 14px; accent-color: var(--bomb-alpha); }
@@ -172,8 +146,6 @@
   .bomb-team__role { display: none; }
   .bomb-objectives { top: 18%; max-width: 48vw; }
   .bomb-site > span:last-child, .bomb-connection .bomb-hud__secondary { display: none; }
-  .bomb-world-marker { max-width: 42vw; padding: 5px 7px; }
-  .bomb-world-marker > span:not(.bomb-token) { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -202,5 +174,5 @@
 
 @media (forced-colors: active) {
   .bomb-hud { --bomb-bg: Canvas; --bomb-panel: Canvas; --bomb-text: CanvasText; --bomb-muted: CanvasText; --bomb-alpha: LinkText; --bomb-bravo: Highlight; --bomb-focus: Highlight; --bomb-danger: Mark; }
-  .bomb-round, .bomb-site, .bomb-state, .bomb-world-marker, .bomb-connection, .bomb-spectator, .bomb-interaction { forced-color-adjust: auto; }
+  .bomb-round, .bomb-site, .bomb-state, .bomb-connection, .bomb-spectator, .bomb-interaction { forced-color-adjust: auto; }
 }

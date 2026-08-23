@@ -270,7 +270,32 @@ function bindingLabel(bindings, action) {
   return value || 'UNBOUND';
 }
 
-function projectInteraction(state, localEntityId, bindings, typedEvent, freshnessStatus) {
+/**
+ * The idle "you could act here" prompt: an adapter (`deriveEligibleInteraction`) asserts
+ * the local player currently satisfies the referee's §6/§7 preconditions. The projection
+ * re-checks every precondition visible in its own inputs so a buggy or hostile adapter
+ * value fails closed, and hides the prompt while syncing — a stale snapshot cannot prove
+ * present-tense eligibility.
+ */
+function projectPrompt(eligibleAction, phase, localRole, bomb, bindings, freshnessStatus) {
+  const kind = eligibleAction === 'plant' || eligibleAction === 'defuse' ? eligibleAction : null;
+  if (!kind) return null;
+  if (freshnessStatus === 'syncing' || freshnessStatus === 'unknown') return null;
+  if (kind === 'plant') {
+    if (phase !== 'live' || localRole !== 'attacker') return null;
+    if (bomb.state !== 'carried' || !bomb.isLocalCarrier) return null;
+  } else {
+    if (phase !== 'planted' || localRole !== 'defender') return null;
+    if (bomb.state !== 'planted') return null;
+  }
+  return Object.freeze({
+    kind,
+    actionLabel: kind === 'plant' ? 'PLANT' : 'DEFUSE',
+    binding: bindingLabel(bindings, 'interact'),
+  });
+}
+
+function projectInteraction(state, localEntityId, bindings, typedEvent, freshnessStatus, prompt) {
   const source = state?.interaction;
   const kind = source?.kind === 'plant' || source?.kind === 'defuse' ? source.kind : 'none';
   const actorId = integer(source?.actorId) && source.actorId > 0 ? source.actorId : null;
@@ -291,7 +316,7 @@ function projectInteraction(state, localEntityId, bindings, typedEvent, freshnes
   if (!isLocalActor) {
     return Object.freeze({
       kind, actorId, isLocalActor: false, visible: false, progress: null, percent: null,
-      actionLabel: null, stateWord: null, binding: null, status,
+      actionLabel: null, stateWord: null, binding: null, status, prompt,
     });
   }
 
@@ -313,6 +338,8 @@ function projectInteraction(state, localEntityId, bindings, typedEvent, freshnes
     stateWord,
     binding: bindingLabel(bindings, 'interact'),
     status,
+    // While channeling, the progress presentation owns the space; the idle prompt yields.
+    prompt: null,
   });
 }
 
@@ -445,6 +472,7 @@ export function projectBombPresentation({
   preferences = null,
   siteMarkers = null,
   localAuthority = false,
+  eligibleAction = null,
 } = {}) {
   if (!finite(nowMs)) throw new TypeError('nowMs must be a finite client-monotonic timestamp.');
   if (!localAuthority && (!finite(freshnessThresholdMs) || freshnessThresholdMs <= 0)) {
@@ -482,7 +510,8 @@ export function projectBombPresentation({
   ]);
   const localRole = local.role === 'attacker' || local.role === 'defender' ? local.role : null;
   const bomb = projectBomb(state, localEntityId, localRole);
-  const interaction = projectInteraction(state, localEntityId, bindings, typedEvent, freshness.status);
+  const prompt = projectPrompt(eligibleAction, phase, localRole, bomb, bindings, freshness.status);
+  const interaction = projectInteraction(state, localEntityId, bindings, typedEvent, freshness.status, prompt);
   const spectator = projectSpectator(state, bindings);
   const connection = projectConnection(netState, reconnect, nowMs, syncing, stats, localAuthority);
   const outcome = projectOutcome(outcomeEvent, localTeam);

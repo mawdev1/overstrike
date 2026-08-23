@@ -29,26 +29,25 @@ function sitesMarkup(sites) {
   </li>`).join('')}</ul>`;
 }
 
-function worldMarkersMarkup(sites) {
-  const projected = sites.filter((site) => site.screenX !== null && site.screenY !== null);
-  if (!projected.length) return '';
-  return `<ul class="bomb-world-markers" aria-hidden="true">${projected.map((site) => `<li class="bomb-world-marker${site.active ? ' bomb-world-marker--active' : ''}${site.occluded ? ' bomb-world-marker--occluded' : ''}${site.offscreen ? ' bomb-world-marker--offscreen' : ''}" data-site="${site.site}" data-direction="${attr(site.direction || '')}" style="--bomb-marker-x:${site.screenX.toFixed(2)}%;--bomb-marker-y:${site.screenY.toFixed(2)}%">
-    <span class="bomb-token bomb-token--${site.shape}" aria-hidden="true">${site.glyph}</span>
-    <strong>${site.label}</strong>
-    <span>${escapeHtml(site.callout)}${site.distanceM === null ? '' : ` · ${Math.round(site.distanceM)} M`}</span>
-    ${site.offscreen && site.direction ? `<span class="bomb-world-marker__edge">EDGE ${site.direction.toUpperCase()}</span>` : ''}
-  </li>`).join('')}</ul>`;
-}
+// The projected world markers (glyph + callout + distance cards floated over the 3D
+// view) are intentionally GONE: they blocked the centre of the screen during live
+// play. Objective location is carried by the 3D ground rings (src/fx/siteRings.js),
+// the minimap site marks, and the edge-anchored sites list above.
 
 function interactionMarkup(interaction) {
-  if (!interaction.visible && !interaction.status) return '';
+  if (!interaction.visible && !interaction.status && !interaction.prompt) return '';
   const progress = interaction.visible ? `<div class="bomb-interaction__progress">
     <progress max="1" value="${interaction.progress}" aria-label="${attr(interaction.actionLabel)} progress" aria-valuetext="${interaction.percent} percent, ${attr(interaction.stateWord)}"></progress>
     <span>${interaction.percent}% · ${escapeHtml(interaction.stateWord)}</span>
   </div>` : '';
   const action = interaction.visible ? `<p class="bomb-interaction__action"><strong>${escapeHtml(interaction.actionLabel)}</strong> <kbd>${escapeHtml(interaction.binding)}</kbd></p>` : '';
+  // Idle in-circle prompt ("PLANT — [E]", live binding). Only when NOT channeling: the
+  // progress presentation above owns the same slot the moment the hold starts.
+  const prompt = !interaction.visible && interaction.prompt
+    ? `<p class="bomb-prompt" data-prompt-kind="${attr(interaction.prompt.kind)}"><strong>${escapeHtml(interaction.prompt.actionLabel)}</strong><span aria-hidden="true"> — </span><kbd>${escapeHtml(interaction.prompt.binding)}</kbd></p>`
+    : '';
   const status = interaction.status ? `<p class="bomb-interaction__status" role="status">${escapeHtml(interaction.status)}</p>` : '';
-  return `<section class="bomb-interaction" aria-label="Objective interaction">${action}${progress}${status}</section>`;
+  return `<section class="bomb-interaction" aria-label="Objective interaction">${prompt}${action}${progress}${status}</section>`;
 }
 
 function spectatorMarkup(spectator) {
@@ -154,7 +153,6 @@ export function renderBombHudHtml(model) {
       ${sitesMarkup(model.sites)}
       <div class="bomb-state"><span class="bomb-case bomb-case--${attr(model.bomb.icon)}" aria-hidden="true">◆</span><strong>${escapeHtml(model.bomb.label)}</strong>${carrier}${marker}</div>
     </section>
-    ${worldMarkersMarkup(model.sites)}
     ${interactionMarkup(model.interaction)}
     ${spectatorMarkup(model.spectator)}
     ${outcomeMarkup(model.outcome)}

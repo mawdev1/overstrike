@@ -949,6 +949,78 @@ function explosion(ctx, dest, t, R, sh) {
   });
 }
 
+/**
+ * The bomb going off — the round-ending detonation, scaled past the frag `explosion`:
+ * double ignition crack, a longer chest-punch sub drop, a heavier debris field and a
+ * ~4 s decorrelated rumble tail. Played positionally by the audio engine's
+ * `bombDetonated` handler; the engine's air-absorption lowpass and the long `concrete`
+ * reverb are what make it read as distant-and-huge from across the map.
+ */
+function bombDetonation(ctx, dest, t, R, sh) {
+  // Ignition — a doubled crack so it reads as one violent, complex transient.
+  noiseLayer(ctx, dest, sh, R, t, { hp: 2200, dur: 0.03, gain: 0.85, atk: 3e-4 });
+  noiseLayer(ctx, dest, sh, R, t + 0.012, { hp: 1400, dur: 0.05, gain: 0.6, atk: 5e-4 });
+
+  // Blast body — saturated pink noise collapsing into the lows, bigger than a frag's.
+  noiseLayer(ctx, dest, sh, R, t, {
+    noise: 'pink', type: 'lowpass', f0: 3200, f1: 80, sweep: 0.6, q: 1.4,
+    dur: 0.85, gain: 0.92, atk: 1.4e-3, drive: 3.0,
+  });
+  noiseLayer(ctx, dest, sh, R, t + 0.005, {
+    type: 'bandpass', f0: 380, f1: 150, sweep: 0.8, q: 0.7,
+    dur: 1.15, gain: 0.32, atk: 7e-3,
+  });
+
+  // The sub drop — longer and deeper than a frag's; this is the chest hit.
+  toneLayer(ctx, dest, sh, R, t, {
+    type: 'sine', f0: 92, f1: 20, sweep: 1.0, dur: 1.7, gain: 0.95, atk: 2e-3, drive: 1.4,
+  });
+  toneLayer(ctx, dest, sh, R, t + 0.03, {
+    type: 'triangle', f0: 55, f1: 17, sweep: 1.4, dur: 2.1, gain: 0.4, atk: 0.01,
+  });
+
+  // Debris — heavier, longer scatter than a frag.
+  grains(ctx, dest, sh, R, t, {
+    count: 30, t0: 0.12, t1: 2.6, f0: 420, f1: 4600,
+    gMin: 0.02, gMax: 0.08, dMin: 0.015, dMax: 0.06, q: 7, spread: 0.95,
+  });
+
+  // Long decorrelated rumble tail — the part that keeps rolling around the map.
+  for (let i = 0; i < 2; i++) {
+    noiseLayer(ctx, dest, sh, R, t + 0.06, {
+      noise: 'pink', type: 'bandpass', f0: 520, f1: 130, sweep: 2.6, q: 0.6,
+      dur: 3.1, gain: 0.16, atk: 0.07, pan: i === 0 ? -0.75 : 0.75,
+    });
+  }
+  noiseLayer(ctx, dest, sh, R, t + 0.04, {
+    noise: 'pink', type: 'lowpass', f0: 230, f1: 48, sweep: 2.8, q: 1.1,
+    dur: 3.6, gain: 0.26, atk: 0.12,
+  });
+}
+
+/**
+ * The detonation's map-wide companion: lows only — sub drop plus rolling filtered
+ * rumble, no crack, no debris. Played NON-positionally, scaled up with distance, so a
+ * player in the far corner still gets a felt, muffled boom after the positional layer
+ * has attenuated to almost nothing. Being all lows, it needs no distance lowpass of its
+ * own — it IS the lowpassed version.
+ */
+function bombRumble(ctx, dest, t, R, sh) {
+  toneLayer(ctx, dest, sh, R, t, {
+    type: 'sine', f0: 64, f1: 21, sweep: 1.1, dur: 2.2, gain: 0.8, atk: 8e-3, drive: 1.2,
+  });
+  noiseLayer(ctx, dest, sh, R, t + 0.02, {
+    noise: 'pink', type: 'lowpass', f0: 320, f1: 55, sweep: 1.6, q: 1.2,
+    dur: 2.6, gain: 0.5, atk: 0.05, drive: 1.6,
+  });
+  for (let i = 0; i < 2; i++) {
+    noiseLayer(ctx, dest, sh, R, t + 0.3, {
+      noise: 'pink', type: 'lowpass', f0: 180, f1: 42, sweep: 2.4, q: 0.9,
+      dur: 3.0, gain: 0.2, atk: 0.25, pan: i === 0 ? -0.6 : 0.6,
+    });
+  }
+}
+
 function streakReady(ctx, dest, t, R, sh) {
   const notes = [440, 554.4, 659.3, 880];
   for (let i = 0; i < notes.length; i++) {
@@ -1088,6 +1160,8 @@ spec('uiHover', 0.08, 2, uiHover, 0.22);
 spec('uiBack', 0.18, 1, uiBack, 0.38);
 
 spec('explosion', 3.05, 2, explosion, 0.95, true);
+spec('bombDetonation', 4.6, 1, bombDetonation, 0.97, true);
+spec('bombRumble', 4.0, 1, bombRumble, 0.85, true);
 spec('streakReady', 1.30, 1, streakReady, 0.70, true);
 spec('matchStart', 2.05, 1, matchStart, 0.86, true);
 spec('matchEnd', 2.45, 1, matchEnd, 0.70, true);

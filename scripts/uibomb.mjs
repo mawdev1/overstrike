@@ -19,6 +19,7 @@ import {
   TEAM_TOKENS,
   baseBombMatchState,
   buildLocalBombSample,
+  deriveEligibleInteraction,
   projectLocalSiteMarker,
   projectBombPresentation,
   renderBombHudFromFacadeSample,
@@ -378,8 +379,11 @@ const localProjected = projectBombPresentation(localSample);
 equal(localProjected.connection.state, 'local', 'local practice is distinguished from a synthetic network connection');
 equal(localProjected.connection.label, 'LOCAL PRACTICE', 'local practice never fabricates RTT or server status');
 equal(localProjected.clock.status, 'authoritative', 'local referee clock requires no network freshness guess');
-check(renderBombHudHtml(localProjected).includes('--bomb-marker-x:'), 'local world-space objectives render at projected screen positions');
-check(renderBombHudHtml(localProjected).includes('aria-hidden="true"'), 'duplicate world marker visuals stay outside the accessibility tree');
+// Player-requested change: world-space objective location is carried by the 3D ground
+// rings (src/fx/siteRings.js) and the minimap — the HUD must never float projected
+// marker cards over the centre view again.
+check(!renderBombHudHtml(localProjected).includes('bomb-world-marker'), 'no projected world-marker cards clutter the live view');
+check(renderBombHudHtml(localProjected).includes('bomb-sites'), 'edge-anchored sites list still carries objective text');
 
 localPlayer.team = 1;
 localGame.match.bomb = { state: 'carried', carrierId: 102, siteId: null, position: { x: 3, y: 0, z: -2 } };
@@ -394,6 +398,99 @@ check(buildLocalBombSample(localGame, 50_300).matchState.bomb.position !== null,
 localPlayer.team = 0;
 localGame.world.losClear = () => true;
 localGame.match.bomb = { state: 'carried', carrierId: 101, siteId: null, position: { x: 0, y: 0, z: 0 } };
+
+// ── in-circle plant/defuse prompt (player request: "show what button to press") ──────
+
+// Model-level: the prompt is an adapter assertion the projection re-checks and renders.
+const promptPlant = model({ eligibleAction: 'plant' });
+equal(promptPlant.interaction.prompt, { kind: 'plant', actionLabel: 'PLANT', binding: 'E' },
+  'eligible carrier in the circle projects a PLANT prompt with the live interact binding');
+const promptPlantHtml = renderBombHudHtml(promptPlant);
+check(promptPlantHtml.includes('bomb-prompt') && promptPlantHtml.includes('<strong>PLANT</strong>')
+  && promptPlantHtml.includes('<kbd>E</kbd>'), 'PLANT prompt renders action text and current key');
+check(!renderBombHudHtml(model()).includes('bomb-prompt'), 'no adapter eligibility, no prompt');
+equal(model({ eligibleAction: 'plant', bindings: { interact: 'F' } }).interaction.prompt.binding, 'F',
+  'prompt binding follows a rebound interact key');
+
+const promptWhilePlanting = model({
+  matchState: baseBombMatchState({ bomb: { siteId: 'A' }, interaction: { kind: 'plant', actorId: 101, progress: 0.5 } }),
+  eligibleAction: 'plant',
+});
+equal(promptWhilePlanting.interaction.prompt, null, 'channeling hands the slot to the progress UI');
+check(renderBombHudHtml(promptWhilePlanting).includes('PLANTING')
+  && !renderBombHudHtml(promptWhilePlanting).includes('bomb-prompt'), 'progress markup replaces the idle prompt');
+
+// Fail-closed re-checks: a looser adapter cannot make the projection advertise an
+// interaction the referee (§6/§7) would refuse.
+equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ phase: 'freeze', phaseEndsAt: SERVER_NOW + 8_000 }) }).interaction.prompt, null,
+  'PLANT prompt refuses a non-live phase');
+equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ localPlayer: { entityId: 202, team: 'bravo', role: 'defender' } }) }).interaction.prompt, null,
+  'PLANT prompt refuses a defender');
+equal(model({ eligibleAction: 'plant', matchState: baseBombMatchState({ bomb: { carrierId: 102 } }) }).interaction.prompt, null,
+  'PLANT prompt refuses a non-carrier');
+equal(model({ eligibleAction: 'defuse', matchState: baseBombMatchState() }).interaction.prompt, null,
+  'DEFUSE prompt refuses a pre-plant phase');
+equal(model({
+  eligibleAction: 'plant',
+  nowMs: SAMPLED_AT + 5_000,
+  netStats: { sampledAt: SAMPLED_AT + 5_000, windowMs: 5_000, snapshotAgeMs: 5_000 },
+}).interaction.prompt, null, 'a stale snapshot cannot prove present-tense eligibility');
+
+const promptDefuse = model({
+  eligibleAction: 'defuse',
+  matchState: baseBombMatchState({
+    phase: 'planted', phaseEndsAt: SERVER_NOW + 40_000,
+    bomb: { state: 'planted', carrierId: null, siteId: 'A', position: { x: -21, y: 0, z: -15 } },
+    localPlayer: { entityId: 202, team: 'bravo', role: 'defender' },
+  }),
+});
+equal(promptDefuse.interaction.prompt, { kind: 'defuse', actionLabel: 'DEFUSE', binding: 'E' },
+  'defender in the planted circle projects a DEFUSE prompt');
+check(renderBombHudHtml(promptDefuse).includes('<strong>DEFUSE</strong>'), 'DEFUSE prompt renders');
+
+// Sample-level: the derivation mirrors the referee's §6/§7 preconditions exactly.
+const eligibilitySites = sitesFromManifest(localManifest);
+equal(eligibilitySites[0].requiresGround, true, 'manifest plant volume defaults to requiresGround');
+equal(eligibilitySites[0].defuseBox, eligibilitySites[0].box, 'omitted defuse volume defaults to the plant volume (§3.3)');
+const eligibility = (overrides = {}) => deriveEligibleInteraction({
+  phase: 'live', role: 'attacker', alive: true, localEntityId: 101,
+  bomb: { state: 'carried', carrierId: 101, siteId: null },
+  sites: eligibilitySites, position: { x: 8, y: 1, z: -12 }, grounded: true,
+  ...overrides,
+});
+equal(eligibility(), 'plant', 'attacker carrying inside site A plant box is plant-eligible');
+equal(eligibility({ position: { x: 0, y: 0, z: 0 } }), null, 'outside every plant volume is ineligible');
+equal(eligibility({ grounded: false }), null, 'airborne in a requiresGround volume is ineligible (§6)');
+equal(eligibility({ grounded: undefined }), 'plant', 'only an explicit grounded === false refuses, as in the referee');
+equal(eligibility({ bomb: { state: 'carried', carrierId: 102, siteId: null } }), null, 'a non-carrier attacker is ineligible');
+equal(eligibility({ bomb: { state: 'dropped', carrierId: null, siteId: null } }), null, 'a dropped bomb prompts nobody');
+equal(eligibility({ phase: 'freeze' }), null, 'plant needs the live phase');
+equal(eligibility({ alive: false }), null, 'the dead are not prompted');
+equal(eligibility({
+  phase: 'planted', role: 'defender',
+  bomb: { state: 'planted', carrierId: null, siteId: 'A' },
+}), 'defuse', 'defender inside the planted site defuse volume is defuse-eligible');
+equal(eligibility({
+  phase: 'planted', role: 'defender',
+  bomb: { state: 'planted', carrierId: null, siteId: 'B' },
+}), null, 'defender in the WRONG circle is not defuse-eligible');
+equal(eligibility({ phase: 'planted', role: 'defender', bomb: { state: 'planted', carrierId: null, siteId: 'A' }, position: { x: 0, y: 0, z: 0 } }),
+  null, 'defender outside the planted defuse volume is ineligible');
+
+// End-to-end through the local-practice sample builder.
+localPlayer.position = { x: 8, y: 1, z: -12 };
+localPlayer.grounded = true;
+const inCircleSample = buildLocalBombSample(localGame, 51_000);
+equal(inCircleSample.eligibleAction, 'plant', 'local sample derives plant eligibility in the circle');
+const inCircleHtml = renderBombHudHtml(projectBombPresentation(inCircleSample));
+check(inCircleHtml.includes('bomb-prompt') && inCircleHtml.includes('<strong>PLANT</strong>') && inCircleHtml.includes('<kbd>E</kbd>'),
+  'local practice renders PLANT — [E] inside the circle');
+localPlayer.position = { x: 0, y: 0, z: 0 };
+const outOfCircleSample = buildLocalBombSample(localGame, 51_100);
+equal(outOfCircleSample.eligibleAction, null, 'leaving the circle removes eligibility');
+check(!renderBombHudHtml(projectBombPresentation(outOfCircleSample)).includes('bomb-prompt'),
+  'no prompt renders outside the circle');
+delete localPlayer.grounded;
 
 // ── escaping and semantic accessibility ──────────────────────────────────────────────
 
@@ -531,23 +628,27 @@ try {
   }
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.setContent(`<!doctype html><meta charset="utf-8"><style>${css}</style><main><div id="hud"><div class="legacy" aria-hidden="true">LEGACY CLOCK</div>${renderBombHudHtml(localProjected)}</div></main>`);
-  const localLayout = await page.evaluate(() => ({
-    legacyHidden: document.querySelector('.legacy')?.getAttribute('aria-hidden'),
-    semanticHudHidden: document.querySelector('.bomb-hud')?.getAttribute('aria-hidden'),
-    markers: [...document.querySelectorAll('.bomb-world-marker')].map((marker) => {
-      const rect = marker.getBoundingClientRect();
-      return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
-    }),
-    markersDecorative: document.querySelector('.bomb-world-markers')?.getAttribute('aria-hidden'),
-  }));
+  const localLayout = await page.evaluate(() => {
+    const centre = { left: 1280 * 0.3, right: 1280 * 0.7, top: 720 * 0.25, bottom: 720 * 0.75 };
+    const intrudes = [...document.querySelectorAll('.bomb-sites, .bomb-objectives')].some((panel) => {
+      const rect = panel.getBoundingClientRect();
+      return rect.left < centre.right && rect.right > centre.left
+        && rect.top < centre.bottom && rect.bottom > centre.top;
+    });
+    return {
+      legacyHidden: document.querySelector('.legacy')?.getAttribute('aria-hidden'),
+      semanticHudHidden: document.querySelector('.bomb-hud')?.getAttribute('aria-hidden'),
+      markerCount: document.querySelectorAll('.bomb-world-marker, .bomb-world-markers').length,
+      sitesListed: document.querySelectorAll('.bomb-site').length,
+      sitesIntrudeOnCentre: intrudes,
+    };
+  });
   equal(localLayout.legacyHidden, 'true', 'browser integration hides legacy decorative HUD semantics');
   equal(localLayout.semanticHudHidden, null, 'browser integration keeps the Bomb semantic subtree exposed');
-  equal(localLayout.markersDecorative, 'true', 'world markers do not duplicate semantic objective announcements');
-  equal(localLayout.markers.length, 2, 'browser integration renders both Square objective markers');
-  for (const [index, rect] of localLayout.markers.entries()) {
-    check(rect.left >= 0 && rect.top >= 0 && rect.right <= 1280 && rect.bottom <= 720,
-      `browser integration keeps site marker ${index + 1} inside the safe viewport`);
-  }
+  equal(localLayout.markerCount, 0,
+    'no projected world-marker cards render over the 3D view (ground rings + minimap replace them)');
+  equal(localLayout.sitesListed, 2, 'both Square objectives remain listed in the edge panel');
+  equal(localLayout.sitesIntrudeOnCentre, false, 'the sites panel stays clear of the centre view');
   equal(browserErrors, [], 'visual matrix has no browser page errors');
 } finally {
   await browser.close();
