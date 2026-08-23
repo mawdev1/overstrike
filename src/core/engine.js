@@ -600,6 +600,15 @@ export class Engine {
       depth: true,
       alpha: false,
     });
+    // three.js validates every program on first use — getProgramInfoLog + getShaderInfoLog +
+    // getProgramParameter(LINK_STATUS) — and each of those is a SYNCHRONOUS driver flush.
+    // Profiling attributes 121-163 ms of self time to getProgramInfoLog alone during boot,
+    // the single largest JS/native entry, and the 53 programs are re-linked on EVERY match
+    // entry rather than amortised across a session. The driver itself is not the cost:
+    // compileShader and linkProgram together measure under 1 ms.
+    //
+    // Kept ON in dev, where a shader that fails to compile should say so loudly.
+    this.renderer.debug.checkShaderErrors = Boolean(import.meta.env?.DEV);
     this.renderer.setClearColor(0x0a0d12, 1);
 
     /**
@@ -1098,6 +1107,9 @@ export class Engine {
   }
 
   _onResize() {
+    // The one place the canvas changes size, so it is the one place that may invalidate
+    // anything cached off it (see WeaponSystem._spreadToPixels).
+    if (this.game?.weapons) this.game.weapons._cachedCanvasH = 0;
     const { w, h, cssW, cssH } = this._targetSize();
     this.renderer.setPixelRatio(1);
     this.renderer.setSize(w, h, false);

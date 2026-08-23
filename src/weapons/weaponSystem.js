@@ -961,7 +961,12 @@ export class WeaponSystem {
   /** Cone half-angle (deg) -> crosshair gap in CSS pixels at the current FOV. */
   _spreadToPixels(deg) {
     const cam = this.game.camera;
-    const h = (this.game.engine?.canvas?.clientHeight) || globalThis.window?.innerHeight || 1080;
+    // `clientHeight` is a LAYOUT read, and this runs every frame on the render path — the
+    // only such read outside src/ui, and profiling put it third among non-three.js entries
+    // at 85-93 ms of self time per 20 s of combat. The canvas only changes size on resize,
+    // so cache it and let the engine's own resize invalidate the cache.
+    const h = this._cachedCanvasH || (this._cachedCanvasH =
+      (this.game.engine?.canvas?.clientHeight) || globalThis.window?.innerHeight || 1080);
     const fov = (cam?.fov || 85) * DEG;
     const halfPlane = Math.tan(fov * 0.5);
     if (halfPlane <= 0) return 0;
