@@ -99,12 +99,37 @@ const HAZARD = 0xe8c24a;        // safety yellow
 // multiply and still read as distinct colours at 30 m.
 const LAUNDRY = [0xffffff, 0x7fd4ff, 0xff9a7a, 0xa8f088, 0xffd24a, 0xd0a8ff, 0xffffff, 0x9fe8e0];
 
-// ── The Square — competitive map-data 1.2 producer ────────────────────────────────
+// ── The Square — competitive map-data producer ────────────────────────────────────
+//
+// CROSSING REDESIGN (3.0.0): the district is rebuilt as a desert crossroads town — an
+// homage to the SOCOM II map "Crossroads" (Algerian city, Demolition), rebuilt from
+// community-documented structure with original geometry, names and callouts:
+//
+//   · Two roads cross at a central town square (the CROSSING) with a well and two
+//     raised market terraces breaking the spawn-to-spawn rifle lanes.
+//   · Four tall GATEHOUSES arch over the roads where they leave the square — the
+//     sightline governors that keep every lane under the §7.0 48 m ceiling.
+//   · The FISH MARKET (NW) and the RED HOUSE (SE) are the two opposing landmark
+//     halls; each hosts a plant site, an interior gallery (y 3.6) over the site
+//     approach, and a corner tower — the MINARET and the CLOCKTOWER — whose open
+//     decks (y 7.6) duel each other diagonally across the square.
+//   · Flanking alley loops (Net Alley / Lantern Alley, Dye Alley / Spice Alley and
+//     the two back streets) give every approach a covered alternative to the roads.
+//   · Spawn yards sit behind the north and south gates, enclosed, with three exits.
+//
+// The layout is 180°-rotationally symmetric about the origin (buildCrossHalf emits
+// each authored feature twice, mirrored through the origin), which is what makes the
+// two teams' route menus provably identical.
+//
+// Sightline discipline: every ground corridor is ≤ 44 m before a mass ≥ head height
+// terminates it; elevated eyes (gallery 3.6 + 1.62, tower deck 7.6 + 1.62) are boxed
+// by the 10 m ring of major buildings, the 11 m gatehouses and the 15 m perimeter.
 
 export const MAP_ID = 'the-square';
-// 2.0.0 is a MAJOR bump under map-data.md §8: site-A's plant volume MOVED, which rewrites
-// the meaning of every match result recorded against 1.0.0. Landed with CCR-001.
-export const MAP_VERSION = '2.0.0';
+// 3.0.0 is a MAJOR bump under map-data.md §8: BOTH site volumes moved (the whole
+// district was rebuilt as the Crossing), which rewrites the meaning of every match
+// result recorded against 2.x. Callouts are a new vocabulary for the same reason.
+export const MAP_VERSION = '3.0.0';
 
 const SQUARE_EDGE = 44;
 const v3 = (x, y, z) => new THREE.Vector3(x, y, z);
@@ -112,7 +137,7 @@ const volume = (x0, y0, z0, x1, y1, z1) => ({ min: v3(x0, y0, z0), max: v3(x1, y
 
 /**
  * Competitive containment is deliberately data, not district architecture. P6 can embed
- * the district by omitting this layer without deleting or re-authoring any civic building.
+ * the district by omitting this layer without deleting or re-authoring any building.
  */
 export const COMPETITIVE_BOUNDARY = Object.freeze([
   volume(-44, -1, -44, -42, 15, 44),
@@ -121,124 +146,161 @@ export const COMPETITIVE_BOUNDARY = Object.freeze([
   volume(-42, -1, 42, 42, 15, 44),
 ]);
 
+// ── Crossing site plan (authored once, mirrored through the origin) ────────────────
+//
+// All named dimensions below are shared by geometry, manifest volumes and blockers so
+// a tuning pass moves everything that references a feature together.
+const CR = Object.freeze({
+  H_MAIN: 10.0,        // major building wall height — the elevation-containment ring
+  H_GATE: 11.0,        // gatehouse mass over the road arches
+  H_LOW: 3.5,          // yard baffles (stables) — cover, never a wall
+  H_MON: 3.2,          // the two market terraces flanking the well
+  ROOF: 9.6,           // interior ceiling / roof slab underside of every hall
+  GAL: 3.6,            // hall gallery walking level
+  DECK: 7.6,           // tower deck walking level
+  T: 0.45,             // wall thickness
+});
+
+// Spawns. Yaw convention: forward = (-sin yaw, -cos yaw); bravo (north, -z) faces +z.
+// Listed in a deliberately interleaved order: the dynamic spawner's seeded tiebreak
+// jitter draws one rng value per candidate in LIST order, so the order is part of the
+// deterministic initial-placement outcome the sector harness pins. Groups: mains are the
+// protected Bomb rows in each yard; back/pocket spread TDM starts across both flanks.
 const squareSpawns = Object.freeze([
-  // Alpha protected Bomb group, south service court.
-  ['alpha-court-1', -10, 0, 34, 0, 0, 'alpha-main'],
-  ['alpha-court-2', -8, 0, 34, 0, 0, 'alpha-main'],
-  ['alpha-court-3', -6, 0, 34, 0, 0, 'alpha-main'],
-  ['alpha-court-4', -4, 0, 34, 0, 0, 'alpha-main'],
-  ['alpha-court-5', -2, 0, 34, 0, 0, 'alpha-main'],
-  ['alpha-market-1', 34, 0, 31, -0.35, 0, 'alpha-market'],
-  ['alpha-transit-1', 31, 0, 32, 0.35, 0, 'alpha-transit'],
-  ['alpha-plaza-1', -34, 0, 38, 0.15, 0, 'alpha-plaza'],
-  // Bravo protected Bomb group, north municipal court.
-  ['bravo-court-1', 36, 0, -28, -Math.PI / 2, 1, 'bravo-main'],
-  ['bravo-court-2', 36, 0, -26, -Math.PI / 2, 1, 'bravo-main'],
-  ['bravo-court-3', 36, 0, -24, -Math.PI / 2, 1, 'bravo-main'],
-  ['bravo-court-4', 36, 0, -22, -Math.PI / 2, 1, 'bravo-main'],
-  ['bravo-court-5', 36, 0, -20, -Math.PI / 2, 1, 'bravo-main'],
-  ['bravo-market-1', -38, 0, -28, Math.PI + 0.35, 1, 'bravo-market'],
-  ['bravo-transit-1', 31, 0, -32, Math.PI - 0.35, 1, 'bravo-transit'],
-  ['bravo-plaza-1', 34, 0, -38, Math.PI - 0.15, 1, 'bravo-plaza'],
+  // Alpha: south yard (mains, west of the stable baffle), south-back street, flanks.
+  ['alpha-yard-5', -5, 0, 38.5, 0, 0, 'alpha-main'],
+  ['alpha-yard-3', -9, 0, 38.5, 0, 0, 'alpha-main'],
+  ['alpha-yard-4', -7, 0, 38.5, 0, 0, 'alpha-main'],
+  ['alpha-back-1', 36, 0, 39, Math.PI / 2, 0, 'alpha-back'],
+  ['alpha-pocket-1', 39.5, 0, 33.5, 0, 0, 'alpha-pocket'],
+  ['alpha-yard-2', -11, 0, 38.5, 0, 0, 'alpha-main'],
+  ['alpha-yard-1', -13, 0, 38.5, 0, 0, 'alpha-main'],
+  ['alpha-back-2', -15.5, 0, 37.5, 0, 0, 'alpha-back'],
+  // Bravo: north yard (mains, east of the stable baffle), north-back street, flanks.
+  ['bravo-yard-2', 11, 0, -38.5, Math.PI, 1, 'bravo-main'],
+  ['bravo-back-1', -36, 0, -39, -Math.PI / 2, 1, 'bravo-back'],
+  ['bravo-yard-4', 7, 0, -38.5, Math.PI, 1, 'bravo-main'],
+  ['bravo-pocket-1', -39.5, 0, -33.5, Math.PI, 1, 'bravo-pocket'],
+  ['bravo-back-2', 15.5, 0, -37.5, Math.PI, 1, 'bravo-back'],
+  ['bravo-yard-1', 13, 0, -38.5, Math.PI, 1, 'bravo-main'],
+  ['bravo-yard-5', 5, 0, -38.5, Math.PI, 1, 'bravo-main'],
+  ['bravo-yard-3', 9, 0, -38.5, Math.PI, 1, 'bravo-main'],
 ].map(([id, x, y, z, yaw, team, group]) => Object.freeze({
   id, position: v3(x, y, z), yaw, team, group, protectionRadius: 4,
   modes: Object.freeze(['tdm', 'bomb']),
 })));
 
+// One vocabulary, used everywhere (map-data.md §3.4). Every priority is distinct so no
+// overlapping pair can ever tie at a standable point.
 const squareCallouts = Object.freeze([
-  // The low-priority district catch-all guarantees one spoken name for every standable
-  // point; named subregions win deterministically where they overlap it.
-  { id: 'district', name: 'District', box: volume(-42, -4, -42, 42, 14, 42), priority: -100 },
-  { id: 'alpha-court', name: 'South Court', box: volume(-14, -1, 30, 14, 4, 42), priority: 10 },
-  { id: 'bravo-court', name: 'North Court', box: volume(-14, -1, -42, 14, 4, -30), priority: 10 },
-  { id: 'plaza-fountain', name: 'Fountain', box: volume(-13, -1, -12, 13, 4, 12), priority: 20 },
-  { id: 'plaza-east', name: 'Plaza East', box: volume(13, -1, -18, 25, 5, 18), priority: 12 },
-  { id: 'plaza-west', name: 'Plaza West', box: volume(-25, -1, -18, -13, 5, 18), priority: 12 },
-  { id: 'civic-archive', name: 'Civic Archive', box: volume(-42, -1, -29, -20, 10, -5), priority: 30 },
-  { id: 'civic-court', name: 'Archive Court', box: volume(-30, -1, -12, -16, 5, 11), priority: 25 },
-  { id: 'market-arcade', name: 'Market Arcade', box: volume(-42, -1, 7, -20, 8, 29), priority: 20 },
-  { id: 'market-alley', name: 'Delivery Alley', box: volume(-42, -1, 29, -14, 5, 42), priority: 18 },
-  { id: 'transit-control', name: 'Transit Control', box: volume(20, -1, 5, 42, 10, 29), priority: 30 },
-  { id: 'transit-platform', name: 'Platform', box: volume(16, -1, -14, 42, 5, 8), priority: 22 },
-  { id: 'service-tunnel', name: 'Service Tunnel', box: volume(14, -1, 20, 42, 5, 42), priority: 18 },
-  { id: 'upper-walk', name: 'Upper Walk', box: volume(-20, 3.5, -8, 20, 8, 8), priority: 40 },
+  { id: 'town', name: 'Town', box: volume(-42, -4, -42, 42, 14, 42), priority: -100 },
+  { id: 'the-crossing', name: 'Crossing', box: volume(-16, -1, -16, 16, 12, 16), priority: 10 },
+  { id: 'old-well', name: 'Well', box: volume(-7, -1, -6.5, 7, 5, 6.5), priority: 60 },
+  { id: 'fish-market', name: 'Fish Market', box: volume(-37, -1, -36, -16, 12, -6), priority: 30 },
+  { id: 'market-gallery', name: 'Gallery', box: volume(-37, 3.4, -36, -30.5, 6, -6), priority: 50 },
+  { id: 'minaret', name: 'Minaret', box: volume(-16, -1, -16, -10, 12, -10), priority: 55 },
+  { id: 'red-house', name: 'Red House', box: volume(16, -1, 6, 37, 12, 36), priority: 31 },
+  { id: 'red-gallery', name: 'Red Gallery', box: volume(30.5, 3.4, 6, 37, 6, 36), priority: 51 },
+  { id: 'clocktower', name: 'Clocktower', box: volume(10, -1, 10, 16, 12, 16), priority: 56 },
+  { id: 'north-road', name: 'North Road', box: volume(-6, -1, -28, 6, 12, -16), priority: 20 },
+  { id: 'south-road', name: 'South Road', box: volume(-6, -1, 16, 6, 12, 28), priority: 21 },
+  { id: 'west-road', name: 'West Road', box: volume(-42, -1, -6, -16, 12, 6), priority: 18 },
+  { id: 'east-road', name: 'East Road', box: volume(16, -1, -6, 42, 12, 6), priority: 19 },
+  { id: 'north-gate', name: 'North Gate', box: volume(-6, -1, -24, 6, 12, -19), priority: 40 },
+  { id: 'south-gate', name: 'South Gate', box: volume(-6, -1, 19, 6, 12, 24), priority: 41 },
+  { id: 'west-arch', name: 'West Arch', box: volume(-24, -1, -6, -19, 12, 6), priority: 42 },
+  { id: 'east-arch', name: 'East Arch', box: volume(19, -1, -6, 24, 12, 6), priority: 43 },
+  { id: 'bravo-yard', name: 'North Yard', box: volume(-16, -1, -42, 20, 8, -28), priority: 12 },
+  { id: 'alpha-yard', name: 'South Yard', box: volume(-20, -1, 28, 16, 8, 42), priority: 13 },
+  { id: 'north-back', name: 'North Back', box: volume(-42, -1, -42, -14, 8, -36), priority: 22 },
+  { id: 'south-back', name: 'South Back', box: volume(14, -1, 36, 42, 8, 42), priority: 23 },
+  { id: 'net-alley', name: 'Net Alley', box: volume(-42, -1, -36, -37, 8, -6), priority: 24 },
+  { id: 'lantern-alley', name: 'Lantern Alley', box: volume(37, -1, 6, 42, 8, 36), priority: 25 },
+  { id: 'dye-alley', name: 'Dye Alley', box: volume(-42, -1, 14, -20, 8, 38), priority: 15 },
+  { id: 'spice-alley', name: 'Spice Alley', box: volume(20, -1, -38, 42, 8, -14), priority: 16 },
+  { id: 'bakery', name: 'Bakery', box: volume(-38, -1, 6, -16, 12, 16), priority: 26 },
+  { id: 'tea-house', name: 'Tea House', box: volume(16, -1, -16, 38, 12, -6), priority: 27 },
+  { id: 'saddlery', name: 'Saddlery', box: volume(-16, -1, -28, -6, 12, -16), priority: 28 },
+  { id: 'barber', name: 'Barber', box: volume(6, -1, 16, 16, 12, 28), priority: 29 },
+  { id: 'dye-house', name: 'Dye House', box: volume(-42, -1, 6, -6, 12, 42), priority: 5 },
+  { id: 'spice-house', name: 'Spice House', box: volume(6, -1, -42, 42, 12, -6), priority: 6 },
 ]);
 
-// The four pylons that flank the two ground-to-L1 ramps, as [x0, z0, x1, z1] footprints.
-// They were 2.8 m cover blocks, and 2.8 m is the one height that is too tall to be cover
-// and too short to be a wall: nothing can be reached from the ground, and a player who
-// steps off the ramp deck lands on top of one with an eye at 4.42 m and an uninterrupted
-// 63 m read straight across the district. §7.0's ceiling is 48 m. They are building
-// height now, so the surface a player was standing on no longer exists.
-const SQUARE_PYLONS = Object.freeze([
-  Object.freeze([-21, -8, -17.5, -5.8]), Object.freeze([-21, -1.2, -17.5, 8]),
-  Object.freeze([17.5, -8, 21, 1.2]), Object.freeze([17.5, 5.8, 21, 8]),
+// Non-walkable caps (map-data.md §3.5's phantom-node rule): every top a player cannot
+// reach (jump 1.15 + mantle 1.35 = 2.50 m ceiling) is force-blocked so the baker never
+// rasters an island there. [x0, z0, x1, z1, topY] — mirrored pairs listed explicitly.
+const CROSS_CAPS = Object.freeze([
+  // Hall / house roofs (slab top 9.9 within 10 m walls).
+  [-37, -36, -16, -6, 9.9], [16, 6, 37, 36, 9.9],            // fish market / red house
+  [-16, -28, -6, -16, 9.9], [6, 16, 16, 28, 9.9],            // saddlery / barber
+  [-20, 16, -6, 28, 9.9], [6, -28, 20, -16, 9.9],            // dye shop / spice shop
+  [-42, -6, -36.6, 3.2, 9.9], [36.6, -3.2, 42, 6, 9.9],      // west / east lodges
+  // Solid masses (top 10).
+  [-38, 6, -16, 16, 9.9], [16, -16, 38, -6, 9.9],            // bakery / tea house
+  [-38, 20, -24, 42, 10], [24, -42, 38, -20, 10],            // dye house / spice house
+  [-42, 20, -38, 42, 10], [38, -42, 42, -20, 10],            // west / east blocks
+  [-24, 38, -14, 42, 10], [14, -42, 24, -38, 10],            // yard fillers
+  [-16, -42, -14, -28, 10], [14, 28, 16, 42, 10],            // yard piers
+  [-24, 25, -20, 29, 10], [20, -29, 24, -25, 10],            // rooms over the alleys
+  // Gatehouses (top 11).
+  [-6, -22.5, 6, -21, 11], [-6, 21, 6, 22.5, 11],
+  [-22.5, -6, -21, 6, 11], [21, -6, 22.5, 6, 11],
+  // Market terraces and yard stables (unreachable low masses).
+  [-8, 0.5, -0.5, 5.5, CR.H_MON], [0.5, -5.5, 8, -0.5, CR.H_MON],
+  [-1.5, -19, 6.5, -18.2, CR.H_MON], [-6.5, 18.2, 1.5, 19, CR.H_MON],  // arch screens N/S
+  [-19, -1.5, -18.2, 6.5, CR.H_MON], [18.2, -6.5, 19, 1.5, CR.H_MON],  // arch screens W/E
+  [-1.3, -1.3, 1.3, 1.3, 3.0],                                       // wellhouse cap
+  [-16, -6.9, -13.8, -6.45, CR.H_MON], [13.8, 6.45, 16, 6.9, CR.H_MON], // door wings
+  [-20, -11.5, -19.55, -6.45, CR.H_MON], [19.55, 6.45, 20, 11.5, CR.H_MON], // vestibule screens
+  [9, -7, 12.8, -3.5, CR.H_MON], [-12.8, 3.5, -9, 7, CR.H_MON],      // road-mouth carts
+  [-17.5, 19.5, -13, 24.5, CR.H_MON], [13, -24.5, 17.5, -19.5, CR.H_MON], // shop store walls
+  [-12, -42, -2, -37, CR.H_LOW], [2, 37, 12, 42, CR.H_LOW],
+  // Tower cores are sealed by their decks; parapet caps are sub-cell and ignored.
 ]);
-const PYLON_H = 7.4;
 
-// Elevated massing, as [x0, z0, x1, z1] footprints capped at UPPER_H.
-//
-// §7.0's 48 m ceiling and an 84 m district with three usable levels are in tension, and the
-// tension is entirely above head height: at eye 1.62 m the plaza is already chopped into
-// sub-16 m reads, while the upper walk (deck y 4), the two ramps and the signal deck (y 8)
-// looked straight over every one of those breaks. So the breaks grow upward. Each footprint
-// below is a blocker that ALREADY existed at 3.0–3.4 m; only its top moves. No footprint
-// changes, so no nav node, no route, no cover distance and no ground sightline moves — the
-// only rays that change are the ones that were passing over a wall at 5 m of eye height.
-const SQUARE_UPPER_CAPS = Object.freeze([
-  Object.freeze([-29, -13, -27, 13]), Object.freeze([27, -13, 29, 13]),
-  Object.freeze([-18, -1, -11, 1]), Object.freeze([11, -1, 18, 1]),
-  Object.freeze([-1, -16.5, 1, -11]), Object.freeze([-1, -8.5, 1, -5]),
-  Object.freeze([-1, 5, 1, 8.5]), Object.freeze([-1, 11, 1, 16.5]),
-  Object.freeze([-15, -34, -11, -13]), Object.freeze([11, 13, 15, 34]),
-  Object.freeze([13, -27, 15, -18]), Object.freeze([-15, 18, -13, 27]),
-]);
-const UPPER_H = 7.4;   // = PYLON_H: one massing height, and 3.4 m clear of the walk deck
-
-const squareRoofBlockers = Object.freeze([
-  // Archive/market and transit roofs are backdrop, not traversable playspace. The
-  // three usable levels are the plaza ground, upper walk, and signal bridge.
-  volume(-42, 3.5, -42, -20, 4.5, 42),
-  volume(20, 3.5, -42, 42, 4.5, 42),
-  // Pylon caps, for the same reason and by the same rule. The nearest standable surface
-  // is the upper walk at y 4, 5.5 m away horizontally and 3.4 m below — no step, no
-  // mantle, no drop reaches them. Left unblocked the baker rasters four islands that are
-  // walkable, unreachable, and counted as playspace by the analytics: the phantom-node
-  // failure §3.5 names.
-  ...SQUARE_PYLONS.map(([x0, z0, x1, z1]) => volume(x0, PYLON_H - 0.6, z0, x1, PYLON_H + 0.6, z1)),
-  // Same rule and same height for the elevated massing caps. 7.4 m is not a round number:
-  // the player's jump apex is 1.15 m and MANTLE_MAX_H is 1.35 m, so 2.50 m is exactly what
-  // can be climbed, and a cap 3.4 m above the walk deck is the first height that cannot be.
-  // A cap the player CAN reach is playspace and must not be declared blocked here.
-  ...SQUARE_UPPER_CAPS.map(([x0, z0, x1, z1]) => volume(x0, UPPER_H - 0.6, z0, x1, UPPER_H + 0.6, z1)),
-]);
+const squareRoofBlockers = Object.freeze(
+  CROSS_CAPS.map(([x0, z0, x1, z1, top]) => volume(x0, top - 0.6, z0, x1, top + 0.6, z1)),
+);
 
 export const MAP_MANIFEST = Object.freeze({
   bounds: Object.freeze(volume(-SQUARE_EDGE, -4, -SQUARE_EDGE, SQUARE_EDGE, 18, SQUARE_EDGE)),
   spawns: squareSpawns,
   objectives: Object.freeze([
-    { id: 'site-A', kind: 'plant', site: 'A', box: volume(-21.75, 0, -19, -19.5, 2.4, -16.75), requiresGround: true },
-    { id: 'site-B', kind: 'plant', site: 'B', box: volume(16, 0, 26, 18, 2.4, 28), requiresGround: true },
+    // Site A sits on the fish market floor beside the gallery; B mirrors it in the red
+    // house. Each is visible from its hall's three doorways and overlooked by the
+    // gallery above — the defender's perch the attacker has to answer.
+    { id: 'site-A', kind: 'plant', site: 'A', box: volume(-27, 0, -17.5, -22, 2.4, -12.5), requiresGround: true },
+    { id: 'site-B', kind: 'plant', site: 'B', box: volume(25, 0, 14, 29, 2.4, 18), requiresGround: true },
   ]),
   callouts: squareCallouts,
   navHints: Object.freeze({
     walkable: Object.freeze([
       volume(-42, -0.1, -42, 42, 0.35, 42),
-      volume(-12, 3.8, -5, 12, 4.25, 5),
-      volume(-2, 7.8, -5, 2, 8.25, 5),
+      // Hall galleries.
+      volume(-36.55, 3.4, -35.55, -31, 3.85, -6.45),
+      volume(31, 3.4, 6.45, 36.55, 3.85, 35.55),
+      // Tower decks and their hall-side landings.
+      volume(-15.6, 7.3, -15.6, -10.4, 7.85, -10.4),
+      volume(10.4, 7.3, 10.4, 15.6, 7.85, 15.6),
+      volume(-17.7, 7.3, -17.9, -16.5, 7.85, -12.9),
+      volume(16.5, 7.3, 12.9, 17.7, 7.85, 17.9),
     ]),
     // Boundary caps are unwalkable only while that removable layer is installed. Reuse
     // the layer objects instead of cloning them so consumers can subtract it exactly.
     blocked: Object.freeze([...squareRoofBlockers, ...COMPETITIVE_BOUNDARY]),
     links: Object.freeze([
-      { from: v3(-21.5, 0, -3), to: v3(-12, 4, -3), kind: 'stair' },
-      { from: v3(21.5, 0, 3), to: v3(12, 4, 3), kind: 'stair' },
-      { from: v3(-9.5, 4, 3), to: v3(-1.5, 8, 3), kind: 'stair' },
-      { from: v3(9.5, 4, -3), to: v3(1.5, 8, -3), kind: 'stair' },
+      // Gallery stairs (market, red house).
+      { from: v3(-24.6, 0, -7.8), to: v3(-31.5, 3.6, -7.8), kind: 'stair' },
+      { from: v3(24.6, 0, 7.8), to: v3(31.5, 3.6, 7.8), kind: 'stair' },
+      // Tower stairs: hall floor to the high landing beside each deck.
+      { from: v3(-17.1, 0, -31), to: v3(-17.1, 7.6, -15), kind: 'stair' },
+      { from: v3(17.1, 0, 31), to: v3(17.1, 7.6, 15), kind: 'stair' },
     ]),
     cover: Object.freeze([
-      { position: v3(-8, 0, -9), facing: 0 }, { position: v3(8, 0, 9), facing: Math.PI },
-      { position: v3(-25, 0, -10), facing: Math.PI / 2 }, { position: v3(25, 0, 10), facing: -Math.PI / 2 },
+      { position: v3(-8.5, 0, 3), facing: Math.PI / 2 }, { position: v3(8.5, 0, -3), facing: -Math.PI / 2 },
+      { position: v3(10, 0, -10.5), facing: 0 }, { position: v3(-10, 0, 10.5), facing: Math.PI },
+      { position: v3(-27, 0, -17), facing: 0 }, { position: v3(27, 0, 17), facing: Math.PI },
+      { position: v3(-3, 0, -25.5), facing: Math.PI }, { position: v3(3, 0, 25.5), facing: 0 },
     ]),
   }),
   budgets: Object.freeze({
@@ -261,13 +323,13 @@ export function squareManifest({ competitiveBoundary = true } = {}) {
 
 /** Empty, collision-free commercial placements. They are metadata, never ad content. */
 export const COMMERCIAL_ANCHORS = Object.freeze([
-  { id: 'sponsor.event.plaza-east', position: v3(17, 2.2, -7), yaw: -Math.PI / 2, maxSize: v3(3.6, 1.8, 0.08), visibleFrom: ['plaza-fountain'], emissiveMax: 0.15 },
-  { id: 'sponsor.rooftop.transit', position: v3(30, 7.2, 17), yaw: Math.PI, maxSize: v3(4.0, 1.4, 0.08), visibleFrom: ['transit-platform'], emissiveMax: 0.1 },
-  { id: 'sponsor.billboard.market-north', position: v3(-30, 4.8, 8), yaw: 0, maxSize: v3(4.5, 2.0, 0.08), visibleFrom: ['market-arcade'], emissiveMax: 0.12 },
-  { id: 'storefront.market.01', position: v3(-40, 2.0, 13), yaw: Math.PI / 2, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['market-arcade'], emissiveMax: 0 },
-  { id: 'storefront.market.02', position: v3(-40, 2.0, 21), yaw: Math.PI / 2, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['market-arcade'], emissiveMax: 0 },
-  { id: 'storefront.civic.01', position: v3(-27, 2.0, -28), yaw: 0, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['civic-archive'], emissiveMax: 0 },
-  { id: 'storefront.civic.02', position: v3(-35, 2.0, -28), yaw: 0, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['civic-archive'], emissiveMax: 0 },
+  { id: 'sponsor.event.plaza-east', position: v3(15.95, 2.4, -11), yaw: -Math.PI / 2, maxSize: v3(3.6, 1.8, 0.08), visibleFrom: ['the-crossing'], emissiveMax: 0.15 },
+  { id: 'sponsor.rooftop.transit', position: v3(26, 8.6, 36.05), yaw: Math.PI, maxSize: v3(4.0, 1.4, 0.08), visibleFrom: ['south-back'], emissiveMax: 0.1 },
+  { id: 'sponsor.billboard.market-north', position: v3(-26, 4.8, -36.05), yaw: Math.PI, maxSize: v3(4.5, 2.0, 0.08), visibleFrom: ['north-back'], emissiveMax: 0.12 },
+  { id: 'storefront.market.01', position: v3(-37.05, 2.0, -18), yaw: Math.PI / 2, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['net-alley'], emissiveMax: 0 },
+  { id: 'storefront.market.02', position: v3(-37.05, 2.0, -30), yaw: Math.PI / 2, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['net-alley'], emissiveMax: 0 },
+  { id: 'storefront.civic.01', position: v3(-30, 2.0, 5.95), yaw: 0, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['west-road'], emissiveMax: 0 },
+  { id: 'storefront.civic.02', position: v3(-23, 2.0, 5.95), yaw: 0, maxSize: v3(2.4, 1.2, 0.05), visibleFrom: ['west-road'], emissiveMax: 0 },
 ]);
 
 /** Build The Square. Architecture remains when COMPETITIVE_BOUNDARY is omitted in P6. */
@@ -292,187 +354,255 @@ export const MERIDIAN_FIXTURE = Object.freeze({
 });
 
 function buildSquareGround(B) {
-  B.groundPlane(-42, -42, 42, 42, 0, 'concreteDark', 'concrete');
-  B.floorFinish(-14, -14, 14, 14, 0.02, 'tile', { cast: false });
-  B.floorFinish(-41, 8, -20, 29, 0.025, 'brick', { cast: false });
-  B.floorFinish(20, -14, 41, 29, 0.025, 'asphalt', { cast: false });
-  // Directional paving breaks orientation without introducing a second callout vocabulary.
-  for (let z = -36; z <= 36; z += 8) B.deco(-1.8, 0.03, z, 1.8, 0.045, z + 2.4, 'concrete', { cast: false });
+  // Sand-town base: packed dirt everywhere, worn tile across the crossing, asphalt-dark
+  // road beds for the two crossing roads so the skeleton reads from the air.
+  B.groundPlane(-42, -42, 42, 42, 0, 'dirt', 'dirt');
+  B.floorFinish(-16, -16, 16, 16, 0.02, 'tile', { cast: false });
+  B.floorFinish(-6, -42, 6, -16, 0.025, 'concreteDark', { cast: false });
+  B.floorFinish(-6, 16, 6, 42, 0.025, 'concreteDark', { cast: false });
+  B.floorFinish(-42, -6, -16, 6, 0.025, 'concreteDark', { cast: false });
+  B.floorFinish(16, -6, 42, 6, 0.025, 'concreteDark', { cast: false });
 }
 
-function buildingShell(B, x0, z0, x1, z1, material, doors = []) {
-  const t = 0.45;
-  const bySide = (side) => doors.filter((d) => d.side === side).map((d) => ({
-    a0: d.a0, a1: d.a1, y0: 0, y1: 2.8, frame: 'door',
-  }));
-  B.wall(x0, z0, x1, z0 + t, 0, 7.4, material, 'concrete', { openings: bySide('north') });
-  B.wall(x0, z1 - t, x1, z1, 0, 7.4, material, 'concrete', { openings: bySide('south') });
-  B.wall(x0, z0, x0 + t, z1, 0, 7.4, material, 'concrete', { openings: bySide('west') });
-  B.wall(x1 - t, z0, x1, z1, 0, 7.4, material, 'concrete', { openings: bySide('east') });
-  B.box(x0, 3.8, z0, x1, 4.0, z1, 'concreteDark', 'concrete');
+/**
+ * Mirror wrapper: every call is emitted at sign s = +1 as authored and at s = -1
+ * rotated 180° about the origin ((x, z) → (−x, −z)), which is what makes the two
+ * teams' halves of the Crossing provably identical.
+ */
+function makeMirror(B, s) {
+  const X = (x) => s * x;
+  const lo = (a, b) => Math.min(s * a, s * b);
+  const hi = (a, b) => Math.max(s * a, s * b);
+  const flipDir = (d) => (s === 1 ? d : ({ '+x': '-x', '-x': '+x', '+z': '-z', '-z': '+z' })[d]);
+  const mapOpen = (op) => (s === 1 ? op : { ...op, a0: -op.a1, a1: -op.a0 });
+  return {
+    box: (x0, y0, z0, x1, y1, z1, mat, surface, opts) =>
+      B.box(lo(x0, x1), y0, lo(z0, z1), hi(x0, x1), y1, hi(z0, z1), mat, surface, opts),
+    deco: (x0, y0, z0, x1, y1, z1, mat, opts) =>
+      B.deco(lo(x0, x1), y0, lo(z0, z1), hi(x0, x1), y1, hi(z0, z1), mat, opts),
+    slab: (x0, z0, x1, z1, y0, y1, mat, surface, opts = {}) => {
+      const o = { ...opts };
+      if (opts.hole) {
+        const [hx0, hz0, hx1, hz1] = opts.hole;
+        o.hole = [lo(hx0, hx1), lo(hz0, hz1), hi(hx0, hx1), hi(hz0, hz1)];
+      }
+      B.slab(lo(x0, x1), lo(z0, z1), hi(x0, x1), hi(z0, z1), y0, y1, mat, surface, o);
+    },
+    wall: (x0, z0, x1, z1, y0, y1, mat, surface, opts = {}) => {
+      const o = { ...opts };
+      if (opts.openings) o.openings = opts.openings.map(mapOpen);
+      B.wall(lo(x0, x1), lo(z0, z1), hi(x0, x1), hi(z0, z1), y0, y1, mat, surface, o);
+    },
+    stairs: (opts) => B.stairs({
+      ...opts,
+      x0: lo(opts.x0, opts.x1), x1: hi(opts.x0, opts.x1),
+      z0: lo(opts.z0, opts.z1), z1: hi(opts.z0, opts.z1),
+      dir: flipDir(opts.dir),
+    }),
+    parapet: (x0, z0, x1, z1, y, h, mat, surface, opts = {}) => {
+      const o = { ...opts };
+      if (opts.gaps) o.gaps = opts.gaps.map(([a0, a1]) => (s === 1 ? [a0, a1] : [-a1, -a0]));
+      if (s === -1) {
+        const es = opts.extendStart, ee = opts.extendEnd;
+        if (es !== undefined || ee !== undefined) { o.extendStart = ee; o.extendEnd = es; }
+      }
+      B.parapet(lo(x0, x1), lo(z0, z1), hi(x0, x1), hi(z0, z1), y, h, mat, surface, o);
+    },
+    railing: (x0, z0, x1, z1, y, opts) =>
+      B.railing(lo(x0, x1), lo(z0, z1), hi(x0, x1), hi(z0, z1), y, opts),
+    cylinder: (x, y, z, r, h, seg, mat, surface, opts) =>
+      B.cylinder(X(x), y, X(z), r, h, seg, mat, surface, opts),
+  };
+}
+
+/** Four-wall shell with a roof slab. Doors are 2.4 m arched openings; entries with
+ *  `window: true` become glazed casements instead (blocking movement, not sight). */
+function crossShell(H, x0, z0, x1, z1, mat, doors) {
+  const t = CR.T;
+  const bySide = (side) => doors.filter((d) => d.side === side).map((d) => {
+    if (d.window) return { a0: d.a0, a1: d.a1, y0: 1.2, y1: 2.4, glass: true, frame: 'window' };
+    if (d.y0 !== undefined) return { a0: d.a0, a1: d.a1, y0: d.y0, y1: d.y1 };
+    return { a0: d.a0, a1: d.a1, y0: 0, y1: 2.8, frame: 'door' };
+  });
+  H.wall(x0, z0, x1, z0 + t, 0, CR.H_MAIN, mat, 'concrete', { openings: bySide('zmin') });
+  H.wall(x0, z1 - t, x1, z1, 0, CR.H_MAIN, mat, 'concrete', { openings: bySide('zmax') });
+  H.wall(x0, z0 + t, x0 + t, z1 - t, 0, CR.H_MAIN, mat, 'concrete', { openings: bySide('xmin') });
+  H.wall(x1 - t, z0 + t, x1, z1 - t, 0, CR.H_MAIN, mat, 'concrete', { openings: bySide('xmax') });
+  H.box(x0, CR.ROOF, z0, x1, CR.ROOF + 0.3, z1, 'concreteDark', 'concrete');
+}
+
+/**
+ * Corner tower — the Minaret (s = +1, square NW corner) and the Clocktower (s = -1).
+ * A solid masonry shaft with a crenellated deck at y 7.6 overlooking the Crossing.
+ * It is entered the way the original's tower was: from INSIDE the hall — a long
+ * stair up the hall's inner east wall to a high landing, then through a doorway in
+ * the shared wall onto the deck. One approach, audible, and the hall owns it.
+ */
+function crossTower(H) {
+  // Shaft and deck: footprint x[-16,-10] z[-16,-10] (authored frame).
+  H.box(-16, 0, -16, -10, 7.3, -10, 'plaster', 'concrete');
+  H.box(-16, 7.3, -16, -10, 7.6, -10, 'plaster', 'concrete');
+  // Crenellated parapet; the west run leaves the landing doorway open.
+  H.parapet(-16, -16, -10, -16, 7.6, 1.1, 'plaster', 'concrete', {});
+  H.parapet(-16, -10, -10, -10, 7.6, 1.1, 'plaster', 'concrete', { gaps: [[-14.2, -13.2], [-12.4, -11.4]] });
+  H.parapet(-10, -16, -10, -10, 7.6, 1.1, 'plaster', 'concrete', { gaps: [[-14.6, -13.6], [-12.6, -11.6]] });
+  H.parapet(-16, -16, -16, -15.4, 7.6, 1.1, 'plaster', 'concrete', { extendEnd: false });
+  H.parapet(-16, -13, -16, -10, 7.6, 1.1, 'plaster', 'concrete', { extendStart: false });
+  // The hall-side climb: stair along the market's inner east wall to a high landing
+  // level with the deck. The shared-wall doorway itself is cut by the hall shell.
+  H.stairs({ x0: -17.75, z0: -32, x1: -16.45, z1: -18, y0: 0, y1: 7.6, dir: '+z', matName: 'wood', surface: 'wood', rail: true, stringer: false });
+  H.box(-17.75, 7.3, -18, -16.45, 7.6, -12.8, 'wood', 'wood');
+  H.railing(-17.75, -18, -17.75, -12.8, 7.6, {});
+  H.railing(-17.75, -12.8, -16.45, -12.8, 7.6, {});
+  // Ceiling baffle flush against the landing's open side: the two deck doorways
+  // mirror through the origin, so without it a tower deck reads 71 m through the
+  // OPPOSITE tower's doorway and across its hall. It hangs well above head height.
+  H.box(-18.2, 7.0, -20, -17.75, CR.ROOF, -12, 'plaster', 'concrete');
+}
+
+/**
+ * One half of the Crossing (s = +1 builds the fish-market half: NW hall + minaret,
+ * north yard, north gate, west arch, bakery, the dye quarter and the west lodge; the
+ * s = -1 pass emits the red-house half by 180° rotation).
+ */
+function buildCrossHalf(B, s) {
+  const H = makeMirror(B, s);
+
+  // ── Fish Market hall (site A) — x[-37,-16] z[-36,-6], three doors, gallery west.
+  crossShell(H, -37, -36, -16, -6, 'plaster', [
+    { side: 'xmax', a0: -9.6, a1: -7.2 },       // square door, in the tower's shadow
+    { side: 'zmax', a0: -35, a1: -32.6 },       // west-road door (west of the stair foot)
+    { side: 'xmin', a0: -13, a1: -10.6 },       // net-alley door (road-end of the alley)
+    { side: 'xmin', a0: -28.4, a1: -26 },       // net-alley door (deep end)
+    { side: 'xmax', a0: -15.4, a1: -13, y0: 7.6, y1: 9.5 },   // deck doorway
+  ]);
+  // Gallery over the west aisle, with a stair at the road end and a crenelled rim
+  // covering the site approach below.
+  H.box(-36.55, 3.4, -35.55, -31, 3.6, -6.45, 'wood', 'wood');
+  H.stairs({ x0: -31, z0: -9.05, x1: -24.8, z1: -6.61, y0: 0, y1: 3.6, dir: '-x', matName: 'wood', surface: 'wood', rail: true });
+  H.parapet(-31, -35.55, -31, -9.2, 3.6, 1.05, 'wood', 'wood',
+    { gaps: [[-30, -28], [-22, -20], [-14, -12]], extendEnd: false });
+  // Market interior: stall counters and a cold slab — cover around the plant floor.
+  H.box(-29, 0, -33, -21, 1.05, -31, 'wood', 'wood');
+  H.box(-22, 0, -16, -18.5, 1.2, -12, 'concrete', 'concrete');
+  // Plant-side screen: chest-high cover between the plant floor and the square-door
+  // approach, so committing to the plant is not a free kill for the first defender
+  // through the vestibule.
+  H.box(-24.2, 0, -18.5, -22.8, 1.2, -13, 'wood', 'wood');
+
+  H.box(-28, 0, -11, -24, 1.05, -9, 'wood', 'wood');
+  H.box(-36.5, 0, -28, -34, 3.4, -24, 'wood', 'wood');   // under-gallery cold store
+  // Vestibule screen: a head-high partition 3.5 m inside the square door. The hall is
+  // 20 m deep behind a door that faces the far frontage 33 m away — without this, any
+  // interior position lines up a 50–62 m read through the door. With it, only the
+  // vestibule (< 4 m of interior) is visible from outside, and vice versa.
+  H.box(-20, 0, -11.5, -19.55, CR.H_MON, -6.45, 'plaster', 'concrete');
+
+  // Door wing: a market-awning pier beside the square door's open jamb. The two
+  // square doors mirror through the origin, so the road-mouth → far-hall diagonals
+  // (60 m+) thread door-to-door without it; the wing closes that cone at the jamb.
+  H.box(-16, 0, -6.9, -13.8, CR.H_MON, -6.45, 'plaster', 'concrete');
+
+  // ── Minaret / Clocktower on the square's corner.
+  crossTower(H);
+
+  // ── Saddlery / Barber: the pass-through house between yard and square.
+  crossShell(H, -16, -28, -6, -16, 'brick', [
+    { side: 'zmax', a0: -9.4, a1: -7 },         // square door (clear of the tower)
+    // The yard door is OFFSET from the square door on purpose: aligned, the
+    // pass-through was a 52 m yard-to-far-frontage lane straight through the house.
+    { side: 'zmin', a0: -14.6, a1: -12.2 },     // yard door
+    { side: 'zmin', a0: -10.5, a1: -8.7, window: true },
+  ]);
+  H.box(-14, 0, -25, -11.5, 1.05, -22, 'wood', 'wood');
+
+  // ── North yard enclosure: the west pier (the back-street entrance stays open at
+  // z[-42,-37]), the stable baffle that shields the protected spawns from that
+  // entrance, and low cover.
+  H.wall(-16, -42, -14, -28, 0, CR.H_MAIN, 'plaster', 'concrete', {
+    openings: [{ a0: -40, a1: -37.6, y0: 0, y1: 2.8, frame: 'door' }],
+  });                                                                 // yard pier + door
+  H.box(-12, 0, -42, -2, CR.H_LOW, -37, 'wood', 'wood');              // stable baffle
+  H.box(9, 0, -34, 12, 1.1, -31, 'wood', 'wood');                     // yard cover
+  H.box(-8, 0, -33, -5, 1.1, -30.5, 'wood', 'wood');
+
+  // ── Yard filler between the pocket and the boundary, east side.
+  H.box(14, 0, -42, 24, CR.H_MAIN, -38, 'brick', 'concrete');
+
+  // ── North gatehouse over the road (arch east of centre; the south gate mirrors west).
+  H.wall(-6, -22.5, 6, -21, 0, CR.H_GATE, 'plaster', 'concrete', {
+    openings: [{ a0: 0.5, a1: 5.5, y0: 0, y1: 3.4, frame: 'door' }],
+  });
+  // ── West gatehouse (arch north of centre; the east gate mirrors).
+  H.wall(-22.5, -6, -21, 6, 0, CR.H_GATE, 'plaster', 'concrete', {
+    openings: [{ a0: 0.5, a1: 5.5, y0: 0, y1: 3.4, frame: 'door' }],
+  });
+  // Arch screens: a market wall two metres square-side of each arch mouth. Straight
+  // lanes through the arches are already killed by the well terraces; these kill the
+  // SHALLOW DIAGONALS (yard corner → arch → far frontage, measured at 52–63 m without
+  // them) while ground movement doglegs around the open end.
+  H.box(-1.5, 0, -19, 6.5, CR.H_MON, -18.2, 'plaster', 'concrete');   // north arch
+  H.box(-19, 0, -1.5, -18.2, CR.H_MON, 6.5, 'plaster', 'concrete');   // west arch
+
+  // ── Bakery row (Tea House mirrored): the shop cut-through between the dye lane
+  // and the west road, landing opposite the hall's road door — the flank's last leg.
+  // Its two doors are offset so no straight lane threads the room.
+  crossShell(H, -38, 6, -16, 16, 'brick', [
+    { side: 'zmax', a0: -23.4, a1: -21 },       // dye-lane door
+    { side: 'zmin', a0: -32.4, a1: -30 },       // west-road door
+    { side: 'zmin', a0: -20.5, a1: -18.7, window: true },
+  ]);
+  H.box(-29, 0, 9.5, -25, 1.05, 12, 'wood', 'wood');
+
+  // ── Dye quarter (SW under s = +1): house masses, shop shell, alley furniture.
+  H.box(-38, 0, 20, -24, CR.H_MAIN, 42, 'plaster', 'concrete');       // dye house
+  H.box(-42, 0, 20, -38, CR.H_MAIN, 42, 'plaster', 'concrete');       // west block
+  crossShell(H, -20, 16, -6, 28, 'plaster', [
+    { side: 'xmax', a0: 21.5, a1: 23.9 },       // road door, mid-block
+    { side: 'xmin', a0: 21, a1: 23.4 },         // dye-alley door
+    { side: 'zmax', a0: -19.4, a1: -17 },       // pocket door (offset from the road door)
+    { side: 'zmax', a0: -12.4, a1: -10.6, window: true },
+  ]);
+  H.box(-17.5, 0, 19.5, -13, CR.H_MON, 24.5, 'plaster', 'concrete');  // store wall
+  H.box(-12, 0, 25, -9.5, 1.05, 27, 'wood', 'wood');
+  // Room-over-alley: an inhabited bridge across Dye Alley that kills the elevated
+  // read down the alley without touching the ground route.
+  H.box(-24, 2.7, 25, -20, CR.H_MAIN, 29, 'plaster', 'concrete');
+  H.box(-23, 0, 32, -21, 1.1, 34.5, 'wood', 'wood');                  // alley cover
+  H.box(-24, 0, 24, -22.2, 1.1, 26, 'wood', 'wood');                  // alley barrels
+  H.box(-34.5, 0, 17.5, -31.5, 1.1, 19.9, 'wood', 'wood');            // bakers-lane cart
+
+  // ── West lodge: the enterable corner room joining net alley to the west road.
+  crossShell(H, -42, -6, -36.6, 3.2, 'brick', [
+    { side: 'zmin', a0: -40.7, a1: -38.3 },     // net-alley door
+    { side: 'xmax', a0: -3.4, a1: -1 },         // road door
+    { side: 'xmax', a0: -5.8, a1: -4, window: true },
+  ]);
+
+  // ── Road and back-street furniture (cover on the long connections).
+  H.box(-33, 0, -1.5, -29.5, 1.1, 1.5, 'wood', 'wood');               // west road cart
+  H.box(-28, 0, -39.5, -24.5, 1.1, -37, 'wood', 'wood');              // back street cart
+  H.box(-40.5, 0, -18, -38.8, 1.1, -14, 'wood', 'wood');              // net alley crates
+
+  // ── Square terrace (M1 under s = +1; M2 mirrors) and square-edge market carts.
+  H.box(-8, 0, 0.5, -0.5, CR.H_MON, 5.5, 'plaster', 'concrete');
+  // Road-mouth cart stack: closes the door → arch double-aperture diagonal (56 m to
+  // the far lodge) and shortens the shallow door → east-road reads.
+  H.box(9, 0, -7, 12.8, CR.H_MON, -3.5, 'wood', 'wood');
+  H.box(-11, 0, 9.8, -8, 1.1, 12, 'wood', 'wood');
+  H.box(8, 0, -13, 11.5, 1.1, -10.8, 'wood', 'wood');
 }
 
 function buildSquareDistrict(B) {
-  // Civic Archive / Site A: orthogonal cover, two public entries and a service court.
-  buildingShell(B, -40, -29, -20, -7, 'plaster', [
-    { side: 'south', a0: -36, a1: -32 }, { side: 'east', a0: -20, a1: -16 },
-    { side: 'north', a0: -28, a1: -24 },
-  ]);
-  B.box(-38, 0, -26, -36, 2.3, -14, 'concreteDark', 'concrete');
-  B.box(-31, 0, -23, -29, 1.5, -12, 'concrete', 'concrete');
-  B.box(-25, 0, -25, -22, 1.1, -20, 'concrete', 'concrete');
-  B.parapet(-40, -29, -20, -29, 4, 1.0, 'concreteDark');
-  B.parapet(-40, -7, -20, -7, 4, 1.0, 'concreteDark');
-
-  // Transit Control / Site B: broken machinery cover and an independently reachable mezzanine.
-  buildingShell(B, 20, 7, 40, 29, 'concreteDark', [
-    { side: 'north', a0: 24, a1: 28 }, { side: 'west', a0: 12, a1: 16 },
-    { side: 'south', a0: 31, a1: 35 },
-  ]);
-  B.box(23, 0, 11, 27, 1.4, 15, 'metal', 'metal');
-  B.box(31, 0, 14, 34, 2.0, 17, 'concrete', 'concrete');
-  B.box(36, 0, 19, 38, 1.2, 26, 'metal', 'metal');
-  B.box(25, 0, 16, 30.5, 3.0, 26, 'concreteDark', 'concrete');
-  B.parapet(20, 7, 40, 7, 4, 1.0, 'metal');
-  B.parapet(20, 29, 40, 29, 4, 1.0, 'metal');
-
-  // Market Row and service tunnel form the concealed rotations around the open plaza.
-  for (const z of [9, 17, 25]) {
-    B.box(-41, 0, z, -34, 3.4, z + 5, 'brick', 'concrete');
-    B.deco(-33.95, 2.2, z + 0.4, -33.85, 2.45, z + 4.6, 'tile', { cast: false });
-  }
-  B.box(-29, 0, 8, -27, 2.1, 28, 'concreteDark', 'concrete');
-  B.box(27, 0, 30, 29, 2.5, 41, 'concreteDark', 'concrete');
-  B.box(36, 0, 30, 38, 2.5, 41, 'concreteDark', 'concrete');
-
-  // Framed transit glazing is consistent and shoot-through: movement is blocked, sight is
-  // not. Panels are freestanding in their openings so no glass is entombed in masonry.
-  for (const x of [-18, 18]) {
-    for (const z of [-37, -29, -21, -13, -5, 13, 21, 29, 37]) {
-      if ((x === -18 || x === 18) && z === -5) continue; // ramp mouths / cross-lane screen
-      B.box(x - 0.025, 0.35, z - 1.7, x + 0.025, 3.05, z + 1.7, 'glass', 'glass',
-        { cast: false, receive: false });
-    }
-  }
-  for (const z of [-18, 18]) {
-    for (const x of [-12, -7, -2, 3, 8]) {
-      B.box(x, 0.35, z - 0.025, x + 3.5, 3.05, z + 0.025, 'glass', 'glass',
-        { cast: false, receive: false });
-    }
-  }
-
-  // Central square: broken cover and a dry fountain around the offset Signal Spire.
-  B.box(-11, 0, -10, -7, 1.0, -4, 'concrete', 'concrete');
-  B.box(7, 0, 4, 11, 1.0, 10, 'concrete', 'concrete');
-  B.box(-10, 0, 7, -4, 0.75, 10, 'concrete', 'concrete');
-  B.box(4, 0, -10, 10, 0.75, -7, 'concrete', 'concrete');
-  // The civic memorial wall breaks the spawn-to-spawn axis and makes the fast plaza
-  // route commit to an east or west shoulder instead of becoming an 88 m rifle lane.
-  B.box(-13, 0, -1, 13, 3.0, 1, 'plaster', 'concrete');
-  B.cylinder(-15, 0, 0, 1.45, 10.5, 12, 'metal', 'metal', { collide: true });
-  B.cylinder(-15, 10.5, 0, 0.45, 2.2, 10, 'metal', 'metal', { collide: false });
-  // The upper information route crosses the plaza but never becomes a dominant roof.
-  B.box(-12, 3.8, -5, 12, 4.0, 5, 'concreteDark', 'concrete');
-  B.box(-2, 7.8, -5, 2, 8.0, 5, 'concreteDark', 'concrete');
-  B.box(-12, 7.8, -5, -10, 8.0, 1.5, 'concreteDark', 'concrete');
-  B.box(10, 7.8, -1.5, 12, 8.0, 5, 'concreteDark', 'concrete');
-  B.ramp({ x0: -20, z0: -5, x1: -12, z1: -2, y0: 0, y1: 4, dir: '+x', matName: 'concrete' });
-  B.ramp({ x0: 12, z0: 2, x1: 20, z1: 5, y0: 0, y1: 4, dir: '-x', matName: 'concrete' });
-  B.ramp({ x0: -10, z0: 2, x1: -2, z1: 5, y0: 4, y1: 8, dir: '+x', matName: 'concrete' });
-  B.ramp({ x0: 2, z0: -5, x1: 10, z1: -2, y0: 4, y1: 8, dir: '-x', matName: 'concrete' });
-  B.parapet(-12, -5, 2, -5, 8, 1.0, 'concreteDark');
-  B.parapet(-2, 5, 12, 5, 8, 1.0, 'concreteDark');
-
-  // Deliberate sightline breaks between opposing courts and across the service routes.
-  // The two long court slabs and the two middle baffle segments carry the elevated
-  // diagonals off the ramps as well as the ground read, so they run to UPPER_H. At 4.2 m
-  // and 3.4 m a player on either ramp looked straight over them and out to the district
-  // edge; nothing at ground level changes, because a 1.62 m eye never saw past them.
-  B.box(-15, 0, -34, -11, UPPER_H, -13, 'plaster', 'concrete');
-  B.box(11, 0, 13, 15, UPPER_H, 34, 'concreteDark', 'concrete');
-  B.box(-4, 0, -28, 4, 2.2, -24, 'concrete', 'concrete');
-  B.box(-4, 0, 24, 4, 2.2, 28, 'concrete', 'concrete');
-  B.box(-8, 0, -21, 8, 2.8, -19, 'plaster', 'concrete');
-  B.box(-8, 0, 19, 8, 2.8, 21, 'plaster', 'concrete');
-  // These pylons flank rather than occupy the two ground-to-L1 ramps: each ramp mouth
-  // keeps its 4.6 m gap, so no route through them changes.
-  for (const [x0, z0, x1, z1] of SQUARE_PYLONS) {
-    B.box(x0, 0, z0, x1, PYLON_H, z1, 'concreteDark', 'concrete');
-  }
-  // The two long plaza-flank screens carry the cardinal east/west read off the upper walk,
-  // which is why they run to UPPER_H rather than the 3.0 m that only stopped a ground eye.
-  B.box(-29, 0, -13, -27, UPPER_H, 13, 'concreteDark', 'concrete');
-  B.box(27, 0, -13, 29, UPPER_H, 13, 'concreteDark', 'concrete');
-  // Long baffles are deliberately broken into staggered segments. Solid lines across a
-  // district make a fine ray-test wall and an unplayable map: these gaps preserve the
-  // sightline break while keeping every court connected to both sites.
-  // The middle segment is emitted only on the side where the taller sightline-break slab
-  // above does not already occupy it. West of the plaza that slab spans x -15..-11 over
-  // z -34..-13 and swallowed the x=-14 / z -27..-18 segment whole; the mirror swallowed
-  // x=+14 / z 18..27. A box wholly inside another is inert — it blocks nothing the
-  // enclosing box did not already block, contradicts §3.1's "no third state", and still
-  // costs every move/raycast/losClear query against the §3.6 collider budget.
-  for (const x of [-14, 14]) {
-    // The outer segments end at |z| = 30, not 31. At 31 they left a 1 m slot that the
-    // nav raster samples at z = -30.9 and z = 30.6, and that slot was a clear 52 m
-    // ground lane the length of the service road — the only >48 m reads left at eye
-    // height. The staggered gap that keeps the courts connected is 3 m instead of 4.
-    B.box(x - 1, 0, -42, x + 1, 3.4, -30, 'plaster', 'concrete');
-    if (x > 0) B.box(x - 1, 0, -27, x + 1, UPPER_H, -18, 'plaster', 'concrete');
-    if (x < 0) B.box(x - 1, 0, 18, x + 1, UPPER_H, 27, 'plaster', 'concrete');
-    B.box(x - 1, 0, 30, x + 1, 3.4, 42, 'plaster', 'concrete');
-  }
-  // Offset cover closes the only >48 m diagonal through the north-east service gap
-  // without turning that gap into a sealed wall.
-  B.box(11, 0, -30.5, 16, 2.8, -27, 'concreteDark', 'concrete');
-  B.box(25.5, 0, -19, 30, 2.8, -17, 'plaster', 'concrete');
-  B.box(-30, 0, -19, -27, 2.8, -17, 'plaster', 'concrete');
-  // The outer cross-runs stop at |x| = 29, not 29.5. The half-metre slot they left between
-  // themselves and the plaza-flank screens at |x| 27..29 was a 48 m north-south ground lane
-  // the full depth of the market and transit flanks — the last one at eye height. The
-  // rotation gap between the two runs is 2 m rather than 2.5 and is still walkable.
-  for (const z of [-14, 14]) {
-    B.box(-42, 0, z - 1, -29, 3.4, z + 1, 'concreteDark', 'concrete');
-    B.box(-27, 0, z - 1, -19, 3.4, z + 1, 'concreteDark', 'concrete');
-    B.box(19, 0, z - 1, 27, 3.4, z + 1, 'concreteDark', 'concrete');
-    B.box(29, 0, z - 1, 42, 3.4, z + 1, 'concreteDark', 'concrete');
-  }
-  // Upper-storey skyline returns: a closed clerestory ring 29.5 m out, from y 3.0 — clear of
-  // a standing player — to y 12. It is the ONLY thing on this map that bounds an elevated
-  // ray without shortening it: a lane off the walk or the signal deck used to run to the
-  // 42 m boundary at 48–63 m, and it now ends at the ring at 30–38 m, which is still inside
-  // §7.1's long band. Blocking the same lane close to its source would have satisfied the
-  // ceiling by deleting the long read instead of framing it.
-  //
-  // The four faces run unbroken. They were authored with a 16 m opening on each face on the
-  // argument that it preserved the cardinal reads, and the opening was exactly where every
-  // remaining breach went: the elevated routes sit on the spine, so the spine axes are the
-  // lanes, and an opening centred on them opens the only ones that were over.
-  //
-  // Nothing below 3.0 m exists here, so no ground route, ground sightline, cover distance
-  // or nav node is touched — the ring is invisible to everything except an elevated eye.
-  // 29.5, not 30: the last ray over the ceiling was the 45-degree diagonal off the signal
-  // ramp into the ring's inside corner, at 48.3 m. The corner is the furthest point of a
-  // square ring from its centre, so it is the one place the ring is weakest, and half a
-  // metre of inset is what that corner was over by.
-  for (const x of [-29.5, 29.5]) B.box(x - 0.5, 3.0, -29.5, x + 0.5, 12, 29.5, 'plaster', 'concrete');
-  for (const z of [-29.5, 29.5]) B.box(-29.5, 3.0, z - 0.5, 29.5, 12, z + 0.5, 'concreteDark', 'concrete');
-  // The four spine fins run to UPPER_H: at 3.4 m their tops were a step down off the walk
-  // deck, so a player who left the walk stood at eye 5.02 m with the plaza spine to
-  // themselves. There is no surface there now.
-  B.box(-1, 0, -16.5, 1, UPPER_H, -11, 'plaster', 'concrete');
-  B.box(-1, 0, -8.5, 1, UPPER_H, -5, 'plaster', 'concrete');
-  B.box(-1, 0, 5, 1, UPPER_H, 8.5, 'plaster', 'concrete');
-  B.box(-1, 0, 11, 1, UPPER_H, 16.5, 'plaster', 'concrete');
-  B.box(-18, 0, -1, -11, UPPER_H, 1, 'concreteDark', 'concrete');
-  B.box(-7, 0, -1, -5, 3.4, 1, 'concreteDark', 'concrete');
-  B.box(5, 0, -1, 7, 3.4, 1, 'concreteDark', 'concrete');
-  B.box(11, 0, -1, 18, UPPER_H, 1, 'concreteDark', 'concrete');
-  for (const x of [-14, 14]) {
-    for (const z of [-14, 14]) {
-      B.box(x - 3, 0, z - 3, x + 3, 2.8, z + 3, 'concrete', 'concrete');
-    }
-  }
+  buildCrossHalf(B, 1);
+  buildCrossHalf(B, -1);
+  // The domed wellhouse at the exact crossing — the one unmirrored centrepiece, and a
+  // load-bearing one: the two hall doors mirror through the origin, so every straight
+  // door-to-door chord passes within 1.2 m of it. At head height it is what keeps the
+  // Fish Market ↔ Red House line from being an 84 m interior-to-interior rifle lane.
+  B.cylinder(0, 0, 0, 1.3, 3.0, 12, 'brick', 'concrete', { collide: true });
+  B.cylinder(0, 3.0, 0, 1.05, 0.5, 12, 'plaster', 'concrete', { collide: false });
+  B.cylinder(0, 3.5, 0, 0.09, 0.9, 6, 'wood', 'wood', { collide: false });
 }
 
 function buildSquareBoundary(B) {
@@ -592,9 +722,9 @@ export const EXTRACTION_EXITS = Object.freeze([
  * concurrent duplicate REQ-CC-074 reconciles.
  */
 export const LOOT_CONTAINERS = Object.freeze([
-  { containerId: 'c-square-fountain', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(5.5, 0, -5.5) },
-  { containerId: 'c-square-transit', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(33, 0, 11.5) },
-  { containerId: 'c-square-archive', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(-27, 0, -26) },
+  { containerId: 'c-square-fountain', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(9, 0, -8) },
+  { containerId: 'c-square-transit', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(27, 0, 30) },
+  { containerId: 'c-square-archive', tier: 2, lootTableId: 'lt.tier2.cache', position: v3(-33.5, 0, -13) },
   { containerId: 'c-warehouse-mezz', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(-28, 3.6, -77) },
   { containerId: 'c-warehouse-floor', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(-14, 0, -84) },
   { containerId: 'c-customs-shed', tier: 1, lootTableId: 'lt.tier1.cache', position: v3(71, 0, -14) },
@@ -689,9 +819,13 @@ export const EXTRACTION_MANIFEST = Object.freeze({
   navHints: Object.freeze({
     walkable: Object.freeze([
       volume(-43, -0.1, -99, 99, 0.35, 43),
-      // District elevated route (identical to the competitive declaration).
-      volume(-12, 3.8, -5, 12, 4.25, 5),
-      volume(-2, 7.8, -5, 2, 8.25, 5),
+      // District elevated routes (identical to the competitive declaration).
+      volume(-36.55, 3.4, -35.55, -31, 3.85, -6.45),
+      volume(31, 3.4, 6.45, 36.55, 3.85, 35.55),
+      volume(-15.6, 7.3, -15.6, -10.4, 7.85, -10.4),
+      volume(10.4, 7.3, 10.4, 15.6, 7.85, 15.6),
+      volume(-17.7, 7.3, -17.9, -16.5, 7.85, -12.9),
+      volume(16.5, 7.3, 12.9, 17.7, 7.85, 17.9),
       // Warehouse mezzanine, watchtower deck, pier walk.
       volume(-32, 3.4, -90, -24, 3.85, -64),
       volume(-2, 3.6, -56, 4, 4.05, -50),
@@ -700,10 +834,10 @@ export const EXTRACTION_MANIFEST = Object.freeze({
     blocked: xmRoofBlockers,
     links: Object.freeze([
       // District (identical to the competitive declaration).
-      { from: v3(-21.5, 0, -3), to: v3(-12, 4, -3), kind: 'stair' },
-      { from: v3(21.5, 0, 3), to: v3(12, 4, 3), kind: 'stair' },
-      { from: v3(-9.5, 4, 3), to: v3(-1.5, 8, 3), kind: 'stair' },
-      { from: v3(9.5, 4, -3), to: v3(1.5, 8, -3), kind: 'stair' },
+      { from: v3(-24.6, 0, -7.8), to: v3(-31.5, 3.6, -7.8), kind: 'stair' },
+      { from: v3(24.6, 0, 7.8), to: v3(31.5, 3.6, 7.8), kind: 'stair' },
+      { from: v3(-17.1, 0, -31), to: v3(-17.1, 7.6, -15), kind: 'stair' },
+      { from: v3(17.1, 0, 31), to: v3(17.1, 7.6, 15), kind: 'stair' },
       // Warehouse mezzanine stair, watchtower ramp, pier stairs, pier drop-down.
       { from: v3(-16, 0, -76.8), to: v3(-25, 3.6, -76.8), kind: 'stair' },
       { from: v3(13, 0, -54), to: v3(1, 3.8, -54), kind: 'stair' },
@@ -711,7 +845,7 @@ export const EXTRACTION_MANIFEST = Object.freeze({
       { from: v3(94.7, 0, -50), to: v3(94.7, 3.8, -43), kind: 'stair' },
     ]),
     cover: Object.freeze([
-      { position: v3(-8, 0, -9), facing: 0 }, { position: v3(8, 0, 9), facing: Math.PI },
+      { position: v3(-8.5, 0, 3), facing: Math.PI / 2 }, { position: v3(8.5, 0, -3), facing: -Math.PI / 2 },
       { position: v3(14, 0, -84), facing: Math.PI }, { position: v3(-20, 0, -62), facing: 0 },
       { position: v3(66, 0, -76), facing: -Math.PI / 2 }, { position: v3(90, 0, 0), facing: -Math.PI / 2 },
     ]),
