@@ -251,12 +251,12 @@ const _occTo = new THREE.Vector3();
  * Engine
  * ---------------------------------------------------------------- */
 
-/** Opt-in switch for the recorded sample bank — see `AudioEngine._deferSampleLoad`. */
-function samplesRequested() {
+/** Escape hatch for the recorded sample bank — see `AudioEngine._deferSampleLoad`. */
+function samplesDisabled() {
   try {
     const q = new URLSearchParams(globalThis.location?.search || '');
-    if (q.get('samples') === '1') return true;
-    return globalThis.localStorage?.getItem('overstrike.audio.samples') === '1';
+    if (q.get('samples') === '0') return true;
+    return globalThis.localStorage?.getItem('overstrike.audio.samples') === '0';
   } catch { return false; }
 }
 
@@ -726,10 +726,12 @@ export class AudioEngine {
     // The procedural synth bank it was meant to improve on is complete, instant, free and
     // has never broken a match.
     //
-    // So the samples become opt-in (`?samples=1`) until the decode failure is understood
-    // OFFLINE and the fill is provably invisible. A feature that is still being diagnosed
-    // does not belong in the path of someone trying to play.
-    if (!samplesRequested()) return;
+    // RESOLVED: the 'decoded silent' half was never a decode failure. `peakOf` reads
+    // `getChannelData`, which Brave's fingerprinting protection farbles to near-zero while
+    // the audio plays normally — so the silence CHECK rejected 36 healthy files. The check
+    // is advisory now (see samples.js) and the bank is on by default again. `?samples=0`
+    // turns it off if it ever misbehaves again.
+    if (samplesDisabled()) return;
     if (this._sampleLoad || this._sampleLoadQueued) return;
     this._sampleLoadQueued = true;
     const go = () => { this._sampleLoadQueued = false; this._startSampleLoad(); };

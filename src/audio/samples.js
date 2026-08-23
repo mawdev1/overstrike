@@ -375,7 +375,7 @@ export async function loadSampleBank(ctx, opts) {
   const entries = Object.entries(manifest)
     .filter(([, spec]) => !tiers || tiers.includes(spec.tier || 'core'));
 
-  const stats = { loaded: 0, failed: 0, bytes: 0, ms: 0, seconds: 0, failures: [] };
+  const stats = { loaded: 0, failed: 0, bytes: 0, ms: 0, seconds: 0, failures: [], quiet: [] };
   const t0 = now();
   let cursor = 0;
 
@@ -404,17 +404,18 @@ export async function loadSampleBank(ctx, opts) {
           buffers = [shape(ctx, decoded, spec)];
         }
 
-        // A buffer that decoded to silence is not a usable sound. But before giving up on
-        // the file, try the UNSHAPED decode: production reported a dozen weapon samples
-        // failing as 'decoded silent' while the same files served byte-identical and played
-        // fine elsewhere, which points at the trim rather than the audio. Falling back to
-        // the raw buffer costs a slightly longer sample; discarding it costs the sound
-        // entirely. Only if the raw decode is silent too is the file genuinely unusable,
-        // and then the synth stays — which is still a working game.
-        if (!buffers.length || peakOf(buffers[0]) < 1e-4) {
-          if (peakOf(decoded) >= 1e-4) buffers = [decoded];
-          else throw new Error('decoded silent');
-        }
+        // DO NOT REJECT ON A SILENT READ. `peakOf` reads `getChannelData`, and privacy
+        // browsers farble exactly that: Brave's fingerprinting protection returns
+        // near-zero PCM to script while the audio itself plays normally. A player on Brave
+        // therefore lost 36 of 69 samples to 'decoded silent' — every entry that carried a
+        // `max`/`gain` and so got measured — while the same files decode to a healthy 0.156
+        // peak and shape correctly in Chromium. The measurement was wrong, not the audio.
+        //
+        // So a zero reading is now only worth a note. A genuinely silent file costs one
+        // sound; refusing every measured file costs the entire bank, which is the failure
+        // that actually happened.
+        if (!buffers.length) throw new Error('decoded empty');
+        if (peakOf(buffers[0]) < 1e-4) stats.quiet.push(name);
 
         for (const b of buffers) stats.seconds += b.duration;
         stats.loaded++;

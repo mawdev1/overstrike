@@ -45,9 +45,17 @@ export class Input {
     this._onBlur = this._onBlur.bind(this);
     this._onCanvasDown = this._onCanvasDown.bind(this);
     this._onContext = (e) => e.preventDefault();
+    /**
+     * Kept as a field, like every other handler here, because an inline arrow cannot be
+     * removed — and this one closes over `this`. Measured (heap snapshot, two match round
+     * trips): `document` held the listener, the listener held the Input, the Input held the
+     * Game, and with it the whole scene graph and every system, so ~5MB per match entry
+     * survived a forced GC and nothing a player did ever gave it back.
+     */
+    this._onLockError = () => { this.locked = false; this._settleLock(); };
 
     document.addEventListener('pointerlockchange', this._onLockChange);
-    document.addEventListener('pointerlockerror', () => { this.locked = false; this._settleLock(); });
+    document.addEventListener('pointerlockerror', this._onLockError);
     document.addEventListener('mousemove', this._onMouseMove);
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
@@ -167,8 +175,13 @@ export class Input {
       cb(e.code);
       return;
     }
-    if (e.repeat) return;
+    // preventDefault BEFORE the repeat guard. Holding Tab fires repeat keydowns, and
+    // returning early on those let the browser act on them: focus walked out of the canvas,
+    // pointer lock dropped, and the resulting `pointerUnlock` opened the pause shell — i.e.
+    // holding the scoreboard key for a couple of seconds ejected the player into the menu.
+    // The default is unwanted for every repeat of these keys, not just the first.
     if (e.code === 'Tab' || (e.code === 'Space' && this.locked)) e.preventDefault();
+    if (e.repeat) return;
     this.codes.add(e.code);
     const action = this.settings.actionFor(e.code);
     if (action) {
@@ -288,6 +301,7 @@ export class Input {
 
   dispose() {
     document.removeEventListener('pointerlockchange', this._onLockChange);
+    document.removeEventListener('pointerlockerror', this._onLockError);
     document.removeEventListener('mousemove', this._onMouseMove);
     window.removeEventListener('keydown', this._onKeyDown);
     window.removeEventListener('keyup', this._onKeyUp);
