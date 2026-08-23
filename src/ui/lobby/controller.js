@@ -16,6 +16,15 @@ const CLOSE_ERRORS = Object.freeze({
   4004: 'ROOM_FULL', 4005: 'SANCTIONED', 4006: 'ROOM_REMOVED', 4007: 'ROOM_CLOSED',
   4008: 'AUTH_SESSION_REPLACED', 4009: 'RECONNECT_GRACE_EXPIRED', 4010: 'PROTOCOL_VERSION_MISMATCH',
 });
+/**
+ * The code THIS side sends when it refuses a frame. It cannot be 1002 (`protocol error`): the
+ * DOM `WebSocket.close()` accepts only 1000 or 3000–4999 and throws `InvalidAccessError` for
+ * anything else — so `close(1002)` never closed the socket at all, it threw out of the message
+ * handler and left the connection open. Found by the multi-client playtest harness, which saw
+ * it on every one of four clients. 4000 sits below `realtime-lobby.md` §3's reserved 4001–4010
+ * server codes, so it cannot be mistaken for one of them.
+ */
+const CLOSE_CLIENT_PROTOCOL = 4000;
 const UTC_MILLIS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const isUtcMillis = (value) => {
   if (typeof value !== 'string' || !UTC_MILLIS_RE.test(value)) return false;
@@ -194,7 +203,7 @@ export function createLobbyController({
       const protocolError = new LobbyProtocolError('Lobby sent invalid JSON.', { cause: error?.message });
       state.status = 'failed'; state.failure = { code: protocolError.code, message: protocolError.message };
       failConfirmations(Object.assign(new Error('Lobby protocol failed before confirmation.'), { code: 'CLIENT_PROTOCOL' }));
-      emit(); finishWelcome(protocolError); deliberateSockets.add(sourceSocket); sourceSocket.close?.(1002, 'invalid frame'); return;
+      emit(); finishWelcome(protocolError); deliberateSockets.add(sourceSocket); sourceSocket.close?.(CLOSE_CLIENT_PROTOCOL, 'invalid frame'); return;
     }
 
     // Unknown additive types are ignored, but envelope sequencing still cannot be trusted until
@@ -261,7 +270,7 @@ export function createLobbyController({
       state.status = 'failed';
       state.failure = { code: error?.code || 'CLIENT_PROTOCOL', message: error?.message || 'Invalid lobby frame.' };
       failConfirmations(Object.assign(new Error('Lobby protocol failed before confirmation.'), { code: 'CLIENT_PROTOCOL' }));
-      emit(); finishWelcome(error); deliberateSockets.add(sourceSocket); sourceSocket.close?.(1002, 'protocol error');
+      emit(); finishWelcome(error); deliberateSockets.add(sourceSocket); sourceSocket.close?.(CLOSE_CLIENT_PROTOCOL, 'protocol error');
     }
   }
 
